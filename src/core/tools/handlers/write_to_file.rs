@@ -64,11 +64,25 @@ impl WriteToFileHandler {
         workspace_root: &Path,
         allowed_external_roots: &[PathBuf],
     ) -> anyhow::Result<String> {
-        use crate::core::file_editor::FileEditGuard;
-        use tokio::fs;
+        let resolved = crate::core::tools::resolve_authorized_path(
+            workspace_root,
+            allowed_external_roots,
+            path,
+        )?;
+        let _guard =
+            crate::core::file_editor::FileEditGuard::acquire(&resolved.to_string_lossy()).await;
+        self.write_file_unlocked(path, content, workspace_root, allowed_external_roots)
+            .await
+    }
 
-        // Acquire exclusive file lock to prevent concurrent writes
-        let _guard = FileEditGuard::acquire(path).await;
+    async fn write_file_unlocked(
+        &self,
+        path: &str,
+        content: &str,
+        workspace_root: &Path,
+        allowed_external_roots: &[PathBuf],
+    ) -> anyhow::Result<String> {
+        use tokio::fs;
 
         // Capture whether the file existed before the write so the
         // success message can explicitly flag overwrite operations.
@@ -168,7 +182,7 @@ impl WriteToFileHandler {
             )));
         }
 
-        self.write_file_with_allowed_roots(path, content, workspace_root, allowed_external_roots)
+        self.write_file_unlocked(path, content, workspace_root, allowed_external_roots)
             .await
             .map_err(|e| {
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
@@ -241,7 +255,9 @@ impl ToolHandler for WriteToFileHandler {
 
             // Keep reads and edits from observing this file while it is being
             // written. The guard remains held through the state update below.
-            let _file_locks = ctx.lock_file_paths(std::slice::from_ref(&resolved_path)).await;
+            let _file_locks = ctx
+                .lock_file_paths(std::slice::from_ref(&resolved_path))
+                .await;
 
             if content.is_empty() {
                 let mut state = ctx.state.lock().await;
@@ -264,19 +280,17 @@ impl ToolHandler for WriteToFileHandler {
                 .await;
             match result {
                 Ok(_) => {
+                    ctx.invalidate_edit_context(&resolved_path).await;
                     let file_context_metadata = {
                         let mut state = ctx.state.lock().await;
                         state.consecutive_mistakes = 0;
                         // Update in memory while holding the state lock, but
                         // defer the synchronous metadata write until after it
                         // is released.
-                        state
-                            .file_context_tracker
-                            .track_file_context_in_memory(
-                                &resolved_path.to_string_lossy(),
-                                crate::core::context::trackers::FileRecordSource::SnedEdited,
-                            )
-                            ;
+                        state.file_context_tracker.track_file_context_in_memory(
+                            &resolved_path.to_string_lossy(),
+                            crate::core::context::trackers::FileRecordSource::SnedEdited,
+                        );
                         // Mark file as edited by Sned to suppress stale mtime detection
                         state
                             .file_context_tracker
@@ -294,7 +308,8 @@ impl ToolHandler for WriteToFileHandler {
                     };
                     let task_id = ctx.task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(storage) = crate::storage::task_storage::TaskStorage::new(&task_id)
+                        if let Ok(storage) =
+                            crate::storage::task_storage::TaskStorage::new(&task_id)
                         {
                             let _ = storage.save_file_context_metadata(&file_context_metadata);
                         }

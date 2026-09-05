@@ -6,7 +6,7 @@ use crate::services::symbol_index::SymbolIndexService;
 use crate::services::tree_sitter::{SymbolRange, get_symbol_range, load_required_language_parsers};
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::fs;
@@ -16,6 +16,17 @@ struct FileBatch {
     absolute_path: String,
     display_path: String,
     replacements: Vec<Replacement>,
+}
+
+pub(crate) struct PendingSymbolWrite {
+    pub(crate) path: PathBuf,
+    pub(crate) original_content: String,
+    pub(crate) final_content: String,
+}
+
+struct PreparedFileBatch {
+    write: PendingSymbolWrite,
+    result: FileResult,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +94,7 @@ impl ReplaceSymbolHandler {
                 params,
                 workspace_root,
                 allowed_external_roots,
+                None,
             )
             .await;
         *state = Arc::try_unwrap(shared_state)
@@ -97,6 +109,7 @@ impl ReplaceSymbolHandler {
         params: serde_json::Value,
         workspace_root: &Path,
         allowed_external_roots: &[std::path::PathBuf],
+        edit_context: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
         let replacements = read_replacements(&params);
         if replacements.is_empty() {
@@ -117,77 +130,36 @@ impl ReplaceSymbolHandler {
             allowed_external_roots,
         )?;
 
-        let mut file_results: Vec<FileResult> = Vec::new();
-        let mut any_error = None;
-
+        let mut prepared = Vec::with_capacity(batches.len());
         for batch in batches.values() {
-            match process_batch(batch, self.symbol_index_service.as_ref(), &state).await {
-                Ok(result) => {
-                    // Mark only after the write succeeds; failed batches must
-                    // remain eligible for stale-file detection.
-                    state
-                        .lock()
-                        .await
-                        .file_context_tracker
-                        .mark_file_as_edited_by_sned(std::path::Path::new(&batch.absolute_path));
-                    file_results.push(result);
-                }
-                Err(e) => {
-                    // Continue processing remaining batches — don't discard
-                    // successful results. Collect the error but keep going.
-                    if any_error.is_none() {
-                        any_error = Some(e);
-                    }
-                    // Don't break — process all remaining batches
-                }
-            }
+            prepared.push(prepare_batch(batch, self.symbol_index_service.as_ref(), &state).await?);
         }
 
-        // If any error occurred, return an error that includes partial results
-        if let Some(err) = any_error {
-            if file_results.is_empty() {
-                let consecutive_mistakes = Self::increment_mistakes(&state).await;
-                tracing::warn!(
-                    consecutive_mistakes,
-                    error = %err,
-                    "replace_symbol: batch processing failed"
-                );
-                return Err(err);
+        let writes = prepared
+            .iter()
+            .map(|batch| &batch.write)
+            .collect::<Vec<_>>();
+        if let Err(error) = commit_symbol_writes_atomically(&writes).await {
+            if let Some(ctx) = edit_context {
+                for write in &writes {
+                    ctx.invalidate_edit_context(&write.path).await;
+                }
             }
+            return Err(error);
+        }
 
-            // Partial success: return results for files that succeeded,
-            // but also include the error so the model knows what failed.
-            let consecutive_mistakes = Self::increment_mistakes(&state).await;
-            tracing::warn!(
-                consecutive_mistakes,
-                error = %err,
-                partial_results = file_results.len(),
-                "replace_symbol: partial batch success"
-            );
-
-            let summaries: Vec<String> = file_results
-                .into_iter()
-                .map(|fr| {
-                    let symbol_list = fr
-                        .symbols
-                        .iter()
-                        .map(|s| format!("'{s}'"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(
-                        "Successfully replaced symbols {} in {}.",
-                        symbol_list, fr.display_path
-                    )
-                })
-                .collect();
-
-            // Return partial results with error appended
-            let result = format!(
-                "{}\n\nError: {}\n\nSome replacements failed. Review the error above and retry only the failed files.",
-                summaries.join("\n\n"),
-                err
-            );
-            return Ok(result);
+        let mut file_results = Vec::with_capacity(prepared.len());
+        for prepared_batch in prepared {
+            if let Some(ctx) = edit_context {
+                ctx.invalidate_edit_context(&prepared_batch.write.path)
+                    .await;
+            }
+            state
+                .lock()
+                .await
+                .file_context_tracker
+                .mark_file_as_edited_by_sned(&prepared_batch.write.path);
+            file_results.push(prepared_batch.result);
         }
 
         if file_results.is_empty() {
@@ -268,15 +240,16 @@ impl ToolHandler for ReplaceSymbolHandler {
                         .collect::<Vec<_>>(),
                 )
                 .await;
-            handler
+            let result = handler
                 .execute_with_shared_state(
                     ctx.state.clone(),
                     params,
                     ctx.workspace_root.as_path(),
                     &ctx.allowed_external_roots,
+                    Some(&ctx),
                 )
-                .await
-                .map(serde_json::Value::String)
+                .await;
+            result.map(serde_json::Value::String)
         })
     }
 
@@ -390,11 +363,11 @@ fn group_replacements_by_file_with_allowed_roots(
     Ok(batches)
 }
 
-async fn process_batch(
+async fn prepare_batch(
     batch: &FileBatch,
     symbol_index_service: Option<&Arc<std::sync::Mutex<SymbolIndexService>>>,
     state: &Arc<Mutex<TaskState>>,
-) -> Result<FileResult, ToolError> {
+) -> Result<PreparedFileBatch, ToolError> {
     let original_content = fs::read_to_string(&batch.absolute_path)
         .await
         .map_err(|e| {
@@ -431,16 +404,20 @@ async fn process_batch(
                         if abs_loc_path == batch.absolute_path
                             || abs_loc_path.starts_with(&format!("{}/", batch.absolute_path))
                         {
-                            let start_index = calculate_byte_offset(
+                            let Some(start_index) = calculate_byte_offset(
                                 &original_content,
                                 loc.start_line,
                                 loc.start_column,
-                            );
-                            let end_index = calculate_byte_offset(
+                            ) else {
+                                continue;
+                            };
+                            let Some(end_index) = calculate_byte_offset(
                                 &original_content,
                                 loc.end_line,
                                 loc.end_column,
-                            );
+                            ) else {
+                                continue;
+                            };
                             result = Some(SymbolRange {
                                 start_index,
                                 end_index,
@@ -544,17 +521,87 @@ async fn process_batch(
         symbols_applied.push(replacement.symbol);
     }
 
-    crate::storage::disk::atomic_write_file_async(&batch.absolute_path, &current_content)
-        .await
-        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to write file: {e}")))?;
-
-    Ok(FileResult {
-        display_path: batch.display_path.clone(),
-        replacements_applied: symbols_applied.len(),
-        replacements_failed: 0,
-        symbols: symbols_applied,
-        new_problems_message: String::new(),
+    Ok(PreparedFileBatch {
+        write: PendingSymbolWrite {
+            path: PathBuf::from(&batch.absolute_path),
+            original_content,
+            final_content: current_content,
+        },
+        result: FileResult {
+            display_path: batch.display_path.clone(),
+            replacements_applied: symbols_applied.len(),
+            replacements_failed: 0,
+            symbols: symbols_applied,
+            new_problems_message: String::new(),
+        },
     })
+}
+
+pub(crate) async fn commit_symbol_writes_atomically(
+    writes: &[&PendingSymbolWrite],
+) -> Result<(), ToolError> {
+    let mut written: Vec<&PendingSymbolWrite> = Vec::with_capacity(writes.len());
+    for write in writes {
+        match fs::read_to_string(&write.path).await {
+            Ok(current) if current == write.original_content => {}
+            Ok(_) => {
+                let detail = rollback_symbol_writes(&written).await;
+                return Err(ToolError::ExecutionFailed(format!(
+                    "File changed while preparing symbol edits: {}. No symbol edits were applied.{detail}",
+                    write.path.display()
+                )));
+            }
+            Err(error) => {
+                let detail = rollback_symbol_writes(&written).await;
+                return Err(ToolError::ExecutionFailed(format!(
+                    "Failed to verify file {} before writing: {error}.{detail}",
+                    write.path.display()
+                )));
+            }
+        }
+        if let Err(error) =
+            crate::storage::disk::atomic_write_file_async(&write.path, &write.final_content).await
+        {
+            let rollback_detail = rollback_symbol_writes(&written).await;
+            return Err(ToolError::ExecutionFailed(format!(
+                "Failed to write file {}: {error}.{rollback_detail}",
+                write.path.display()
+            )));
+        }
+        written.push(*write);
+    }
+    Ok(())
+}
+
+async fn rollback_symbol_writes(written: &[&PendingSymbolWrite]) -> String {
+    let mut failures = Vec::new();
+    for previous in written.iter().rev() {
+        match fs::read_to_string(&previous.path).await {
+            Ok(current) if current == previous.final_content => {
+                if let Err(error) = crate::storage::disk::atomic_write_file_async(
+                    &previous.path,
+                    &previous.original_content,
+                )
+                .await
+                {
+                    failures.push(format!("{}: {error}", previous.path.display()));
+                }
+            }
+            Ok(_) => failures.push(format!(
+                "{} changed after this request and was preserved",
+                previous.path.display()
+            )),
+            Err(error) => failures.push(format!(
+                "{} could not be checked before rollback: {error}",
+                previous.path.display()
+            )),
+        }
+    }
+    if failures.is_empty() {
+        String::new()
+    } else {
+        format!(" Rollback issues: {}.", failures.join("; "))
+    }
 }
 
 fn find_symbol_via_tree_sitter(
@@ -590,21 +637,107 @@ fn find_line_start_byte(content: &str, byte_offset: usize) -> usize {
     line_start
 }
 
-fn calculate_byte_offset(content: &str, line: usize, column: usize) -> usize {
+fn calculate_byte_offset(content: &str, line: usize, column: usize) -> Option<usize> {
     let mut byte_offset = 0;
 
-    for (current_line, line_str) in content.lines().enumerate() {
+    for (current_line, line_str) in content.split_inclusive('\n').enumerate() {
         if current_line == line {
-            return byte_offset + column;
+            let logical_line = line_str.trim_end_matches(['\r', '\n']);
+            return (column <= logical_line.len() && logical_line.is_char_boundary(column))
+                .then_some(byte_offset + column);
         }
-        byte_offset += line_str.len() + 1;
+        byte_offset += line_str.len();
     }
-    0
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_offsets_preserve_crlf_and_reject_invalid_positions() {
+        let text = "a\r\n雪x\r\nz";
+        assert_eq!(calculate_byte_offset(text, 1, 3), Some(6));
+        assert_eq!(calculate_byte_offset(text, 2, 0), Some(9));
+        assert_eq!(calculate_byte_offset(text, 1, 1), None);
+        assert_eq!(calculate_byte_offset(text, 1, 5), None);
+        assert_eq!(calculate_byte_offset(text, 3, 0), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symbol_write_failure_restores_earlier_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let writable = workspace.path().join("writable");
+        let blocked = workspace.path().join("blocked");
+        std::fs::create_dir_all(&writable).unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        let first = writable.join("first.rs");
+        let second = blocked.join("second.rs");
+        std::fs::write(&first, "fn old_first() {}\n").unwrap();
+        std::fs::write(&second, "fn old_second() {}\n").unwrap();
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let writes = [
+            PendingSymbolWrite {
+                path: first.clone(),
+                original_content: "fn old_first() {}\n".to_string(),
+                final_content: "fn new_first() {}\n".to_string(),
+            },
+            PendingSymbolWrite {
+                path: second,
+                original_content: "fn old_second() {}\n".to_string(),
+                final_content: "fn new_second() {}\n".to_string(),
+            },
+        ];
+        let write_refs = writes.iter().collect::<Vec<_>>();
+        let result = commit_symbol_writes_atomically(&write_refs).await;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(first).unwrap(),
+            "fn old_first() {}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replace_symbol_rolls_back_all_files_when_a_later_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let writable = workspace.path().join("a_writable");
+        let blocked = workspace.path().join("z_blocked");
+        std::fs::create_dir_all(&writable).unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        let first = writable.join("first.rs");
+        let second = blocked.join("second.rs");
+        std::fs::write(&first, "fn first() {}\n").unwrap();
+        std::fs::write(&second, "fn second() {}\n").unwrap();
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut state = TaskState::default();
+        let result = ReplaceSymbolHandler::new()
+            .execute_with_workspace_root(
+                &mut state,
+                serde_json::json!({
+                    "replacements": [
+                        {"path": first, "symbol": "first", "text": "fn first() { updated(); }"},
+                        {"path": second, "symbol": "second", "text": "fn second() { updated(); }"}
+                    ]
+                }),
+                workspace.path(),
+            )
+            .await;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "fn first() {}\n");
+    }
 
     #[test]
     fn test_replace_symbol_handler_creation() {
@@ -789,6 +922,37 @@ mod tests {
         assert!(
             warning.is_some(),
             "a failed batch must not suppress later external modification detection"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_symbol_preflights_all_files_before_writing_any() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = workspace.path().join("first.rs");
+        let second = workspace.path().join("second.rs");
+        std::fs::write(&first, "fn first() {}\n").unwrap();
+        std::fs::write(&second, "fn second() {}\n").unwrap();
+
+        let handler = ReplaceSymbolHandler::new();
+        let mut state = TaskState::default();
+        let result = handler
+            .execute_with_workspace_root(
+                &mut state,
+                serde_json::json!({
+                    "replacements": [
+                        {"path": "first.rs", "symbol": "first", "text": "fn renamed() {}"},
+                        {"path": "second.rs", "symbol": "missing", "text": "fn missing() {}"}
+                    ]
+                }),
+                workspace.path(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "fn first() {}\n");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "fn second() {}\n"
         );
     }
 }

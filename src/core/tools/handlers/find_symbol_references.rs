@@ -28,7 +28,6 @@ struct FileData {
     canonical_path: String,
     lines: Vec<String>,
     hits: Vec<Hit>,
-    _file_locks: Vec<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl FindSymbolReferencesHandler {
@@ -73,14 +72,42 @@ impl FindSymbolReferencesHandler {
                 ToolError::ExecutionFailed(format!("Unable to resolve workspace: {error}"))
             })?;
 
+        let (index_status, indexed_locations, project_root) =
+            self.index_locations(&symbols, find_type, paths.is_empty())?;
+        let mut requested = Vec::new();
         for path in &paths {
             let abs_path = ctx.resolve_path(path)?;
             let canonical_path = fs::canonicalize(&abs_path).await.map_err(|error| {
                 ToolError::ExecutionFailed(format!("Error reading file {path}: {error}"))
             })?;
-            let file_locks = ctx
-                .lock_file_paths(std::slice::from_ref(&canonical_path))
-                .await;
+            requested.push((path, canonical_path));
+        }
+        let mut indexed_paths = BTreeMap::new();
+        for location in &indexed_locations {
+            let Some(path) = location.path.as_deref() else {
+                continue;
+            };
+            match fs::canonicalize(Path::new(&project_root).join(path)).await {
+                Ok(resolved) if resolved.starts_with(&canonical_workspace) => {
+                    indexed_paths.insert(path.to_string(), resolved);
+                }
+                Ok(_) => {
+                    index_warnings.push(format!("Index entry skipped outside workspace: {path}"))
+                }
+                Err(error) => {
+                    index_warnings.push(format!("Index entry skipped for {path}: {error}"))
+                }
+            }
+        }
+        // Indexed files belong in the same lock order as explicitly requested files.
+        let lock_paths: Vec<_> = requested
+            .iter()
+            .map(|(_, path)| path.clone())
+            .chain(indexed_paths.values().cloned())
+            .collect();
+        let _file_locks = ctx.lock_file_paths(&lock_paths).await;
+
+        for (path, canonical_path) in requested {
             let abs_path_str = canonical_path.to_string_lossy();
 
             let content = match fs::read_to_string(&canonical_path).await {
@@ -109,10 +136,8 @@ impl FindSymbolReferencesHandler {
                         ToolError::ExecutionFailed(format!("Error finding references: {e}"))
                     })?;
 
-            let lines: Vec<String> = content
-                .lines()
-                .map(std::string::ToString::to_string)
-                .collect();
+            let (normalized, _) = crate::core::file_editor::normalize_file_content(&content);
+            let lines = crate::core::file_editor::split_content_lines(&normalized);
             {
                 let mut state = ctx.state.lock().await;
                 record_complete_file_read(&mut state, &canonical_path);
@@ -124,7 +149,6 @@ impl FindSymbolReferencesHandler {
                     canonical_path: abs_path_str.into_owned(),
                     lines,
                     hits,
-                    _file_locks: file_locks,
                 },
             );
         }
@@ -133,13 +157,11 @@ impl FindSymbolReferencesHandler {
             return Err(err);
         }
 
-        let (index_status, indexed_locations, project_root) =
-            self.index_locations(&symbols, find_type, paths.is_empty())?;
         if !indexed_locations.is_empty() {
             merge_index_locations(
                 &mut file_data,
                 ctx,
-                &project_root,
+                &indexed_paths,
                 indexed_locations,
                 &mut index_warnings,
             )
@@ -320,41 +342,19 @@ impl ToolHandler for FindSymbolReferencesHandler {
 async fn merge_index_locations(
     file_data: &mut BTreeMap<String, FileData>,
     ctx: &ToolContext,
-    project_root: &str,
+    indexed_paths: &BTreeMap<String, std::path::PathBuf>,
     locations: Vec<SymbolLocation>,
     warnings: &mut Vec<String>,
 ) {
-    let canonical_workspace = match fs::canonicalize(&ctx.workspace_root).await {
-        Ok(path) => path,
-        Err(error) => {
-            warnings.push(format!(
-                "Unable to resolve workspace for index results: {error}"
-            ));
-            return;
-        }
-    };
-
     for location in locations {
         let Some(rel_path) = location.path.as_deref() else {
             continue;
         };
-        let absolute_path = Path::new(project_root).join(rel_path);
-        let resolved_path = match fs::canonicalize(&absolute_path).await {
-            Ok(path) => path,
-            Err(error) => {
-                warnings.push(format!("Index entry skipped for {rel_path}: {error}"));
-                continue;
-            }
-        };
-        if !resolved_path.starts_with(&canonical_workspace) {
-            warnings.push(format!("Index entry skipped outside workspace: {rel_path}"));
+        let Some(resolved_path) = indexed_paths.get(rel_path) else {
             continue;
-        }
+        };
         let display_path = rel_path.to_string();
         if !file_data.contains_key(&display_path) {
-            let file_locks = ctx
-                .lock_file_paths(std::slice::from_ref(&resolved_path))
-                .await;
             let content = match fs::read_to_string(&resolved_path).await {
                 Ok(content) => content,
                 Err(error) => {
@@ -372,12 +372,10 @@ async fn merge_index_locations(
                 display_path.clone(),
                 FileData {
                     canonical_path,
-                    lines: content
-                        .lines()
-                        .map(std::string::ToString::to_string)
-                        .collect(),
+                    lines: crate::core::file_editor::split_content_lines(
+                        &crate::core::file_editor::normalize_file_content(&content).0,
+                    ),
                     hits: Vec::new(),
-                    _file_locks: file_locks,
                 },
             );
         }

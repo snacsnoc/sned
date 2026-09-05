@@ -160,9 +160,18 @@ pub fn atomic_write_file<P: AsRef<Path>>(file_path: P, data: &str) -> io::Result
     atomic_write_file_bytes(file_path, data.as_bytes())
 }
 
+fn existing_permissions(file_path: &Path) -> io::Result<Option<fs::Permissions>> {
+    match fs::metadata(file_path) {
+        Ok(metadata) => Ok(Some(metadata.permissions())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn atomic_write_file_bytes<P: AsRef<Path>>(file_path: P, data: &[u8]) -> io::Result<()> {
     let _write_guard = AtomicWriteGuard::begin(&ATOMIC_WRITES);
-    let file_path = file_path.as_ref();
+    let file_path = atomic_write_target(file_path.as_ref())?;
+    let existing_permissions = existing_permissions(&file_path)?;
     let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
 
     let now = SystemTime::now()
@@ -186,6 +195,9 @@ pub fn atomic_write_file_bytes<P: AsRef<Path>>(file_path: P, data: &[u8]) -> io:
             .create_new(true)
             .mode(0o600)
             .open(&tmp_path)?;
+        if let Some(permissions) = existing_permissions.as_ref() {
+            file.set_permissions(permissions.clone())?;
+        }
         file.write_all(data)?;
         if should_fsync() {
             file.sync_data()?;
@@ -219,7 +231,7 @@ pub fn atomic_write_file_bytes<P: AsRef<Path>>(file_path: P, data: &[u8]) -> io:
         }
     }
 
-    match fs::rename(&tmp_path, file_path) {
+    match fs::rename(&tmp_path, &file_path) {
         Ok(()) => Ok(()),
         Err(e) => {
             // Clean up temp file and propagate error
@@ -246,7 +258,8 @@ pub fn atomic_write_file_bytes<P: AsRef<Path>>(file_path: P, data: &[u8]) -> io:
 /// could cause data corruption if the process crashes mid-write.
 pub async fn atomic_write_file_async<P: AsRef<Path>>(file_path: P, data: &str) -> io::Result<()> {
     let _write_guard = AtomicWriteGuard::begin(&ATOMIC_WRITES);
-    let file_path = file_path.as_ref();
+    let file_path = atomic_write_target(file_path.as_ref())?;
+    let existing_permissions = existing_permissions(&file_path)?;
     let parent = file_path.parent().unwrap_or_else(|| Path::new(""));
 
     let now = SystemTime::now()
@@ -270,6 +283,9 @@ pub async fn atomic_write_file_async<P: AsRef<Path>>(file_path: P, data: &str) -
             .mode(0o600)
             .open(&tmp_path)
             .await?;
+        if let Some(permissions) = existing_permissions.as_ref() {
+            file.set_permissions(permissions.clone()).await?;
+        }
         file.write_all(data.as_bytes()).await?;
         if should_fsync() {
             file.sync_all().await?;
@@ -304,7 +320,7 @@ pub async fn atomic_write_file_async<P: AsRef<Path>>(file_path: P, data: &str) -
         }
     }
 
-    match tokio_fs::rename(&tmp_path, file_path).await {
+    match tokio_fs::rename(&tmp_path, &file_path).await {
         Ok(()) => Ok(()),
         Err(e) => {
             // Clean up temp file and propagate error
@@ -312,6 +328,15 @@ pub async fn atomic_write_file_async<P: AsRef<Path>>(file_path: P, data: &str) -
             let _ = tokio_fs::remove_file(&tmp_path).await;
             Err(e)
         }
+    }
+}
+
+fn atomic_write_target(file_path: &Path) -> io::Result<PathBuf> {
+    match fs::symlink_metadata(file_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(file_path),
+        Ok(_) => Ok(file_path.to_path_buf()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(file_path.to_path_buf()),
+        Err(error) => Err(error),
     }
 }
 
@@ -440,6 +465,68 @@ mod tests {
 
         let written = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(written, content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_preserves_existing_permissions_and_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = temp_dir.path().join("target.sh");
+        let link = temp_dir.path().join("run.sh");
+        fs::write(&target, "#!/bin/sh\necho old\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        atomic_write_file(&link, "#!/bin/sh\necho new\n").unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "#!/bin/sh\necho new\n"
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_atomic_write_async_preserves_existing_permissions_and_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = temp_dir.path().join("target.sh");
+        let link = temp_dir.path().join("run.sh");
+        fs::write(&target, "#!/bin/sh\necho old\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        atomic_write_file_async(&link, "#!/bin/sh\necho new\n")
+            .await
+            .unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "#!/bin/sh\necho new\n"
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 
     #[tokio::test]

@@ -1374,9 +1374,7 @@ fn drain_output_queues(
     if let Some(err) = app.take_task_transcript_writer_error() {
         tracing::warn!("Failed to persist task transcript batch: {err}");
     }
-    if saw_turn_end
-        && let Err(err) = app.flush_task_transcript()
-    {
+    if saw_turn_end && let Err(err) = app.flush_task_transcript() {
         tracing::warn!("Failed to flush completed task transcript: {err}");
     }
     drained_events
@@ -1947,9 +1945,7 @@ async fn cancel_agent(
         let pids = {
             let mut state = sh.lock().await;
             state.is_cancelled = true;
-            state
-                .checkpoint_cancellation
-                .store(true, Ordering::Release);
+            state.checkpoint_cancellation.store(true, Ordering::Release);
             state.is_cancelled_atomic.store(true, Ordering::Release);
 
             #[cfg(unix)]
@@ -1959,9 +1955,13 @@ async fn cancel_agent(
             state.running_command_pids.clear();
 
             #[cfg(unix)]
-            { pids }
+            {
+                pids
+            }
             #[cfg(not(unix))]
-            { Vec::new() }
+            {
+                Vec::new()
+            }
         };
 
         #[cfg(unix)]
@@ -2451,6 +2451,30 @@ async fn handle_key_event_inner(
     Ok(None)
 }
 
+async fn invalidate_restored_file_context(
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    workspace_root: &std::path::Path,
+    changed_files: &[String],
+) {
+    let Some(state) = state_handle.lock().await.clone() else {
+        return;
+    };
+
+    let mut state = state.lock().await;
+    for changed_file in changed_files {
+        let path = workspace_root.join(changed_file);
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        for key in [path, canonical] {
+            let key = key.to_string_lossy().into_owned();
+            state.file_content_cache.pop(&key);
+            state.consecutive_reads.remove(&key);
+            // A restored checkpoint invalidates the model's file snapshot. Require a
+            // fresh read so reconciliation can bind anchors to the restored bytes.
+            state.must_reread_before_edit.insert(key);
+        }
+    }
+}
+
 /// Handle CLI-only slash commands, routing output to the App buffer.
 /// Returns `true` if the caller should exit the main loop (for /exit, /quit).
 async fn handle_cli_only_command(
@@ -2823,6 +2847,14 @@ async fn handle_cli_only_command(
 
             match checkpoint_mgr.restore_checkpoint(&most_recent.hash).await {
                 Ok(()) => {
+                    if let Ok(workspace_root) = std::env::current_dir() {
+                        invalidate_restored_file_context(
+                            state_handle,
+                            &workspace_root,
+                            &changed_files,
+                        )
+                        .await;
+                    }
                     app.push_plain(format!(
                         "Restored to checkpoint {} — {} file(s) reverted",
                         most_recent.number,
@@ -3074,7 +3106,7 @@ async fn handle_cli_only_command(
             }
 
             if let Some(checkpoint) = checkpoints.get(num - 1) {
-                match checkpoint_mgr
+                let changed_files = match checkpoint_mgr
                     .get_changed_files(&checkpoint.hash, None)
                     .await
                 {
@@ -3122,6 +3154,7 @@ async fn handle_cli_only_command(
                                 return Ok(false);
                             }
                         }
+                        changed_files
                     }
                     Err(e) => {
                         app.push_styled(
@@ -3130,10 +3163,18 @@ async fn handle_cli_only_command(
                         );
                         return Ok(false);
                     }
-                }
+                };
 
                 match checkpoint_mgr.restore_checkpoint(&checkpoint.hash).await {
                     Ok(()) => {
+                        if let Ok(workspace_root) = std::env::current_dir() {
+                            invalidate_restored_file_context(
+                                state_handle,
+                                &workspace_root,
+                                &changed_files,
+                            )
+                            .await;
+                        }
                         app.push_plain(format!(
                             "Checkpoint {} ({}) restored successfully.",
                             num, checkpoint.hash
@@ -3790,8 +3831,7 @@ async fn run_main_loop(
             );
             eprintln!(
                 "[timing] reasoning: chunks_received={} pending_bytes_peak={}",
-                self.reasoning_chunks_received,
-                self.reasoning_pending_bytes_peak,
+                self.reasoning_chunks_received, self.reasoning_pending_bytes_peak,
             );
             eprintln!(
                 "[timing] layout_rebuild: total={}us count={} peak={}us",
@@ -3812,10 +3852,7 @@ async fn run_main_loop(
                 crate::cli::syntax_highlight::highlight_cache_stats();
             eprintln!(
                 "[timing] render_cache: markdown_hits={} markdown_misses={} highlight_hits={} highlight_misses={}",
-                markdown_hits,
-                markdown_misses,
-                highlight_hits,
-                highlight_misses,
+                markdown_hits, markdown_misses, highlight_hits, highlight_misses,
             );
 
             if let Some(session_start) = self.session_start_time {
@@ -3901,7 +3938,8 @@ async fn run_main_loop(
             let main_queue_before = output_rx.len();
             timing.main_queue_backlog_peak = timing.main_queue_backlog_peak.max(main_queue_before);
             if main_queue_before > 0 {
-                timing.main_queue_backlog_cycles = timing.main_queue_backlog_cycles.saturating_add(1);
+                timing.main_queue_backlog_cycles =
+                    timing.main_queue_backlog_cycles.saturating_add(1);
             }
             let drained_events = drain_output_queues(
                 approval_output_rx,
@@ -4198,9 +4236,7 @@ async fn run_main_loop(
 
                         // Ctrl+C dismisses any input-bound overlay before it
                         // begins agent cancellation or the exit gesture.
-                        if app.picker_active
-                            || app.slash_command_active
-                            || app.model_picker_active
+                        if app.picker_active || app.slash_command_active || app.model_picker_active
                         {
                             clear_input_overlays(app);
                             continue;
@@ -4968,10 +5004,7 @@ mod tests {
             self.inner.get_cursor_position()
         }
 
-        fn set_cursor_position<P: Into<Position>>(
-            &mut self,
-            position: P,
-        ) -> std::io::Result<()> {
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> std::io::Result<()> {
             self.inner.set_cursor_position(position)
         }
 
@@ -5537,12 +5570,7 @@ mod tests {
 
         let mut app = App::new();
         app.set_content_width(80);
-        drain_output_for_test_with_lanes(
-            &mut approval_rx,
-            &mut priority_rx,
-            &mut rx,
-            &mut app,
-        );
+        drain_output_for_test_with_lanes(&mut approval_rx, &mut priority_rx, &mut rx, &mut app);
 
         assert!(app.has_pending_approval());
         assert_eq!(writer.dropped_count(), 0);
@@ -5684,12 +5712,7 @@ mod tests {
             app.push_plain(format!("old line {index:02}"));
         }
 
-        drain_output_for_test_with_lanes(
-            &mut approval_rx,
-            &mut priority_rx,
-            &mut rx,
-            &mut app,
-        );
+        drain_output_for_test_with_lanes(&mut approval_rx, &mut priority_rx, &mut rx, &mut app);
         terminal
             .draw(|frame| app.render(frame))
             .expect("render should succeed");
@@ -8884,6 +8907,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_restored_files_require_a_fresh_read_before_editing() {
+        let workspace = tempfile::tempdir().unwrap();
+        let relative_path = "src/lib.rs".to_string();
+        let file_path = workspace.path().join(&relative_path);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "restored\n").unwrap();
+
+        let state = Arc::new(Mutex::new(crate::core::agent_types::TaskState::default()));
+        let raw_path = file_path.to_string_lossy().into_owned();
+        {
+            let mut guard = state.lock().await;
+            guard.insert_file_content(raw_path.clone(), "stale\n".to_string());
+            guard.consecutive_reads.insert(raw_path.clone(), 2);
+        }
+        let state_handle = Arc::new(Mutex::new(Some(Arc::clone(&state))));
+
+        invalidate_restored_file_context(&state_handle, workspace.path(), &[relative_path]).await;
+
+        let mut guard = state.lock().await;
+        assert!(guard.file_content_cache.get(&raw_path).is_none());
+        assert!(!guard.consecutive_reads.contains_key(&raw_path));
+        assert!(guard.must_reread_before_edit.contains(&raw_path));
+    }
+
+    #[tokio::test]
     async fn test_session_retains_cli_key_per_provider() -> anyhow::Result<()> {
         let mut task_opts = retry_test_task_opts();
         task_opts.api_key = Some("cli-mock-key".to_string());
@@ -10714,13 +10762,12 @@ mod tests {
         let locked = Arc::new(tokio::sync::Notify::new());
         let locked_task = Arc::clone(&locked);
         let held_state = Arc::clone(&task_state);
-        let task_slot: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(Some(
-            tokio::spawn(async move {
+        let task_slot: Arc<Mutex<Option<JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Some(tokio::spawn(async move {
                 let _guard = held_state.lock().await;
                 locked_task.notify_one();
                 tokio::time::sleep(Duration::from_secs(60)).await;
-            }),
-        )));
+            }))));
         locked.notified().await;
 
         let agent_done = Arc::new(tokio::sync::Notify::new());
@@ -10736,6 +10783,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(task_state.lock().await.is_cancelled_atomic.load(Ordering::Acquire));
+        assert!(
+            task_state
+                .lock()
+                .await
+                .is_cancelled_atomic
+                .load(Ordering::Acquire)
+        );
     }
 }

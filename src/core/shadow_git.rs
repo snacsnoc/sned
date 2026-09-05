@@ -23,6 +23,27 @@ const SHADOW_GIT_AUTHOR_EMAIL: &str = "sned@localhost";
 const SHADOW_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const STALE_INDEX_LOCK_AGE: Duration = Duration::from_secs(90);
 
+fn porcelain_paths(status: &[u8]) -> Vec<String> {
+    let mut records = status
+        .split(|byte| *byte == b'\0')
+        .filter(|record| !record.is_empty());
+    let mut paths = Vec::new();
+
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+
+        let kind = &record[..2];
+        paths.push(String::from_utf8_lossy(&record[3..]).into_owned());
+        if kind.contains(&b'R') || kind.contains(&b'C') {
+            let _ = records.next();
+        }
+    }
+
+    paths
+}
+
 pub(crate) struct ShadowGitLock {
     _file: File,
 }
@@ -47,7 +68,8 @@ impl ShadowGitLock {
             use std::os::fd::AsRawFd;
             let started = Instant::now();
             loop {
-                let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if result == 0 {
                     return Ok(Self { _file: file });
                 }
@@ -98,7 +120,10 @@ fn with_shadow_lock<T>(workspace_root: &Path, operation: impl FnOnce() -> Result
     operation()
 }
 
-fn with_real_git_lock<T>(workspace_root: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+fn with_real_git_lock<T>(
+    workspace_root: &Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let lock_path = workspace_root.join(".sned/.git-agent/real-git.lock");
     let _lock = ShadowGitLock::acquire_path(&lock_path)?;
     operation()
@@ -146,7 +171,9 @@ fn init_shadow_repo_locked(workspace_root: &Path) -> Result<()> {
 
 /// Commit the current state to the shadow repo.
 pub fn commit_turn(workspace_root: &Path, message: &str) -> Result<()> {
-    with_shadow_lock(workspace_root, || commit_turn_internal(workspace_root, message, false))
+    with_shadow_lock(workspace_root, || {
+        commit_turn_internal(workspace_root, message, false)
+    })
 }
 
 fn commit_turn_internal(workspace_root: &Path, message: &str, force: bool) -> Result<()> {
@@ -342,6 +369,7 @@ fn undo_last_turn_locked(workspace_root: &Path) -> Result<(Vec<String>, Vec<Stri
     let status_output = Command::new("git")
         .arg("status")
         .arg("--porcelain")
+        .arg("-z")
         .current_dir(workspace_root)
         .env("GIT_DIR", &shadow_git_path)
         .env("GIT_WORK_TREE", workspace_root)
@@ -349,22 +377,7 @@ fn undo_last_turn_locked(workspace_root: &Path) -> Result<(Vec<String>, Vec<Stri
         .context("Failed to check working tree status")?;
 
     if status_output.status.success() {
-        let uncommitted_files: Vec<String> = String::from_utf8_lossy(&status_output.stdout)
-            .lines()
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                // porcelain format: "XY filename" or "R1 old_name -> new_name"
-                let parts: Vec<&str> = s.split_whitespace().collect();
-                let status = parts.first().unwrap_or(&"");
-                if status.starts_with('R') {
-                    // Renames: "R1 old_name -> new_name" — use the new name
-                    parts.last().map(|p| p.to_string()).unwrap_or_default()
-                } else {
-                    parts.get(1).map(|p| p.to_string()).unwrap_or_default()
-                }
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
+        let uncommitted_files = porcelain_paths(&status_output.stdout);
 
         // Check if any uncommitted file is outside the last turn's modified files
         let unexpected_changes: Vec<&String> = uncommitted_files
@@ -424,7 +437,9 @@ fn undo_last_turn_locked(workspace_root: &Path) -> Result<(Vec<String>, Vec<Stri
 
 /// Show diff between two turns.
 pub fn diff_turns(workspace_root: &Path, from: usize, to: usize) -> Result<String> {
-    with_shadow_lock(workspace_root, || diff_turns_locked(workspace_root, from, to))
+    with_shadow_lock(workspace_root, || {
+        diff_turns_locked(workspace_root, from, to)
+    })
 }
 
 fn diff_turns_locked(workspace_root: &Path, from: usize, to: usize) -> Result<String> {
@@ -499,7 +514,9 @@ fn log_locked(workspace_root: &Path, limit: Option<usize>) -> Result<String> {
 /// Commit shadow changes to the user's real git repo.
 pub fn commit_to_real_git(workspace_root: &Path, message: &str) -> Result<Vec<String>> {
     with_shadow_lock(workspace_root, || {
-        with_real_git_lock(workspace_root, || commit_to_real_git_locked(workspace_root, message))
+        with_real_git_lock(workspace_root, || {
+            commit_to_real_git_locked(workspace_root, message)
+        })
     })
 }
 
@@ -582,7 +599,9 @@ pub fn is_initialized(workspace_root: &Path) -> bool {
 /// Get files that were modified by the user since the last shadow commit.
 /// Excludes files that were already modified by the agent in the last turn.
 pub fn get_user_edits_since_last_turn(workspace_root: &Path) -> Result<Vec<String>> {
-    with_shadow_lock(workspace_root, || get_user_edits_since_last_turn_locked(workspace_root))
+    with_shadow_lock(workspace_root, || {
+        get_user_edits_since_last_turn_locked(workspace_root)
+    })
 }
 
 fn get_user_edits_since_last_turn_locked(workspace_root: &Path) -> Result<Vec<String>> {
@@ -634,20 +653,15 @@ fn get_user_edits_since_last_turn_locked(workspace_root: &Path) -> Result<Vec<St
     let status_output = Command::new("git")
         .arg("status")
         .arg("--porcelain")
+        .arg("-z")
         .current_dir(workspace_root)
         .env("GIT_DIR", &shadow_git_path)
         .env("GIT_WORK_TREE", workspace_root)
         .output()
         .context("Failed to check working tree status")?;
 
-    let user_edited: Vec<String> = String::from_utf8_lossy(&status_output.stdout)
-        .lines()
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            // porcelain format: "XY filename" or "XY old_filename -> new_filename"
-            s.split_whitespace().nth(1).unwrap_or("").to_string()
-        })
-        .filter(|s| !s.is_empty())
+    let user_edited: Vec<String> = porcelain_paths(&status_output.stdout)
+        .into_iter()
         .filter(|s| !modified_files.contains(s) && !added_files.contains(s))
         .collect();
 
@@ -836,6 +850,32 @@ mod tests {
         let edits = get_user_edits_since_last_turn(temp.path()).unwrap();
         assert!(edits.contains(&"user_file.txt".to_string()));
         assert!(!edits.contains(&"agent_file.txt".to_string()));
+    }
+
+    #[test]
+    fn test_get_user_edits_preserves_paths_with_spaces() {
+        let temp = TempDir::new().unwrap();
+        git_config_for_tests(temp.path());
+        init_shadow_repo(temp.path()).unwrap();
+
+        fs::write(temp.path().join("agent file.txt"), "agent").unwrap();
+        commit_turn(temp.path(), "agent change").unwrap();
+
+        fs::write(temp.path().join("user file.txt"), "user").unwrap();
+        let edits = get_user_edits_since_last_turn(temp.path()).unwrap();
+        assert_eq!(edits, vec!["user file.txt"]);
+    }
+
+    #[test]
+    fn test_porcelain_paths_preserve_spaces_and_renames() {
+        assert_eq!(
+            porcelain_paths(b"?? a directory/user file.txt\0"),
+            vec!["a directory/user file.txt"]
+        );
+        assert_eq!(
+            porcelain_paths(b"R  new file.txt\0old file.txt\0"),
+            vec!["new file.txt"]
+        );
     }
 
     #[test]

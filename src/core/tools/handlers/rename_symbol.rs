@@ -1,9 +1,12 @@
 use crate::core::agent_loop::TaskState;
 use crate::core::tools::handlers::error_guidance;
+use crate::core::tools::handlers::replace_symbol::{
+    PendingSymbolWrite, commit_symbol_writes_atomically,
+};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::symbol_index::SymbolIndexService;
 use crate::services::tree_sitter::load_required_language_parsers;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -87,6 +90,7 @@ impl RenameSymbolHandler {
                 params,
                 workspace_root,
                 allowed_external_roots,
+                None,
             )
             .await;
         *state = Arc::try_unwrap(shared_state)
@@ -101,6 +105,7 @@ impl RenameSymbolHandler {
         params: serde_json::Value,
         workspace_root: &Path,
         allowed_external_roots: &[std::path::PathBuf],
+        edit_context: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
         let paths = read_string_list(&params, "paths", "path");
         let existing_symbol = params
@@ -152,7 +157,7 @@ impl RenameSymbolHandler {
             expand_paths_with_allowed_roots(&paths, workspace_root, allowed_external_roots)
                 .await?
                 .into_iter()
-                .collect::<HashSet<_>>()
+                .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
 
@@ -291,13 +296,14 @@ impl RenameSymbolHandler {
             ));
         }
 
+        let mut prepared_writes = Vec::new();
         let mut file_results = Vec::new();
         let mut total_replacements = 0;
 
         for (abs_path, file_data) in locations_by_file {
             let mut current_lines: Vec<String> = file_data
                 .content
-                .lines()
+                .split('\n')
                 .map(std::string::ToString::to_string)
                 .collect();
             let mut occurrences = file_data.occurrences;
@@ -318,63 +324,64 @@ impl RenameSymbolHandler {
                 if occ.end_column > line.len() || occ.start_column > line.len() {
                     continue;
                 }
-                let actual_name: String = line
-                    .chars()
-                    .skip(occ.start_column)
-                    .take(occ.end_column - occ.start_column)
-                    .collect();
-                if actual_name != existing_symbol {
+                if line.get(occ.start_column..occ.end_column) != Some(existing_symbol) {
                     continue;
                 }
-                let before: String = line.chars().take(occ.start_column).collect();
-                let after: String = line.chars().skip(occ.end_column).collect();
+                let before = &line[..occ.start_column];
+                let after = &line[occ.end_column..];
                 current_lines[occ.start_line] = format!("{before}{new_symbol}{after}");
                 replacement_count += 1;
             }
 
             if replacement_count > 0 {
                 let final_content = current_lines.join("\n");
-                match crate::storage::disk::atomic_write_file_async(&abs_path, &final_content).await
-                {
-                    Ok(()) => {
-                        // Mark file as edited by Sned to suppress stale mtime detection
-                        state
-                            .lock()
-                            .await
-                            .file_context_tracker
-                            .mark_file_as_edited_by_sned(std::path::Path::new(&abs_path));
-                        if let Some(symbol_index_service) = &self.symbol_index_service {
-                            let index_root = tokio::fs::canonicalize(workspace_root)
-                                .await
-                                .unwrap_or_else(|_| workspace_root.to_path_buf());
-                            if let Ok(rel_path) = Path::new(&abs_path).strip_prefix(&index_root) {
-                                crate::services::symbol_index::index_file_after_write(
-                                    Arc::clone(symbol_index_service),
-                                    &index_root,
-                                    &rel_path.to_string_lossy(),
-                                    &final_content,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let consecutive_mistakes = Self::increment_mistakes(&state).await;
-                        tracing::warn!(
-                            consecutive_mistakes,
-                            error = %e,
-                            "rename_symbol: failed to write file"
-                        );
-                        return Err(ToolError::ExecutionFailed(format!(
-                            "Failed to write file {abs_path}: {e}"
-                        )));
-                    }
-                }
+                prepared_writes.push(PendingSymbolWrite {
+                    path: Path::new(&abs_path).to_path_buf(),
+                    original_content: file_data.content,
+                    final_content,
+                });
             }
 
             let display_path = abs_path.clone();
             total_replacements += replacement_count;
             file_results.push(FileRenameResult { display_path });
+        }
+
+        let write_refs = prepared_writes.iter().collect::<Vec<_>>();
+        if let Err(error) = commit_symbol_writes_atomically(&write_refs).await {
+            if let Some(ctx) = edit_context {
+                for write in &prepared_writes {
+                    ctx.invalidate_edit_context(&write.path).await;
+                }
+            }
+            let consecutive_mistakes = Self::increment_mistakes(&state).await;
+            tracing::warn!(consecutive_mistakes, error = %error, "rename_symbol: write failed");
+            return Err(error);
+        }
+
+        let index_root = tokio::fs::canonicalize(workspace_root)
+            .await
+            .unwrap_or_else(|_| workspace_root.to_path_buf());
+        for write in &prepared_writes {
+            if let Some(ctx) = edit_context {
+                ctx.invalidate_edit_context(&write.path).await;
+            }
+            state
+                .lock()
+                .await
+                .file_context_tracker
+                .mark_file_as_edited_by_sned(&write.path);
+            if let Some(symbol_index_service) = &self.symbol_index_service
+                && let Ok(rel_path) = write.path.strip_prefix(&index_root)
+            {
+                crate::services::symbol_index::index_file_after_write(
+                    Arc::clone(symbol_index_service),
+                    &index_root,
+                    &rel_path.to_string_lossy(),
+                    &write.final_content,
+                )
+                .await;
+            }
         }
 
         let files_affected = file_results.len();
@@ -439,15 +446,16 @@ impl ToolHandler for RenameSymbolHandler {
                         .collect::<Vec<_>>(),
                 )
                 .await;
-            handler
+            let result = handler
                 .execute_with_shared_state(
                     ctx.state.clone(),
                     params,
                     ctx.workspace_root.as_path(),
                     &ctx.allowed_external_roots,
+                    Some(&ctx),
                 )
-                .await
-                .map(serde_json::Value::String)
+                .await;
+            result.map(serde_json::Value::String)
         })
     }
 
@@ -831,6 +839,43 @@ mod tests {
             .unwrap();
         assert!(new_content.contains("new_func"));
         assert!(!new_content.contains("old_func"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_symbol_rolls_back_all_files_when_a_later_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let writable = workspace.path().join("a_writable");
+        let blocked = workspace.path().join("z_blocked");
+        std::fs::create_dir_all(&writable).unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        let first = writable.join("first.rs");
+        let second = blocked.join("second.rs");
+        std::fs::write(&first, "fn old_name() {}\n").unwrap();
+        std::fs::write(&second, "fn old_name() {}\n").unwrap();
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut state = TaskState::default();
+        let result = RenameSymbolHandler::new()
+            .execute_with_workspace_root(
+                &mut state,
+                serde_json::json!({
+                    "paths": [first, second],
+                    "existing_symbol": "old_name",
+                    "new_symbol": "new_name"
+                }),
+                workspace.path(),
+            )
+            .await;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(first).unwrap(),
+            "fn old_name() {}\n"
+        );
     }
 
     #[tokio::test]
