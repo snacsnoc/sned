@@ -1,4 +1,5 @@
 use crate::core::agent_loop::TaskState;
+use crate::core::file_editor::{FileTextFormat, normalize_file_content, restore_file_content};
 use crate::core::hash_utils::strip_hashes;
 use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
@@ -511,6 +512,14 @@ async fn prepare_batch(
             new_text.clone()
         };
 
+        let (_, file_format) = normalize_file_content(&current_content);
+        let (normalized_new_text, _) = normalize_file_content(&adjusted_new_text);
+        let replacement_format = FileTextFormat {
+            line_ending: file_format.line_ending,
+            has_utf8_bom: false,
+        };
+        let adjusted_new_text = restore_file_content(&normalized_new_text, replacement_format);
+
         current_content = format!(
             "{}{}{}",
             &current_content[..range.start_index],
@@ -891,6 +900,40 @@ mod tests {
             .unwrap();
         assert!(new_content.contains("FOO"));
         assert!(!new_content.contains("fn foo()"));
+    }
+
+    #[tokio::test]
+    async fn replace_symbol_preserves_crlf_for_multiline_replacements() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("test.rs");
+        std::fs::write(
+            &path,
+            "fn foo() {\r\n    let value = 1;\r\n}\r\nfn bar() {}\r\n",
+        )
+        .unwrap();
+
+        let handler = ReplaceSymbolHandler::new();
+        let mut state = TaskState::default();
+        handler
+            .execute_with_workspace_root(
+                &mut state,
+                serde_json::json!({
+                    "replacements": [{
+                        "path": "test.rs",
+                        "symbol": "foo",
+                        "text": "fn foo() {\n    let value = 2;\n    let other = 3;\n}"
+                    }]
+                }),
+                workspace.path(),
+            )
+            .await
+            .unwrap();
+
+        let updated = std::fs::read(&path).unwrap();
+        assert_eq!(
+            updated,
+            b"fn foo() {\r\n    let value = 2;\r\n    let other = 3;\r\n}\r\nfn bar() {}\r\n"
+        );
     }
 
     #[tokio::test]
