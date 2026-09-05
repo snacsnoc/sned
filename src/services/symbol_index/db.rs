@@ -150,7 +150,10 @@ impl SymbolIndexDatabase {
 
     /// Remove entries for files that were present in a previous workspace
     /// snapshot but are absent from the current reconciliation walk.
-    pub fn remove_missing_files(&mut self, existing_paths: &HashSet<String>) -> rusqlite::Result<()> {
+    pub fn remove_missing_files(
+        &mut self,
+        existing_paths: &HashSet<String>,
+    ) -> rusqlite::Result<()> {
         let mut statement = self.conn.prepare("SELECT path FROM files")?;
         let indexed_paths = statement
             .query_map([], |row| row.get::<_, String>(0))?

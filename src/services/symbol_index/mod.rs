@@ -990,7 +990,11 @@ mod tests {
         ));
         run_initial_walk(&first, temp.path()).unwrap();
         assert_eq!(
-            first.lock().unwrap().get_definitions("removed_symbol", None).len(),
+            first
+                .lock()
+                .unwrap()
+                .get_definitions("removed_symbol", None)
+                .len(),
             1
         );
         drop(first);

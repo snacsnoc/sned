@@ -622,7 +622,10 @@ data: [DONE]
             assert_eq!(call_id, "call_1");
             assert_eq!(name, "read_file");
         }
-        _ => panic!("Expected first tool_call_started chunk, got {:?}", chunks[0]),
+        _ => panic!(
+            "Expected first tool_call_started chunk, got {:?}",
+            chunks[0]
+        ),
     }
 
     match &chunks[1] {
@@ -630,7 +633,10 @@ data: [DONE]
             assert_eq!(call_id, "call_2");
             assert_eq!(name, "list_files");
         }
-        _ => panic!("Expected second tool_call_started chunk, got {:?}", chunks[1]),
+        _ => panic!(
+            "Expected second tool_call_started chunk, got {:?}",
+            chunks[1]
+        ),
     }
 
     match &chunks[2] {

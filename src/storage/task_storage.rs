@@ -1582,7 +1582,12 @@ mod tests {
         drop(summary_guard);
 
         drop(history_guard);
-        drop(waiting_history.await.unwrap().expect("history lock should release"));
+        drop(
+            waiting_history
+                .await
+                .unwrap()
+                .expect("history lock should release"),
+        );
     }
 
     #[tokio::test]
@@ -1987,7 +1992,10 @@ mod tests {
 
         let recovered = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
         assert_eq!(recovered.len(), DEFAULT_TRANSCRIPT_CAP);
-        assert_eq!(recovered.last().unwrap().ts, (DEFAULT_TRANSCRIPT_CAP + 1) as u64);
+        assert_eq!(
+            recovered.last().unwrap().ts,
+            (DEFAULT_TRANSCRIPT_CAP + 1) as u64
+        );
         assert_eq!(
             fs::read_to_string(path.with_extension("jsonl.bak")).unwrap(),
             original
