@@ -1000,7 +1000,8 @@ async fn process_openai_sse_line(
                         signature: None,
                     }),
                     "text",
-                ).await;
+                )
+                .await;
             }
 
             if let Some(reasoning) = delta.reasoning_content
@@ -1017,7 +1018,8 @@ async fn process_openai_sse_line(
                         id: Some(chunk.id.clone()),
                     }),
                     "reasoning",
-                ).await;
+                )
+                .await;
             }
 
             // Handle OpenAI refusal responses (content policy violations)
@@ -1028,7 +1030,8 @@ async fn process_openai_sse_line(
                     tx,
                     ApiStreamChunk::Error(format!("OpenAI model refused: {refusal}")),
                     "refusal",
-                ).await;
+                )
+                .await;
             }
 
             // Accumulate tool call deltas by index. Do not send immediately —
@@ -1096,7 +1099,8 @@ async fn process_openai_sse_line(
                                 name: name.clone(),
                             },
                             "tool_call_started",
-                        ).await
+                        )
+                        .await
                     {
                         delta_state.started_tool_call_indices.insert(tool_index);
                     }
@@ -1141,7 +1145,8 @@ async fn process_openai_sse_line(
                                     signature: None,
                                 }),
                                 "tool_calls",
-                            ).await;
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1159,7 +1164,8 @@ async fn process_openai_sse_line(
                     model_info,
                 )),
                 "usage",
-            ).await;
+            )
+            .await;
         }
     }
 }
@@ -1312,7 +1318,8 @@ pub async fn finish_openai_sse_to_chunks(
                         signature: None,
                     }),
                     "tool_calls",
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -1333,7 +1340,8 @@ pub async fn finish_openai_sse_to_chunks(
                 id: None,
             }),
             "usage",
-        ).await;
+        )
+        .await;
     }
 }
 
@@ -1456,13 +1464,12 @@ impl Provider for OpenAiProvider {
                         error = %error,
                         "OpenAI endpoint returned an SSE body without an SSE content type; using the SSE decoder"
                     );
-                    let chunks =
-                        decode_openai_sse_body(
-                            &response_body,
-                            self.config.model_info.as_ref(),
-                            cumulative_text_stream,
-                        )
-                        .await;
+                    let chunks = decode_openai_sse_body(
+                        &response_body,
+                        self.config.model_info.as_ref(),
+                        cumulative_text_stream,
+                    )
+                    .await;
                     return Ok(Box::pin(tokio_stream::iter(chunks)));
                 }
                 Err(error) => {
@@ -1600,7 +1607,8 @@ impl Provider for OpenAiProvider {
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
                             "error",
-                        ).await;
+                        )
+                        .await;
                         stream_errored = true;
                         break;
                     }
@@ -3178,20 +3186,12 @@ mod tests {
             Some(" brown")
         );
         assert_eq!(
-            normalize_openai_text_delta(
-                &mut emitted,
-                &mut mode,
-                "the quick brown fox".to_string()
-            )
-            .as_deref(),
+            normalize_openai_text_delta(&mut emitted, &mut mode, "the quick brown fox".to_string())
+                .as_deref(),
             Some(" fox")
         );
         assert_eq!(
-            normalize_openai_text_delta(
-                &mut emitted,
-                &mut mode,
-                "the quick brown fox".to_string()
-            ),
+            normalize_openai_text_delta(&mut emitted, &mut mode, "the quick brown fox".to_string()),
             None
         );
         assert_eq!(emitted, "the quick brown fox");
@@ -3237,8 +3237,7 @@ mod tests {
         let mut mode = OpenAiTextStreamMode::Cumulative;
 
         assert_eq!(
-            normalize_openai_text_delta(&mut emitted, &mut mode, "café".to_string())
-                .as_deref(),
+            normalize_openai_text_delta(&mut emitted, &mut mode, "café".to_string()).as_deref(),
             Some("café")
         );
         assert_eq!(

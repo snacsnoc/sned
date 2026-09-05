@@ -643,7 +643,8 @@ impl Provider for AnthropicProvider {
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
                             "error",
-                        ).await;
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -904,7 +905,8 @@ async fn process_anthropic_event(
                     id: None,
                 }),
                 "usage",
-            ).await;
+            )
+            .await;
         }
         AnthropicStreamEvent::MessageDelta { delta, usage } => {
             // Emit final output_tokens from MessageDelta — MessageStart only
@@ -924,7 +926,8 @@ async fn process_anthropic_event(
                     id: None,
                 }),
                 "usage_delta",
-            ).await;
+            )
+            .await;
         }
         AnthropicStreamEvent::MessageStop | AnthropicStreamEvent::Ping => {
             // Both are terminal/keepalive events, no action needed
@@ -937,7 +940,8 @@ async fn process_anthropic_event(
                     error.error_type, error.message
                 )),
                 "error",
-            ).await;
+            )
+            .await;
         }
         AnthropicStreamEvent::ContentBlockStart { content_block } => match content_block {
             AnthropicContentBlock::Thinking {
@@ -955,7 +959,8 @@ async fn process_anthropic_event(
                         id: None,
                     }),
                     "reasoning",
-                ).await;
+                )
+                .await;
             }
             AnthropicContentBlock::RedactedThinking { data } => {
                 last_tool_call.last_was_text = false;
@@ -969,7 +974,8 @@ async fn process_anthropic_event(
                         id: None,
                     }),
                     "reasoning",
-                ).await;
+                )
+                .await;
             }
             AnthropicContentBlock::ToolUse { id, name } => {
                 last_tool_call.id.clone_from(&id);
@@ -993,7 +999,8 @@ async fn process_anthropic_event(
                         signature: None,
                     }),
                     "tool_calls",
-                ).await;
+                )
+                .await;
             }
             AnthropicContentBlock::Text { text } => {
                 // Emit newline between consecutive text blocks
@@ -1006,7 +1013,8 @@ async fn process_anthropic_event(
                             signature: None,
                         }),
                         "text_newline",
-                    ).await;
+                    )
+                    .await;
                 }
                 last_tool_call.last_was_text = true;
                 send_chunk(
@@ -1017,7 +1025,8 @@ async fn process_anthropic_event(
                         signature: None,
                     }),
                     "text",
-                ).await;
+                )
+                .await;
             }
         },
         AnthropicStreamEvent::ContentBlockDelta { delta } => match delta {
@@ -1032,7 +1041,8 @@ async fn process_anthropic_event(
                         id: None,
                     }),
                     "reasoning",
-                ).await;
+                )
+                .await;
             }
             AnthropicContentDelta::SignatureDelta { signature } => {
                 send_chunk(
@@ -1045,7 +1055,8 @@ async fn process_anthropic_event(
                         id: None,
                     }),
                     "reasoning",
-                ).await;
+                )
+                .await;
             }
             AnthropicContentDelta::TextDelta { text } => {
                 send_chunk(
@@ -1056,7 +1067,8 @@ async fn process_anthropic_event(
                         signature: None,
                     }),
                     "text",
-                ).await;
+                )
+                .await;
             }
             AnthropicContentDelta::InputJsonDelta { partial_json } => {
                 if !last_tool_call.id.is_empty() && !last_tool_call.name.is_empty() {
@@ -1105,7 +1117,8 @@ async fn process_anthropic_event(
                         signature: None,
                     }),
                     "tool_calls",
-                ).await;
+                )
+                .await;
             }
             last_tool_call.id.clear();
             last_tool_call.name.clear();
@@ -1455,6 +1468,8 @@ mod tests {
         }
         assert_eq!(count, 10);
         assert!(send_task.await.unwrap());
-        assert!(matches!(rx.recv().await, Some(ApiStreamChunk::Text(chunk)) if chunk.text == "delivered"));
+        assert!(
+            matches!(rx.recv().await, Some(ApiStreamChunk::Text(chunk)) if chunk.text == "delivered")
+        );
     }
 }

@@ -1098,7 +1098,8 @@ async fn process_minimax_sse_line(
         if let Some(choice) = event.choices.first() {
             // Handle reasoning_content (MiniMax M2.7+ interleaved thinking)
             if let Some(reasoning) = &choice.delta.reasoning_content {
-                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id)
+                    .await;
                 emit_minimax_reasoning(
                     tx,
                     reasoning_state,
@@ -1110,7 +1111,8 @@ async fn process_minimax_sse_line(
             }
             // Handle reasoning_details array (MiniMax with reasoning_split=true)
             for detail in &choice.delta.reasoning_details {
-                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id)
+                    .await;
                 emit_minimax_reasoning(
                     tx,
                     reasoning_state,
@@ -1124,7 +1126,8 @@ async fn process_minimax_sse_line(
             // Handle content: check for MiniMax-M2 XML tool calls
             if let Some(content) = &choice.delta.content {
                 if content.contains("<minimax:tool_call>") {
-                    flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
+                    flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id)
+                        .await;
                     // Buffer XML content (bounded to prevent unbounded memory growth)
                     if xml_buffer.len() + content.len() <= MAX_XML_TOOL_CALL_BUFFER {
                         xml_buffer.push_str(content);
@@ -1140,7 +1143,8 @@ async fn process_minimax_sse_line(
                     extract_and_emit_xml_tool_calls(xml_buffer, tx, &event.id).await;
                     // Don't emit XML as text
                 } else if !xml_buffer.is_empty() {
-                    flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
+                    flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id)
+                        .await;
                     // Continue buffering (bounded)
                     if xml_buffer.len() + content.len() <= MAX_XML_TOOL_CALL_BUFFER {
                         xml_buffer.push_str(content);
@@ -1172,7 +1176,8 @@ async fn process_minimax_sse_line(
                     continue;
                 }
 
-                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id)
+                    .await;
 
                 if let Some(id) = &tool_call.id {
                     let entry = accumulated_tool_calls
@@ -1229,7 +1234,8 @@ async fn process_minimax_sse_line(
             if let Some(finish_reason) = &choice.finish_reason
                 && (finish_reason == "tool_calls" || finish_reason == "tool_call")
             {
-                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id).await;
+                flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id)
+                    .await;
                 for (idx, (id, name, args)) in accumulated_tool_calls.iter() {
                     if !id.is_empty()
                         && !name.is_empty()
@@ -1536,7 +1542,6 @@ mod tests {
             api_line: Some("china".to_string()),
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
         assert_eq!(provider.base_url(), "https://api.minimaxi.com/v1");
@@ -1549,7 +1554,6 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1586,9 +1590,13 @@ mod tests {
             ..request
         };
         let fallback_body = provider.build_request_body(&empty_history).unwrap();
-        assert!(fallback_body["messages"].as_array().unwrap().iter().any(|msg| {
-            msg["role"] == "user" && msg["content"] == "Please proceed."
-        }));
+        assert!(
+            fallback_body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|msg| { msg["role"] == "user" && msg["content"] == "Please proceed." })
+        );
     }
 
     #[test]
@@ -1598,7 +1606,6 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1632,7 +1639,6 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1658,7 +1664,6 @@ mod tests {
             api_line: None,
             model_id: "some-unknown-model".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1690,7 +1695,6 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1726,7 +1730,6 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1782,7 +1785,6 @@ mod tests {
                 supports_tools: Some(true),
                 ..ModelInfo::default()
             }),
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1806,7 +1808,6 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1831,7 +1832,6 @@ mod tests {
             api_line: None,
             model_id: "minimax-m2.7".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1909,7 +1909,6 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -1996,7 +1995,6 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 
@@ -2058,7 +2056,6 @@ mod tests {
             api_line: None,
             model_id: "MiniMax-M2.7".to_string(),
             model_info: None,
-
         };
         let provider = MinimaxProvider::new(config).unwrap();
 

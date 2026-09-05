@@ -300,10 +300,7 @@ impl MockProvider {
 
     #[must_use]
     pub fn plan_act_no_state_scenario() -> Self {
-        Self::plan_no_state_exit_scenario(
-            "plan-act-no-state-smoke",
-            "PLAN_ACT_NO_STATE_COMPLETION",
-        )
+        Self::plan_no_state_exit_scenario("plan-act-no-state-smoke", "PLAN_ACT_NO_STATE_COMPLETION")
     }
 
     #[must_use]

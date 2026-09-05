@@ -502,7 +502,8 @@ async fn process_gemini_sse_line(
                                 id: Some(response_id.clone()),
                             }),
                             "reasoning",
-                        ).await;
+                        )
+                        .await;
                         emitted_chunk = true;
                     }
                 }
@@ -516,7 +517,8 @@ async fn process_gemini_sse_line(
                             signature: signature.clone(),
                         }),
                         "text",
-                    ).await;
+                    )
+                    .await;
                     emitted_chunk = true;
                 }
 
@@ -573,7 +575,8 @@ async fn process_gemini_sse_line(
                             signature: part_signature.clone(),
                         }),
                         "signature_only",
-                    ).await;
+                    )
+                    .await;
                 }
 
                 // Reset carry-forward after functionCall - parallel FCs should NOT inherit signature
@@ -623,7 +626,8 @@ async fn process_gemini_sse_line(
                         signature: signature.clone(),
                     }),
                     "tool_calls",
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -681,7 +685,8 @@ async fn process_gemini_sse_line(
                 id: Some(response_id),
             }),
             "usage",
-        ).await;
+        )
+        .await;
     }
 }
 
@@ -715,7 +720,8 @@ async fn finish_gemini_sse_to_chunks(
                         signature: signature.clone(),
                     }),
                     "tool_calls",
-                ).await;
+                )
+                .await;
             }
         }
     }
@@ -744,7 +750,8 @@ async fn finish_gemini_sse_to_chunks(
                     signature: None,
                 }),
                 "grounding_sources",
-            ).await;
+            )
+            .await;
         }
     }
 }
@@ -812,7 +819,8 @@ impl Provider for GeminiProvider {
                                 &mut response_blocked,
                                 &mut last_grounding_metadata,
                                 model_info.as_ref(),
-                            ).await;
+                            )
+                            .await;
                         }
                         if let Some(err) = sse_buffer.take_error() {
                             send_chunk(&tx, ApiStreamChunk::Error(err), "error").await;
@@ -830,7 +838,8 @@ impl Provider for GeminiProvider {
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
                             "error",
-                        ).await;
+                        )
+                        .await;
                         stream_errored = true;
                         break;
                     }
@@ -844,7 +853,8 @@ impl Provider for GeminiProvider {
                     &mut completed_tool_call_ids,
                     response_blocked,
                     &mut last_grounding_metadata,
-                ).await;
+                )
+                .await;
             }
         });
 
