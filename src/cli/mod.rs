@@ -1016,9 +1016,7 @@ pub(crate) fn create_provider(
     }
 
     if task_opts.no_stream && provider_name != "openai" {
-        anyhow::bail!(
-            "--no-stream is only supported for custom OpenAI-compatible endpoints."
-        );
+        anyhow::bail!("--no-stream is only supported for custom OpenAI-compatible endpoints.");
     }
 
     // ── Per-provider flag support checks ──────────────────────────────
@@ -2584,10 +2582,7 @@ mod tests {
 
     #[test]
     fn test_parse_max_consecutive_mistakes_zero_disables_limit() {
-        assert_eq!(
-            parse_max_consecutive_mistakes("0", "test").unwrap(),
-            None
-        );
+        assert_eq!(parse_max_consecutive_mistakes("0", "test").unwrap(), None);
         assert_eq!(
             parse_max_consecutive_mistakes("3", "test").unwrap(),
             Some(3)

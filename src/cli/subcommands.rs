@@ -869,7 +869,10 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
 
     if opts.verbose {
         println!("\nCurrent configuration:");
-        println!("{}", format_config_output(&state_manager.global_state_snapshot()));
+        println!(
+            "{}",
+            format_config_output(&state_manager.global_state_snapshot())
+        );
     }
 
     Ok(())

@@ -212,7 +212,9 @@ impl VisualLayoutIndex {
     }
 
     fn entry_start(&self, index: usize) -> usize {
-        index.checked_sub(1).map_or(0, |previous| self.offsets[previous])
+        index
+            .checked_sub(1)
+            .map_or(0, |previous| self.offsets[previous])
     }
 
     fn locate(&self, scroll_y: usize, content_height: usize) -> (usize, usize, usize) {
@@ -400,7 +402,10 @@ impl ScrollbackWriter {
         let (sender, receiver) = std_mpsc::channel();
         let response = match self.sender.send(ScrollbackCommand::Shutdown(sender)) {
             Ok(()) => receiver.recv_timeout(WRITER_RESPONSE_TIMEOUT).map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "scrollback writer shutdown timed out")
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "scrollback writer shutdown timed out",
+                )
             }),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -1275,9 +1280,7 @@ impl App {
             self.cached_visual_rows = self.cached_visual_rows.saturating_add(added_rows);
         }
         if can_extend_layout {
-            if previous_kind
-                .is_some_and(|previous| Self::should_insert_separator(previous, kind))
-            {
+            if previous_kind.is_some_and(|previous| Self::should_insert_separator(previous, kind)) {
                 self.visual_layout_index.append_entry(LayoutEntry {
                     source: LayoutSource::Separator,
                     kind: BlockKind::Separator,
@@ -1287,11 +1290,7 @@ impl App {
             self.visual_layout_index.append_entry(LayoutEntry {
                 source: LayoutSource::Output(self.output_lines.len().saturating_sub(1)),
                 kind,
-                rows: Self::output_row_visual_rows(
-                    self.output_lines.back(),
-                    kind,
-                    wrap_width,
-                ),
+                rows: Self::output_row_visual_rows(self.output_lines.back(), kind, wrap_width),
             });
             self.cached_visual_rows = self.visual_layout_index.total_rows();
         } else if !self.visual_layout_index.is_valid_for(wrap_width) {
@@ -1758,9 +1757,8 @@ impl App {
         // Prepending as a span keeps the indicator on the same line as
         // the start of the response.
         let have_indicator = self.turn_indicator.take().is_some();
-        let mut rendered = rendered.unwrap_or_else(|| {
-            crate::cli::markdown::render_streamed_markdown(markdown_text, true)
-        });
+        let mut rendered = rendered
+            .unwrap_or_else(|| crate::cli::markdown::render_streamed_markdown(markdown_text, true));
         if have_indicator && let Some(first) = rendered.first_mut() {
             let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
             new_spans.push(Span::styled(
@@ -3103,8 +3101,7 @@ impl App {
             .zip(self.output_line_kinds.iter())
             .enumerate()
         {
-            if previous_kind
-                .is_some_and(|previous| Self::should_insert_separator(previous, *kind))
+            if previous_kind.is_some_and(|previous| Self::should_insert_separator(previous, *kind))
             {
                 entries.push(LayoutEntry {
                     source: LayoutSource::Separator,
@@ -3328,8 +3325,7 @@ impl App {
         };
         let line = self.output_lines.get(output_index)?;
         let separator_before = entry_index > 0
-            && self.visual_layout_index.entries[entry_index - 1].source
-                == LayoutSource::Separator;
+            && self.visual_layout_index.entries[entry_index - 1].source == LayoutSource::Separator;
         Some(ManualViewportAnchor {
             output_index,
             row_offset: if separator_before && entry_index != start {
@@ -3360,16 +3356,20 @@ impl App {
             .find(|(_, entry)| entry.source == LayoutSource::Output(anchor.output_index))?;
         let line_start = self.visual_layout_index.entry_start(entry_index);
         let separator_before = entry_index > 0
-            && self.visual_layout_index.entries[entry_index - 1].source
-                == LayoutSource::Separator;
+            && self.visual_layout_index.entries[entry_index - 1].source == LayoutSource::Separator;
         if anchor.separator_before && separator_before {
             return Some(line_start.saturating_sub(1));
         }
-        Some(line_start.saturating_add(
-            anchor
-                .row_offset
-                .min(entry.rows.saturating_sub(separator_before as usize).saturating_sub(1)),
-        ))
+        Some(
+            line_start.saturating_add(
+                anchor.row_offset.min(
+                    entry
+                        .rows
+                        .saturating_sub(separator_before as usize)
+                        .saturating_sub(1),
+                ),
+            ),
+        )
     }
 
     fn restore_manual_viewport_anchor(
@@ -3453,12 +3453,10 @@ impl App {
                     skipped_rows -= 1;
                 } else if row_sources.len() < content_height {
                     row_sources.push(match entry.source {
-                        LayoutSource::Output(output_line_index) => {
-                            Some(SelectionRowSource {
-                                output_line_index,
-                                row_in_line,
-                            })
-                        }
+                        LayoutSource::Output(output_line_index) => Some(SelectionRowSource {
+                            output_line_index,
+                            row_in_line,
+                        }),
                         LayoutSource::Error(_) | LayoutSource::Separator => None,
                     });
                 }
@@ -6690,13 +6688,8 @@ mod tests {
 
         let mut expected_rows = 0;
         let mut previous_kind = None;
-        for (line, kind) in app
-            .output_lines
-            .iter()
-            .zip(app.output_line_kinds.iter())
-        {
-            if previous_kind.is_some_and(|previous| App::should_insert_separator(previous, *kind))
-            {
+        for (line, kind) in app.output_lines.iter().zip(app.output_line_kinds.iter()) {
+            if previous_kind.is_some_and(|previous| App::should_insert_separator(previous, *kind)) {
                 expected_rows += 1;
             }
             expected_rows += App::output_row_visual_rows(Some(line), *kind, wrap_width);

@@ -328,5 +328,4 @@ mod tests {
         let display = format!("{}", err);
         assert!(display.contains("Suggestion: Try again"));
     }
-
 }

@@ -5,10 +5,10 @@
 //! converts that markdown into a sequence of styled lines suitable for
 //! the Task Completed box.
 
+use lru::LruCache;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
 
@@ -140,16 +140,19 @@ impl MarkdownCache {
     }
 
     fn get(&mut self, key: &MarkdownCacheKey) -> Option<Vec<Line<'static>>> {
-        self.entries
-            .get(key)
-            .map(|value| value.rendered.clone())
+        self.entries.get(key).map(|value| value.rendered.clone())
     }
 
     fn insert(&mut self, key: MarkdownCacheKey, rendered: Vec<Line<'static>>) {
         let resident_bytes = key.text.len().saturating_add(
             rendered
                 .iter()
-                .map(|line| line.spans.iter().map(|span| span.content.len()).sum::<usize>())
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.len())
+                        .sum::<usize>()
+                })
                 .sum::<usize>(),
         );
         if resident_bytes > MARKDOWN_CACHE_BYTES {
@@ -181,10 +184,8 @@ fn markdown_cache() -> &'static Mutex<MarkdownCache> {
     CACHE.get_or_init(|| Mutex::new(MarkdownCache::new()))
 }
 
-static MARKDOWN_CACHE_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static MARKDOWN_CACHE_MISSES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static MARKDOWN_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MARKDOWN_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn markdown_cache_stats() -> (u64, u64) {
     (
@@ -235,11 +236,8 @@ pub(crate) fn render_streamed_markdown_timed(
 ) -> (Vec<Line<'static>>, MarkdownRenderTiming) {
     let started = std::time::Instant::now();
     let mut syntax_highlight_us = 0;
-    let rendered = render_streamed_markdown_cached(
-        text,
-        interactive_mode,
-        Some(&mut syntax_highlight_us),
-    );
+    let rendered =
+        render_streamed_markdown_cached(text, interactive_mode, Some(&mut syntax_highlight_us));
     (
         rendered,
         MarkdownRenderTiming {
@@ -741,9 +739,17 @@ mod tests {
         let text = collect_text(&lines);
         assert!(text.contains("let x = 1;"), "got: {}", text);
         assert!(text.contains("let y = 2;"), "got: {}", text);
-        assert!(text.contains(" code "), "expected code label, got: {}", text);
+        assert!(
+            text.contains(" code "),
+            "expected code label, got: {}",
+            text
+        );
         assert!(text.contains("│   "), "expected code border, got: {}", text);
-        assert!(text.contains(&"─".repeat(60)), "expected bottom border, got: {}", text);
+        assert!(
+            text.contains(&"─".repeat(60)),
+            "expected bottom border, got: {}",
+            text
+        );
     }
 
     #[test]
@@ -777,11 +783,17 @@ mod tests {
             .iter()
             .position(|line| line.spans.iter().any(|span| span.content == "heading"))
             .expect("heading line");
-        assert!(heading_index > 0, "heading must follow the paragraph: {lines:?}");
-        assert!(lines[heading_index]
-            .spans
-            .iter()
-            .any(|span| span.content == "heading" && span.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(
+            heading_index > 0,
+            "heading must follow the paragraph: {lines:?}"
+        );
+        assert!(
+            lines[heading_index]
+                .spans
+                .iter()
+                .any(|span| span.content == "heading"
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+        );
         assert!(!collect_text(&lines).contains("## heading"));
     }
 

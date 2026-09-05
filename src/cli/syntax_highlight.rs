@@ -116,10 +116,8 @@ fn highlight_cache() -> &'static Mutex<HighlightCache> {
     CACHE.get_or_init(|| Mutex::new(HighlightCache::new()))
 }
 
-static HIGHLIGHT_CACHE_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static HIGHLIGHT_CACHE_MISSES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static HIGHLIGHT_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HIGHLIGHT_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn highlight_cache_stats() -> (u64, u64) {
     (
@@ -170,7 +168,8 @@ pub fn highlight_code(code: &str, lang: &str) -> String {
 
     let mut spans = Vec::new();
     collect_spans(tree.root_node(), code.as_bytes(), &mut spans);
-    let rendered = render_highlights(code, &spans).unwrap_or_else(|| render_lexical_highlights(code));
+    let rendered =
+        render_highlights(code, &spans).unwrap_or_else(|| render_lexical_highlights(code));
     highlight_cache()
         .lock()
         .expect("highlight cache poisoned")

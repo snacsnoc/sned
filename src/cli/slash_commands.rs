@@ -521,17 +521,17 @@ impl SlashCommand {
         None
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_skill_command(&self) -> bool {
         matches!(self, Self::SkillCommand { .. })
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_compact(&self) -> bool {
         matches!(self, Self::Compact)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn instruction_block(&self) -> &'static str {
         match self {
             Self::Compact => CONDENSE_INSTRUCTION,
@@ -539,7 +539,7 @@ impl SlashCommand {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn skill_name(&self) -> Option<&str> {
         match self {
             Self::SkillCommand { name } => Some(name),
@@ -562,7 +562,7 @@ pub struct SlashCommandParseResult {
     pub command: Option<ParsedSlashCommand>,
 }
 
-#[must_use] 
+#[must_use]
 pub fn get_skill_content_for_command(
     skill_name: &str,
     available_skills: &[SkillMetadata],
@@ -693,12 +693,8 @@ impl CliOnlyCommand {
             Some(PlanSubcommand::Add(after, desc)) => {
                 Some(Self::Plan(PlanSubcommand::Add(after, desc)))
             }
-            Some(PlanSubcommand::Remove(step)) => {
-                Some(Self::Plan(PlanSubcommand::Remove(step)))
-            }
-            Some(PlanSubcommand::Replace(text)) => {
-                Some(Self::Plan(PlanSubcommand::Replace(text)))
-            }
+            Some(PlanSubcommand::Remove(step)) => Some(Self::Plan(PlanSubcommand::Remove(step))),
+            Some(PlanSubcommand::Replace(text)) => Some(Self::Plan(PlanSubcommand::Replace(text))),
             Some(PlanSubcommand::Approve) => Some(Self::PlanApprove),
             Some(PlanSubcommand::Pause) => Some(Self::PlanPause),
             Some(PlanSubcommand::Resume) => Some(Self::PlanResume),
@@ -769,7 +765,7 @@ impl CliOnlyCommand {
     }
 
     /// Returns true if this command requires the agent to be idle.
-    #[must_use] 
+    #[must_use]
     pub fn requires_agent_idle(&self) -> bool {
         matches!(
             self,
@@ -784,7 +780,7 @@ impl CliOnlyCommand {
     }
 
     /// Returns true if this is a plan command.
-    #[must_use] 
+    #[must_use]
     pub fn is_plan_command(&self) -> bool {
         matches!(
             self,
@@ -992,7 +988,7 @@ pub fn parse_slash_command(text: &str) -> SlashCommandParseResult {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn process_slash_command(text: &str) -> String {
     let result = parse_slash_command(text);
     if let Some(cmd) = result.command
@@ -1007,7 +1003,7 @@ pub fn process_slash_command(text: &str) -> String {
     text.to_string()
 }
 
-#[must_use] 
+#[must_use]
 pub fn process_slash_command_with_context(
     text: &str,
     available_skills: &[SkillMetadata],
@@ -1048,7 +1044,7 @@ pub fn process_slash_command_with_context(
     text.to_string()
 }
 
-#[must_use] 
+#[must_use]
 pub fn is_compact_command(text: &str) -> bool {
     let result = parse_slash_command(text);
     if let Some(cmd) = result.command
@@ -1250,7 +1246,7 @@ pub fn apply_slash_completion(text: &str, command_name: &str) -> Option<(String,
 /// 2. Prefix match on name
 /// 3. Prefix match on alias
 /// 4. Substring match on name or description
-#[must_use] 
+#[must_use]
 pub fn filter_slash_commands(entries: &[SlashCommandEntry], query: &str) -> Vec<SlashCommandEntry> {
     if query.is_empty() {
         return entries.to_vec();
@@ -1366,7 +1362,12 @@ pub fn format_help_text() -> String {
         }
 
         lines.push(String::new());
-        lines.push(format!("{}{}:{}", style::BOLD, section.title(), style::RESET));
+        lines.push(format!(
+            "{}{}:{}",
+            style::BOLD,
+            section.title(),
+            style::RESET
+        ));
         for spec in specs {
             let aliases = if spec.aliases.is_empty() {
                 String::new()
@@ -1480,7 +1481,7 @@ pub struct ModelPickerEntry {
 }
 
 /// Build the list of available model picker entries.
-#[must_use] 
+#[must_use]
 pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
     vec![
         ModelPickerEntry {
@@ -1588,7 +1589,7 @@ pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
     ]
 }
 
-#[must_use] 
+#[must_use]
 pub fn format_stats_text(state: &crate::core::agent_types::TaskState) -> String {
     if let Some(ref api_req_info) = state.last_api_req_info {
         let tokens_in = api_req_info.tokens_in.unwrap_or(0);
@@ -1641,7 +1642,7 @@ pub fn format_stats_text(state: &crate::core::agent_types::TaskState) -> String 
 }
 
 /// Format session file changes for /changes command.
-#[must_use] 
+#[must_use]
 pub fn format_changes_text(state: &crate::core::agent_types::TaskState) -> String {
     use crate::core::context::trackers::FileRecordSource;
 
@@ -1868,7 +1869,10 @@ mod tests {
     fn test_is_compact_command_compact() {
         assert!(is_compact_command("/compact"));
         assert_eq!(COMPACTING_CONTEXT_ACKNOWLEDGEMENT, "Compacting context…");
-        assert_eq!(compact_acknowledgement("/compact"), Some("Compacting context…"));
+        assert_eq!(
+            compact_acknowledgement("/compact"),
+            Some("Compacting context…")
+        );
         assert_eq!(compact_acknowledgement("/help"), None);
     }
 
@@ -2011,9 +2015,7 @@ mod tests {
             for name in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
                 let invocation = format!("/{name}");
                 let parsed = match spec.id {
-                    SlashCommandId::Compact => {
-                        SlashCommand::parse(name).is_some()
-                    }
+                    SlashCommandId::Compact => SlashCommand::parse(name).is_some(),
                     _ => get_cli_only_command(&invocation).is_some(),
                 };
                 assert!(parsed, "advertised command did not parse: {invocation}");
