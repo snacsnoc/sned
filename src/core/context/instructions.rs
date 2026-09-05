@@ -283,7 +283,10 @@ fn format_agent_rule_files(cwd: &Path, files: &[AgentRuleFile]) -> Option<String
 
 /// Read and combine only the workspace-root AGENTS.md file.
 pub fn get_local_agents_rules(cwd: &Path, toggles: &RuleToggles) -> Option<String> {
-    format_agent_rule_files(cwd, &load_agent_rule_files(find_agents_md_files(cwd), toggles))
+    format_agent_rule_files(
+        cwd,
+        &load_agent_rule_files(find_agents_md_files(cwd), toggles),
+    )
 }
 
 /// Read applicable AGENTS.md files for one explicit file or directory target.
@@ -294,7 +297,10 @@ pub fn load_path_scoped_agents_rules(
     target: &Path,
     toggles: &RuleToggles,
 ) -> Vec<AgentRuleFile> {
-    load_agent_rule_files(find_path_scoped_agents_md_files(workspace_root, target), toggles)
+    load_agent_rule_files(
+        find_path_scoped_agents_md_files(workspace_root, target),
+        toggles,
+    )
 }
 
 /// Format path-scoped AGENTS.md rules for callers that need the complete chain.
@@ -845,7 +851,10 @@ mod tests {
         fs::write(&nested, "nested").unwrap();
 
         let files = find_agents_md_files(cwd);
-        assert!(files.is_empty(), "Nested rules are path-scoped, not startup rules");
+        assert!(
+            files.is_empty(),
+            "Nested rules are path-scoped, not startup rules"
+        );
     }
 
     #[test]
@@ -1271,8 +1280,9 @@ mod tests {
         assert!(rules_str.contains("top-level rules"));
         assert!(!rules_str.contains("nested rules"));
 
-        let scoped = get_path_scoped_agents_rules(cwd, &nested.join("file.rs"), &RuleToggles::new())
-            .unwrap();
+        let scoped =
+            get_path_scoped_agents_rules(cwd, &nested.join("file.rs"), &RuleToggles::new())
+                .unwrap();
         assert!(scoped.contains("top-level rules"));
         assert!(scoped.contains("nested rules"));
 
@@ -1282,8 +1292,7 @@ mod tests {
         let rules = get_local_agents_rules(cwd, &toggles);
         assert!(rules.is_none());
 
-        let scoped = get_path_scoped_agents_rules(cwd, &nested.join("file.rs"), &toggles)
-            .unwrap();
+        let scoped = get_path_scoped_agents_rules(cwd, &nested.join("file.rs"), &toggles).unwrap();
         assert!(!scoped.contains("top-level rules"));
         assert!(scoped.contains("nested rules"));
     }

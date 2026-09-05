@@ -158,8 +158,7 @@ impl CancellationHandler {
         // 5. Persist state on a bounded best-effort path. Cancellation must
         // not wait indefinitely on a slow filesystem or a contended state
         // lock; the next periodic/startup persistence attempt can retry it.
-        const CANCELLATION_PERSIST_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(2);
+        const CANCELLATION_PERSIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         match tokio::time::timeout(
             CANCELLATION_PERSIST_TIMEOUT,
             StateManager::persist_async(state_manager),

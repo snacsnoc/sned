@@ -33,9 +33,7 @@ impl AttemptCompletionHandler {
                     || plan
                         .steps
                         .iter()
-                        .any(|step| {
-                            step.status == crate::core::plan_state::PlanStepStatus::Failed
-                        }))
+                        .any(|step| step.status == crate::core::plan_state::PlanStepStatus::Failed))
         });
         if plan_blocks_completion {
             return Err(ToolError::ExecutionFailed(
@@ -229,9 +227,8 @@ mod tests {
     fn test_attempt_completion_rejected_for_failed_plan() {
         let handler = AttemptCompletionHandler::new();
         let mut state = TaskState::default();
-        let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
-            "Run the command".to_string(),
-        ]);
+        let mut plan =
+            crate::core::plan_state::PlanState::create_plan(vec!["Run the command".to_string()]);
         plan.approved = true;
         plan.paused = true;
         plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Failed;

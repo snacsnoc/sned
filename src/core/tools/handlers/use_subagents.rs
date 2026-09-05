@@ -319,7 +319,10 @@ impl UseSubagentsHandler {
                     error = %error,
                     "subagent output collector task failed"
                 );
-                (format!("[subagent {stream_name} collection failed: {error}]"), false)
+                (
+                    format!("[subagent {stream_name} collection failed: {error}]"),
+                    false,
+                )
             }
             Err(_) => {
                 tracing::warn!(
@@ -329,7 +332,10 @@ impl UseSubagentsHandler {
                 );
                 handle.abort();
                 let _ = handle.await;
-                (format!("[subagent {stream_name} collection timed out]"), true)
+                (
+                    format!("[subagent {stream_name} collection timed out]"),
+                    true,
+                )
             }
         }
     }
