@@ -5875,6 +5875,24 @@ mod tests {
     }
 
     #[test]
+    fn edit_diff_preview_accepts_precise_identity_guidance() {
+        let result = "Edited 1 file(s): 1 edit(s) applied.\n\nApplied 1 edit(s) successfully (+1, -1 lines). Untouched lines retain their anchors. Inserted and changed lines have new anchors shown below.\n\n- Old§old\n+ New§new";
+        let previews = edit_result_diff_previews(result);
+        assert_eq!(previews.len(), 1);
+        assert!(previews[0].contains("Old§old"));
+        assert!(previews[0].contains("New§new"));
+    }
+
+    #[test]
+    fn publication_failure_does_not_render_a_normal_edit_diff() {
+        let result = "Edited 1 file(s): 1 edit(s) applied.\n\nContent was applied, but anchor state could not be published.\nNo returned anchors are reusable. Call read_file before editing this file again.";
+        assert!(edit_result_diff_previews(result).is_empty());
+        let retained = truncate_tool_result(result);
+        assert!(retained.contains("Content was applied"));
+        assert!(retained.contains("Call read_file"));
+    }
+
+    #[test]
     fn test_strip_edit_diff_anchors_preserves_syntax_spans() {
         let mut line = crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(
             "\x1b[92m+ AddedHash§\x1b[0m\x1b[96mlet\x1b[0m value = 1;",

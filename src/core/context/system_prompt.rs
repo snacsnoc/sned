@@ -116,7 +116,7 @@ impl PromptBuilder {
             let has = |tool| profile.tools().contains(&tool);
             if has(SnedTool::ReadFile) && has(SnedTool::EditFile) {
                 section.push_str(
-                    "- Execute file changes in small, verifiable steps: re-read with read_file before edit_file so the anchor matches the current line exactly.\n",
+                    "- Use exact anchors from the current tracked state. Prefer batching independent edits from the same snapshot unless the task requires sequential edits; read again when an error requires it or the needed context is missing.\n",
                 );
             } else if has(SnedTool::ReadFile) {
                 section.push_str(
@@ -159,10 +159,10 @@ impl PromptBuilder {
 
         if self.context.enable_parallel_tool_calling {
             prompt.push_str(
-                "- Batch independent work in one response when it is truly independent.\n",
+                "- Prefer batching independent work in one response unless the task requires sequential execution.\n",
             );
             prompt.push_str(
-                "- Multiple edits to different sections of one file are independent when based on current hash anchors; batch them to save roundtrips.\n",
+                "- Prefer batching independent tool calls unless the task requires sequential execution; edits within one file can share one edit_file call with edits based on the same snapshot.\n",
             );
         }
         if !self.context.enable_parallel_tool_calling {
@@ -201,7 +201,8 @@ impl PromptBuilder {
         }
         if self.has_tool(SnedTool::EditFile) {
             prompt.push_str(
-                "- For `edit_file`, read the current file first and copy one exact, complete `Word§line content` anchor from that tool output, including its prefix; never invent an anchor prefix or use a line number alone.\n\
+                "- For `edit_file`, use the current tracked state from a file read or successful edit result and copy one exact, complete `Word§line content` anchor from that tool output, including its prefix; never invent an anchor prefix or use a line number alone.\n\
+                 - Different prefixes distinguish identical-content occurrences in the current tracked state. Prefer batching independent edits from the same snapshot in one `edit_file` call, including in sequential tool mode, unless the task requires sequential edits. Explicit workflow requirements override batching defaults. Unchanged tracked occurrences retain their anchors across edits; a fresh read is not required for each edit. Dependent edits use the updated result. Large-file snapshot anchors expire after any edit; use newly returned anchors or read again.\n\
                  - In an `edit_file` edit, put replacement text in `text`; the optional `content` field is only an exact array of interior lines for duplicate-anchor disambiguation, never a replacement string.\n\
                  - After a stale, unknown, malformed, or ambiguous edit error, call `read_file` again before retrying. Do not repeat the same anchor.\n",
             );
@@ -406,6 +407,8 @@ mod tests {
         );
         assert!(prompt.contains("If no tools are needed or available, answer directly in text"));
         assert!(prompt.contains("Word§line content"));
+        assert!(prompt.contains("Unchanged tracked occurrences retain their anchors"));
+        assert!(!prompt.lines().any(|line| line.starts_with('\\')));
         assert!(prompt.contains("In ACT mode"));
         assert!(prompt.contains("PLAN mode"));
         // Environment info is now provided by context_loader, not in system prompt
@@ -624,19 +627,24 @@ mod tests {
             ..Default::default()
         };
         let prompt = PromptBuilder::new(context).build();
-        assert!(prompt.contains("Batch independent work in one response"));
-        assert!(prompt.contains("Multiple edits to different sections of one file"));
+        assert!(prompt.contains("Prefer batching independent work in one response"));
+        assert!(prompt.contains("unless the task requires sequential execution"));
+        assert!(prompt.contains("edits based on the same snapshot"));
     }
 
     #[test]
     fn test_prompt_builder_sequential_mode_has_sequential_guidance() {
         let context = SystemPromptContext {
             enable_parallel_tool_calling: false,
+            tool_profile: Some(ToolProfile::CoreEdit),
             ..Default::default()
         };
         let prompt = PromptBuilder::new(context).build();
         assert!(prompt.contains("Use tools sequentially"));
-        assert!(!prompt.contains("Batch independent tool calls"));
+        assert!(prompt.contains("including in sequential tool mode"));
+        assert!(prompt.contains("unless the task requires sequential edits"));
+        assert!(prompt.contains("Explicit workflow requirements override batching defaults"));
+        assert!(!prompt.contains("Prefer batching independent tool calls"));
     }
 
     #[test]
@@ -647,6 +655,7 @@ mod tests {
         };
         let prompt = PromptBuilder::new(context).build();
         assert!(prompt.contains("QWEN MODEL GUIDANCE"));
+        assert!(!prompt.contains("re-read with read_file before edit_file"));
         assert!(prompt.contains("Call an available tool explicitly"));
     }
 

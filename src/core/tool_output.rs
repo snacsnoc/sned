@@ -460,7 +460,11 @@ pub fn summarize_single_section(section: &str) -> String {
     let anchored_lines: Vec<&str> = section
         .lines()
         .skip(1)
-        .filter(|l| l.contains('§'))
+        .filter(|line| {
+            line.split_once('§').is_some_and(|(prefix, _)| {
+                !prefix.is_empty() && prefix.chars().all(char::is_alphanumeric)
+            })
+        })
         .take(MAX_PRESERVED_ANCHORS)
         .collect();
 
@@ -469,11 +473,15 @@ pub fn summarize_single_section(section: &str) -> String {
     if anchored_lines.is_empty() {
         out.push_str(" Re-read with read_file if you need current anchors.");
     } else {
-        out.push_str("\nPreserved anchors (copy EXACTLY for edit_file):\n");
+        out.push_str("\nPreserved anchors from the earlier read (copy EXACTLY; reuse only for untouched lines, not replaced or deleted lines):\n");
         out.push_str(&anchored_lines.join("\n"));
         out.push_str(
-            "\nRe-read with read_file for full content or to see lines beyond the preserved set.",
+            "\nUse the edit result's new anchors for inserted or changed lines. Re-read with read_file for full content or to see lines beyond the preserved set.",
         );
+    }
+
+    if section.contains("large-file snapshot anchors") {
+        out.push_str("\nLarge-file snapshot anchors expire after any edit, including anchors for untouched lines; use the edit result or read_file again.");
     }
 
     out
@@ -618,6 +626,26 @@ pub fn format_tool_result(result: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pruned_read_distinguishes_retained_text_from_live_identity() {
+        let summary = summarize_single_section(
+            "[File: status.md, Hash: abc]\nCopy Word§line content exactly.\nAlpha§unchanged\nBeta§old content",
+        );
+        assert!(summary.contains("Alpha§unchanged\nBeta§old content"));
+        assert!(!summary.contains("Copy Word§"));
+        assert!(summary.contains("reuse only for untouched lines"));
+        assert!(summary.contains("new anchors for inserted or changed lines"));
+    }
+
+    #[test]
+    fn pruned_read_retains_large_file_snapshot_expiry() {
+        let summary = summarize_single_section(
+            "[File: large.txt, Hash: abc]\nLabcN1§old\n[Note: These large-file snapshot anchors are valid only for this file version.]",
+        );
+        assert!(summary.contains("expire after any edit"));
+        assert!(summary.contains("including anchors for untouched lines"));
+    }
 
     #[test]
     fn test_format_tool_call_lines_shows_all_arguments() {

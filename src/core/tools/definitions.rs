@@ -95,13 +95,13 @@ impl ToolSchema {
 pub fn read_file_schema() -> ToolSchema {
     ToolSchema {
         name: "read_file",
-        description: "Reads files or line ranges and returns hash-anchored lines (Word§line content) for edit_file. Copy anchors exactly. The read/edit limit defaults to 512KB and is set at startup with SNED_MAX_FILE_READ_SIZE. Ranged, truncated, get_function, and get_file_skeleton output above that limit is inspection-only: restart Sned with a higher limit before editing. Examples: { paths: [\"src/main.ts\", \"package.json\"] }, { paths: [\"src/main.ts\"], start_line: 10, end_line: 50 }.",
+        description: "Read files/ranges as Word§source lines for edit_file. Copy exactly; prefixes distinguish duplicate occurrences. Above SNED_MAX_FILE_READ_SIZE (default 512KB), reads and structural output are inspection-only; restart with a higher limit to edit.",
         parameters: vec![
             ToolParameter {
                 name: "paths",
                 required: true,
                 param_type: "array",
-                description: "An array of relative paths to the source files.",
+                description: "Relative file paths.",
                 items: Some(serde_json::json!({"type": "string"})),
                 extra: None,
             },
@@ -109,7 +109,7 @@ pub fn read_file_schema() -> ToolSchema {
                 name: "start_line",
                 required: false,
                 param_type: "integer",
-                description: "Optional. If not supplied, output will start from line 1.",
+                description: "First line (default 1).",
                 items: None,
                 extra: None,
             },
@@ -117,7 +117,7 @@ pub fn read_file_schema() -> ToolSchema {
                 name: "end_line",
                 required: false,
                 param_type: "integer",
-                description: "Optional. If not supplied, the output will go until the last line.",
+                description: "Last line (default EOF).",
                 items: None,
                 extra: None,
             },
@@ -129,13 +129,13 @@ pub fn read_file_schema() -> ToolSchema {
 pub fn write_to_file_schema() -> ToolSchema {
     ToolSchema {
         name: "write_to_file",
-        description: "Write complete file content at the specified path. Overwrites existing files and creates parent directories. Use for new files or complete rewrites. For targeted existing-file changes, use edit_file after reading; do not substitute shell redirection, heredocs, or ad-hoc Python/sed rewrites.",
+        description: "Create/full-rewrite a file, creating parent directories. Overwrites existing content. For targeted changes use edit_file with read anchors; no shell/script bypass.",
         parameters: vec![
             ToolParameter {
                 name: "path",
                 required: true,
                 param_type: "string",
-                description: "The path of the file to write (relative to the workspace root).",
+                description: "Path relative to workspace root.",
                 items: None,
                 extra: None,
             },
@@ -143,7 +143,7 @@ pub fn write_to_file_schema() -> ToolSchema {
                 name: "content",
                 required: true,
                 param_type: "string",
-                description: "The content to write to the file.",
+                description: "Complete file content.",
                 items: None,
                 extra: None,
             },
@@ -155,13 +155,13 @@ pub fn write_to_file_schema() -> ToolSchema {
 pub fn list_files_schema() -> ToolSchema {
     ToolSchema {
         name: "list_files",
-        description: "Lists files and directories in the specified path. Returns a formatted tree-like listing with file sizes and line counts.",
+        description: "List files/directories as a tree with sizes and line counts.",
         parameters: vec![
             ToolParameter {
                 name: "path",
                 required: false,
                 param_type: "string",
-                description: "The path to list (relative to current working directory). Defaults to current directory.",
+                description: "Directory relative to cwd (default cwd).",
                 items: None,
                 extra: None,
             },
@@ -169,7 +169,7 @@ pub fn list_files_schema() -> ToolSchema {
                 name: "recursive",
                 required: false,
                 param_type: "boolean",
-                description: "Whether to list files recursively. Defaults to false.",
+                description: "Recurse (default false).",
                 items: None,
                 extra: None,
             },
@@ -181,13 +181,13 @@ pub fn list_files_schema() -> ToolSchema {
 pub fn search_files_schema() -> ToolSchema {
     ToolSchema {
         name: "search_files",
-        description: "Search for files matching a regex pattern. Returns file paths with line numbers and match context.",
+        description: "Search file contents by regex; returns paths, line numbers and context.",
         parameters: vec![
             ToolParameter {
                 name: "path",
                 required: false,
                 param_type: "string",
-                description: "The directory to search in (relative to current working directory). Defaults to current directory.",
+                description: "Search directory relative to cwd (default cwd).",
                 items: None,
                 extra: None,
             },
@@ -195,7 +195,7 @@ pub fn search_files_schema() -> ToolSchema {
                 name: "regex",
                 required: true,
                 param_type: "string",
-                description: "The regular expression pattern to search for.",
+                description: "Search regex.",
                 items: None,
                 extra: None,
             },
@@ -215,37 +215,37 @@ pub fn search_files_schema() -> ToolSchema {
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
-        description: "Edit existing files with exact Word§line anchors: call read_file, get_function, or get_file_skeleton; does not create files. Each file is atomic: an invalid anchor, overlap, duplicate insertion, or assembly failure withholds that file. Other files may apply; any rejection returns an error summary. Re-read after anchor errors. For oversized files, raise SNED_MAX_FILE_READ_SIZE; do not bypass with execute_command. text replaces; content disambiguates anchors. Use write_to_file to create or fully rewrite files.",
+        description: "Edit existing files; does not create files. Use exact anchors from reads or successful edits. Batch independent edits from one snapshot. Untouched tracked anchors remain valid; large-file snapshot anchors expire after any edit: use new anchors or reread. Failures withhold that file; other files may apply. Reread after anchor errors. Oversized files need higher SNED_MAX_FILE_READ_SIZE; no shell bypass. text replaces; content disambiguates. Use write_to_file to create/full-rewrite.",
         parameters: vec![ToolParameter {
             name: "files",
             required: true,
             param_type: "array",
-            description: "An array of file objects to edit.",
+            description: "Files to edit.",
             items: Some(serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "The path of an existing file to edit (relative to the workspace root). Use write_to_file when creating a new file."
+                        "description": "Path of an existing file relative to workspace root; create via write_to_file."
                     },
                     "edits": {
                         "type": "array",
-                        "description": "An array of edit objects to apply to the file.",
+                        "description": "Edits for this file.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "edit_type": {
                                     "type": "string",
                                     "enum": ["replace", "insert_after", "insert_before"],
-                                    "description": "Defaults to replace. Inserts preserve the anchor; use a range replace to wrap code. Adjacent duplicates and insertion text repeating the anchor line are rejected."
+                                    "description": "Default replace. Inserts preserve anchor; wrap with range replace. Reject adjacent duplicates or insertions repeating anchor."
                                 },
                                 "anchor": {
                                     "type": "string",
-                                    "description": "Anchor for the start of the edit or insertion point. MUST be copied exactly from read_file, get_function, or get_file_skeleton output (format: Word§line content). Example: \"Crawler§void draw_game_over() {\". Must be a single line only, no newline char."
+                                    "description": "Start/insertion anchor: copy one complete Word§source line exactly from read_file, get_function, get_file_skeleton, or successful edit output. No newline."
                                 },
                                 "end_anchor": {
                                     "type": "string",
-                                    "description": "Optional for a single-line replace; required for a range or duplicate-line fingerprint. Inclusive range. Copy exactly from a reading tool as one physical Word§line content line."
+                                    "description": "Optional for a single-line replace; required for a range/fingerprint. Inclusive endpoint: copy one exact Word§source line from current read/edit output."
                                 },
                                 "content": {
                                     "type": "array",
@@ -314,12 +314,12 @@ pub fn execute_command_schema() -> ToolSchema {
 pub fn ask_followup_question_schema() -> ToolSchema {
     ToolSchema {
         name: "ask_followup_question",
-        description: "Ask the user a question to clarify their request or get additional information.",
+        description: "Ask the user for clarification.",
         parameters: vec![ToolParameter {
             name: "question",
             required: true,
             param_type: "string",
-            description: "The question to ask the user.",
+            description: "Question.",
             items: None,
             extra: None,
         }],
@@ -330,13 +330,13 @@ pub fn ask_followup_question_schema() -> ToolSchema {
 pub fn attempt_completion_schema() -> ToolSchema {
     ToolSchema {
         name: "attempt_completion",
-        description: "Present the final result of the task to the user. Use this when you have completed the user's request.",
+        description: "Present the final result when the task is complete.",
         parameters: vec![
             ToolParameter {
                 name: "result",
                 required: true,
                 param_type: "string",
-                description: "A summary of what was accomplished.",
+                description: "Completion summary.",
                 items: None,
                 extra: None,
             },
@@ -344,7 +344,7 @@ pub fn attempt_completion_schema() -> ToolSchema {
                 name: "command",
                 required: false,
                 param_type: "string",
-                description: "Optional CLI command to demonstrate the result.",
+                description: "Optional demonstration command.",
                 items: None,
                 extra: None,
             },
@@ -382,13 +382,13 @@ pub fn plan_mode_respond_schema() -> ToolSchema {
 pub fn get_function_schema() -> ToolSchema {
     ToolSchema {
         name: "get_function",
-        description: "Get the implementation of a specific function or method from a file. Returned lines include hash anchors that can be passed directly to edit_file; a successful result refreshes edit state for that file.",
+        description: "Get function/method code with editable anchors. Identical snapshots reuse identities; mandatory read_file recovery stays required. Above 5000 source lines, anchors expire after any edit. Oversized files are inspection-only.",
         parameters: vec![
             ToolParameter {
                 name: "path",
                 required: true,
                 param_type: "string",
-                description: "The path of the file containing the function.",
+                description: "File path.",
                 items: None,
                 extra: None,
             },
@@ -396,7 +396,7 @@ pub fn get_function_schema() -> ToolSchema {
                 name: "name",
                 required: true,
                 param_type: "string",
-                description: "The name of the function or method to retrieve.",
+                description: "Function/method name.",
                 items: None,
                 extra: None,
             },
@@ -408,12 +408,12 @@ pub fn get_function_schema() -> ToolSchema {
 pub fn get_file_skeleton_schema() -> ToolSchema {
     ToolSchema {
         name: "get_file_skeleton",
-        description: "Get a structural skeleton showing definitions and signatures. Returned definition lines include hash anchors usable only for edits of those lines; a successful result refreshes edit state for that file.",
+        description: "Get definitions/signatures with anchors for shown lines. Identical snapshots reuse identities; mandatory read_file recovery stays required. Above 5000 source lines, anchors expire after any edit. Oversized files are inspection-only.",
         parameters: vec![ToolParameter {
             name: "path",
             required: true,
             param_type: "string",
-            description: "The path of the file to analyze.",
+            description: "File path.",
             items: None,
             extra: None,
         }],
@@ -424,13 +424,13 @@ pub fn get_file_skeleton_schema() -> ToolSchema {
 pub fn find_symbol_references_schema() -> ToolSchema {
     ToolSchema {
         name: "find_symbol_references",
-        description: "Find symbol definitions/references. Returned lines have canonical edit_file anchors and mark files read within the edit limit. Supply paths for direct parsing, or omit both to use a ready index.",
+        description: "Find definitions/references with canonical anchors. Supply paths for direct parsing; omit paths to use a ready index.",
         parameters: vec![
             ToolParameter {
                 name: "path",
                 required: false,
                 param_type: "string",
-                description: "Optional path to search directly. Omit only when the workspace symbol index is ready and enabled.",
+                description: "Direct search path; omit only with a ready, enabled index.",
                 items: None,
                 extra: None,
             },
@@ -438,7 +438,7 @@ pub fn find_symbol_references_schema() -> ToolSchema {
                 name: "paths",
                 required: false,
                 param_type: "array",
-                description: "Optional relative paths to parse directly. Merged with indexed workspace hits when the symbol index is enabled.",
+                description: "Direct paths; merged with indexed hits when enabled.",
                 items: Some(serde_json::json!({"type": "string"})),
                 extra: None,
             },
@@ -446,7 +446,7 @@ pub fn find_symbol_references_schema() -> ToolSchema {
                 name: "name",
                 required: true,
                 param_type: "string",
-                description: "The name of the symbol to find references for.",
+                description: "Symbol name.",
                 items: None,
                 extra: None,
             },
@@ -464,7 +464,7 @@ pub fn replace_symbol_schema() -> ToolSchema {
                 name: "path",
                 required: true,
                 param_type: "string",
-                description: "The path of the file containing the symbol definition.",
+                description: "Definition file path.",
                 items: None,
                 extra: None,
             },
@@ -472,7 +472,7 @@ pub fn replace_symbol_schema() -> ToolSchema {
                 name: "old_name",
                 required: true,
                 param_type: "string",
-                description: "The current name of the symbol.",
+                description: "Current symbol name.",
                 items: None,
                 extra: None,
             },
@@ -480,7 +480,7 @@ pub fn replace_symbol_schema() -> ToolSchema {
                 name: "new_name",
                 required: true,
                 param_type: "string",
-                description: "The new name for the symbol.",
+                description: "New symbol name.",
                 items: None,
                 extra: None,
             },
@@ -492,13 +492,13 @@ pub fn replace_symbol_schema() -> ToolSchema {
 pub fn rename_symbol_schema() -> ToolSchema {
     ToolSchema {
         name: "rename_symbol",
-        description: "Renames ALL occurrences of a symbol (function, class, method, or variable) inside the specified files or directories. This tool can identify precise symbols using a language's AST and is more accurate than a simple search-and-replace because it understands the language structure. For renaming tasks, strongly prefer this as the first pass.",
+        description: "Rename all AST-resolved occurrences in specified files/directories. Prefer for symbol renames.",
         parameters: vec![
             ToolParameter {
                 name: "paths",
                 required: true,
                 param_type: "array",
-                description: "An array of relative paths to the directories or files to perform the rename in.",
+                description: "Relative file/directory paths.",
                 items: Some(serde_json::json!({"type": "string"})),
                 extra: None,
             },
@@ -506,7 +506,7 @@ pub fn rename_symbol_schema() -> ToolSchema {
                 name: "existing_symbol",
                 required: true,
                 param_type: "string",
-                description: "The exact name of the symbol to be renamed.",
+                description: "Exact current symbol name.",
                 items: None,
                 extra: None,
             },
@@ -514,7 +514,7 @@ pub fn rename_symbol_schema() -> ToolSchema {
                 name: "new_symbol",
                 required: true,
                 param_type: "string",
-                description: "The new name for the symbol.",
+                description: "New symbol name.",
                 items: None,
                 extra: None,
             },
@@ -1006,6 +1006,7 @@ mod tests {
     #[test]
     fn test_edit_file_definition() {
         let schema = edit_file_schema();
+        assert!(schema.description.contains("Edit existing files"));
         assert!(schema.description.contains("does not create files"));
         assert!(schema.description.contains("write_to_file"));
 
@@ -1060,7 +1061,22 @@ mod tests {
         );
         assert!(!required.iter().any(|field| field == "edit_type"));
         assert!(required.iter().any(|field| field == "anchor"));
-        assert!(schema.description.contains("call read_file"));
+        assert!(
+            schema
+                .description
+                .contains("from reads or successful edits")
+        );
+        assert!(
+            schema
+                .description
+                .contains("Untouched tracked anchors remain valid")
+        );
+        assert!(
+            schema
+                .description
+                .contains("snapshot anchors expire after any edit")
+        );
+        assert!(schema.description.contains("Reread after anchor errors"));
     }
 
     #[test]

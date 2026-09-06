@@ -32,7 +32,20 @@ static DUPLICATE_ANCHOR_SUFFIX_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-const MAX_LISTED_DUPLICATE_LINES: usize = 8;
+/// Shared explanation kept outside source lines so anchors can be copied verbatim.
+pub const ANCHOR_GUIDANCE: &str = "[Anchors: Copy the complete prefix§source line. Different prefixes distinguish identical-content occurrences in the current tracked state. Batch independent edits from the same snapshot in one edit_file call.]";
+
+/// Reader guidance follows the same full-source threshold as anchor reconciliation.
+#[must_use]
+pub(crate) fn anchor_guidance(line_count: usize) -> String {
+    if line_count > crate::core::file_editor::MAX_TRACKED_LINES {
+        format!(
+            "{ANCHOR_GUIDANCE}\n[Note: Large-file snapshot anchors expire after any edit, including anchors for unchanged lines; use newly returned anchors or read again.]"
+        )
+    } else {
+        ANCHOR_GUIDANCE.to_string()
+    }
+}
 
 // ============================================================================
 // Line Hashing Utilities
@@ -69,10 +82,7 @@ pub fn compute_hashes(lines: &[String]) -> Vec<u64> {
 
 /// Computes, for each line in `lines`, the 1-based indices of other
 /// lines whose content is identical. Returned vector is parallel to
-/// `lines`; an empty inner slice means the line is unique. Used by
-/// `read_file` to flag duplicate lines so the model can pick a
-/// fingerprint anchor or fall back to `write_to_file` when many lines
-/// share content.
+/// `lines`; an empty inner slice means the line is unique.
 #[must_use]
 pub fn identical_content_indices(lines: &[String]) -> Vec<Vec<usize>> {
     let mut buckets: HashMap<&str, Vec<usize>> = HashMap::new();
@@ -91,114 +101,22 @@ pub fn identical_content_indices(lines: &[String]) -> Vec<Vec<usize>> {
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DuplicateContentInfo {
-    pub(crate) other_indices: Vec<usize>,
-    pub(crate) other_count: usize,
-}
-
-/// Keeps exact overflow counts while retaining only the locations needed to
-/// render the selected lines; retaining every occurrence per line is
-/// quadratic for repetitive files.
+/// Formats a clean anchor plus source line. Duplicate-location arguments are
+/// retained for existing callers; occurrence identity is carried by the prefix.
 #[must_use]
-pub(crate) fn duplicate_content_info_for_range(
-    lines: &[String],
-    range_start: usize,
-    range_end: usize,
-) -> Vec<DuplicateContentInfo> {
-    const MAX_RETAINED_POSITIONS: usize = MAX_LISTED_DUPLICATE_LINES + 2;
-    let mut buckets: HashMap<&str, (usize, Vec<usize>)> = HashMap::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let entry = buckets
-            .entry(line.as_str())
-            .or_insert_with(|| (0, Vec::new()));
-        entry.0 += 1;
-        if entry.1.len() < MAX_RETAINED_POSITIONS {
-            entry.1.push(idx + 1);
-        }
-    }
-
-    let start = range_start.min(lines.len());
-    let end = range_end.min(lines.len()).max(start);
-    lines[start..end]
-        .iter()
-        .enumerate()
-        .map(|(offset, line)| {
-            let line_number = start + offset + 1;
-            let (count, positions) = buckets
-                .get(line.as_str())
-                .expect("line was inserted into duplicate buckets");
-            let other_indices = positions
-                .iter()
-                .copied()
-                .filter(|&position| position != line_number)
-                .take(MAX_LISTED_DUPLICATE_LINES + 1)
-                .collect();
-            DuplicateContentInfo {
-                other_indices,
-                other_count: count.saturating_sub(1),
-            }
-        })
-        .collect()
+pub fn format_line_with_hash(content: &str, anchor: &str, _identical_at: &[usize]) -> String {
+    format!("{anchor}{ANCHOR_DELIMITER}{content}")
 }
 
-/// Formats a line with its anchor prefix, appending a duplicate-content
-/// annotation when the line's content appears elsewhere in the slice.
-///
-/// The annotation is appended after the line content using the same
-/// `saturating_sub(8)` overflow pattern as `UnchangedSite`: when more
-/// than eight other occurrences exist, the annotation reads
-/// "identical content also at lines N1, N2, … (X more)". When the line
-/// is unique the annotation is omitted and the line is returned as
-/// `{anchor}§{content}`. Line numbers are 1-based.
-#[must_use]
-pub fn format_line_with_hash(content: &str, anchor: &str, identical_at: &[usize]) -> String {
-    format_line_with_hash_with_offset(content, anchor, identical_at, 0)
-}
-
-/// Formats an anchored line while translating duplicate locations to the
-/// file's 1-based line numbering.
+/// Compatibility wrapper; line offsets do not affect occurrence prefixes.
 #[must_use]
 pub fn format_line_with_hash_with_offset(
     content: &str,
     anchor: &str,
     identical_at: &[usize],
-    line_number_offset: usize,
+    _line_number_offset: usize,
 ) -> String {
-    format_line_with_hash_and_count(
-        content,
-        anchor,
-        identical_at,
-        identical_at.len(),
-        line_number_offset,
-    )
-}
-
-/// Formats an anchored line when the displayed duplicate locations are
-/// bounded but the total duplicate count is known exactly.
-#[must_use]
-pub(crate) fn format_line_with_hash_and_count(
-    content: &str,
-    anchor: &str,
-    identical_at: &[usize],
-    identical_count: usize,
-    line_number_offset: usize,
-) -> String {
-    if identical_count == 0 || content.trim().is_empty() {
-        return format!("{anchor}{ANCHOR_DELIMITER}{content}");
-    }
-    let listed: Vec<String> = identical_at
-        .iter()
-        .take(MAX_LISTED_DUPLICATE_LINES)
-        .map(|n| n.saturating_add(line_number_offset).to_string())
-        .collect();
-    let overflow = identical_count.saturating_sub(listed.len());
-    let listing = if overflow > 0 {
-        format!("{}, … ({} more)", listed.join(", "), overflow)
-    } else {
-        listed.join(", ")
-    };
-    format!("{anchor}{ANCHOR_DELIMITER}{content} [identical content also at lines {listing}]")
+    format_line_with_hash(content, anchor, identical_at)
 }
 
 /// Splits a raw anchor string into anchor word and content.
@@ -392,23 +310,24 @@ mod tests {
     }
 
     #[test]
+    fn test_reader_guidance_uses_full_snapshot_threshold() {
+        let limit = crate::core::file_editor::MAX_TRACKED_LINES;
+        assert_eq!(anchor_guidance(limit), ANCHOR_GUIDANCE);
+        assert!(anchor_guidance(limit + 1).contains("including anchors for unchanged lines"));
+    }
+
+    #[test]
     fn test_format_line_with_hash() {
         assert_eq!(
             format_line_with_hash("content", "Apple", &[]),
             "Apple§content"
         );
-        assert_eq!(
-            format_line_with_hash("dup", "Apple", &[3, 7]),
-            "Apple§dup [identical content also at lines 3, 7]"
-        );
+        assert_eq!(format_line_with_hash("dup", "Apple", &[3, 7]), "Apple§dup");
         let nine: Vec<usize> = (2..=10).collect();
-        assert_eq!(
-            format_line_with_hash("dup", "Apple", &nine),
-            "Apple§dup [identical content also at lines 2, 3, 4, 5, 6, 7, 8, 9, … (1 more)]"
-        );
+        assert_eq!(format_line_with_hash("dup", "Apple", &nine), "Apple§dup");
         assert_eq!(
             format_line_with_hash_with_offset("dup", "Apple", &[1, 4], 10),
-            "Apple§dup [identical content also at lines 11, 14]"
+            "Apple§dup"
         );
     }
 
@@ -454,14 +373,8 @@ mod tests {
 
     #[test]
     fn test_blank_duplicate_lines_are_not_annotated() {
-        assert_eq!(
-            format_line_with_hash_and_count("", "Blank", &[2, 4], 56, 0),
-            "Blank§"
-        );
-        assert_eq!(
-            format_line_with_hash_and_count("  ", "Blank", &[2, 4], 56, 0),
-            "Blank§  "
-        );
+        assert_eq!(format_line_with_hash("", "Blank", &[2, 4]), "Blank§");
+        assert_eq!(format_line_with_hash("  ", "Blank", &[2, 4]), "Blank§  ");
     }
 
     #[test]

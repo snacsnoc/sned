@@ -12,10 +12,11 @@ EXAMPLE TOOL CALLS
 - File workflow: inspect first with read_file, then make the smallest file change with the matching file tool, then re-read or run a focused check.
 - inspect/read: tool=read_file args={\"paths\": [\"src/main.rs\"]}
 - search/find: tool=search_files args={\"regex\": \"fn handle_error\", \"path\": \"src\"}
-- edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (copy the exact full anchor returned by the immediately preceding read_file call; never invent the prefix)
+- edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
 - run/test: tool=execute_command args={\"commands\": [\"cargo test --no-fail-fast\"]} (commands is a literal JSON array, not a string containing an array)
 - complex run-only logic: tool=execute_command args={\"script\": \"...\", \"language\": \"python\"}
+- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. Large-file snapshot anchors expire after any edit; use newly returned anchors or read again.
 - edit_file uses text for replacement text. Its optional content field is only an array of exact interior lines for a duplicate-anchor fingerprint; it is not the replacement string.
 - Use file tools for workspace changes. Use execute_command for inspection, builds, tests, and other execution; do not replace a file edit with shell redirection, a heredoc, or an ad-hoc Python/sed rewrite.
 - retry after tool failure: read the complete error, correct the named argument, and call the same tool again. For a stale or unknown edit anchor, call read_file again before retrying.
@@ -32,8 +33,9 @@ EXAMPLE TOOL CALLS
 - File workflow: inspect first with read_file, then make the smallest file change with the matching file tool, then re-read or run a focused check.
 - inspect/read: tool=read_file args={\"paths\": [\"src/main.rs\"]}
 - search/find: tool=search_files args={\"regex\": \"fn handle_error\", \"path\": \"src\"}
-- edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (copy the exact full anchor returned by the immediately preceding read_file call; never invent the prefix)
+- edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
+- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. Large-file snapshot anchors expire after any edit; use newly returned anchors or read again.
 - edit_file uses text for replacement text. Its optional content field is only an array of exact interior lines for a duplicate-anchor fingerprint; it is not the replacement string.
 - retry after a stale or unknown edit anchor: call read_file again before retrying.
 ";
@@ -87,6 +89,22 @@ mod tests {
         let result = tool_examples_for_model(Some("qwen3.6-35b-a3b"), Some(ToolProfile::Full));
         assert!(result.is_some());
         assert!(result.unwrap().contains("EXAMPLE TOOL CALLS"));
+    }
+
+    #[test]
+    fn test_edit_examples_use_current_state_and_same_snapshot_batches() {
+        for profile in [
+            ToolProfile::CoreEdit,
+            ToolProfile::Symbol,
+            ToolProfile::Validate,
+            ToolProfile::Full,
+        ] {
+            let examples = tool_examples_for_model(None, Some(profile)).unwrap();
+            assert!(examples.contains("current tracked state"));
+            assert!(examples.contains("same snapshot in one edit_file call"));
+            assert!(examples.contains("Large-file snapshot anchors expire after any edit"));
+            assert!(!examples.contains("immediately preceding"));
+        }
     }
 
     #[test]
