@@ -5254,6 +5254,94 @@ mod tests {
     }
 
     #[test]
+    fn test_live_model_updates_survive_transcript_eviction() {
+        assert_live_model_updates_replace(10_000, false);
+    }
+
+    #[test]
+    fn test_live_model_updates_survive_interleaved_reasoning() {
+        assert_live_model_updates_replace(0, true);
+    }
+
+    #[test]
+    fn test_live_model_updates_survive_reasoning_at_transcript_limit() {
+        assert_live_model_updates_replace(10_000, true);
+    }
+
+    fn assert_live_model_updates_replace(history: usize, reasoning: bool) {
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = App::new();
+        for _ in 0..history {
+            app.push_output(Line::from("history"));
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        for (index, text) in [
+            "1. **Same-line duplicates.**",
+            "1. **Same-line duplicates.** STATUS.md had the line",
+            "1. **Same-line duplicates.** STATUS.md had the line at lines 3 and 6.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if reasoning && index > 0 {
+                tx.try_send(OutputEvent::ReasoningChunk("inspect context\n".into()))
+                    .unwrap();
+                drain_output(&mut rx, &mut app);
+            }
+            let line = Line::from(text);
+            tx.try_send(if index == 0 {
+                OutputEvent::Line(line)
+            } else {
+                OutputEvent::ModelUpdateLine(line)
+            })
+            .unwrap();
+            drain_output(&mut rx, &mut app);
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(100)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                screen.matches("Same-line duplicates").count(),
+                1,
+                "{screen}"
+            );
+            let model_lines: Vec<_> = app
+                .output_lines
+                .iter()
+                .map(ToString::to_string)
+                .filter(|line| line.contains("Same-line duplicates"))
+                .collect();
+            assert_eq!(model_lines, [text]);
+        }
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text:
+                "1. **Same-line duplicates.** STATUS.md had the line at lines 3 and 6.".into(),
+        })
+        .unwrap();
+        drain_output(&mut rx, &mut app);
+        let model_lines: Vec<_> = app
+            .output_lines
+            .iter()
+            .map(ToString::to_string)
+            .filter(|line| line.contains("Same-line duplicates"))
+            .collect();
+        assert_eq!(
+            model_lines,
+            ["• Same-line duplicates. STATUS.md had the line at lines 3 and 6."]
+        );
+        assert_eq!(app.output_lines.len(), app.output_line_kinds.len());
+        reset_prompt_state();
+    }
+
+    #[test]
     fn test_drain_output_coalesces_model_update_bursts() {
         use crate::cli::output::OutputEvent;
         use ratatui::text::Line;

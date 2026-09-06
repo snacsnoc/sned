@@ -1243,6 +1243,23 @@ impl App {
             self.output_lines.pop_front();
             self.output_line_ids.pop_front();
             self.output_line_kinds.pop_front();
+            // Eviction shifts surviving lines; losing their stream identity
+            // turns every subsequent partial update into another append.
+            self.turn_stream_entries.retain_mut(|(index, _)| {
+                if let Some(shifted) = index.checked_sub(1) {
+                    *index = shifted;
+                    true
+                } else {
+                    false
+                }
+            });
+            self.last_stream_group = self.last_stream_group.and_then(|(start, count, kind)| {
+                if start > 0 {
+                    Some((start - 1, count, kind))
+                } else {
+                    (count > 1).then_some((0, count.saturating_sub(1), kind))
+                }
+            });
             if self.text_selection.as_ref().is_some_and(|selection| {
                 selection.pane == SelectionPane::Transcript
                     && (selection.anchor.output_line_index == 0
@@ -1357,6 +1374,34 @@ impl App {
     pub fn replace_last_stream_line(&mut self, line: Line<'static>, kind: StreamKind) {
         if kind == StreamKind::Model {
             self.turn_had_streamed_line = true;
+            if let Some(index) =
+                self.turn_stream_entries
+                    .iter()
+                    .rev()
+                    .find_map(|(index, entry_kind)| {
+                        (*entry_kind == StreamKind::Model).then_some(*index)
+                    })
+            {
+                if index + 1 < self.output_lines.len() {
+                    // Interleaved reasoning must not displace the model's
+                    // partial line. Keep its ID for asynchronous finalization.
+                    let wrap_width = self.last_wrap_width();
+                    let manual_anchor = self.manual_viewport_anchor(wrap_width);
+                    self.output_lines[index] = line;
+                    self.needs_redraw = true;
+                    self.cached_wrap_width = None;
+                    self.cached_visible_window = None;
+                    self.visual_layout_index.invalidate();
+                    if let Some(anchor) = manual_anchor {
+                        self.restore_manual_viewport_anchor(&anchor, wrap_width);
+                    }
+                    self.refresh_pending_manual_viewport_anchor(wrap_width);
+                    return;
+                }
+                if index + 1 == self.output_lines.len() {
+                    self.last_stream_group = Some((index, 1, kind));
+                }
+            }
         }
 
         let Some((start_idx, visual_line_count, last_kind)) = self.last_stream_group else {
@@ -2498,26 +2543,16 @@ impl App {
             StreamKind::Reasoning => BlockKind::Reasoning,
             StreamKind::ToolOutput => BlockKind::ToolOutput,
         };
-        let start_idx = self.output_lines.len();
         let mut pushed = 0usize;
 
         for line in lines_to_push {
-            let idx = self.output_lines.len();
             self.push_output_with_kind(line, block_kind);
-            // push_output may have evicted the front of the buffer if it
-            // exceeded 10,000 lines. If our recorded index fell off, drop
-            // it and any earlier recorded indices for this turn — the
-            // eviction means the model output was so long that we cannot
-            // usefully re-render it as a unit anyway.
-            if idx >= self.output_lines.len() {
-                self.turn_stream_entries.clear();
-                self.last_stream_group = None;
-                return;
-            }
+            let idx = self.output_lines.len() - 1;
             self.turn_stream_entries.push((idx, kind));
             pushed = pushed.saturating_add(1);
         }
 
+        let start_idx = self.output_lines.len().saturating_sub(pushed);
         self.last_stream_group = Some((start_idx, pushed, kind));
     }
 
@@ -2757,6 +2792,13 @@ impl App {
                 new_lines.push_back(divider);
                 new_ids.push_back(self.allocate_output_line_id());
                 new_kinds.push_back(BlockKind::Separator);
+            }
+            let prepended = new_lines.len();
+            for (index, _) in &mut self.turn_stream_entries {
+                *index += prepended;
+            }
+            if let Some((start, _, _)) = &mut self.last_stream_group {
+                *start += prepended;
             }
             for line in &self.output_lines {
                 new_lines.push_back(line.clone());
@@ -3324,8 +3366,9 @@ impl App {
             return None;
         };
         let line = self.output_lines.get(output_index)?;
-        let separator_before = entry_index > 0
-            && self.visual_layout_index.entries[entry_index - 1].source == LayoutSource::Separator;
+        // Only a viewport starting on the separator should restore there;
+        // wrapped rows inside the following line retain their row offset.
+        let separator_before = entry_index != start;
         Some(ManualViewportAnchor {
             output_index,
             row_offset: if separator_before && entry_index != start {
@@ -3360,16 +3403,7 @@ impl App {
         if anchor.separator_before && separator_before {
             return Some(line_start.saturating_sub(1));
         }
-        Some(
-            line_start.saturating_add(
-                anchor.row_offset.min(
-                    entry
-                        .rows
-                        .saturating_sub(separator_before as usize)
-                        .saturating_sub(1),
-                ),
-            ),
-        )
+        Some(line_start.saturating_add(anchor.row_offset.min(entry.rows.saturating_sub(1))))
     }
 
     fn restore_manual_viewport_anchor(
@@ -7885,6 +7919,110 @@ mod tests {
 
         // turn_stream_entries must be cleared after finalize.
         assert!(app.turn_stream_entries.is_empty());
+    }
+
+    #[test]
+    fn test_live_model_update_preserves_scrollback_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("scrollback.log");
+        std::fs::write(&path, "old history\n").unwrap();
+        let mut app = App::new();
+        app.scrollback_file = Some(path);
+        app.push_stream_line(Line::from("partial"), StreamKind::Model);
+        app.enter_scrollback().unwrap();
+        app.replace_last_stream_line(Line::from("partial extended"), StreamKind::Model);
+        let lines: Vec<_> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            lines,
+            [
+                "old history".to_string(),
+                "─".repeat(40),
+                "partial extended".to_string()
+            ]
+        );
+        app.shutdown_scrollback_writer().unwrap();
+    }
+
+    #[test]
+    fn test_live_model_update_preserves_manual_reasoning_viewport() {
+        let mut app = App::new();
+        app.set_content_width(30);
+        app.last_content_height = 3;
+        app.push_stream_line(Line::from("partial"), StreamKind::Model);
+        for index in 0..20 {
+            app.push_reasoning_chunk(&format!("reasoning {index}\n"));
+        }
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 5;
+        let width = app.last_wrap_width();
+        let before = app.manual_viewport_anchor(width).unwrap();
+        assert!(before.text.contains("reasoning"));
+        app.replace_last_stream_line(Line::from("expanded answer ".repeat(30)), StreamKind::Model);
+        let after = app.manual_viewport_anchor(width).unwrap();
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.row_offset, before.row_offset);
+    }
+
+    #[test]
+    fn test_live_model_update_preserves_wrapped_reasoning_row() {
+        let mut app = App::new();
+        app.set_content_width(30);
+        app.last_content_height = 3;
+        app.push_stream_line(Line::from("partial"), StreamKind::Model);
+        app.push_reasoning_chunk(&"reasoning words ".repeat(40));
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 5;
+        let width = app.last_wrap_width();
+        let before = app.manual_viewport_anchor(width).unwrap();
+        assert!(before.row_offset > 0);
+        app.replace_last_stream_line(Line::from("expanded answer ".repeat(30)), StreamKind::Model);
+        let after = app.manual_viewport_anchor(width).unwrap();
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.row_offset, before.row_offset);
+    }
+
+    #[test]
+    fn test_async_turn_render_preserves_stream_identity_after_eviction() {
+        let mut app = App::new();
+        for _ in 0..10_000 {
+            app.push_output(Line::from("history"));
+        }
+        app.push_stream_line(Line::from("**first**"), StreamKind::Model);
+        app.push_stream_line(Line::from("second"), StreamKind::Model);
+        app.push_output(Line::from("tool output"));
+        app.replace_last_stream_line(Line::from("second extended"), StreamKind::Model);
+        let request = app
+            .begin_async_turn_render("**first**\n\nsecond extended".into())
+            .unwrap();
+        assert!(!request.append);
+        assert_eq!(request.target_line_ids.len(), 2);
+
+        app.push_stream_line(Line::from("next turn"), StreamKind::Model);
+        let rendered =
+            crate::cli::markdown::render_streamed_markdown("**first**\n\nsecond extended", true);
+        assert!(app.apply_async_turn_render(request, rendered));
+        app.replace_last_stream_line(Line::from("next turn extended"), StreamKind::Model);
+        let actual: Vec<_> = app
+            .output_lines
+            .iter()
+            .map(ToString::to_string)
+            .filter(|line| line != "history" && !line.is_empty())
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                "first",
+                "second extended",
+                "tool output",
+                "next turn extended"
+            ]
+        );
+        assert_eq!(app.output_lines.len(), app.output_line_ids.len());
+        assert_eq!(app.output_lines.len(), app.output_line_kinds.len());
+        assert_eq!(app.turn_stream_entries.len(), 1);
+        let (index, kind) = app.turn_stream_entries[0];
+        assert_eq!(kind, StreamKind::Model);
+        assert_eq!(app.output_lines[index].to_string(), "next turn extended");
     }
 
     #[test]
