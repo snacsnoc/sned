@@ -1,4 +1,4 @@
-use crate::core::hash_utils::format_line_with_hash;
+use crate::core::hash_utils::{anchor_guidance, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::symbol_index::{SymbolIndexService, SymbolLocation, SymbolType};
 use crate::services::tree_sitter::load_required_language_parsers;
@@ -231,7 +231,12 @@ impl FindSymbolReferencesHandler {
             }
 
             if !file_lines.is_empty() {
-                sections.push(format!("{}:\n{}", path, file_lines.join("\n")));
+                sections.push(format!(
+                    "{}:\n{}\n{}",
+                    path,
+                    anchor_guidance(data.lines.len()),
+                    file_lines.join("\n")
+                ));
             }
         }
 

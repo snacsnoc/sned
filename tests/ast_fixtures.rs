@@ -116,6 +116,13 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                 .unwrap();
 
                 if let Some(res) = result {
+                    // The compatibility fixtures predate occurrence guidance.
+                    // Replace only the exact legacy header; retain the complete
+                    // source/hash/context comparison below.
+                    let expected_output = expected_output.replace(
+                        "All Hash Anchors provided below are stable and can be used with edit_file directly.",
+                        sned::core::hash_utils::ANCHOR_GUIDANCE,
+                    );
                     let actual_output =
                         sned::core::hash_utils::strip_hashes(&res.formatted_content);
                     assert_eq!(
@@ -171,6 +178,15 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                 });
                 let actual_output =
                     strip_reference_anchors(value.as_str().expect("tool result must be a string"));
+                // Reference readers now explain occurrence identity once per
+                // file. Require that header while comparing every source line.
+                let header = format!("{sample_rel_path}:\n");
+                assert!(expected_output.starts_with(&header));
+                let expected_output = expected_output.replacen(
+                    &header,
+                    &format!("{header}{}\n", sned::core::hash_utils::ANCHOR_GUIDANCE),
+                    1,
+                );
                 assert_eq!(
                     actual_output.trim(),
                     expected_output.trim(),

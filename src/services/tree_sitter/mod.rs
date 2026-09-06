@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use streaming_iterator::StreamingIterator;
 
 use crate::core::file_editor::AnchorStateManager;
-use crate::core::hash_utils::{content_hash, format_line_with_hash};
+use crate::core::hash_utils::{anchor_guidance, content_hash, format_line_with_hash};
 
 pub(crate) const MAX_STRUCTURAL_FILE_READ_SIZE: u64 = 5 * 1024 * 1024;
 
@@ -173,6 +173,8 @@ pub fn get_functions(
     language_parsers: &LanguageParserMap,
     task_id: Option<&str>,
 ) -> Result<Option<GetFunctionsResult>, LanguageParserError> {
+    let (normalized, _) = crate::core::file_editor::normalize_file_content(file_content);
+    let file_content = normalized.as_str();
     let ext = get_extension(absolute_path);
 
     let Some(entry) = language_parsers.get(&ext) else {
@@ -194,9 +196,9 @@ pub fn get_functions(
         }));
     };
 
-    let (normalized, _) = crate::core::file_editor::normalize_file_content(file_content);
-    let all_lines = crate::core::file_editor::split_content_lines(&normalized);
+    let all_lines = crate::core::file_editor::split_content_lines(file_content);
     let all_anchors = anchor_mgr.reconcile(absolute_path, &all_lines, task_id);
+    let anchor_guidance = anchor_guidance(all_lines.len());
 
     let root_node = tree.root_node();
 
@@ -353,7 +355,7 @@ pub fn get_functions(
 
                 let func_hash = content_hash(def_text);
                 file_results.push(format!(
-                    "{}::{}\n[Function Hash: {}]\nAll Hash Anchors provided below are stable and can be used with edit_file directly.\n{}{}",
+                    "{}::{}\n[Function Hash: {}]\n{anchor_guidance}\n{}{}",
                     rel_path,
                     full_name,
                     func_hash,
@@ -621,6 +623,103 @@ mod tests {
         let after = anchors.reconcile("fixture.rs", &lines, Some("task"));
 
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn structural_readers_reuse_normalized_full_snapshot_identities() {
+        let parsers = load_required_language_parsers(&["fixture.rs"]).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let anchors = AnchorStateManager::with_cache_file(cache_dir.path().join("anchors.json"));
+        let content = "fn first() {\n    same();\n}\nfn second() {\n    same();\n}\n";
+        let lines = crate::core::file_editor::split_content_lines(content);
+        let before = anchors.reconcile("fixture.rs", &lines, Some("task"));
+        let encoded = format!("\u{feff}{}", content.replace('\n', "\r\n"));
+        for _ in 0..2 {
+            let skeleton =
+                get_file_skeleton(&anchors, "fixture.rs", &encoded, &parsers, Some("task"))
+                    .unwrap()
+                    .unwrap();
+            let functions = get_functions(
+                &anchors,
+                "fixture.rs",
+                "fixture.rs",
+                &["first".into(), "second".into()],
+                &encoded,
+                &parsers,
+                Some("task"),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(skeleton.contains(&format!("{}§fn first() {{", before[0])));
+            assert!(
+                functions
+                    .formatted_content
+                    .contains(&format!("{}§fn first() {{", before[0]))
+            );
+            assert!(!functions.formatted_content.contains('\u{feff}'));
+            assert!(
+                functions
+                    .formatted_content
+                    .contains(&format!("{}§    same();", before[1]))
+            );
+            assert!(
+                functions
+                    .formatted_content
+                    .contains(&format!("{}§    same();", before[4]))
+            );
+            assert_ne!(before[1], before[4]);
+            assert_eq!(
+                before,
+                anchors.reconcile("fixture.rs", &lines, Some("task"))
+            );
+        }
+    }
+
+    #[test]
+    fn structural_readers_preserve_large_file_snapshot_distinction() {
+        let parsers = load_required_language_parsers(&["fixture.rs"]).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let anchors = AnchorStateManager::with_cache_file(cache_dir.path().join("anchors.json"));
+        let content = format!(
+            "fn target() {{}}\n{}",
+            "\n".repeat(crate::core::file_editor::MAX_TRACKED_LINES)
+        );
+        let lines = crate::core::file_editor::split_content_lines(&content);
+        let before = anchors.reconcile("fixture.rs", &lines, Some("task"));
+        for snapshot in [&content, &format!("{content}// changed\n")] {
+            let skeleton =
+                get_file_skeleton(&anchors, "fixture.rs", snapshot, &parsers, Some("task"))
+                    .unwrap()
+                    .unwrap();
+            let functions = get_functions(
+                &anchors,
+                "fixture.rs",
+                "fixture.rs",
+                &["target".into()],
+                snapshot,
+                &parsers,
+                Some("task"),
+            )
+            .unwrap()
+            .unwrap();
+            let current = anchors.reconcile(
+                "fixture.rs",
+                &crate::core::file_editor::split_content_lines(snapshot),
+                Some("task"),
+            );
+            assert!(skeleton.contains(&format!("{}§fn target() {{}}", current[0])));
+            assert!(
+                functions
+                    .formatted_content
+                    .contains(&format!("{}§fn target() {{}}", current[0]))
+            );
+            assert_eq!(before == current, snapshot == &content);
+            assert!(
+                functions
+                    .formatted_content
+                    .contains("Large-file snapshot anchors expire after any edit")
+            );
+        }
     }
 
     #[test]

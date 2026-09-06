@@ -99,16 +99,19 @@ impl GetFileSkeletonHandler {
                             language_parsers.as_ref(),
                             Some(task_id.as_str()),
                         ) {
-                            Ok(Some(skeleton)) => {
-                                (
-                                    index,
-                                    format!(
-                                        "--- {rel_path} ---\nStable Anchors are provided with each line.\n{skeleton}"
-                                    ),
-                                    false,
-                                )
+                            Ok(Some(skeleton)) => (
+                                index,
+                                format!(
+                                    "--- {rel_path} ---\n{}\n{skeleton}",
+                                    crate::core::hash_utils::anchor_guidance(
+                                        content.split('\n').count()
+                                    )
+                                ),
+                                false,
+                            ),
+                            Ok(None) => {
+                                (index, format!("No definitions found in {rel_path}"), false)
                             }
-                            Ok(None) => (index, format!("No definitions found in {rel_path}"), false),
                             Err(e) => (index, format!("Error parsing {rel_path}: {e}"), true),
                         },
                         Err(e) => (index, format!("Error reading file {rel_path}: {e}"), true),
@@ -196,7 +199,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(output.contains("Stable Anchors"));
+        assert!(output.contains(crate::core::hash_utils::ANCHOR_GUIDANCE));
         assert!(
             state
                 .lock()
@@ -308,7 +311,7 @@ mod tests {
         .await
         .expect_err("incomplete multi-file context must be marked as a tool failure");
         let output = error.to_string();
-        assert!(output.contains("Stable Anchors"));
+        assert!(output.contains(crate::core::hash_utils::ANCHOR_GUIDANCE));
         assert!(output.contains("Error reading file missing.rs"));
     }
 
