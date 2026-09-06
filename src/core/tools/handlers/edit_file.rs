@@ -51,6 +51,14 @@ pub struct EditFileHandler {
     preserve_external_change_mtime: bool,
     #[cfg(test)]
     external_change_before_rollback: Option<(String, String)>,
+    #[cfg(test)]
+    invalid_provenance: bool,
+    #[cfg(test)]
+    publication_cache_failure: Option<PathBuf>,
+    #[cfg(test)]
+    generation_change: Option<(AnchorStateManager, String, bool)>,
+    #[cfg(test)]
+    external_change_after_writes: Option<(String, String)>,
 }
 
 impl EditFileHandler {
@@ -65,6 +73,14 @@ impl EditFileHandler {
             preserve_external_change_mtime: false,
             #[cfg(test)]
             external_change_before_rollback: None,
+            #[cfg(test)]
+            invalid_provenance: false,
+            #[cfg(test)]
+            publication_cache_failure: None,
+            #[cfg(test)]
+            generation_change: None,
+            #[cfg(test)]
+            external_change_after_writes: None,
         }
     }
 }
@@ -918,6 +934,7 @@ impl EditFileHandler {
         let mut total_duplicate_batches = 0usize;
         let mut rejected_paths: HashSet<String> = HashSet::new();
         let mut reread_paths: HashSet<String> = HashSet::new();
+        let mut storage_failed_paths: HashSet<String> = HashSet::new();
         let mut range_insufficient_paths: HashSet<String> = HashSet::new();
         let mut write_failure = false;
         let mut diff_previews: Vec<String> = Vec::new();
@@ -927,6 +944,7 @@ impl EditFileHandler {
             String,
         )> = Vec::new();
         let mut file_text_formats: HashMap<String, FileTextFormat> = HashMap::new();
+        let mut snapshots = HashMap::new();
 
         for rejection in preflight_rejections {
             rejected_paths.insert(rejection.absolute_path.clone());
@@ -967,25 +985,14 @@ impl EditFileHandler {
 
             let reread_key =
                 crate::core::tools::canonical_path_key(Path::new(&batch.absolute_path));
-            if state
+            let must_reread = state
                 .lock()
                 .await
                 .must_reread_before_edit
                 .iter()
                 .any(|key| {
                     crate::core::tools::path_key_matches(key, Path::new(&batch.absolute_path))
-                })
-            {
-                rejected_paths.insert(batch.absolute_path.clone());
-                reread_paths.insert(batch.absolute_path.clone());
-                total_failed += batch.edits.len();
-                all_results.push(format!(
-                    "File {}: batch rejected before applying edits. No edits were applied to this file.\n\n{}",
-                    batch.display_path,
-                    Self::reread_required_error(&batch.display_path, &batch.absolute_path)
-                ));
-                continue;
-            }
+                });
 
             let stale_check = {
                 let mut state_guard = state.lock().await;
@@ -1131,52 +1138,55 @@ impl EditFileHandler {
                     Path::new(&batch.absolute_path),
                 )));
 
-            // Stale-anchor preflight: capture the tracked anchor set BEFORE
-            // reconcile mutates it, so we can detect anchors the model is
-            // reusing from a previous read after the file changed.
-            let pre_reconcile_anchors = anchor_mgr.get_anchors(&batch.absolute_path, task_id);
-
-            // Compute line hashes via AnchorStateManager
-            let lines = crate::core::file_editor::split_content_lines(&content);
-            let anchors = anchor_mgr.reconcile(&batch.absolute_path, &lines, task_id);
-
-            // If the model submitted anchors that exist in the OLD tracked
-            // state but not in the NEW one, the file has changed since its
-            // last read. Surface a clearer error than the generic
-            // "anchor not found" and force a re-read.
-            if let Some(ref old) = pre_reconcile_anchors {
-                let new_set: std::collections::HashSet<&str> =
-                    anchors.iter().map(std::string::String::as_str).collect();
-                let mut stale_anchors: Vec<String> = Vec::new();
-                for edit in &batch.edits {
-                    let anchor_raw = edit.anchor.lines().next().unwrap_or("").trim();
-                    if let Some((name, _)) = anchor_raw.split_once(ANCHOR_DELIMITER) {
-                        let name = name.trim();
-                        if old.iter().any(|a| a == name) && !new_set.contains(name) {
-                            stale_anchors.push(anchor_raw.to_string());
-                        }
-                    }
+            // Observation must not publish anchors, even when a later file fails.
+            let snapshot = match anchor_mgr.observe_snapshot(
+                &batch.absolute_path,
+                &raw_content,
+                task_id,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(crate::core::file_editor::AnchorTransitionError::Persistence(error)) => {
+                    Self::mark_must_reread(state, &batch.absolute_path).await;
+                    storage_failed_paths.insert(batch.absolute_path.clone());
+                    rejected_paths.insert(batch.absolute_path.clone());
+                    total_failed += batch.edits.len();
+                    all_results.push(format!(
+                        "File {}: anchor storage failed before writing: {error}. No edits were applied. Ask the user to repair the anchor cache or its permissions, then call read_file. Repeated reads cannot repair storage.",
+                        batch.display_path
+                    ));
+                    continue;
                 }
-                if !stale_anchors.is_empty() {
+                Err(crate::core::file_editor::AnchorTransitionError::Validation(error)) => {
+                    rejected_paths.insert(batch.absolute_path.clone());
+                    total_failed += batch.edits.len();
+                    all_results.push(format!("File {}: anchor observation validation failed: {error}. No edits were applied.", batch.display_path));
+                    continue;
+                }
+                Err(error) => {
                     Self::mark_must_reread(state, &batch.absolute_path).await;
                     reread_paths.insert(batch.absolute_path.clone());
                     rejected_paths.insert(batch.absolute_path.clone());
-                    let mut msg = String::from(
-                        "Stale anchor detected: this anchor is from a previous read_file call. \
-                         The file has changed since then. Call read_file to refresh anchors.\n\n",
-                    );
-                    msg.push_str("Stale anchors:\n");
-                    for a in &stale_anchors {
-                        msg.push_str(&format!("  - {a}\n"));
-                    }
                     all_results.push(format!(
-                        "Error preparing edits for {}: {}",
-                        batch.display_path, msg
+                            "Stale anchor detected for {}: the file changed since the previous read_file. {error}. Call read_file to refresh anchors.",
+                        batch.display_path
                     ));
                     total_failed += batch.edits.len();
                     continue;
                 }
+            };
+            if must_reread {
+                rejected_paths.insert(batch.absolute_path.clone());
+                reread_paths.insert(batch.absolute_path.clone());
+                total_failed += batch.edits.len();
+                all_results.push(format!(
+                    "File {}: batch rejected before applying edits. No edits were applied to this file.\n\n{}",
+                    batch.display_path,
+                    Self::reread_required_error(&batch.display_path, &batch.absolute_path)
+                ));
+                continue;
             }
+            let anchors = snapshot.anchors().to_vec();
+            snapshots.insert(batch.absolute_path.clone(), snapshot);
 
             // Prepare edits
             let mut prepared = match processor.prepare_edits(
@@ -1357,6 +1367,9 @@ impl EditFileHandler {
             duplicate_insertions: Vec<crate::core::file_editor::FailedEdit>,
         }
         let mut file_results: Vec<FileResult> = Vec::new();
+        let mut transitions = HashMap::new();
+        let mut publication_failed_paths = HashSet::new();
+        let mut publication_outcomes = Vec::new();
 
         // Collect file writes for Phase 4b (two-phase commit with rollback)
         struct WriteItem {
@@ -1371,6 +1384,36 @@ impl EditFileHandler {
         for (batch, mut prepared, original_content) in prepared_batches {
             let result =
                 processor.apply_batch(&mut prepared, &batch.absolute_path, &batch.display_path);
+
+            if result.success {
+                #[cfg(test)]
+                if self.invalid_provenance {
+                    prepared.provenance.origins.push(Some(usize::MAX));
+                }
+                let final_content = result.final_content.as_deref().unwrap_or("");
+                let text_format = file_text_formats
+                    .get(&batch.absolute_path)
+                    .copied()
+                    .unwrap_or_default();
+                match anchor_mgr.stage_transition(
+                    &snapshots[&batch.absolute_path],
+                    &restore_file_content(final_content, text_format),
+                    &prepared.provenance,
+                ) {
+                    Ok(transition) => {
+                        transitions.insert(batch.absolute_path.clone(), transition);
+                    }
+                    Err(error) => {
+                        rejected_paths.insert(batch.absolute_path.clone());
+                        total_failed += batch.edits.len();
+                        all_results.push(format!(
+                            "File {}: transition validation failed: {error}. No edits were applied to this file.",
+                            batch.display_path
+                        ));
+                        continue;
+                    }
+                }
+            }
 
             if result.success {
                 total_applied += result.resolved_count;
@@ -1445,6 +1488,10 @@ impl EditFileHandler {
 
         // Restore earlier files only while they still contain this request's output.
         let mut write_failed_paths: HashSet<String> = HashSet::new();
+        #[cfg(test)]
+        if let Some((manager, path, false)) = &self.generation_change {
+            manager.clear_state(path, task_id);
+        }
         if !write_items.is_empty() {
             let original_contents: HashMap<String, String> = write_items
                 .iter()
@@ -1457,7 +1504,36 @@ impl EditFileHandler {
             let mut written_paths: Vec<String> = Vec::new();
             let mut aborted_write: Option<(String, Option<String>)> = None;
 
+            // Check generations against persisted state before the first write;
+            // publication repeats this check after the write phase.
+            let staged: Vec<_> = transitions.values().cloned().collect();
+            if let Err(error) = anchor_mgr.validate_transitions_checked(&staged) {
+                if matches!(
+                    &error,
+                    crate::core::file_editor::AnchorTransitionError::Persistence(_)
+                ) {
+                    for item in &write_items {
+                        storage_failed_paths.insert(item.absolute_path.clone());
+                        Self::mark_must_reread(state, &item.absolute_path).await;
+                    }
+                    all_results.push("Anchor storage failed before writing. Ask the user to repair the anchor cache or its permissions, then call read_file. Repeated reads cannot repair storage.".into());
+                }
+                let stale = match &error {
+                    crate::core::file_editor::AnchorTransitionError::StaleGeneration { path } => {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                };
+                aborted_write = Some((
+                    format!("Anchor transition prewrite validation failed: {error}"),
+                    stale,
+                ));
+            }
+
             for item in &write_items {
+                if aborted_write.is_some() {
+                    break;
+                }
                 let std_file = match std::fs::OpenOptions::new()
                     .write(true)
                     .open(&item.absolute_path)
@@ -1506,9 +1582,9 @@ impl EditFileHandler {
                 } else {
                     true
                 };
-                let content_unchanged = tokio::fs::read_to_string(&item.absolute_path)
+                let content_unchanged = tokio::fs::read(&item.absolute_path)
                     .await
-                    .is_ok_and(|content| content == item.original_content);
+                    .is_ok_and(|content| content == item.original_content.as_bytes());
 
                 if !mtime_unchanged || !content_unchanged {
                     let _ = std_file.unlock();
@@ -1530,20 +1606,33 @@ impl EditFileHandler {
 
                 match write_result {
                     Ok(()) => {
-                        let mut state = state.lock().await;
-                        state.insert_file_content(
-                            crate::core::tools::canonical_path_key(Path::new(&item.absolute_path)),
-                            item.final_content.clone(),
-                        );
-                        state
-                            .file_context_tracker
-                            .mark_file_as_edited_by_sned(Path::new(&item.absolute_path));
                         written_paths.push(item.absolute_path.clone());
                     }
                     Err(e) => {
                         aborted_write = Some((
                             format!("Error writing file {}: {e}", item.display_path),
                             None,
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            // Verify every output after the whole write phase. An earlier file
+            // may have changed while another file was being written.
+            #[cfg(test)]
+            if let Some((path, content)) = &self.external_change_after_writes {
+                std::fs::write(path, content).expect("test output change should succeed");
+            }
+            if aborted_write.is_none() {
+                for item in &write_items {
+                    if !tokio::fs::read(&item.absolute_path)
+                        .await
+                        .is_ok_and(|current| current == item.final_content.as_bytes())
+                    {
+                        aborted_write = Some((
+                            format!("Output verification failed for {}", item.display_path),
+                            Some(item.absolute_path.clone()),
                         ));
                         break;
                     }
@@ -1588,6 +1677,64 @@ impl EditFileHandler {
             }
         }
 
+        // Publication starts only after all writes and any rollback have ended.
+        // A publication failure does not undo content that was successfully
+        // written; its response must explicitly withhold candidate anchors.
+        if !write_failure {
+            #[cfg(test)]
+            if let Some(path) = &self.publication_cache_failure {
+                std::fs::write(path, "invalid cache JSON")
+                    .expect("test cache failure should succeed");
+            }
+            #[cfg(test)]
+            if let Some((manager, path, true)) = &self.generation_change {
+                manager.clear_state(path, task_id);
+            }
+            let staged: Vec<_> = transitions.values().cloned().collect();
+            if let Err(error) = anchor_mgr.commit_transitions_checked(&staged) {
+                for file_result in &file_results {
+                    if !file_result.had_success {
+                        continue;
+                    }
+                    let path = &file_result.batch_absolute_path;
+                    publication_failed_paths.insert(path.clone());
+                    rejected_paths.insert(path.clone());
+                    reread_paths.insert(path.clone());
+                    Self::mark_must_reread(state, path).await;
+                    anchor_mgr.invalidate_state(path, task_id);
+                    publication_outcomes.push(crate::core::tools::ToolPublicationOutcome {
+                        path: path.clone(),
+                        content_applied: file_result.applied_count > 0,
+                        anchors_published: false,
+                    });
+                    let content_status = if file_result.applied_count > 0 {
+                        "Content was applied, but anchor state could not be published."
+                    } else {
+                        "No content changes were needed, but anchor state could not be published."
+                    };
+                    all_results.push(format!(
+                        "File {}: {content_status} No returned anchors are reusable. Call read_file before editing again. Publication error: {error}.",
+                        file_result.batch_display_path,
+                    ));
+                }
+            }
+        }
+
+        if !write_failure {
+            let mut state = state.lock().await;
+            for item in &write_items {
+                state
+                    .file_context_tracker
+                    .mark_file_as_edited_by_sned(Path::new(&item.absolute_path));
+                if !publication_failed_paths.contains(&item.absolute_path) {
+                    state.insert_file_content(
+                        crate::core::tools::canonical_path_key(Path::new(&item.absolute_path)),
+                        item.final_content.clone(),
+                    );
+                }
+            }
+        }
+
         for file_result in &mut file_results {
             if file_result.had_success
                 && write_failed_paths.contains(&file_result.batch_absolute_path)
@@ -1598,12 +1745,12 @@ impl EditFileHandler {
                 continue;
             }
 
-            if file_result.had_success {
-                file_result.final_hashes = anchor_mgr.reconcile(
-                    &file_result.batch_absolute_path,
-                    &file_result.final_lines,
-                    task_id,
-                );
+            if file_result.had_success
+                && !publication_failed_paths.contains(&file_result.batch_absolute_path)
+            {
+                file_result.final_hashes = transitions[&file_result.batch_absolute_path]
+                    .anchors()
+                    .to_vec();
             }
 
             if file_result.had_success && file_result.applied_count > 0 {
@@ -1716,9 +1863,14 @@ impl EditFileHandler {
         // loop below — we need them for the inline summary diagnostic.
         let mut all_unchanged_sites: Vec<crate::core::file_editor::UnchangedSite> = Vec::new();
         for file_result in &file_results {
-            all_unchanged_sites.extend(file_result.unchanged_sites.iter().cloned());
+            if !publication_failed_paths.contains(&file_result.batch_absolute_path) {
+                all_unchanged_sites.extend(file_result.unchanged_sites.iter().cloned());
+            }
         }
         for file_result in file_results {
+            if publication_failed_paths.contains(&file_result.batch_absolute_path) {
+                continue;
+            }
             if !file_result.duplicate_insertions.is_empty() {
                 let diagnostics = file_result
                     .duplicate_insertions
@@ -1927,9 +2079,47 @@ impl EditFileHandler {
         let output = format!("{}\n\n{}", summary, all_results.join("\n\n---\n\n"));
 
         if !rejected_paths.is_empty() || write_failure || total_failed > 0 || total_overlap > 0 {
+            if !storage_failed_paths.is_empty() && publication_outcomes.is_empty() {
+                let mut affected_paths: Vec<_> = storage_failed_paths.into_iter().collect();
+                affected_paths.sort();
+                return Err(ToolError::ExecutionFailedWithMetadata(
+                    output,
+                    ToolFailureMetadata {
+                        class: ToolFailureClass::StorageFailure,
+                        affected_paths,
+                        required_next_step: Some(ToolRequiredNextStep::AskUser),
+                    },
+                ));
+            }
             let mut reread_paths = reread_paths.into_iter().collect::<Vec<_>>();
             reread_paths.sort();
             if !reread_paths.is_empty() {
+                if !publication_outcomes.is_empty() {
+                    publication_outcomes.sort_by(|a, b| a.path.cmp(&b.path));
+                    // Other rejected files can echo submitted anchors in their
+                    // diagnostics. This response promises no reusable anchors,
+                    // including unchanged-site and rejected-edit details.
+                    let output = output
+                        .lines()
+                        .map(|line| {
+                            if line.contains(ANCHOR_DELIMITER) {
+                                "[Anchor-bearing diagnostic withheld; call read_file.]"
+                            } else {
+                                line
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(ToolError::ExecutionFailedWithPublicationMetadata(
+                        output,
+                        ToolFailureMetadata {
+                            class: ToolFailureClass::AnchorInvalid,
+                            affected_paths: reread_paths,
+                            required_next_step: Some(ToolRequiredNextStep::ReadFile),
+                        },
+                        publication_outcomes,
+                    ));
+                }
                 return Err(ToolError::ExecutionFailedWithMetadata(
                     output,
                     ToolFailureMetadata {
@@ -2227,7 +2417,7 @@ mod tests {
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
         let ctx = ToolContext::new(
             state,
@@ -2326,7 +2516,7 @@ mod tests {
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
             anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("path-fallback"));
         let ctx = ToolContext::new(
@@ -2370,7 +2560,7 @@ mod tests {
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
             anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("repair-task"));
         let ctx = ToolContext::new(
@@ -2411,7 +2601,7 @@ mod tests {
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
             anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("runlog-task"));
         let ctx = ToolContext::new(
@@ -2455,7 +2645,7 @@ mod tests {
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
         let ctx = ToolContext::new(
             state,
@@ -2929,7 +3119,7 @@ mod tests {
         let file_path = file_path.canonicalize().unwrap_or(file_path);
 
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
         // Use relative path from workspace root to match handler's path resolution
@@ -2994,7 +3184,7 @@ mod tests {
         tokio::fs::write(&file_path, raw_content).await.unwrap();
 
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
         state
             .lock()
@@ -3060,7 +3250,7 @@ mod tests {
         tokio::fs::write(&file_path, raw_content).await.unwrap();
 
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
         tokio::fs::write(&file_path, "Changed\nThis is a test\n")
@@ -3092,7 +3282,11 @@ mod tests {
         let result = ToolHandler::execute(&handler, &ctx, params)
             .await
             .expect_err("stale anchor must be a tool failure");
-        assert!(result.to_string().contains("Error preparing edits"));
+        assert!(result.to_string().contains("Stale anchor detected"));
+        assert_eq!(
+            result.metadata().unwrap().required_next_step,
+            Some(ToolRequiredNextStep::ReadFile)
+        );
         assert!(
             state
                 .lock()
@@ -3119,7 +3313,7 @@ mod tests {
         tokio::fs::write(&file_path, raw_content).await.unwrap();
 
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
         {
@@ -3357,7 +3551,7 @@ mod tests {
         let file_path = file_path.canonicalize().unwrap_or(file_path);
 
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
         let params = serde_json::json!({
@@ -3414,7 +3608,7 @@ mod tests {
         tokio::fs::write(&file_path, raw_content).await.unwrap();
 
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
         // Use relative path from workspace root to match handler's path resolution
@@ -3477,7 +3671,7 @@ mod tests {
         let file_path = file_path.canonicalize().unwrap_or(file_path);
 
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
         // Use relative path from workspace root to match handler's path resolution
@@ -3538,7 +3732,7 @@ mod tests {
         tokio::fs::write(&file_path, raw_content).await.unwrap();
 
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
         // Use relative path from workspace root to match handler's path resolution
@@ -3596,7 +3790,7 @@ mod tests {
         let file_path = file_path.canonicalize().unwrap_or(file_path);
 
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
         let relative_path = file_path
@@ -3660,7 +3854,7 @@ mod tests {
         tokio::fs::write(&file_path, raw_content).await.unwrap();
 
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("test-task"));
 
         let mut handles = Vec::new();
@@ -4272,6 +4466,295 @@ edition = "2021"
         );
     }
 
+    fn staged_handler_fixture() -> (
+        tempfile::TempDir,
+        ToolContext,
+        serde_json::Value,
+        String,
+        PathBuf,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transition.txt");
+        let cache = dir.path().join("anchors.json");
+        let original = "first\nsecond\n";
+        std::fs::write(&path, original).unwrap();
+        let path = crate::core::tools::canonical_path_key(&path);
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        let anchors = manager.reconcile(
+            &path,
+            &crate::core::file_editor::split_content_lines(original),
+            Some("staged-handler"),
+        );
+        let mut task = TaskState::default();
+        task.insert_file_content(path.clone(), original.into());
+        let ctx = ToolContext::new(
+            Arc::new(Mutex::new(task)),
+            None,
+            dir.path().to_path_buf(),
+            manager,
+            false,
+            "staged-handler".into(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let params = serde_json::json!({"files": [{"path": path, "edits": [{
+            "anchor": format!("{}§first", anchors[0]), "edit_type": "replace", "text": "changed"
+        }]}]});
+        (dir, ctx, params, path, cache)
+    }
+
+    #[tokio::test]
+    async fn test_staged_publication_failure_retains_content_without_anchors() {
+        for generation_conflict in [false, true] {
+            let (_dir, ctx, mut params, path, cache) = staged_handler_fixture();
+            let anchors = ctx
+                .anchor_mgr
+                .get_anchors(&path, Some("staged-handler"))
+                .unwrap();
+            params["files"][0]["edits"].as_array_mut().unwrap().push(serde_json::json!({
+                "anchor": format!("{}§second", anchors[1]), "edit_type": "replace", "text": "second",
+            }));
+            let mut handler = EditFileHandler::new();
+            if generation_conflict {
+                handler.generation_change = Some((
+                    AnchorStateManager::with_cache_file(cache.clone()),
+                    path.clone(),
+                    true,
+                ));
+            } else {
+                handler.publication_cache_failure = Some(cache.clone());
+            }
+            let error = ToolHandler::execute(&handler, &ctx, params.clone())
+                .await
+                .unwrap_err();
+            let metadata = error
+                .metadata()
+                .expect("publication failure requires recovery metadata");
+            assert_eq!(metadata.class, ToolFailureClass::AnchorInvalid);
+            assert_eq!(
+                metadata.required_next_step,
+                Some(ToolRequiredNextStep::ReadFile)
+            );
+            assert_eq!(metadata.affected_paths, vec![path.clone()]);
+            let output = error.to_string();
+            assert!(
+                output.contains("Content was applied, but anchor state could not be published."),
+                "{output}"
+            );
+            assert_eq!(
+                error.publication_outcomes().unwrap(),
+                &[crate::core::tools::ToolPublicationOutcome {
+                    path: path.clone(),
+                    content_applied: true,
+                    anchors_published: false,
+                }]
+            );
+            assert!(
+                !output.contains('§'),
+                "candidate anchors must never escape: {output}"
+            );
+            assert!(output.contains("1 edit(s) applied"), "{output}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed\nsecond\n");
+            assert!(
+                ctx.anchor_mgr
+                    .get_anchors(&path, Some("staged-handler"))
+                    .is_none()
+            );
+            let state = ctx.state.lock().await;
+            assert!(state.must_reread_before_edit.contains(&path));
+            assert!(!state.file_content_cache.contains(&path));
+            drop(state);
+            // Invalidating local state must never overwrite a failed cache or
+            // another manager's newer generation.
+            if generation_conflict {
+                let independently_loaded = AnchorStateManager::with_cache_file(cache);
+                assert!(
+                    independently_loaded
+                        .get_anchors(&path, Some("staged-handler"))
+                        .is_none()
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(cache).unwrap(),
+                    "invalid cache JSON"
+                );
+                let retry = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    retry.metadata().unwrap().class,
+                    ToolFailureClass::StorageFailure
+                );
+                assert_eq!(
+                    retry.metadata().unwrap().required_next_step,
+                    Some(ToolRequiredNextStep::AskUser)
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed\nsecond\n");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_staged_corrupt_storage_requires_user_repair_even_with_reread_latch() {
+        let (_dir, ctx, params, path, cache) = staged_handler_fixture();
+        std::fs::write(&cache, "invalid cache JSON").unwrap();
+        for _ in 0..2 {
+            let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params.clone())
+                .await
+                .unwrap_err();
+            let metadata = error.metadata().unwrap();
+            assert_eq!(metadata.class, ToolFailureClass::StorageFailure);
+            assert_eq!(
+                metadata.required_next_step,
+                Some(ToolRequiredNextStep::AskUser)
+            );
+            assert!(error.to_string().contains("repair the anchor cache"));
+            assert!(!error.to_string().contains("Stale anchor detected"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+            assert_eq!(
+                std::fs::read_to_string(&cache).unwrap(),
+                "invalid cache JSON"
+            );
+            assert!(
+                ctx.state
+                    .lock()
+                    .await
+                    .must_reread_before_edit
+                    .contains(&path)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_staged_noop_publication_failure_has_no_applied_claim_or_anchors() {
+        let (_dir, ctx, mut params, path, cache) = staged_handler_fixture();
+        params["files"][0]["edits"][0]["text"] = serde_json::json!("first");
+        let mut handler = EditFileHandler::new();
+        handler.publication_cache_failure = Some(cache);
+        let error = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .unwrap_err();
+        let output = error.to_string();
+        assert!(
+            output.contains(
+                "No content changes were needed, but anchor state could not be published."
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("Content was applied"));
+        assert!(!output.contains('§'), "{output}");
+        assert_eq!(
+            error.publication_outcomes().unwrap(),
+            &[crate::core::tools::ToolPublicationOutcome {
+                path: path.clone(),
+                content_applied: false,
+                anchors_published: false,
+            }]
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "first\nsecond\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_staged_anchor_cache_atomic_write_failure_retains_applied_content() {
+        let (dir, mut ctx, params, path, cache) = staged_handler_fixture();
+        // Both the cache and its lock fit NAME_MAX; the atomic-write suffix
+        // exceeds it. Reads and prewrite validation succeed, publication fails.
+        let long_cache = dir.path().join(format!("{}.json", "a".repeat(235)));
+        let before = std::fs::read(cache).unwrap();
+        std::fs::write(&long_cache, &before).unwrap();
+        ctx.anchor_mgr = AnchorStateManager::with_cache_file(long_cache.clone());
+        let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
+            .await
+            .unwrap_err();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed\nsecond\n");
+        assert_eq!(std::fs::read(long_cache).unwrap(), before);
+        assert_eq!(
+            error.publication_outcomes().unwrap(),
+            &[crate::core::tools::ToolPublicationOutcome {
+                path: path.clone(),
+                content_applied: true,
+                anchors_published: false,
+            }]
+        );
+        assert_eq!(
+            error.metadata().unwrap().required_next_step,
+            Some(ToolRequiredNextStep::ReadFile)
+        );
+        assert!(!error.to_string().contains('§'));
+        assert!(
+            ctx.anchor_mgr
+                .get_anchors(&path, Some("staged-handler"))
+                .is_none()
+        );
+        let state = ctx.state.lock().await;
+        assert!(state.must_reread_before_edit.contains(&path));
+        assert!(!state.file_content_cache.contains(&path));
+    }
+
+    #[tokio::test]
+    async fn test_staged_invalid_mapping_rejected_without_reread_or_mutation() {
+        let (_dir, ctx, params, path, cache) = staged_handler_fixture();
+        let before = std::fs::read(&cache).unwrap();
+        let anchors = ctx.anchor_mgr.get_anchors(&path, Some("staged-handler"));
+        let mut handler = EditFileHandler::new();
+        handler.invalid_provenance = true;
+        let error = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .unwrap_err();
+        assert!(
+            error.metadata().is_none(),
+            "mapping failure is not stale context"
+        );
+        assert!(error.to_string().contains("transition validation failed"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+        assert_eq!(std::fs::read(cache).unwrap(), before);
+        assert_eq!(
+            ctx.anchor_mgr.get_anchors(&path, Some("staged-handler")),
+            anchors
+        );
+        assert!(ctx.state.lock().await.must_reread_before_edit.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_staged_generation_change_before_write_preserves_content() {
+        let (_dir, ctx, params, path, cache) = staged_handler_fixture();
+        let mut handler = EditFileHandler::new();
+        handler.generation_change = Some((
+            AnchorStateManager::with_cache_file(cache),
+            path.clone(),
+            false,
+        ));
+        let error = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.metadata().unwrap().required_next_step,
+            Some(ToolRequiredNextStep::ReadFile)
+        );
+        assert!(error.to_string().contains("0 edit(s) applied"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "first\nsecond\n");
+    }
+
+    #[tokio::test]
+    async fn test_staged_output_verification_preserves_external_bytes_and_anchor_cache() {
+        let (_dir, ctx, params, path, cache) = staged_handler_fixture();
+        let before = std::fs::read(&cache).unwrap();
+        let mut handler = EditFileHandler::new();
+        handler.external_change_after_writes = Some((path.clone(), "external\r\n".into()));
+        let error = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Output verification failed"));
+        assert_eq!(
+            error.metadata().unwrap().required_next_step,
+            Some(ToolRequiredNextStep::ReadFile)
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"external\r\n");
+        assert_eq!(std::fs::read(cache).unwrap(), before);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_atomic_write_failure_returns_error_and_rolls_back_all_files() {
@@ -4295,7 +4778,8 @@ edition = "2021"
         let last_content = "last line 1\nlast line 2\n";
         std::fs::write(&last_file_path, last_content).unwrap();
 
-        let anchor_mgr = AnchorStateManager::new();
+        let anchor_cache = dir.path().join("rollback-anchors.json");
+        let anchor_mgr = AnchorStateManager::with_cache_file(anchor_cache.clone());
         let first_lines = crate::core::file_editor::split_content_lines(first_content);
         let first_anchors = anchor_mgr.reconcile(
             first_file_path.to_str().unwrap(),
@@ -4314,6 +4798,7 @@ edition = "2021"
             &last_lines,
             Some("write-failure-task"),
         );
+        let before_anchor_cache = std::fs::read(&anchor_cache).unwrap();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
             state.clone(),
@@ -4372,6 +4857,18 @@ edition = "2021"
             std::fs::read_to_string(&last_file_path).unwrap(),
             last_content
         );
+        assert_eq!(std::fs::read(anchor_cache).unwrap(), before_anchor_cache);
+        for (path, anchors) in [
+            (&first_file_path, first_anchors),
+            (&failing_file_path, failing_anchors),
+            (&last_file_path, last_anchors),
+        ] {
+            assert_eq!(
+                ctx.anchor_mgr
+                    .get_anchors(path.to_str().unwrap(), Some("write-failure-task")),
+                Some(anchors)
+            );
+        }
         assert!(output.contains("Error writing file"), "got: {output}");
         assert!(output.contains("0 edit(s) applied"), "got: {output}");
         assert!(output.contains("3 edit(s) failed"), "got: {output}");
@@ -5002,7 +5499,7 @@ edition = "2021"
         std::fs::write(&file_path, raw_content).unwrap();
 
         let prep_anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(str::to_string).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
             prep_anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("noop-task"));
 
@@ -5077,7 +5574,7 @@ edition = "2021"
         std::fs::write(&file_path, raw_content).unwrap();
 
         let prep_anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(str::to_string).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
             prep_anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("occurrence-task"));
 
@@ -5130,7 +5627,7 @@ edition = "2021"
         std::fs::write(&dup_file_path, dup_raw_content).unwrap();
 
         let dup_prep_mgr = AnchorStateManager::new();
-        let dup_lines: Vec<String> = dup_raw_content.lines().map(str::to_string).collect();
+        let dup_lines: Vec<String> = crate::core::file_editor::split_content_lines(dup_raw_content);
         let dup_anchors = dup_prep_mgr.reconcile(
             dup_file_path.to_str().unwrap(),
             &dup_lines,
@@ -5185,7 +5682,7 @@ edition = "2021"
         // Simulate a previous read by reconciling the file once
         // to populate the anchor state.
         let anchor_mgr = AnchorStateManager::new();
-        let initial_lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let initial_lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let initial_anchors = anchor_mgr.reconcile(
             canonical_path.to_str().unwrap(),
             &initial_lines,
@@ -5276,7 +5773,7 @@ edition = "2021"
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
             anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("contract-task"));
         let ctx = ToolContext::new(
@@ -5371,7 +5868,7 @@ edition = "2021"
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
             anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("literal-task"));
         let ctx = ToolContext::new(
@@ -5436,7 +5933,7 @@ edition = "2021"
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
             anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("multiline-task"));
         let ctx = ToolContext::new(
@@ -5638,7 +6135,7 @@ edition = "2021"
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
             anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("fallback-task"));
         let ctx = ToolContext::new(
@@ -5695,7 +6192,7 @@ edition = "2021"
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("e2e-task"));
 
         // Create a real channel-based writer. The edit_file emit calls
@@ -5752,7 +6249,7 @@ edition = "2021"
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = raw_content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
             anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("reread-task"));
         // Simulate a prior successful edit that set must_reread_before_edit.
@@ -7031,13 +7528,16 @@ edition = "2021"
         .await
         .expect("read_file should succeed");
 
-        let annotated_anchor = read_output
+        let native_anchor = read_output
             .as_str()
             .expect("read_file returns string output")
             .lines()
-            .find(|line| line.contains("§dup line [identical content also at lines"))
-            .expect("duplicate line should be annotated")
+            .find(|line| line.ends_with("§dup line"))
+            .expect("duplicate line should have a native anchor")
             .to_string();
+        // Older reads emitted this suffix. Copied legacy anchors remain valid
+        // even though current readers no longer emit the annotation.
+        let annotated_anchor = format!("{native_anchor} [identical content also at lines 3]");
 
         let params = serde_json::json!({
             "files": [{

@@ -406,8 +406,10 @@ pub(crate) static ANCHOR_NAME_REGEX: LazyLock<Regex> =
 // ============================================================================
 
 /// Tracked document state.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct TrackedDocument {
+    #[serde(default)]
+    generation: u64,
     hashes: Vec<u64>,
     anchors: Vec<String>,
     /// Tracks used words in insertion order for LRU eviction.
@@ -420,6 +422,7 @@ struct TrackedDocument {
 #[derive(Debug)]
 struct AnchorStorage {
     tasks: IndexMap<String, IndexMap<String, TrackedDocument>>,
+    persisted_tasks: IndexMap<String, IndexMap<String, TrackedDocument>>,
     dictionary: Vec<String>,
     cache_file: std::path::PathBuf,
 }
@@ -434,14 +437,7 @@ impl AnchorCacheLock {
             .write(true)
             .open(path)?;
 
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
+        file.lock()?;
 
         Ok(Self(file))
     }
@@ -449,13 +445,7 @@ impl AnchorCacheLock {
 
 impl Drop for AnchorCacheLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            unsafe {
-                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-            }
-        }
+        let _ = self.0.unlock();
     }
 }
 
@@ -469,6 +459,7 @@ impl AnchorStorage {
                 Ok(tasks) => {
                     tracing::debug!("Loaded {} task(s) from anchor cache", tasks.len());
                     return Self {
+                        persisted_tasks: tasks.clone(),
                         tasks,
                         dictionary: Vec::new(),
                         cache_file: anchors_file,
@@ -482,6 +473,7 @@ impl AnchorStorage {
 
         Self {
             tasks: IndexMap::new(),
+            persisted_tasks: IndexMap::new(),
             dictionary: Vec::new(),
             cache_file: anchors_file,
         }
@@ -491,13 +483,14 @@ impl AnchorStorage {
     fn new() -> Self {
         Self {
             tasks: IndexMap::new(),
+            persisted_tasks: IndexMap::new(),
             dictionary: Vec::new(),
             cache_file: crate::storage::disk::get_data_dir().join("cache/anchors.json"),
         }
     }
 
     /// Save anchor state to disk
-    fn save(&self) {
+    fn save(&mut self) {
         let anchors_file = &self.cache_file;
         let cache_dir = anchors_file.parent().unwrap_or(std::path::Path::new("."));
 
@@ -513,19 +506,99 @@ impl AnchorStorage {
             return;
         };
 
-        let mut tasks = Self::load(anchors_file.clone()).tasks;
+        let Ok(mut tasks) = Self::read_tasks(anchors_file) else {
+            tracing::warn!("Failed to reload anchor cache; preserving existing state");
+            return;
+        };
+        let mut changed_tasks = HashSet::new();
+        let mut cache_changed = false;
         for (task_id, documents) in &self.tasks {
-            tasks.insert(task_id.clone(), documents.clone());
+            for (path, document) in documents {
+                let expected = self
+                    .persisted_tasks
+                    .get(task_id)
+                    .and_then(|files| files.get(path));
+                if Some(document) == expected {
+                    continue;
+                }
+                let current = tasks.get(task_id).and_then(|files| files.get(path));
+                if current == expected {
+                    cache_changed = true;
+                    changed_tasks.insert(task_id);
+                    tasks
+                        .entry(task_id.clone())
+                        .or_default()
+                        .insert(path.clone(), document.clone());
+                }
+            }
+        }
+        for (task_id, documents) in &self.persisted_tasks {
+            for (path, expected) in documents {
+                if self
+                    .tasks
+                    .get(task_id)
+                    .and_then(|files| files.get(path))
+                    .is_none()
+                    && tasks.get(task_id).and_then(|files| files.get(path)) == Some(expected)
+                    && let Some(files) = tasks.get_mut(task_id)
+                {
+                    cache_changed = true;
+                    files.shift_remove(path);
+                }
+            }
+        }
+        for task_id in self.tasks.keys() {
+            // Unchanged entries from a stale manager must not evict newer tasks.
+            if !changed_tasks.contains(task_id) {
+                continue;
+            }
+            if let Some(documents) = tasks.shift_remove(task_id) {
+                tasks.insert(task_id.clone(), documents);
+            }
+        }
+        cache_changed |= tasks.len() > MAX_TRACKED_TASKS
+            || tasks.values().any(|files| files.len() > MAX_TRACKED_FILES);
+        Self::enforce_limits(&mut tasks);
+        // A reload can change HashSet serialization order without changing state.
+        // Avoid rewriting durable bytes when this manager has nothing to publish.
+        if !cache_changed {
+            self.persisted_tasks = tasks.clone();
+            self.tasks = tasks;
+            return;
         }
 
         match serde_json::to_string_pretty(&tasks) {
             Ok(json) => {
                 if let Err(e) = crate::storage::disk::atomic_write_file(&anchors_file, &json) {
                     tracing::warn!("Failed to save anchor cache: {}", e);
+                } else {
+                    self.persisted_tasks = tasks.clone();
+                    self.tasks = tasks;
                 }
             }
             Err(e) => {
                 tracing::warn!("Failed to serialize anchor cache: {}", e);
+            }
+        }
+    }
+
+    fn read_tasks(
+        path: &std::path::Path,
+    ) -> std::io::Result<IndexMap<String, IndexMap<String, TrackedDocument>>> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(IndexMap::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn enforce_limits(tasks: &mut IndexMap<String, IndexMap<String, TrackedDocument>>) {
+        while tasks.len() > MAX_TRACKED_TASKS {
+            tasks.shift_remove_index(0);
+        }
+        for files in tasks.values_mut() {
+            while files.len() > MAX_TRACKED_FILES {
+                files.shift_remove_index(0);
             }
         }
     }
@@ -695,7 +768,484 @@ pub struct AnchorStateManager {
     storage: Arc<Mutex<AnchorStorage>>,
 }
 
+/// Exact origin of each assembled line. `None` denotes newly supplied text.
+/// Constructed by the executor at the same splice boundaries as the content.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpliceProvenance {
+    pub origins: Vec<Option<usize>>,
+    pub edit_ranges: Vec<AppliedEdit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineProvenance {
+    Preserved { original_idx: usize },
+    Created { assigned_word: String },
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum AnchorTransitionError {
+    #[error("Anchor generation changed for {path}; re-read the file with read_file")]
+    StaleGeneration { path: String },
+    #[error("Invalid anchor transition: {0}")]
+    Validation(String),
+    #[error("Failed to persist anchor transition: {0}")]
+    Persistence(String),
+}
+
+/// Observation does not publish anchors, allocate shared words, or touch LRU state.
+#[derive(Debug, Clone)]
+pub struct AnchorSnapshot {
+    absolute_path: String,
+    task_id: String,
+    generation: u64,
+    raw_digest: String,
+    normalized_digest: String,
+    lines: Vec<String>,
+    anchors: Vec<String>,
+    snapshot_mode: bool,
+    expected: Option<TrackedDocument>,
+    memory_expected: Option<TrackedDocument>,
+    document: TrackedDocument,
+}
+
+/// Private state is checked and persisted before any in-memory publication.
+#[derive(Debug, Clone)]
+pub struct AnchorTransition {
+    absolute_path: String,
+    task_id: String,
+    generation: u64,
+    raw_digest: String,
+    normalized_digest: String,
+    anchors: Vec<String>,
+    expected_generation: Option<u64>,
+    input_raw_digest: String,
+    output_raw_digest: String,
+    input_normalized_digest: String,
+    output_normalized_digest: String,
+    output_lines: Vec<String>,
+    provenance: Vec<LineProvenance>,
+    retired_identities: Vec<String>,
+    edit_ranges: Vec<AppliedEdit>,
+    is_noop: bool,
+    expected: Option<TrackedDocument>,
+    memory_expected: Option<TrackedDocument>,
+    document: TrackedDocument,
+    snapshot_mode: bool,
+}
+
+impl AnchorSnapshot {
+    pub fn absolute_path(&self) -> &str {
+        &self.absolute_path
+    }
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn raw_digest(&self) -> &str {
+        &self.raw_digest
+    }
+    pub fn normalized_digest(&self) -> &str {
+        &self.normalized_digest
+    }
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+    pub fn anchors(&self) -> &[String] {
+        &self.anchors
+    }
+    pub fn snapshot_mode(&self) -> bool {
+        self.snapshot_mode
+    }
+}
+
+impl AnchorTransition {
+    pub fn absolute_path(&self) -> &str {
+        &self.absolute_path
+    }
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn raw_digest(&self) -> &str {
+        &self.raw_digest
+    }
+    pub fn normalized_digest(&self) -> &str {
+        &self.normalized_digest
+    }
+    pub fn anchors(&self) -> &[String] {
+        &self.anchors
+    }
+    pub fn expected_generation(&self) -> Option<u64> {
+        self.expected_generation
+    }
+    pub fn input_raw_digest(&self) -> &str {
+        &self.input_raw_digest
+    }
+    pub fn output_raw_digest(&self) -> &str {
+        &self.output_raw_digest
+    }
+    pub fn input_normalized_digest(&self) -> &str {
+        &self.input_normalized_digest
+    }
+    pub fn output_normalized_digest(&self) -> &str {
+        &self.output_normalized_digest
+    }
+    pub fn output_lines(&self) -> &[String] {
+        &self.output_lines
+    }
+    pub fn provenance(&self) -> &[LineProvenance] {
+        &self.provenance
+    }
+    pub fn retired_identities(&self) -> &[String] {
+        &self.retired_identities
+    }
+    pub fn edit_ranges(&self) -> &[AppliedEdit] {
+        &self.edit_ranges
+    }
+    pub fn is_noop(&self) -> bool {
+        self.is_noop
+    }
+    pub fn snapshot_mode(&self) -> bool {
+        self.snapshot_mode
+    }
+}
+
+fn content_digest(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+fn snapshot_line_anchors(lines: &[String]) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for line in lines {
+        hash.update((line.len() as u64).to_le_bytes());
+        hash.update(line.as_bytes());
+    }
+    let revision = format!("{:x}", hash.finalize());
+    (1..=lines.len())
+        .map(|index| format!("L{}N{index}", &revision[..32]))
+        .collect()
+}
+
 impl AnchorStateManager {
+    pub fn observe_snapshot(
+        &self,
+        absolute_path: &str,
+        raw_content: &str,
+        task_id: Option<&str>,
+    ) -> Result<AnchorSnapshot, AnchorTransitionError> {
+        let task_id = task_id.unwrap_or("default");
+        let (normalized, _) = normalize_file_content(raw_content);
+        let lines = split_content_lines(&normalized);
+        let hashes = compute_hashes(&lines);
+        let (memory_expected, expected) = {
+            let storage = self.storage();
+            let memory = storage
+                .tasks
+                .get(task_id)
+                .and_then(|files| files.get(absolute_path))
+                .cloned();
+            let tasks = AnchorStorage::read_tasks(&storage.cache_file)
+                .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?;
+            let disk = tasks
+                .get(task_id)
+                .and_then(|files| files.get(absolute_path))
+                .cloned();
+            (memory, disk)
+        };
+        if expected.is_none() && memory_expected.is_some() && lines.len() <= MAX_TRACKED_LINES {
+            return Err(AnchorTransitionError::StaleGeneration {
+                path: absolute_path.into(),
+            });
+        }
+        let document = if lines.len() > MAX_TRACKED_LINES {
+            TrackedDocument {
+                generation: expected.as_ref().map_or(0, |document| document.generation),
+                hashes,
+                anchors: snapshot_line_anchors(&lines),
+                used_words: VecDeque::new(),
+                used_words_set: HashSet::new(),
+            }
+        } else if let Some(document) = &expected {
+            if document.hashes != hashes || document.anchors.len() != lines.len() {
+                return Err(AnchorTransitionError::StaleGeneration {
+                    path: absolute_path.into(),
+                });
+            }
+            document.clone()
+        } else {
+            let dictionary: Vec<String> = ANCHOR_DICTIONARY
+                .iter()
+                .map(|word| (*word).to_string())
+                .collect();
+            let mut document = TrackedDocument {
+                generation: 0,
+                hashes,
+                anchors: Vec::new(),
+                used_words: VecDeque::new(),
+                used_words_set: HashSet::new(),
+            };
+            for hash in &document.hashes {
+                let word = self.get_word_for_hash(*hash, &document.used_words_set, &dictionary);
+                document.anchors.push(word.clone());
+                document.used_words.push_back(word.clone());
+                document.used_words_set.insert(word);
+            }
+            document
+        };
+        let snapshot = AnchorSnapshot {
+            absolute_path: absolute_path.into(),
+            task_id: task_id.into(),
+            generation: document.generation,
+            raw_digest: content_digest(raw_content),
+            normalized_digest: content_digest(&normalized),
+            snapshot_mode: lines.len() > MAX_TRACKED_LINES,
+            lines,
+            anchors: document.anchors.clone(),
+            expected,
+            memory_expected,
+            document,
+        };
+        Ok(snapshot)
+    }
+
+    /// Preserve only origins proven by native splices; never infer identity from a diff.
+    pub fn stage_transition(
+        &self,
+        snapshot: &AnchorSnapshot,
+        final_content: &str,
+        provenance: &SpliceProvenance,
+    ) -> Result<AnchorTransition, AnchorTransitionError> {
+        let (normalized, _) = normalize_file_content(final_content);
+        let lines = split_content_lines(&normalized);
+        if lines.len() != provenance.origins.len() {
+            return Err(AnchorTransitionError::Validation(
+                "provenance line count differs from content".into(),
+            ));
+        }
+        let dictionary: Vec<String> = ANCHOR_DICTIONARY
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect();
+        let mut document = snapshot.document.clone();
+        document.hashes = compute_hashes(&lines);
+        document.anchors.clear();
+        let mut previous = None;
+        let snapshot_anchors =
+            (lines.len() > MAX_TRACKED_LINES).then(|| snapshot_line_anchors(&lines));
+        for (index, origin) in provenance.origins.iter().enumerate() {
+            if let Some(origin) = origin {
+                if snapshot.lines.get(*origin) != Some(&lines[index])
+                    || previous.is_some_and(|last| last >= *origin)
+                {
+                    return Err(AnchorTransitionError::Validation(
+                        "invalid or reordered preserved line origin".into(),
+                    ));
+                }
+                previous = Some(*origin);
+            }
+            let word = if let Some(anchors) = &snapshot_anchors {
+                anchors[index].clone()
+            } else if let Some(origin) = origin.filter(|_| !snapshot.snapshot_mode) {
+                snapshot.document.anchors[origin].clone()
+            } else {
+                let word = self.get_word_for_hash(
+                    document.hashes[index],
+                    &document.used_words_set,
+                    &dictionary,
+                );
+                document.used_words.push_back(word.clone());
+                document.used_words_set.insert(word.clone());
+                word
+            };
+            document.anchors.push(word);
+        }
+        if document != snapshot.document {
+            document.generation = document
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| AnchorTransitionError::Validation("generation exhausted".into()))?;
+        }
+        let live_words: HashSet<&String> = document.anchors.iter().collect();
+        let retired_identities = snapshot
+            .anchors
+            .iter()
+            .filter(|word| !live_words.contains(word))
+            .cloned()
+            .collect();
+        let transition = AnchorTransition {
+            absolute_path: snapshot.absolute_path.clone(),
+            task_id: snapshot.task_id.clone(),
+            generation: document.generation,
+            raw_digest: content_digest(final_content),
+            normalized_digest: content_digest(&normalized),
+            anchors: document.anchors.clone(),
+            expected_generation: snapshot
+                .expected
+                .as_ref()
+                .map(|document| document.generation),
+            input_raw_digest: snapshot.raw_digest.clone(),
+            output_raw_digest: content_digest(final_content),
+            input_normalized_digest: snapshot.normalized_digest.clone(),
+            output_normalized_digest: content_digest(&normalized),
+            output_lines: lines.clone(),
+            provenance: provenance
+                .origins
+                .iter()
+                .enumerate()
+                .map(|(index, origin)| {
+                    if let Some(original_idx) = origin
+                        .filter(|_| !snapshot.snapshot_mode && lines.len() <= MAX_TRACKED_LINES)
+                    {
+                        LineProvenance::Preserved { original_idx }
+                    } else {
+                        LineProvenance::Created {
+                            assigned_word: document.anchors[index].clone(),
+                        }
+                    }
+                })
+                .collect(),
+            retired_identities,
+            edit_ranges: provenance.edit_ranges.clone(),
+            is_noop: snapshot.raw_digest == content_digest(final_content)
+                && snapshot.document == document,
+            expected: snapshot.expected.clone(),
+            memory_expected: snapshot.memory_expected.clone(),
+            document,
+            snapshot_mode: lines.len() > MAX_TRACKED_LINES,
+        };
+        Ok(transition)
+    }
+
+    /// Commit the complete set in one cache write. Call after content writes, while
+    /// holding file operation locks. A failure leaves anchor state unchanged;
+    /// the handler reports already-applied content with dedicated reread recovery.
+    pub fn commit_transitions_checked(
+        &self,
+        transitions: &[AnchorTransition],
+    ) -> Result<(), AnchorTransitionError> {
+        self.check_transitions(transitions, true)
+    }
+
+    pub fn validate_transitions_checked(
+        &self,
+        transitions: &[AnchorTransition],
+    ) -> Result<(), AnchorTransitionError> {
+        self.check_transitions(transitions, false)
+    }
+
+    /// Discard this manager's view after content changed without anchor publication.
+    /// Persistence may be unavailable, or another manager may have committed newer
+    /// anchors. Never repair this failure with a best-effort cache write/delete:
+    /// a fresh observation rejects mismatched content until a reread reconciles it.
+    pub fn invalidate_state(&self, absolute_path: &str, task_id: Option<&str>) {
+        let mut storage = self.storage();
+        let task_id = task_id.unwrap_or("default");
+        if let Some(files) = storage.tasks.get_mut(task_id) {
+            files.shift_remove(absolute_path);
+        }
+        // Forget the baseline too, so a later save cannot queue a durable deletion.
+        if let Some(files) = storage.persisted_tasks.get_mut(task_id) {
+            files.shift_remove(absolute_path);
+        }
+    }
+
+    fn check_transitions(
+        &self,
+        transitions: &[AnchorTransition],
+        publish: bool,
+    ) -> Result<(), AnchorTransitionError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let persistence =
+            |error: std::io::Error| AnchorTransitionError::Persistence(error.to_string());
+        let mut storage = self.storage();
+        let cache_dir = storage
+            .cache_file
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(cache_dir).map_err(persistence)?;
+        let _lock = AnchorCacheLock::acquire(&storage.cache_file.with_extension("json.lock"))
+            .map_err(persistence)?;
+        // Unlike legacy best-effort loading, corrupt/unreadable state fails closed.
+        let mut tasks: IndexMap<String, IndexMap<String, TrackedDocument>> =
+            match std::fs::read(&storage.cache_file) {
+                Ok(bytes) => serde_json::from_slice(&bytes)
+                    .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => IndexMap::new(),
+                Err(error) => return Err(persistence(error)),
+            };
+        let mut targets = HashSet::new();
+        for transition in transitions {
+            if !targets.insert((&transition.task_id, &transition.absolute_path)) {
+                return Err(AnchorTransitionError::Validation(
+                    "duplicate transition target".into(),
+                ));
+            }
+            let memory = storage
+                .tasks
+                .get(&transition.task_id)
+                .and_then(|files| files.get(&transition.absolute_path));
+            let disk = tasks
+                .get(&transition.task_id)
+                .and_then(|files| files.get(&transition.absolute_path));
+            if transition.anchors != transition.document.anchors
+                || compute_hashes(&transition.output_lines) != transition.document.hashes
+                || transition.generation != transition.document.generation
+                || transition.expected_generation
+                    != transition
+                        .expected
+                        .as_ref()
+                        .map(|document| document.generation)
+            {
+                return Err(AnchorTransitionError::Validation(
+                    "transition metadata differs from staged document".into(),
+                ));
+            }
+            if memory != transition.memory_expected.as_ref() || disk != transition.expected.as_ref()
+            {
+                return Err(AnchorTransitionError::StaleGeneration {
+                    path: transition.absolute_path.clone(),
+                });
+            }
+        }
+        if !publish || transitions.iter().all(|transition| transition.is_noop) {
+            return Ok(());
+        }
+        for transition in transitions {
+            if transition.is_noop {
+                continue;
+            }
+            if transition.snapshot_mode {
+                if let Some(files) = tasks.get_mut(&transition.task_id) {
+                    files.shift_remove(&transition.absolute_path);
+                }
+            } else {
+                let mut files = tasks.shift_remove(&transition.task_id).unwrap_or_default();
+                files.shift_remove(&transition.absolute_path);
+                files.insert(
+                    transition.absolute_path.clone(),
+                    transition.document.clone(),
+                );
+                tasks.insert(transition.task_id.clone(), files);
+            }
+        }
+        AnchorStorage::enforce_limits(&mut tasks);
+        let json = serde_json::to_string_pretty(&tasks)
+            .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?;
+        crate::storage::disk::atomic_write_file(&storage.cache_file, &json).map_err(persistence)?;
+        // There are no fallible operations after durable replacement.
+        storage.persisted_tasks = tasks.clone();
+        storage.tasks = tasks;
+        Ok(())
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::with_cache_file(crate::storage::disk::get_data_dir().join("cache/anchors.json"))
@@ -826,6 +1376,34 @@ impl AnchorStateManager {
         }
     }
 
+    fn republish_document(
+        &self,
+        absolute_path: &str,
+        task_id: &str,
+        document: &TrackedDocument,
+    ) -> std::io::Result<()> {
+        let mut storage = self.storage();
+        let files = storage.tasks.entry(task_id.to_string()).or_default();
+        files.insert(absolute_path.to_string(), document.clone());
+
+        if let Some(files) = storage.persisted_tasks.get_mut(task_id) {
+            files.shift_remove(absolute_path);
+        }
+        storage.save();
+
+        let durable = AnchorStorage::read_tasks(&storage.cache_file)?
+            .get(task_id)
+            .and_then(|files| files.get(absolute_path))
+            .cloned();
+        if durable.as_ref() == Some(document) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "anchor cache did not contain the republished document",
+            ))
+        }
+    }
+
     /// Reconciles the current file content with saved state using diff.
     ///
     #[must_use]
@@ -835,6 +1413,25 @@ impl AnchorStateManager {
         current_lines: &[String],
         task_id: Option<&str>,
     ) -> Vec<String> {
+        match self.reconcile_checked(absolute_path, current_lines, task_id) {
+            Ok(anchors) => anchors,
+            Err(error) => {
+                tracing::warn!(
+                    path = absolute_path,
+                    error = %error,
+                    "anchor reconciliation could not be persisted"
+                );
+                self.get_anchors(absolute_path, task_id).unwrap_or_default()
+            }
+        }
+    }
+
+    pub fn reconcile_checked(
+        &self,
+        absolute_path: &str,
+        current_lines: &[String],
+        task_id: Option<&str>,
+    ) -> Result<Vec<String>, AnchorTransitionError> {
         let task_id = task_id.unwrap_or("default");
 
         if current_lines.len() > MAX_TRACKED_LINES {
@@ -847,16 +1444,49 @@ impl AnchorStateManager {
                 hash.update(line.as_bytes());
             }
             let revision = format!("{:x}", hash.finalize());
-            return (1..=current_lines.len())
+            return Ok((1..=current_lines.len())
                 .map(|i| format!("L{}N{i}", &revision[..32]))
-                .collect();
+                .collect());
         }
 
         let current_hashes = compute_hashes(current_lines);
-        let tracked = {
+        let (tracked, durable_missing) = {
             let mut storage = self.storage();
+            // Readers must adopt a newer committed document before diffing or
+            // returning the identical-content fast path from a stale manager.
+            let durable_document = AnchorStorage::read_tasks(&storage.cache_file)
+                .ok()
+                .and_then(|tasks| {
+                    tasks
+                        .get(task_id)
+                        .and_then(|files| files.get(absolute_path))
+                        .cloned()
+                });
+            if let Some(document) = durable_document {
+                storage
+                    .tasks
+                    .entry(task_id.to_string())
+                    .or_default()
+                    .insert(absolute_path.to_string(), document.clone());
+                storage
+                    .persisted_tasks
+                    .entry(task_id.to_string())
+                    .or_default()
+                    .insert(absolute_path.to_string(), document);
+            }
             let state = Self::get_task_state_mut(&mut storage, task_id);
-            state.get(absolute_path).cloned()
+            let tracked = state.get(absolute_path).cloned();
+            let durable_missing = tracked.is_some()
+                && AnchorStorage::read_tasks(&storage.cache_file)
+                    .ok()
+                    .and_then(|tasks| {
+                        tasks
+                            .get(task_id)
+                            .and_then(|files| files.get(absolute_path))
+                            .cloned()
+                    })
+                    .is_none();
+            (tracked, durable_missing)
         };
 
         // Fast path: if hashes are identical, nothing changed
@@ -875,7 +1505,12 @@ impl AnchorStateManager {
                 if let Some(document) = state.shift_remove(absolute_path) {
                     state.insert(absolute_path.to_string(), document);
                 }
-                return tracked.anchors.clone();
+                drop(storage);
+                if durable_missing {
+                    self.republish_document(absolute_path, task_id, tracked)
+                        .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?;
+                }
+                return Ok(tracked.anchors.clone());
             }
         }
 
@@ -898,6 +1533,7 @@ impl AnchorStateManager {
             }
 
             let tracked = TrackedDocument {
+                generation: 0,
                 hashes: current_hashes,
                 anchors,
                 used_words: used_words_vec,
@@ -906,7 +1542,7 @@ impl AnchorStateManager {
             let anchors = tracked.anchors.clone();
             self.update_state(absolute_path, tracked, task_id);
             self.save();
-            return anchors;
+            return Ok(anchors);
         }
 
         let tracked = tracked.unwrap();
@@ -982,6 +1618,7 @@ impl AnchorStateManager {
             .collect();
 
         let tracked = TrackedDocument {
+            generation: tracked.generation.saturating_add(1),
             hashes: current_hashes,
             anchors: new_anchors,
             used_words: new_used_words_vec,
@@ -993,7 +1630,7 @@ impl AnchorStateManager {
         // Persist anchor state to disk
         self.save();
 
-        anchors
+        Ok(anchors)
     }
 
     /// Returns true if the file is currently being tracked.
@@ -1038,7 +1675,7 @@ impl AnchorStateManager {
 
     /// Persists anchor state to disk.
     pub fn save(&self) {
-        let storage = self.storage();
+        let mut storage = self.storage();
         storage.save();
     }
 }
@@ -1648,6 +2285,28 @@ impl EditExecutor {
     /// Returns the outcome — see [`ApplyOutcome`]. Overlap is detected
     /// before application; glued-anchor detection runs after assembly.
     pub fn apply_edits(&self, lines: &[String], resolved_edits: &[ResolvedEdit]) -> ApplyOutcome {
+        self.apply_edits_with_provenance(lines, resolved_edits).0
+    }
+
+    pub fn apply_edits_with_provenance(
+        &self,
+        lines: &[String],
+        resolved_edits: &[ResolvedEdit],
+    ) -> (ApplyOutcome, SpliceProvenance) {
+        let mut provenance = SpliceProvenance {
+            origins: (0..lines.len()).map(Some).collect(),
+            edit_ranges: Vec::new(),
+        };
+        let outcome = self.apply_edits_recording(lines, resolved_edits, &mut provenance);
+        (outcome, provenance)
+    }
+
+    fn apply_edits_recording(
+        &self,
+        lines: &[String],
+        resolved_edits: &[ResolvedEdit],
+        provenance: &mut SpliceProvenance,
+    ) -> ApplyOutcome {
         let mut unchanged_sites: Vec<UnchangedSite> = Vec::new();
         let effective_edits: Vec<&ResolvedEdit> = resolved_edits
             .iter()
@@ -1819,6 +2478,10 @@ impl EditExecutor {
                 splice_index..splice_index + removed_in_this_edit,
                 replacement_lines.clone(),
             );
+            provenance.origins.splice(
+                splice_index..splice_index + removed_in_this_edit,
+                std::iter::repeat_n(None, replacement_lines.len()),
+            );
 
             added_count += replacement_lines.len();
             removed_count += removed_in_this_edit;
@@ -1863,6 +2526,7 @@ impl EditExecutor {
             .collect();
 
         applied_edits.sort_by_key(|applied| applied.original_start_idx);
+        provenance.edit_ranges = applied_edits.clone();
 
         // Defense-in-depth: refuse to write content that still has any
         // `Word§` or `hex§` fragment in touched or added lines. The model
@@ -1885,6 +2549,11 @@ impl EditExecutor {
             return ApplyOutcome::GluedAnchor(glued_lines);
         }
 
+        // Empty content still has one logical line under split_content_lines.
+        if new_lines.is_empty() {
+            new_lines.push(String::new());
+            provenance.origins.push(None);
+        }
         ApplyOutcome::Applied(
             new_lines,
             added_count,
@@ -1949,8 +2618,14 @@ impl FileEditor {
         absolute_path: &str,
         task_id: Option<&str>,
     ) -> Result<(String, Vec<AppliedEdit>, Vec<FailedEdit>), FileEditorError> {
-        let lines = split_content_lines(content);
-        let line_hashes = self.anchor_mgr.reconcile(absolute_path, &lines, task_id);
+        let snapshot = self
+            .anchor_mgr
+            .observe_snapshot(absolute_path, content, task_id)
+            .map_err(|error| FileEditorError::AllEditsFailed {
+                message: error.to_string(),
+            })?;
+        let lines = &snapshot.lines;
+        let line_hashes = &snapshot.anchors;
 
         let (resolved_edits, failed_edits) =
             self.executor.resolve_edits(edits, &lines, &line_hashes);
@@ -1970,7 +2645,9 @@ impl FileEditor {
             ));
         }
 
-        let outcome = self.executor.apply_edits(&lines, &resolved_edits);
+        let (outcome, provenance) = self
+            .executor
+            .apply_edits_with_provenance(lines, &resolved_edits);
         let (final_lines, applied_edits) = match outcome {
             ApplyOutcome::Overlap => {
                 return Err(FileEditorError::OverlappingEdits {
@@ -2005,12 +2682,23 @@ impl FileEditor {
             }
         };
 
-        let final_content = final_lines.join("\n");
-
-        // Reconcile anchors for the modified content
-        let _ = self
+        let (_, format) = normalize_file_content(content);
+        let final_content = if applied_edits.is_empty() {
+            content.to_string()
+        } else {
+            restore_file_content(&final_lines.join("\n"), format)
+        };
+        let transition = self
             .anchor_mgr
-            .reconcile(absolute_path, &final_lines, task_id);
+            .stage_transition(&snapshot, &final_content, &provenance)
+            .map_err(|error| FileEditorError::AllEditsFailed {
+                message: error.to_string(),
+            })?;
+        self.anchor_mgr
+            .commit_transitions_checked(&[transition])
+            .map_err(|error| FileEditorError::AllEditsFailed {
+                message: error.to_string(),
+            })?;
 
         Ok((final_content, applied_edits, failed_edits))
     }
@@ -2022,6 +2710,457 @@ impl FileEditor {
 
 #[cfg(test)]
 mod tests {
+    fn staged_edit(
+        manager: &AnchorStateManager,
+        path: &str,
+        content: &str,
+        ranges: &[(usize, usize, &str, &str)],
+    ) -> AnchorTransition {
+        let snapshot = manager
+            .observe_snapshot(path, content, Some("staged"))
+            .unwrap();
+        let edits: Vec<ResolvedEdit> = ranges
+            .iter()
+            .map(|&(line_idx, end_idx, kind, text)| ResolvedEdit {
+                line_idx,
+                end_idx,
+                edit: Edit {
+                    anchor: format!(
+                        "{}§{}",
+                        snapshot.anchors[line_idx], snapshot.lines[line_idx]
+                    ),
+                    end_anchor: None,
+                    edit_type: kind.into(),
+                    text: text.into(),
+                    content: None,
+                },
+            })
+            .collect();
+        let (outcome, provenance) =
+            EditExecutor::new().apply_edits_with_provenance(&snapshot.lines, &edits);
+        let ApplyOutcome::Applied(lines, ..) = outcome else {
+            panic!("assembly rejected")
+        };
+        manager
+            .stage_transition(&snapshot, &lines.join("\n"), &provenance)
+            .unwrap()
+    }
+
+    #[test]
+    fn staged_splices_preserve_exact_duplicate_occurrences() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        let content = "same\nleft\nsame\nright\nsame\n";
+        let before = manager
+            .observe_snapshot("duplicates", content, Some("staged"))
+            .unwrap();
+        let transition = staged_edit(
+            &manager,
+            "duplicates",
+            content,
+            &[
+                (1, 1, "replace", "new\nlines"),
+                (3, 3, "insert_after", "inserted"),
+            ],
+        );
+        assert_eq!(
+            transition.output_lines.join("\n"),
+            "same\nnew\nlines\nsame\nright\ninserted\nsame\n"
+        );
+        for (final_index, original_index) in [(0, 0), (3, 2), (4, 3), (6, 4), (7, 5)] {
+            assert_eq!(
+                transition.anchors[final_index],
+                before.anchors[original_index]
+            );
+            assert_eq!(
+                transition.provenance[final_index],
+                LineProvenance::Preserved {
+                    original_idx: original_index
+                }
+            );
+        }
+        assert_eq!(
+            transition.retired_identities,
+            vec![before.anchors[1].clone()]
+        );
+        assert_eq!(transition.edit_ranges.len(), 2);
+        assert!(!manager.is_tracking("duplicates", Some("staged")));
+        manager
+            .commit_transitions_checked(&[transition.clone()])
+            .unwrap();
+        assert_eq!(
+            manager.get_anchors("duplicates", Some("staged")).unwrap(),
+            transition.anchors
+        );
+    }
+
+    #[test]
+    fn staged_noop_observation_and_failure_do_not_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        let before = manager.storage().tasks.clone();
+        let transition = staged_edit(&manager, "noop", "same\nsame", &[(1, 1, "replace", "same")]);
+        assert!(transition.is_noop);
+        assert_eq!(transition.generation, 0);
+        assert!(transition.retired_identities.is_empty());
+        manager.commit_transitions_checked(&[transition]).unwrap();
+        assert_eq!(manager.storage().tasks, before);
+        assert!(!cache.exists());
+        let snapshot = manager
+            .observe_snapshot("noop", "same\nsame", Some("staged"))
+            .unwrap();
+        assert!(matches!(
+            manager.stage_transition(&snapshot, "changed", &SpliceProvenance::default()),
+            Err(AnchorTransitionError::Validation(_))
+        ));
+        assert_eq!(manager.storage().tasks, before);
+    }
+
+    #[test]
+    fn staged_whole_file_delete_creates_synthetic_empty_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        let transition = staged_edit(&manager, "deleted", "one\ntwo\n", &[(0, 2, "replace", "")]);
+        assert_eq!(transition.output_lines, vec![String::new()]);
+        assert!(matches!(
+            &transition.provenance[..],
+            [LineProvenance::Created { .. }]
+        ));
+        assert_eq!(transition.retired_identities.len(), 3);
+        manager
+            .commit_transitions_checked(&[transition.clone()])
+            .unwrap();
+        assert_eq!(
+            manager
+                .observe_snapshot("deleted", "", Some("staged"))
+                .unwrap()
+                .anchors,
+            transition.anchors
+        );
+    }
+
+    #[test]
+    fn staged_raw_digest_is_distinct_from_normalized_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        let unix = manager
+            .observe_snapshot("format", "one\ntwo\n", None)
+            .unwrap();
+        let windows = manager
+            .observe_snapshot("format", "\u{feff}one\r\ntwo\r\n", None)
+            .unwrap();
+        assert_ne!(unix.raw_digest, windows.raw_digest);
+        assert_eq!(unix.normalized_digest, windows.normalized_digest);
+        assert_eq!(unix.anchors, windows.anchors);
+    }
+
+    #[test]
+    fn staged_insert_before_and_trailing_newline_replacement_map_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        let inserted = staged_edit(
+            &manager,
+            "insert",
+            "a\nb\n",
+            &[(1, 1, "insert_before", "new")],
+        );
+        assert_eq!(inserted.output_lines.join("\n"), "a\nnew\nb\n");
+        assert_eq!(
+            inserted.provenance[2],
+            LineProvenance::Preserved { original_idx: 1 }
+        );
+        let replaced = staged_edit(&manager, "replace", "a\nb", &[(0, 1, "replace", "new\n")]);
+        assert_eq!(replaced.output_lines, vec!["new", ""]);
+        assert!(
+            replaced
+                .provenance
+                .iter()
+                .all(|origin| matches!(origin, LineProvenance::Created { .. }))
+        );
+    }
+
+    #[test]
+    fn staged_large_to_large_keeps_snapshot_lifetime_without_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        let content = (0..=MAX_TRACKED_LINES)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let transition = staged_edit(&manager, "large", &content, &[(0, 0, "replace", "changed")]);
+        assert!(transition.snapshot_mode);
+        assert_eq!(transition.retired_identities.len(), MAX_TRACKED_LINES + 1);
+        assert!(transition.document.used_words_set.is_empty());
+        assert_eq!(
+            transition.anchors,
+            snapshot_line_anchors(&transition.output_lines)
+        );
+        manager
+            .commit_transitions_checked(&[transition.clone()])
+            .unwrap();
+        assert!(!manager.is_tracking("large", Some("staged")));
+        assert_eq!(
+            manager
+                .observe_snapshot("large", &transition.output_lines.join("\n"), Some("staged"))
+                .unwrap()
+                .anchors,
+            transition.anchors
+        );
+    }
+
+    #[test]
+    fn staged_commit_rejects_stale_generation_and_preserves_all_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let first = AnchorStateManager::with_cache_file(cache.clone());
+        let second = AnchorStateManager::with_cache_file(cache.clone());
+        let stale = staged_edit(&second, "same", "old", &[(0, 0, "replace", "stale")]);
+        let independent = staged_edit(&second, "independent", "old", &[(0, 0, "replace", "new")]);
+        first
+            .commit_transitions_checked(&[staged_edit(
+                &first,
+                "same",
+                "old",
+                &[(0, 0, "replace", "winner")],
+            )])
+            .unwrap();
+        let bytes = std::fs::read(&cache).unwrap();
+        let memory = second.storage().tasks.clone();
+        assert!(matches!(
+            second.commit_transitions_checked(&[independent, stale]),
+            Err(AnchorTransitionError::StaleGeneration { .. })
+        ));
+        assert_eq!(std::fs::read(&cache).unwrap(), bytes);
+        assert_eq!(second.storage().tasks, memory);
+    }
+
+    #[test]
+    fn staged_persistence_and_mutated_metadata_fail_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        let transition = staged_edit(&manager, "file", "old", &[(0, 0, "replace", "new")]);
+        let mut corrupted = transition.clone();
+        corrupted.anchors[0] = "forged".into();
+        assert!(matches!(
+            manager.commit_transitions_checked(&[corrupted]),
+            Err(AnchorTransitionError::Validation(_))
+        ));
+        std::fs::create_dir(cache.with_extension("json.lock")).unwrap_err();
+        // An unreadable cache must not be treated as an empty cache and overwritten.
+        std::fs::create_dir(&cache).unwrap();
+        let before = manager.storage().tasks.clone();
+        assert!(matches!(
+            manager.commit_transitions_checked(&[transition]),
+            Err(AnchorTransitionError::Persistence(_))
+        ));
+        assert_eq!(manager.storage().tasks, before);
+        assert!(cache.is_dir());
+    }
+
+    #[test]
+    fn staged_corrupt_cache_retry_remains_persistence_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        let _ = manager.reconcile("file", &split_content_lines("old"), Some("staged"));
+        std::fs::write(&cache, "malformed cache").unwrap();
+        for _ in 0..2 {
+            // A legacy best-effort reread cannot repair storage, and must not
+            // turn a storage error into a stale-anchor retry at observation.
+            let _ = manager.reconcile("file", &split_content_lines("changed"), Some("staged"));
+            let before = manager.storage().tasks.clone();
+            assert!(matches!(
+                manager.observe_snapshot("file", "changed", Some("staged")),
+                Err(AnchorTransitionError::Persistence(_))
+            ));
+            assert_eq!(manager.storage().tasks, before);
+            assert_eq!(std::fs::read_to_string(&cache).unwrap(), "malformed cache");
+        }
+        let fresh = AnchorStateManager::with_cache_file(cache);
+        assert!(matches!(
+            fresh.observe_snapshot("unknown", "text", None),
+            Err(AnchorTransitionError::Persistence(_))
+        ));
+        assert!(fresh.storage().tasks.is_empty());
+    }
+
+    #[test]
+    fn concurrent_cache_saves_preserve_new_tasks_and_enforce_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let seed = AnchorStateManager::with_cache_file(cache.clone());
+        let document = seed
+            .observe_snapshot("seed", "line", None)
+            .unwrap()
+            .document;
+        {
+            let mut storage = seed.storage();
+            for index in 0..MAX_TRACKED_TASKS - 1 {
+                storage.tasks.insert(
+                    format!("seed-{index}"),
+                    IndexMap::from([("file".into(), document.clone())]),
+                );
+            }
+            storage.tasks.insert(
+                "wide".into(),
+                (0..=MAX_TRACKED_FILES)
+                    .map(|index| (format!("file-{index}"), document.clone()))
+                    .collect(),
+            );
+        }
+        seed.save();
+        assert_eq!(seed.storage().tasks["wide"].len(), MAX_TRACKED_FILES);
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        std::thread::scope(|scope| {
+            for index in 0..4 {
+                let manager = AnchorStateManager::with_cache_file(cache.clone());
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let _ =
+                        manager.reconcile("file", &["new".into()], Some(&format!("new-{index}")));
+                });
+            }
+        });
+        let tasks = AnchorStorage::read_tasks(&cache).unwrap();
+        assert_eq!(tasks.len(), MAX_TRACKED_TASKS);
+        assert!(tasks.values().all(|files| files.len() <= MAX_TRACKED_FILES));
+        for index in 0..4 {
+            assert!(tasks.contains_key(&format!("new-{index}")));
+        }
+        assert_eq!(tasks["wide"].len(), MAX_TRACKED_FILES);
+    }
+
+    #[test]
+    fn staged_large_snapshot_crossing_down_retires_every_snapshot_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        let content = (0..=MAX_TRACKED_LINES)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let transition = staged_edit(&manager, "large", &content, &[(0, 1, "replace", "")]);
+        assert!(!transition.snapshot_mode);
+        assert_eq!(transition.retired_identities.len(), MAX_TRACKED_LINES + 1);
+        assert!(
+            transition
+                .provenance
+                .iter()
+                .all(|origin| matches!(origin, LineProvenance::Created { .. }))
+        );
+        manager
+            .commit_transitions_checked(&[transition.clone()])
+            .unwrap();
+        assert_eq!(
+            manager
+                .observe_snapshot("large", &transition.output_lines.join("\n"), Some("staged"))
+                .unwrap()
+                .anchors,
+            transition.anchors
+        );
+    }
+
+    #[test]
+    fn staged_stale_reader_adopts_newer_words_and_cannot_overwrite_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let first = AnchorStateManager::with_cache_file(cache.clone());
+        let original = "same\nold\nsame";
+        let _ = first.reconcile("file", &split_content_lines(original), Some("staged"));
+        let stale = AnchorStateManager::with_cache_file(cache.clone());
+        let transition = staged_edit(&first, "file", original, &[(1, 1, "replace", "new")]);
+        first
+            .commit_transitions_checked(&[transition.clone()])
+            .unwrap();
+        stale.save();
+        assert_eq!(
+            AnchorStateManager::with_cache_file(cache)
+                .get_anchors("file", Some("staged"))
+                .unwrap(),
+            transition.anchors
+        );
+        assert_eq!(
+            stale.reconcile("file", &transition.output_lines, Some("staged")),
+            transition.anchors
+        );
+    }
+
+    #[test]
+    fn staged_invalidation_does_not_delete_persisted_or_newer_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        let _ = manager.reconcile("file", &split_content_lines("old"), Some("staged"));
+        let original = std::fs::read(&cache).unwrap();
+        manager.invalidate_state("file", Some("staged"));
+        assert_eq!(std::fs::read(&cache).unwrap(), original);
+        manager.save();
+        assert_eq!(std::fs::read(&cache).unwrap(), original);
+
+        let fresh = AnchorStateManager::with_cache_file(cache.clone());
+        assert!(matches!(
+            fresh.observe_snapshot("file", "unpublished", Some("staged")),
+            Err(AnchorTransitionError::StaleGeneration { .. })
+        ));
+        let reread = fresh.reconcile("file", &split_content_lines("unpublished"), Some("staged"));
+        assert_eq!(
+            fresh
+                .observe_snapshot("file", "unpublished", Some("staged"))
+                .unwrap()
+                .anchors,
+            reread
+        );
+
+        let transition = staged_edit(
+            &fresh,
+            "file",
+            "unpublished",
+            &[(0, 0, "replace", "winner")],
+        );
+        fresh
+            .commit_transitions_checked(&[transition.clone()])
+            .unwrap();
+        let committed = std::fs::read(&cache).unwrap();
+        manager.invalidate_state("file", Some("staged"));
+        manager.save();
+        assert_eq!(std::fs::read(&cache).unwrap(), committed);
+        let restarted = AnchorStateManager::with_cache_file(cache);
+        assert_eq!(
+            restarted
+                .observe_snapshot("file", "winner", Some("staged"))
+                .unwrap()
+                .anchors,
+            transition.anchors
+        );
+        assert!(matches!(
+            restarted.observe_snapshot("file", "unpublished", Some("staged")),
+            Err(AnchorTransitionError::StaleGeneration { .. })
+        ));
+    }
+
+    #[test]
+    fn unchanged_reconcile_republishes_missing_durable_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        let content = "same\nother\n";
+        let lines = split_content_lines(content);
+        let initial = manager.reconcile("file", &lines, Some("staged"));
+
+        std::fs::remove_file(&cache).unwrap();
+        let reread = manager.reconcile("file", &lines, Some("staged"));
+
+        assert_eq!(reread, initial);
+        assert!(cache.exists());
+        let restarted = AnchorStateManager::with_cache_file(cache);
+        let snapshot = restarted
+            .observe_snapshot("file", content, Some("staged"))
+            .unwrap();
+        assert_eq!(snapshot.anchors, initial);
+        assert!(snapshot.expected.is_some());
+    }
     use super::*;
 
     #[tokio::test]
@@ -2280,10 +3419,8 @@ mod tests {
 
     #[test]
     fn test_anchor_state_manager_task_scoping() {
-        // Do NOT call reset(None) here — it races with other tests that share the
-        // global AnchorStorage.  Each test uses a unique task_id, so scoping is
-        // already verified without clearing global state.
-        let anchor_mgr = AnchorStateManager::new();
+        let dir = tempfile::tempdir().unwrap();
+        let anchor_mgr = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
         let lines = vec!["def hello():".to_string()];
 
         let anchors1 = anchor_mgr.reconcile("/tmp/scope1.py", &lines, Some("scope_task1"));
@@ -2676,10 +3813,11 @@ mod tests {
     #[test]
     fn test_file_editor_end_to_end() {
         let task_id = "e2e_test";
-        let anchor_mgr = AnchorStateManager::new();
-        anchor_mgr.reset(Some(task_id));
-
-        let editor = FileEditor::new();
+        let dir = tempfile::tempdir().unwrap();
+        let editor = FileEditor {
+            executor: EditExecutor::new(),
+            anchor_mgr: AnchorStateManager::with_cache_file(dir.path().join("anchors.json")),
+        };
         let content = "def hello():\n    print('world')\n    return 42";
 
         // First reconcile to get anchors

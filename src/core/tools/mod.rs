@@ -340,6 +340,7 @@ pub enum ToolFailureClass {
     AnchorInvalid,
     RangeInsufficient,
     RootListingFailed,
+    StorageFailure,
 }
 
 /// Internal failure metadata carried with tool errors.
@@ -348,6 +349,14 @@ pub struct ToolFailureMetadata {
     pub class: ToolFailureClass,
     pub affected_paths: Vec<String>,
     pub required_next_step: Option<ToolRequiredNextStep>,
+}
+
+/// Content and anchor publication are separate outcomes for each edited path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolPublicationOutcome {
+    pub path: String,
+    pub content_applied: bool,
+    pub anchors_published: bool,
 }
 
 /// Sanitize and resolve a path relative to the workspace root.
@@ -612,6 +621,12 @@ pub enum ToolError {
     InvalidInputWithMetadata(String, ToolFailureMetadata),
     #[error("Execution failed: {0}")]
     ExecutionFailedWithMetadata(String, ToolFailureMetadata),
+    #[error("Execution failed: {0}")]
+    ExecutionFailedWithPublicationMetadata(
+        String,
+        ToolFailureMetadata,
+        Vec<ToolPublicationOutcome>,
+    ),
 }
 
 impl ToolError {
@@ -619,8 +634,17 @@ impl ToolError {
     pub fn metadata(&self) -> Option<&ToolFailureMetadata> {
         match self {
             Self::InvalidInputWithMetadata(_, metadata)
-            | Self::ExecutionFailedWithMetadata(_, metadata) => Some(metadata),
+            | Self::ExecutionFailedWithMetadata(_, metadata)
+            | Self::ExecutionFailedWithPublicationMetadata(_, metadata, _) => Some(metadata),
             Self::InvalidInput(_) | Self::ExecutionFailed(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn publication_outcomes(&self) -> Option<&[ToolPublicationOutcome]> {
+        match self {
+            Self::ExecutionFailedWithPublicationMetadata(_, _, outcomes) => Some(outcomes),
+            _ => None,
         }
     }
 }

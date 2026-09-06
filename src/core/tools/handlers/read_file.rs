@@ -11,9 +11,7 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::file_editor::{AnchorStateManager, normalize_file_content, split_content_lines};
-use crate::core::hash_utils::{
-    content_hash, duplicate_content_info_for_range, format_line_with_hash_and_count,
-};
+use crate::core::hash_utils::{ANCHOR_GUIDANCE, content_hash, format_line_with_hash};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use futures::StreamExt;
 use std::future::Future;
@@ -294,7 +292,7 @@ impl ReadFileHandler {
             full_lines,
             range_start,
             range_end,
-            line_number_offset,
+            _line_number_offset,
             refreshes_edit_context,
         ) = if has_line_range {
             let large_file_range = metadata.len() > max_read_size as u64;
@@ -382,7 +380,22 @@ impl ReadFileHandler {
         let lines_for_reconcile = full_lines.as_ref().expect(
             "full_lines must be Some: all read paths (range/truncated/full) return Some(full_lines)"
         );
-        let anchors = anchor_mgr.reconcile(path, lines_for_reconcile, task_id);
+        let anchors = match anchor_mgr.reconcile_checked(path, lines_for_reconcile, task_id) {
+            Ok(anchors) => anchors,
+            Err(error) => {
+                return FileReadResult {
+                    path: display_path.to_string(),
+                    canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
+                    content: String::new(),
+                    hash: String::new(),
+                    success: false,
+                    refreshes_edit_context: false,
+                    error: Some(format!(
+                        "Unable to persist editable anchor state for {display_path}: {error}"
+                    )),
+                };
+            }
+        };
 
         let output_lines = &sliced_lines;
         let output_anchors = if has_line_range {
@@ -412,37 +425,12 @@ impl ReadFileHandler {
             };
         }
 
-        let anchored_content = {
-            let (duplicate_start, duplicate_end) = if has_line_range && refreshes_edit_context {
-                (range_start, range_end)
-            } else {
-                (0, output_lines.len())
-            };
-            let duplicate_info = duplicate_content_info_for_range(
-                lines_for_reconcile,
-                duplicate_start,
-                duplicate_end,
-            );
-            output_lines
-                .iter()
-                .zip(output_anchors.iter())
-                .zip(duplicate_info.iter())
-                .map(|((line, anchor), info)| {
-                    format_line_with_hash_and_count(
-                        line,
-                        anchor,
-                        &info.other_indices,
-                        info.other_count,
-                        if refreshes_edit_context {
-                            0
-                        } else {
-                            line_number_offset
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let anchored_content = output_lines
+            .iter()
+            .zip(output_anchors.iter())
+            .map(|(line, anchor)| format_line_with_hash(line, anchor, &[]))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let hash_content = if refreshes_edit_context {
             full_lines
@@ -454,7 +442,8 @@ impl ReadFileHandler {
         };
         let hash = content_hash(&hash_content);
 
-        let mut content = format!("[File: {display_path}, Hash: {hash}]\n{anchored_content}");
+        let mut content =
+            format!("[File: {display_path}, Hash: {hash}]\n{ANCHOR_GUIDANCE}\n{anchored_content}");
         if refreshes_edit_context
             && lines_for_reconcile.len() > crate::core::file_editor::MAX_TRACKED_LINES
         {
@@ -1400,7 +1389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_line_range_reports_absolute_duplicate_lines() {
+    async fn test_read_file_line_range_preserves_clean_occurrence_anchor() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "same").unwrap();
         writeln!(temp_file, "different").unwrap();
@@ -1418,7 +1407,14 @@ mod tests {
             .await;
 
         assert!(result.success);
-        assert!(result.content.contains("identical content also at lines 1"));
+        assert!(!result.content.contains("identical content also at lines"));
+        let line = result
+            .content
+            .lines()
+            .find(|line| line.contains("§same"))
+            .unwrap();
+        assert_eq!(crate::core::hash_utils::split_anchor(line).1, "same");
+        assert_eq!(result.content.matches(ANCHOR_GUIDANCE).count(), 1);
     }
 
     #[tokio::test]
@@ -2151,7 +2147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_annotates_duplicate_content_lines() {
+    async fn test_read_file_distinguishes_duplicate_content_with_clean_prefixes() {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "unique line one").unwrap();
         writeln!(temp_file, "    \"\"\"").unwrap();
@@ -2178,10 +2174,19 @@ mod tests {
             .matches("identical content also at lines")
             .count();
         assert_eq!(
-            dup_line_annotations, 2,
-            "both duplicate `    \"\"\"` lines must be annotated, got: {}",
+            dup_line_annotations, 0,
+            "duplicate lines must not be annotated, got: {}",
             result.content
         );
+        let duplicates: Vec<_> = result
+            .content
+            .lines()
+            .filter(|line| line.ends_with("§    \"\"\""))
+            .map(crate::core::hash_utils::split_anchor)
+            .collect();
+        assert_eq!(duplicates.len(), 2);
+        assert_ne!(duplicates[0].0, duplicates[1].0);
+        assert_eq!(result.content.matches(ANCHOR_GUIDANCE).count(), 1);
         let unique_line_count = result
             .content
             .matches("unique line one")

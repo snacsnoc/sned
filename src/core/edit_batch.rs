@@ -4,7 +4,7 @@
 
 use crate::core::file_editor::{
     AppliedEdit, ApplyOutcome, Edit, EditExecutor, FailedEdit, FileEditorError, ResolvedEdit,
-    UnchangedSite, split_content_lines,
+    SpliceProvenance, UnchangedSite, split_content_lines,
 };
 use crate::core::hash_utils::format_line_with_hash;
 use crate::core::tools::handlers::error_guidance;
@@ -53,6 +53,7 @@ pub struct FileEditBatch {
 /// Result of preparing edits for a file.
 #[derive(Debug, Clone)]
 pub struct PreparedEdits {
+    pub provenance: SpliceProvenance,
     pub content: String,
     pub final_content: String,
     pub diff: String,
@@ -279,6 +280,7 @@ impl BatchProcessor {
         }
 
         Ok(PreparedEdits {
+            provenance: SpliceProvenance::default(),
             content: content.to_string(),
             final_content: content.to_string(),
             diff: String::new(),
@@ -300,9 +302,9 @@ impl BatchProcessor {
         _absolute_path: &str,
         display_path: &str,
     ) -> BatchResult {
-        let outcome = self
+        let (outcome, provenance) = self
             .executor
-            .apply_edits(&batch.lines, &batch.resolved_edits);
+            .apply_edits_with_provenance(&batch.lines, &batch.resolved_edits);
         match outcome {
             ApplyOutcome::Overlap => BatchResult {
                 success: false,
@@ -351,6 +353,7 @@ impl BatchProcessor {
                 unchanged_sites,
             ) => {
                 let resolved_count = applied_edits.len();
+                batch.provenance = provenance;
                 batch.final_lines = final_lines.clone();
                 batch.final_content = final_lines.join("\n");
                 batch.applied_edits = applied_edits;
@@ -578,8 +581,15 @@ impl BatchProcessor {
         let summary = if prepared.applied_edits.is_empty() {
             format!("No changes applied.{unchanged_note}{failure_note}")
         } else {
+            let anchor_note = if final_lines.len() > crate::core::file_editor::MAX_TRACKED_LINES {
+                "All previous anchors expired. The new large-file snapshot anchors expire after any edit, including anchors for untouched lines; use newly returned anchors or read_file again."
+            } else if prepared.lines.len() > crate::core::file_editor::MAX_TRACKED_LINES {
+                "All previous large-file snapshot anchors expired. This file now has new tracked anchors; use the anchors shown or read_file for lines not shown."
+            } else {
+                "Untouched lines retain their anchors; inserted or replaced lines have new anchors. Deleted or replaced anchors are retired. Use the shown anchors for changed lines."
+            };
             format!(
-                "Applied {} edit(s) successfully (+{total_added}, -{total_removed} lines). NOTE the UPDATED anchors below.{unchanged_note}{failure_note}",
+                "Applied {} edit(s) successfully (+{total_added}, -{total_removed} lines). {anchor_note}{unchanged_note}{failure_note}",
                 prepared.applied_edits.len()
             )
         };
@@ -950,6 +960,11 @@ mod tests {
         assert!(result.final_content.is_some());
         let final_content = result.final_content.unwrap();
         assert!(final_content.contains("fn greeting()"));
+        assert_eq!(
+            prepared.provenance.origins,
+            vec![None, None, Some(2), Some(3)]
+        );
+        assert_eq!(prepared.provenance.edit_ranges, prepared.applied_edits);
     }
 
     #[test]
@@ -1225,7 +1240,67 @@ mod tests {
             processor.format_result("format.rs", &prepared, &final_lines, &final_hashes, None);
 
         assert!(formatted.contains("Applied 1 edit(s) successfully"));
-        assert!(formatted.contains("NOTE the UPDATED anchors below"));
+        let summary = formatted.split("\n\n").next().unwrap();
+        assert!(summary.contains("Untouched lines retain their anchors"));
+        assert!(summary.contains("inserted or replaced lines have new anchors"));
+        assert!(summary.contains("Deleted or replaced anchors are retired"));
+        assert!(!formatted.contains("NOTE the UPDATED anchors below"));
+    }
+
+    #[test]
+    fn test_format_result_snapshot_threshold_crossing_guidance_stays_in_summary() {
+        for (before_count, after_count) in [(5001, 2), (2, 5001)] {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+            let content = (0..before_count)
+                .map(|index| format!("old {index}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let replacement = (0..after_count)
+                .map(|index| format!("new {index}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let snapshot = manager.observe_snapshot("file", &content, None).unwrap();
+            let edits = [Edit {
+                anchor: format!("{}§old 0", snapshot.anchors()[0]),
+                end_anchor: Some(format!(
+                    "{}§old {}",
+                    snapshot.anchors()[before_count - 1],
+                    before_count - 1
+                )),
+                edit_type: "replace".into(),
+                text: replacement,
+                content: None,
+            }];
+            let processor = BatchProcessor::new(DiffMode::Full);
+            let mut prepared = processor
+                .prepare_edits("file", "file", &content, &edits, snapshot.anchors())
+                .unwrap();
+            assert!(processor.apply_batch(&mut prepared, "file", "file").success);
+            let transition = manager
+                .stage_transition(&snapshot, &prepared.final_content, &prepared.provenance)
+                .unwrap();
+            let formatted = processor.format_result(
+                "file",
+                &prepared,
+                &prepared.final_lines,
+                transition.anchors(),
+                None,
+            );
+            let summary = formatted.split("\n\n").next().unwrap();
+            assert!(summary.starts_with("Applied 1 edit(s) successfully"));
+            assert!(!summary.contains("Untouched lines retain their anchors"));
+            if after_count > crate::core::file_editor::MAX_TRACKED_LINES {
+                assert!(summary.contains("All previous anchors expired"));
+                assert!(
+                    summary
+                        .contains("expire after any edit, including anchors for untouched lines")
+                );
+            } else {
+                assert!(summary.contains("All previous large-file snapshot anchors expired"));
+                assert!(summary.contains("new tracked anchors"));
+            }
+        }
     }
 
     #[test]
@@ -1238,6 +1313,7 @@ mod tests {
             content: None,
         };
         let prepared = PreparedEdits {
+            provenance: SpliceProvenance::default(),
             content: "same\nsame".to_string(),
             final_content: "same".to_string(),
             diff: String::new(),

@@ -14,6 +14,292 @@ struct Workflow {
 }
 
 #[tokio::test]
+async fn native_workflow_known_edit_preserves_untouched_duplicate_identity() {
+    let w = Workflow::new(b"head\n}\nmiddle\n}\ntail\n");
+    let copied = w.read(None).await;
+    w.edit(json!([{"anchor": copied[2], "edit_type": "insert_before", "text": "inserted\n}"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\n}\ninserted\n}\nmiddle\n}\ntail\n");
+    w.edit(json!([{"anchor": copied[3], "text": "} // original below"}]))
+        .await
+        .expect("known insertion must preserve the untouched duplicate below it");
+    w.assert_bytes(b"head\n}\ninserted\n}\nmiddle\n} // original below\ntail\n");
+    w.edit(json!([{"anchor": copied[1], "text": "} // original above"}]))
+        .await
+        .expect("successive known edits must preserve the untouched duplicate above them");
+    w.assert_bytes(b"head\n} // original above\ninserted\n}\nmiddle\n} // original below\ntail\n");
+}
+
+#[tokio::test]
+async fn native_workflow_known_edit_duplicate_format_matrix() {
+    for newline in ["\n", "\r\n"] {
+        for bom in ["", "\u{feff}"] {
+            for terminal in [false, true] {
+                for edit_type in ["replace", "insert_before", "insert_after"] {
+                    // Either side must be independently reachable on a failing implementation.
+                    for below_first in [false, true] {
+                        let encode = |lines: &[&str]| {
+                            format!(
+                                "{bom}{}{}",
+                                lines.join(newline),
+                                if terminal { newline } else { "" }
+                            )
+                        };
+                        let before = encode(&["雪", "}", "middle", "}", "tail"]);
+                        let w = Workflow::new(before.as_bytes());
+                        let copied = w.read(None).await;
+                        w.edit(json!([{"anchor": copied[2], "edit_type": edit_type, "text": "new\n}"}]))
+                            .await
+                            .unwrap();
+                        let mut expected = match edit_type {
+                            "replace" => vec!["雪", "}", "new", "}", "}", "tail"],
+                            "insert_before" => vec!["雪", "}", "new", "}", "middle", "}", "tail"],
+                            _ => vec!["雪", "}", "middle", "new", "}", "}", "tail"],
+                        };
+                        w.assert_bytes(encode(&expected).as_bytes());
+                        for index in if below_first { [3, 1] } else { [1, 3] } {
+                            let replacement = if index == 1 {
+                                "} // above"
+                            } else {
+                                "} // below"
+                            };
+                            w.edit(json!([{"anchor": copied[index], "text": replacement}]))
+                                .await
+                                .unwrap_or_else(|error| panic!("{newline:?} BOM={bom:?} terminal={terminal} {edit_type} original index={index}: {error}"));
+                            let position = if index == 1 { 1 } else { expected.len() - 2 };
+                            expected[position] = replacement;
+                            w.assert_bytes(encode(&expected).as_bytes());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_workflow_known_edit_insertion_has_fresh_identity() {
+    let w = Workflow::new(b"head\n}\nmiddle\n}\ntail\n");
+    let copied = w.read(None).await;
+    w.edit(json!([{"anchor": copied[2], "edit_type": "insert_before", "text": "new\n}"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\n}\nnew\n}\nmiddle\n}\ntail\n");
+    let fresh = w.read(None).await;
+    // Only inspect words copied from tool output; never synthesize an anchor.
+    for original in [&copied[1], &copied[3]] {
+        assert_ne!(
+            fresh[3].split_once('§').unwrap().0,
+            original.split_once('§').unwrap().0
+        );
+    }
+    w.edit(json!([{"anchor": fresh[3], "text": "} // inserted"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\n}\nnew\n} // inserted\nmiddle\n}\ntail\n");
+    w.edit(json!([{"anchor": copied[3], "text": "} // original below"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\n}\nnew\n} // inserted\nmiddle\n} // original below\ntail\n");
+    w.edit(json!([{"anchor": copied[1], "text": "} // original above"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(
+        b"head\n} // original above\nnew\n} // inserted\nmiddle\n} // original below\ntail\n",
+    );
+}
+
+#[tokio::test]
+async fn native_workflow_known_edit_noop_keeps_duplicate_anchors() {
+    for newline in ["\n", "\r\n"] {
+        let before = ["head", "}", "middle", "}", "tail", ""].join(newline);
+        let w = Workflow::new(before.as_bytes());
+        let copied = w.read(None).await;
+        for index in [1, 2, 3, 1] {
+            let text = if index == 2 { "middle" } else { "}" };
+            w.edit(json!([{"anchor": copied[index], "text": text}]))
+                .await
+                .unwrap();
+            w.assert_bytes(before.as_bytes());
+        }
+        for (index, text, expected) in [
+            (3, "below", vec!["head", "}", "middle", "below", "tail", ""]),
+            (
+                1,
+                "above",
+                vec!["head", "above", "middle", "below", "tail", ""],
+            ),
+        ] {
+            w.edit(json!([{"anchor": copied[index], "text": text}]))
+                .await
+                .unwrap();
+            w.assert_bytes(expected.join(newline).as_bytes());
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_workflow_known_edit_structural_reads_preserve_duplicate_identity() {
+    use sned::core::tools::handlers::{
+        find_symbol_references::FindSymbolReferencesHandler,
+        get_file_skeleton::GetFileSkeletonHandler, get_function::GetFunctionHandler,
+    };
+    for newline in ["\n", "\r\n"] {
+        for reader in ["function", "skeleton", "references"] {
+            let w = Workflow::new(b"");
+            let source = ["fn foo() {", "}", "fn main() {", "    foo();", "}", ""].join(newline);
+            std::fs::write(w.dir.path().join("code.rs"), source).unwrap();
+            let copied = w.read_path("code.rs", None).await;
+            w.edit_path("code.rs", json!([{"anchor": copied[2], "edit_type": "insert_before", "text": "fn added() {\n}"}]))
+                .await
+                .unwrap();
+            let mut expected = vec![
+                "fn foo() {",
+                "}",
+                "fn added() {",
+                "}",
+                "fn main() {",
+                "    foo();",
+                "}",
+                "",
+            ];
+            assert_eq!(
+                std::fs::read(w.dir.path().join("code.rs")).unwrap(),
+                expected.join(newline).as_bytes()
+            );
+            let output = match reader {
+                "function" => {
+                    ToolHandler::execute(
+                        &GetFunctionHandler,
+                        &w.ctx,
+                        json!({"path":"code.rs", "name":"foo"}),
+                    )
+                    .await
+                }
+                "skeleton" => {
+                    ToolHandler::execute(
+                        &GetFileSkeletonHandler,
+                        &w.ctx,
+                        json!({"paths":["code.rs"]}),
+                    )
+                    .await
+                }
+                _ => {
+                    ToolHandler::execute(
+                        &FindSymbolReferencesHandler::new(),
+                        &w.ctx,
+                        json!({"paths":["code.rs"], "name":"foo"}),
+                    )
+                    .await
+                }
+            }
+            .unwrap();
+            assert!(!output.as_str().unwrap().is_empty(), "{reader}");
+            // No read_file refresh between the structural read and copied-anchor edits.
+            for (index, position, text) in [(4, 6, "} // main"), (1, 1, "} // foo")] {
+                w.edit_path("code.rs", json!([{"anchor": copied[index], "text": text}]))
+                    .await
+                    .unwrap_or_else(|error| panic!("{reader} {newline:?}: {error}"));
+                expected[position] = text;
+                assert_eq!(
+                    std::fs::read(w.dir.path().join("code.rs")).unwrap(),
+                    expected.join(newline).as_bytes()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_workflow_known_edit_manager_matches_copied_duplicate_identity() {
+    let w = Workflow::new(b"head\n}\nmiddle\n}\ntail\n");
+    let copied = w.read(None).await;
+    w.edit(json!([{"anchor": copied[2], "edit_type": "insert_before", "text": "new\n}"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\n}\nnew\n}\nmiddle\n}\ntail\n");
+    let path = w.dir.path().join("fixture.txt").canonicalize().unwrap();
+    let managed = w
+        .ctx
+        .anchor_mgr
+        .get_anchors(path.to_str().unwrap(), Some(&w.ctx.task_id))
+        .unwrap();
+    assert_eq!(
+        managed[1],
+        copied[1].split_once('§').unwrap().0,
+        "original above retains identity"
+    );
+    assert_eq!(
+        managed[5],
+        copied[3].split_once('§').unwrap().0,
+        "original below retains identity"
+    );
+    assert_ne!(
+        managed[3], managed[1],
+        "inserted duplicate has fresh identity"
+    );
+    assert_ne!(
+        managed[3], managed[5],
+        "inserted duplicate cannot borrow the lower identity"
+    );
+    w.edit(json!([{"anchor": copied[3], "text": "below"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\n}\nnew\n}\nmiddle\nbelow\ntail\n");
+    let after = w
+        .ctx
+        .anchor_mgr
+        .get_anchors(path.to_str().unwrap(), Some(&w.ctx.task_id))
+        .unwrap();
+    assert_eq!(after[1], managed[1]);
+    assert_eq!(after[3], managed[3]);
+    w.edit(json!([{"anchor": copied[1], "text": "above"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\nabove\nnew\n}\nmiddle\nbelow\ntail\n");
+}
+
+#[tokio::test]
+async fn native_workflow_known_edit_external_duplicate_change_rejects_old_identity() {
+    for reread in [false, true] {
+        let w = Workflow::new(b"head\n}\nmiddle\n}\ntail\n");
+        let copied = w.read(None).await;
+        w.edit(json!([{"anchor": copied[2], "text": "changed"}]))
+            .await
+            .unwrap();
+        w.assert_bytes(b"head\n}\nchanged\n}\ntail\n");
+        let path = w.dir.path().join("fixture.txt");
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let external = b"head\nchanged\n}\ntail\n";
+        std::fs::write(&path, external).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        if reread {
+            w.read(None).await;
+        }
+        let error = w
+            .edit(json!([{"anchor": copied[3], "text": "unsafe"}]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.metadata().unwrap().required_next_step,
+            Some(ToolRequiredNextStep::ReadFile)
+        );
+        w.assert_bytes(external);
+        let fresh = w.read(None).await;
+        w.edit(json!([{"anchor": fresh[2], "text": "safe"}]))
+            .await
+            .unwrap();
+        w.assert_bytes(b"head\nchanged\nsafe\ntail\n");
+    }
+}
+
+#[tokio::test]
 async fn native_workflow_diff_context_exposes_usable_duplicate_anchors() {
     let w = Workflow::new(b"head\n}\ntarget\n}\ntail\n");
     let a = w.read(None).await;
@@ -652,9 +938,11 @@ async fn native_workflow_duplicate_occurrences_outside_range() {
         let full = w.read(None).await;
         let selected = w.read(Some((index + 6, index + 6))).await;
         assert_eq!(selected[0], full[index + 5]);
-        if !selected[0].ends_with("§") {
-            assert!(selected[0].contains(&format!("lines {}", index + 1)));
-        }
+        assert_eq!(
+            selected[0].split_once('§').unwrap().1,
+            before.split('\n').nth(index + 5).unwrap()
+        );
+        assert!(!selected[0].contains("identical content also at lines"));
         w.edit(json!([{"anchor": selected[0], "text": "changed"}]))
             .await
             .unwrap();
@@ -828,6 +1116,21 @@ async fn native_workflow_restart_preserves_occurrence_history() {
 }
 
 #[tokio::test]
+async fn native_workflow_reread_republishes_missing_anchor_cache() {
+    let w = Workflow::new(b"first\nsecond\n");
+    let anchors = w.read(None).await;
+    let cache = w.dir.path().join("anchors.json");
+    std::fs::remove_file(&cache).unwrap();
+
+    assert_eq!(w.read(None).await, anchors);
+    assert!(cache.exists());
+    w.edit(json!([{"anchor": anchors[0], "text": "updated"}]))
+        .await
+        .expect("a successful reread must restore durable anchor state");
+    w.assert_bytes(b"updated\nsecond\n");
+}
+
+#[tokio::test]
 async fn native_workflow_schema_error_does_not_force_reread() {
     let w = Workflow::new(b"alpha missing anchor is stale\nbeta\n");
     let a = w.read(None).await;
@@ -949,9 +1252,13 @@ async fn native_workflow_large_snapshot_never_retargets_duplicate() {
 async fn native_workflow_copied_replacement_does_not_write_display_annotations() {
     let w = Workflow::new(b"/* duplicate */\nunchanged\n/* duplicate */\n");
     let a = w.read(None).await;
-    assert!(a[2].contains("[identical content also at lines 1]"));
-    let copied_replacement = a[2].replace("/* duplicate */", "/* selected */");
-    w.edit(json!([{"anchor": a[2], "text": copied_replacement}]))
+    assert_eq!(a[2].split_once('§').unwrap().1, "/* duplicate */");
+    assert!(!a[2].contains("identical content also at lines"));
+    // Historical-output compatibility: fresh reads no longer emit this suffix.
+    // Keep the real copied identity and append only the legacy display annotation.
+    let historical_anchor = format!("{} [identical content also at lines 1]", a[2]);
+    let copied_replacement = historical_anchor.replace("/* duplicate */", "/* selected */");
+    w.edit(json!([{"anchor": historical_anchor, "text": copied_replacement}]))
         .await
         .unwrap();
     w.assert_bytes(b"/* duplicate */\nunchanged\n/* selected */\n");
@@ -972,6 +1279,28 @@ async fn native_workflow_ranged_read_bounds_duplicate_metadata() {
     let selected = w.read(Some((50_000, 50_000))).await;
 
     assert_eq!(selected.len(), 1);
-    assert!(selected[0].contains("identical content also at lines"));
-    assert!(selected[0].contains("(99991 more)"));
+    assert_eq!(selected[0].split_once('§').unwrap().1, "same");
+    assert!(
+        selected[0].len() < 128,
+        "one copied anchor must stay bounded"
+    );
+    let output = ToolHandler::execute(
+        &ReadFileHandler::new(),
+        &w.ctx,
+        json!({"paths":["fixture.txt"], "start_line":50_000, "end_line":50_000}),
+    )
+    .await
+    .unwrap();
+    let output = output.as_str().unwrap();
+    assert!(!output.contains("identical content also at lines"));
+    assert!(
+        output.len() < 4096,
+        "ranged output must not grow with duplicate count"
+    );
+    w.edit(json!([{"anchor":selected[0], "text":"selected occurrence"}]))
+        .await
+        .unwrap();
+    let mut expected: Vec<&str> = before.split('\n').collect();
+    expected[49_999] = "selected occurrence";
+    w.assert_bytes(expected.join("\n").as_bytes());
 }
