@@ -1961,7 +1961,7 @@ impl EditFileHandler {
                 let final_content = result.final_content.as_deref().unwrap_or("");
                 let text_format = file_text_formats
                     .get(&batch.absolute_path)
-                    .copied()
+                    .cloned()
                     .unwrap_or_default();
                 match anchor_mgr.stage_transition(
                     &snapshots[&batch.absolute_path],
@@ -2012,7 +2012,7 @@ impl EditFileHandler {
                 if let Some(ref final_content) = result.final_content {
                     let text_format = file_text_formats
                         .get(&batch.absolute_path)
-                        .copied()
+                        .cloned()
                         .unwrap_or_default();
                     write_items.push(WriteItem {
                         absolute_path: batch.absolute_path.clone(),

@@ -42,9 +42,10 @@ pub(crate) enum FileLineEnding {
     CrLf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileTextFormat {
     pub line_ending: FileLineEnding,
+    pub line_endings: Vec<FileLineEnding>,
     pub has_utf8_bom: bool,
 }
 
@@ -52,6 +53,7 @@ impl Default for FileTextFormat {
     fn default() -> Self {
         Self {
             line_ending: FileLineEnding::Lf,
+            line_endings: Vec::new(),
             has_utf8_bom: false,
         }
     }
@@ -60,17 +62,19 @@ impl Default for FileTextFormat {
 pub(crate) fn normalize_file_content(content: &str) -> (String, FileTextFormat) {
     let has_utf8_bom = content.starts_with('\u{feff}');
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
-    let line_ending = content
-        .as_bytes()
+    let bytes = content.as_bytes();
+    let line_endings: Vec<FileLineEnding> = bytes
         .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(FileLineEnding::Lf, |index| {
-            if index > 0 && content.as_bytes()[index - 1] == b'\r' {
+        .enumerate()
+        .filter_map(|(index, byte)| {
+            (*byte == b'\n').then_some(if index > 0 && bytes[index - 1] == b'\r' {
                 FileLineEnding::CrLf
             } else {
                 FileLineEnding::Lf
-            }
-        });
+            })
+        })
+        .collect();
+    let line_ending = line_endings.first().copied().unwrap_or(FileLineEnding::Lf);
     let normalized = if content.contains("\r\n") {
         content.replace("\r\n", "\n")
     } else {
@@ -80,26 +84,36 @@ pub(crate) fn normalize_file_content(content: &str) -> (String, FileTextFormat) 
         normalized,
         FileTextFormat {
             line_ending,
+            line_endings,
             has_utf8_bom,
         },
     )
 }
 
 pub(crate) fn restore_file_content(content: &str, format: FileTextFormat) -> String {
-    let content = match format.line_ending {
-        FileLineEnding::Lf => content.to_string(),
-        FileLineEnding::CrLf => {
-            let mut restored = String::with_capacity(content.len());
-            let mut previous_was_cr = false;
-            for character in content.chars() {
-                if character == '\n' && !previous_was_cr {
+    let content = if format.line_endings.is_empty() && format.line_ending == FileLineEnding::Lf {
+        content.to_string()
+    } else {
+        let mut restored = String::with_capacity(content.len());
+        let mut previous_was_cr = false;
+        let mut newline_index = 0;
+        for character in content.chars() {
+            if character == '\n' && !previous_was_cr {
+                if format
+                    .line_endings
+                    .get(newline_index)
+                    .copied()
+                    .unwrap_or(format.line_ending)
+                    == FileLineEnding::CrLf
+                {
                     restored.push('\r');
                 }
-                restored.push(character);
-                previous_was_cr = character == '\r';
+                newline_index += 1;
             }
-            restored
+            restored.push(character);
+            previous_was_cr = character == '\r';
         }
+        restored
     };
     if format.has_utf8_bom {
         format!("\u{feff}{content}")
@@ -3224,7 +3238,29 @@ mod tests {
 
         assert_eq!(normalized, "first\nsecond\n");
         assert_eq!(format.line_ending, FileLineEnding::CrLf);
+        assert_eq!(
+            format.line_endings,
+            vec![FileLineEnding::CrLf, FileLineEnding::CrLf]
+        );
         assert!(format.has_utf8_bom);
+        assert_eq!(restore_file_content(&normalized, format), raw);
+    }
+
+    #[test]
+    fn test_file_content_normalization_preserves_mixed_line_endings() {
+        let raw = "first\r\nsecond\nthird\r\nfourth";
+
+        let (normalized, format) = normalize_file_content(raw);
+
+        assert_eq!(normalized, "first\nsecond\nthird\nfourth");
+        assert_eq!(
+            format.line_endings,
+            vec![
+                FileLineEnding::CrLf,
+                FileLineEnding::Lf,
+                FileLineEnding::CrLf,
+            ]
+        );
         assert_eq!(restore_file_content(&normalized, format), raw);
     }
 
@@ -3242,6 +3278,7 @@ mod tests {
     fn test_crlf_restoration_does_not_double_existing_carriage_returns() {
         let format = FileTextFormat {
             line_ending: FileLineEnding::CrLf,
+            line_endings: Vec::new(),
             has_utf8_bom: false,
         };
 

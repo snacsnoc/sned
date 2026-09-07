@@ -516,6 +516,7 @@ async fn prepare_batch(
         let (normalized_new_text, _) = normalize_file_content(&adjusted_new_text);
         let replacement_format = FileTextFormat {
             line_ending: file_format.line_ending,
+            line_endings: file_format.line_endings.clone(),
             has_utf8_bom: false,
         };
         let adjusted_new_text = restore_file_content(&normalized_new_text, replacement_format);
