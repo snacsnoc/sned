@@ -91,7 +91,7 @@ where
     use tokio::io::AsyncReadExt;
 
     let mut captured = CapturedOutput::new(limit);
-    let mut chunk = [0_u8; READ_CHUNK_BYTES];
+    let mut chunk = vec![0_u8; READ_CHUNK_BYTES];
     let mut pending_carriage_return = false;
     loop {
         let read = reader.read(&mut chunk).await?;
@@ -128,7 +128,7 @@ where
     F: FnMut(&[u8]),
 {
     let mut captured = CapturedOutput::new(limit);
-    let mut chunk = [0_u8; READ_CHUNK_BYTES];
+    let mut chunk = vec![0_u8; READ_CHUNK_BYTES];
     loop {
         let read = reader.read(&mut chunk)?;
         if read == 0 {

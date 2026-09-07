@@ -78,7 +78,7 @@ where
 
         loop {
             if self.pending.is_empty() {
-                let mut chunk = [0_u8; COMMAND_STREAM_READ_CHUNK_BYTES];
+                let mut chunk = vec![0_u8; COMMAND_STREAM_READ_CHUNK_BYTES];
                 let read = self.reader.read(&mut chunk).await?;
                 if read == 0 {
                     if self.discarding_line {

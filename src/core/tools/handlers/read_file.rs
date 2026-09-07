@@ -785,7 +785,7 @@ impl ReadFileHandler {
                 requested_range_complete = true;
                 // The full revision still covers the tail, but lines outside the
                 // requested range must not inherit its decoding or size limits.
-                let mut tail = [0u8; 64 * 1024];
+                let mut tail = vec![0u8; 64 * 1024];
                 loop {
                     let tail_len = reader.read(&mut tail).await.map_err(|error| {
                         let err =
