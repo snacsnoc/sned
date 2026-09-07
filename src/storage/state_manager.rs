@@ -37,6 +37,7 @@ impl StatePersistenceLock {
         fs::create_dir_all(parent)?;
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;

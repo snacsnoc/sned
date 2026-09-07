@@ -59,9 +59,10 @@ impl ShadowGitLock {
         }
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
-            .open(&lock_path)?;
+            .open(lock_path)?;
 
         #[cfg(unix)]
         {
@@ -110,9 +111,9 @@ fn cleanup_stale_index_lock(workspace_root: &Path) -> Result<()> {
 /// worktree. They must acquire this guard before their repository-specific
 /// lock so a checkpoint restore cannot race a shadow-git snapshot.
 pub(crate) fn acquire_workspace_git_lock(workspace_root: &Path) -> Result<ShadowGitLock> {
-    let _lock = ShadowGitLock::acquire(workspace_root)?;
+    let lock = ShadowGitLock::acquire(workspace_root)?;
     cleanup_stale_index_lock(workspace_root)?;
-    Ok(_lock)
+    Ok(lock)
 }
 
 fn with_shadow_lock<T>(workspace_root: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {

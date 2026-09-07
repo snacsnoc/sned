@@ -440,6 +440,7 @@ impl AnchorCacheLock {
     fn acquire(path: &std::path::Path) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
@@ -499,7 +500,7 @@ impl AnchorStorage {
         let cache_dir = anchors_file.parent().unwrap_or(std::path::Path::new("."));
 
         // Ensure cache directory exists
-        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        if let Err(e) = std::fs::create_dir_all(cache_dir) {
             tracing::warn!("Failed to create cache directory: {}", e);
             return;
         }
@@ -573,7 +574,7 @@ impl AnchorStorage {
 
         match serde_json::to_string_pretty(&tasks) {
             Ok(json) => {
-                if let Err(e) = crate::storage::disk::atomic_write_file(&anchors_file, &json) {
+                if let Err(e) = crate::storage::disk::atomic_write_file(anchors_file, &json) {
                     tracing::warn!("Failed to save anchor cache: {}", e);
                 } else {
                     self.persisted_tasks = tasks.clone();
@@ -2636,8 +2637,7 @@ impl FileEditor {
         let lines = &snapshot.lines;
         let line_hashes = &snapshot.anchors;
 
-        let (resolved_edits, failed_edits) =
-            self.executor.resolve_edits(edits, &lines, &line_hashes);
+        let (resolved_edits, failed_edits) = self.executor.resolve_edits(edits, lines, line_hashes);
 
         if !failed_edits.is_empty() {
             let failure_messages: Vec<String> = failed_edits

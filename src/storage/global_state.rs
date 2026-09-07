@@ -199,7 +199,7 @@ fn repair_corrupt_global_state(path: &Path) {
 
 /// Load plain JSON settings, accepting the previous checksum-prefixed format.
 pub fn load_global_state_from_path(path: &Path) -> io::Result<GlobalState> {
-    match fs::read_to_string(&path) {
+    match fs::read_to_string(path) {
         Ok(contents) => {
             // Parse checksum and data
             let mut lines = contents.lines();
@@ -223,13 +223,13 @@ pub fn load_global_state_from_path(path: &Path) -> io::Result<GlobalState> {
                     file_path = %path.display(),
                     "Global state checksum mismatch - file may be corrupted or tampered"
                 );
-                if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
+                if let Ok(backup_path) = crate::storage::disk::create_backup(path) {
                     tracing::warn!(
                         file_path = %path.display(),
                         backup_path = %backup_path.display(),
                         "Global state integrity check failed; backed up corrupted file"
                     );
-                    repair_corrupt_global_state(&path);
+                    repair_corrupt_global_state(path);
                 } else {
                     tracing::warn!(
                         file_path = %path.display(),
@@ -253,14 +253,14 @@ pub fn load_global_state_from_path(path: &Path) -> io::Result<GlobalState> {
                         ));
                     }
                     // Create backup of corrupted file
-                    if let Ok(backup_path) = crate::storage::disk::create_backup(&path) {
+                    if let Ok(backup_path) = crate::storage::disk::create_backup(path) {
                         tracing::warn!(
                             file_path = %path.display(),
                             backup_path = %backup_path.display(),
                             error = %error,
                             "Created backup of corrupted global state JSON"
                         );
-                        repair_corrupt_global_state(&path);
+                        repair_corrupt_global_state(path);
                     } else {
                         tracing::warn!(
                             file_path = %path.display(),

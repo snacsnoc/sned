@@ -710,21 +710,17 @@ impl TaskStorage {
     }
 
     async fn acquire_lock_with_retry_for(&self, lock_file: &str) -> io::Result<LockGuard> {
-        for attempt in 0..=ASYNC_LOCK_RETRY_DELAYS_MS.len() {
+        for delay in ASYNC_LOCK_RETRY_DELAYS_MS {
             match self.acquire_lock_for(lock_file) {
                 Ok(guard) => return Ok(guard),
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        && attempt < ASYNC_LOCK_RETRY_DELAYS_MS.len() =>
-                {
-                    tokio::time::sleep(Duration::from_millis(ASYNC_LOCK_RETRY_DELAYS_MS[attempt]))
-                        .await;
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(*delay)).await;
                 }
                 Err(error) => return Err(error),
             }
         }
 
-        unreachable!("lock retry loop always returns after its final attempt")
+        self.acquire_lock_for(lock_file)
     }
 
     fn acquire_lock_blocking_for(&self, lock_file: &str) -> io::Result<LockGuard> {
