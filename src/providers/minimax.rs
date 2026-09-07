@@ -1166,6 +1166,9 @@ async fn process_minimax_sse_line(
                         reasoning_state,
                     )
                     .await;
+                    if tx.is_closed() {
+                        return;
+                    }
                 }
             }
 
@@ -1178,6 +1181,9 @@ async fn process_minimax_sse_line(
 
                 flush_minimax_text_buffer(tx, pending_text, pending_text_signature, &event.id)
                     .await;
+                if tx.is_closed() {
+                    return;
+                }
 
                 if let Some(id) = &tool_call.id {
                     let entry = accumulated_tool_calls
@@ -1212,6 +1218,9 @@ async fn process_minimax_sse_line(
                         if args.trim().is_empty() {
                             continue;
                         }
+                        if crate::providers::tool_arguments_are_rejected(&entry.2) {
+                            continue;
+                        }
                         if entry.2.len() + args.len() <= crate::providers::MAX_TOOL_ARGUMENT_SIZE {
                             entry.2.push_str(args);
                         } else {
@@ -1225,6 +1234,10 @@ async fn process_minimax_sse_line(
                                 tool_index = idx,
                                 accumulated_size = entry.2.len(),
                                 "MiniMax tool call arguments exceeded MAX_TOOL_ARGUMENT_SIZE, truncated"
+                            );
+                            entry.2 = crate::providers::rejected_truncated_tool_args(
+                                "MiniMax",
+                                "during stream accumulation",
                             );
                         }
                     }
@@ -1265,6 +1278,9 @@ async fn process_minimax_sse_line(
                             "tool_calls",
                         )
                         .await;
+                        if tx.is_closed() {
+                            return;
+                        }
                     }
                 }
             }
@@ -1385,16 +1401,19 @@ impl Provider for MinimaxProvider {
                                 &mut reasoning_state,
                             )
                             .await;
+                            if tx.is_closed() {
+                                break;
+                            }
                         }
                         if let Some(err) = sse_buffer.take_error() {
-                            send_chunk(&tx, ApiStreamChunk::Error(err), "error").await;
+                            let _ = send_chunk(&tx, ApiStreamChunk::Error(err), "error").await;
                         }
                     }
                     Err(e) => {
                         let error_msg = format!("MiniMax SSE stream error: {e}");
                         let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "MiniMax SSE bytes_stream error");
-                        send_chunk(
+                        if !send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "{}{}",
@@ -1403,7 +1422,11 @@ impl Provider for MinimaxProvider {
                             )),
                             "error",
                         )
-                        .await;
+                        .await
+                        {
+                            stream_errored = true;
+                            break;
+                        }
                         stream_errored = true;
                         break;
                     }
@@ -1423,6 +1446,9 @@ impl Provider for MinimaxProvider {
                         &mut reasoning_state,
                     )
                     .await;
+                    if tx.is_closed() {
+                        return;
+                    }
                 }
 
                 // Flush any remaining XML tool calls from the buffer
@@ -1476,6 +1502,9 @@ impl Provider for MinimaxProvider {
                             "tool_calls",
                         )
                         .await;
+                        if tx.is_closed() {
+                            return;
+                        }
                     }
                 }
             }

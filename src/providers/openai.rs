@@ -1004,6 +1004,9 @@ async fn process_openai_sse_line(
                     "text",
                 )
                 .await;
+                if tx.is_closed() {
+                    return;
+                }
             }
 
             if let Some(reasoning) = delta.reasoning_content
@@ -1022,6 +1025,9 @@ async fn process_openai_sse_line(
                     "reasoning",
                 )
                 .await;
+                if tx.is_closed() {
+                    return;
+                }
             }
 
             // Handle OpenAI refusal responses (content policy violations)
@@ -1034,6 +1040,9 @@ async fn process_openai_sse_line(
                     "refusal",
                 )
                 .await;
+                if tx.is_closed() {
+                    return;
+                }
             }
 
             // Accumulate tool call deltas by index. Do not send immediately —
@@ -1067,6 +1076,9 @@ async fn process_openai_sse_line(
                             let entry = accumulated_tool_calls
                                 .entry(tool_index)
                                 .or_insert_with(|| (String::new(), String::new(), String::new()));
+                            if crate::providers::tool_arguments_are_rejected(&entry.2) {
+                                continue;
+                            }
                             // Enforce MAX_TOOL_ARGUMENT_SIZE during accumulation to prevent
                             // memory exhaustion from providers sending many small deltas.
                             // This matches the validation in agent_loop.rs for other providers.
@@ -1086,6 +1098,10 @@ async fn process_openai_sse_line(
                                     accumulated_size = entry.2.len(),
                                     "OpenAI tool call arguments exceeded MAX_TOOL_ARGUMENT_SIZE, truncated"
                                 );
+                                entry.2 = crate::providers::rejected_truncated_tool_args(
+                                    "OpenAI",
+                                    "during stream accumulation",
+                                );
                             }
                         }
                     }
@@ -1094,15 +1110,21 @@ async fn process_openai_sse_line(
                         && let Some((id, name, _)) = accumulated_tool_calls.get(&tool_index)
                         && !id.is_empty()
                         && is_safe_tool_name(name)
-                        && send_chunk(
-                            tx,
-                            ApiStreamChunk::ToolCallStarted {
-                                call_id: id.clone(),
-                                name: name.clone(),
-                            },
-                            "tool_call_started",
-                        )
-                        .await
+                        && {
+                            if !send_chunk(
+                                tx,
+                                ApiStreamChunk::ToolCallStarted {
+                                    call_id: id.clone(),
+                                    name: name.clone(),
+                                },
+                                "tool_call_started",
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                            true
+                        }
                     {
                         delta_state.started_tool_call_indices.insert(tool_index);
                     }
@@ -1149,6 +1171,9 @@ async fn process_openai_sse_line(
                                 "tool_calls",
                             )
                             .await;
+                            if tx.is_closed() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -1275,9 +1300,12 @@ pub async fn parse_openai_sse_to_chunks(
             usage_sent,
         )
         .await;
+        if tx.is_closed() {
+            break;
+        }
     }
     if let Some(err) = buffer.take_error() {
-        send_chunk(tx, ApiStreamChunk::Error(err), "error").await;
+        let _ = send_chunk(tx, ApiStreamChunk::Error(err), "error").await;
     }
     (frame_count, empty_frame_count)
 }
@@ -1312,6 +1340,9 @@ pub async fn finish_openai_sse_to_chunks(
             usage_sent,
         )
         .await;
+        if tx.is_closed() {
+            return (frame_count, empty_frame_count);
+        }
     }
 
     // Flush any remaining accumulated tool calls on stream end
@@ -1326,7 +1357,7 @@ pub async fn finish_openai_sse_to_chunks(
                 let validated_args =
                     crate::providers::validate_tool_call_args(args, "OpenAI", "at stream end");
                 completed_tool_call_indices.insert(*idx);
-                send_chunk(
+                if !send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -1343,14 +1374,17 @@ pub async fn finish_openai_sse_to_chunks(
                     }),
                     "tool_calls",
                 )
-                .await;
+                .await
+                {
+                    return (frame_count, empty_frame_count);
+                }
             }
         }
     }
 
     // Emit synthetic Usage chunk if no usage chunk was sent
-    if !*usage_sent {
-        send_chunk(
+    if !*usage_sent
+        && !send_chunk(
             tx,
             ApiStreamChunk::Usage(ApiStreamUsageChunk {
                 input_tokens: 0,
@@ -1365,7 +1399,9 @@ pub async fn finish_openai_sse_to_chunks(
             }),
             "usage",
         )
-        .await;
+        .await
+    {
+        return (frame_count, empty_frame_count);
     }
     (frame_count, empty_frame_count)
 }
@@ -1598,7 +1634,7 @@ impl Provider for OpenAiProvider {
                             diagnostics = %diagnostics,
                             "OpenAI SSE stream timeout"
                         );
-                        send_chunk(
+                        if !send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "OpenAI SSE {phase} timeout after {}ms; diagnostics: {} (retryable). Increase or unset the corresponding SNED_SSE_*_TIMEOUT_SECS setting for long reasoning gaps.",
@@ -1606,7 +1642,10 @@ impl Provider for OpenAiProvider {
                                 diagnostics,
                             )),
                             "timeout",
-                        ).await;
+                        ).await {
+                            stream_errored = true;
+                            break;
+                        }
                         stream_errored = true;
                         break;
                     }
@@ -1642,6 +1681,9 @@ impl Provider for OpenAiProvider {
                         .await;
                         raw_sse_frames += frames;
                         empty_sse_frames += empty_frames;
+                        if tx.is_closed() {
+                            break;
+                        }
                     }
                     Err(e) => {
                         let diagnostics = format_stream_error_diagnostics(
@@ -1657,7 +1699,7 @@ impl Provider for OpenAiProvider {
                             diagnostics = %diagnostics,
                             "OpenAI SSE bytes_stream error"
                         );
-                        send_chunk(
+                        if !send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "OpenAI SSE stream error: {}; diagnostics: {}{}",
@@ -1667,7 +1709,11 @@ impl Provider for OpenAiProvider {
                             )),
                             "error",
                         )
-                        .await;
+                        .await
+                        {
+                            stream_errored = true;
+                            break;
+                        }
                         stream_errored = true;
                         break;
                     }

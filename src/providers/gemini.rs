@@ -467,7 +467,11 @@ async fn process_gemini_sse_line(
                     "Gemini blocked the prompt (reason: {block_reason}). Rephrase the prompt and try again."
                 )),
                 "blocked_prompt",
-            ).await;
+            )
+            .await;
+            if tx.is_closed() {
+                return;
+            }
         }
         *response_blocked = true;
     }
@@ -504,6 +508,9 @@ async fn process_gemini_sse_line(
                             "reasoning",
                         )
                         .await;
+                        if tx.is_closed() {
+                            return;
+                        }
                         emitted_chunk = true;
                     }
                 }
@@ -519,6 +526,9 @@ async fn process_gemini_sse_line(
                         "text",
                     )
                     .await;
+                    if tx.is_closed() {
+                        return;
+                    }
                     emitted_chunk = true;
                 }
 
@@ -539,8 +549,9 @@ async fn process_gemini_sse_line(
                             }
                             Some(_) | None => "{}".to_string(),
                         };
-                        let args_str = if args_str.len() <= crate::providers::MAX_TOOL_ARGUMENT_SIZE
-                        {
+                        let args_truncated =
+                            args_str.len() > crate::providers::MAX_TOOL_ARGUMENT_SIZE;
+                        let args_str = if !args_truncated {
                             args_str
                         } else {
                             tracing::warn!(
@@ -557,7 +568,14 @@ async fn process_gemini_sse_line(
                             (
                                 call_id.clone(),
                                 fc.name.clone(),
-                                args_str,
+                                if args_truncated {
+                                    crate::providers::rejected_truncated_tool_args(
+                                        "Gemini",
+                                        "during stream accumulation",
+                                    )
+                                } else {
+                                    args_str
+                                },
                                 signature.clone(),
                             ),
                         );
@@ -577,6 +595,9 @@ async fn process_gemini_sse_line(
                         "signature_only",
                     )
                     .await;
+                    if tx.is_closed() {
+                        return;
+                    }
                 }
 
                 // Reset carry-forward after functionCall - parallel FCs should NOT inherit signature
@@ -593,6 +614,9 @@ async fn process_gemini_sse_line(
             *last_stop_reason = Some(finish.clone());
             if let Some(error) = gemini_candidate_block_error(&finish) {
                 send_chunk(tx, ApiStreamChunk::Error(error), "blocked_response").await;
+                if tx.is_closed() {
+                    return;
+                }
                 *response_blocked = true;
             }
         }
@@ -628,6 +652,9 @@ async fn process_gemini_sse_line(
                     "tool_calls",
                 )
                 .await;
+                if tx.is_closed() {
+                    return;
+                }
             }
         }
     }
@@ -722,6 +749,9 @@ async fn finish_gemini_sse_to_chunks(
                     "tool_calls",
                 )
                 .await;
+                if tx.is_closed() {
+                    return;
+                }
             }
         }
     }
@@ -821,16 +851,19 @@ impl Provider for GeminiProvider {
                                 model_info.as_ref(),
                             )
                             .await;
+                            if tx.is_closed() {
+                                break;
+                            }
                         }
                         if let Some(err) = sse_buffer.take_error() {
-                            send_chunk(&tx, ApiStreamChunk::Error(err), "error").await;
+                            let _ = send_chunk(&tx, ApiStreamChunk::Error(err), "error").await;
                         }
                     }
                     Err(e) => {
                         let error_msg = format!("Gemini SSE stream error: {e}");
                         let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "Gemini SSE bytes_stream error");
-                        send_chunk(
+                        if !send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "{}{}",
@@ -839,7 +872,11 @@ impl Provider for GeminiProvider {
                             )),
                             "error",
                         )
-                        .await;
+                        .await
+                        {
+                            stream_errored = true;
+                            break;
+                        }
                         stream_errored = true;
                         break;
                     }

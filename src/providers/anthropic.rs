@@ -630,12 +630,15 @@ impl Provider for AnthropicProvider {
                             &mut last_tool_call,
                         )
                         .await;
+                        if tx.is_closed() {
+                            break;
+                        }
                     }
                     Err(e) => {
                         let error_msg = format!("Anthropic SSE stream error: {e}");
                         let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "Anthropic SSE bytes_stream error");
-                        send_chunk(
+                        if !send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "{}{}",
@@ -644,7 +647,10 @@ impl Provider for AnthropicProvider {
                             )),
                             "error",
                         )
-                        .await;
+                        .await
+                        {
+                            break;
+                        }
                         break;
                     }
                 }
@@ -867,9 +873,12 @@ pub async fn parse_anthropic_sse_to_chunks(
 ) {
     for line in buffer.push_chunk(chunk) {
         process_anthropic_sse_line(&line, tx, last_tool_call).await;
+        if tx.is_closed() {
+            return;
+        }
     }
     if let Some(err) = buffer.take_error() {
-        send_chunk(tx, ApiStreamChunk::Error(err), "error").await;
+        let _ = send_chunk(tx, ApiStreamChunk::Error(err), "error").await;
     }
 }
 
@@ -1072,6 +1081,9 @@ async fn process_anthropic_event(
             }
             AnthropicContentDelta::InputJsonDelta { partial_json } => {
                 if !last_tool_call.id.is_empty() && !last_tool_call.name.is_empty() {
+                    if crate::providers::tool_arguments_are_rejected(&last_tool_call.arguments) {
+                        return;
+                    }
                     // Enforce MAX_TOOL_ARGUMENT_SIZE during accumulation to prevent
                     // memory exhaustion from providers sending many small deltas.
                     // This matches the enforcement in openai.rs and minimax.rs.
@@ -1089,6 +1101,10 @@ async fn process_anthropic_event(
                         tracing::warn!(
                             accumulated_size = last_tool_call.arguments.len(),
                             "Anthropic tool call arguments exceeded MAX_TOOL_ARGUMENT_SIZE, truncated"
+                        );
+                        last_tool_call.arguments = crate::providers::rejected_truncated_tool_args(
+                            "Anthropic",
+                            "during stream accumulation",
                         );
                     }
                 }

@@ -339,6 +339,13 @@ pub(crate) fn is_retryable_stream_transport_error(error: &str) -> bool {
         || error.contains("incomplete")
         || error.contains("decode")
         || error.contains("decoding")
+        || error.contains("broken pipe")
+        || error.contains("broken_pipe")
+        || error.contains("stream reset")
+        || error.contains("reset by peer")
+        || error.contains("unexpected eof")
+        || error.contains("early eof")
+        || error == "eof"
 }
 
 pub(crate) fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
@@ -564,22 +571,11 @@ impl ProviderHttpError {
             None
         };
 
-        let body_display = if body.len() > 1024 {
-            let end = body.floor_char_boundary(1024);
-            format!(
-                "{}... [truncated, total {} bytes]",
-                &body[..end],
-                body.len()
-            )
-        } else {
-            body
-        };
-
         Self {
             provider: provider.into(),
             url,
             status,
-            body: body_display,
+            body,
             headers,
             retry_delay_ms,
         }
@@ -845,10 +841,28 @@ pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -
     }
 }
 
+/// Encode a provider-side truncation as a tool error. A syntactically
+/// repairable prefix is still incomplete model input and must not reach a
+/// tool handler.
+pub fn rejected_truncated_tool_args(provider_name: &str, context: &str) -> String {
+    serde_json::json!({
+        TOOL_ARGUMENTS_ERROR_FIELD: format!(
+            "{provider_name} tool call arguments were truncated {context}; the tool call was rejected. Retry with complete JSON arguments."
+        )
+    })
+    .to_string()
+}
+
 /// Returns the provider-side argument error encoded by
 /// [`validate_tool_call_args`], if any.
 pub fn tool_arguments_error(value: &serde_json::Value) -> Option<&str> {
     value.as_object()?.get(TOOL_ARGUMENTS_ERROR_FIELD)?.as_str()
+}
+
+pub fn tool_arguments_are_rejected(args: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .is_some_and(|value| tool_arguments_error(&value).is_some())
 }
 
 /// Repair common model-produced JSON defects in a structured argument value.
@@ -1197,10 +1211,19 @@ impl Provider for Providers {
     fn preoutput_policy(&self) -> PreoutputPolicy {
         match self {
             Self::OpenAi(p) => p.preoutput_policy(),
-            _ => PreoutputPolicy {
-                budget: Duration::from_secs(180),
-                transport: ProviderTransport::Streaming,
-            },
+            Self::Anthropic(p) => p.preoutput_policy(),
+            Self::DeepSeek(p) => p.preoutput_policy(),
+            Self::Gemini(p) => p.preoutput_policy(),
+            Self::Minimax(p) => p.preoutput_policy(),
+            Self::OpenRouter(p) => p.preoutput_policy(),
+            Self::Mock(p) => p.preoutput_policy(),
+            Self::RetryTest(p) => p.preoutput_policy(),
+            #[cfg(test)]
+            Self::RecordingChunk(p) => p.preoutput_policy(),
+            #[cfg(test)]
+            Self::TinyContext(p) => p.preoutput_policy(),
+            #[cfg(test)]
+            Self::Error(p) => p.preoutput_policy(),
         }
     }
 }
@@ -1448,6 +1471,19 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_http_error_preserves_full_response_body() {
+        let body = "x".repeat(2048);
+        let error = ProviderHttpError::new(
+            "test",
+            "https://api.example.com".to_string(),
+            StatusCode::BAD_GATEWAY,
+            body.clone(),
+            HeaderMap::new(),
+        );
+        assert_eq!(error.body, body);
+    }
+
+    #[test]
     fn test_provider_error_rate_limit_preserves_retry_delay() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", "5".parse().unwrap());
@@ -1529,6 +1565,50 @@ mod tests {
     fn test_validate_tool_call_args_valid_json_passes_through() {
         let args = r#"{"a": 1, "b": [2, 3]}"#;
         assert_eq!(validate_tool_call_args(args, "test", "unit"), args);
+    }
+
+    #[test]
+    fn test_truncated_tool_args_are_rejected_without_repair() {
+        let args = rejected_truncated_tool_args("test", "during accumulation");
+        let parsed: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert!(tool_arguments_error(&parsed).is_some());
+        assert!(tool_arguments_are_rejected(&args));
+    }
+
+    #[tokio::test]
+    async fn test_send_chunk_reports_closed_receiver() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        assert!(
+            !send_chunk(
+                &tx,
+                ApiStreamChunk::Text(ApiStreamTextChunk {
+                    text: "discarded".to_string(),
+                    id: None,
+                    signature: None,
+                }),
+                "test",
+                "text",
+            )
+            .await
+        );
+    }
+
+    #[test]
+    fn test_retryable_stream_transport_error_covers_reset_and_eof_variants() {
+        for message in [
+            "broken pipe",
+            "stream reset",
+            "connection reset by peer",
+            "unexpected EOF",
+            "early eof",
+            "eof",
+        ] {
+            assert!(
+                is_retryable_stream_transport_error(message),
+                "expected retryable transport error: {message}"
+            );
+        }
     }
 
     #[test]
