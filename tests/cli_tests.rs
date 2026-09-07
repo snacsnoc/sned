@@ -39,14 +39,14 @@ fn test_help_shows_task_options() {
 fn test_version_shows_version() {
     let mut cmd = Command::cargo_bin("sned").unwrap();
     cmd.arg("--version");
-    cmd.assert().success().stdout(contains("0.1.2"));
+    cmd.assert().success().stdout(contains("0.1.3"));
 }
 
 #[test]
 fn test_version_subcommand_shows_version() {
     let mut cmd = Command::cargo_bin("sned").unwrap();
     cmd.arg("version");
-    cmd.assert().success().stdout(contains("0.1.2"));
+    cmd.assert().success().stdout(contains("0.1.3"));
 }
 
 #[test]
