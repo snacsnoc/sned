@@ -162,6 +162,7 @@ pub(crate) struct TurnRenderRequest {
     pub(crate) append: bool,
     pub(crate) turn_indicator: Option<Line<'static>>,
     pub(crate) viewport_revision: u64,
+    pub(crate) turn_end_dequeued_at: Option<Instant>,
     anchor: Option<ManualViewportAnchor>,
 }
 
@@ -179,15 +180,243 @@ struct LayoutEntry {
     rows: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RowPrefixIndex {
+    values: Vec<usize>,
+    tree: Vec<usize>,
+    capacity: usize,
+}
+
+impl RowPrefixIndex {
+    fn from_rows(rows: impl IntoIterator<Item = usize>) -> Self {
+        let mut index = Self::default();
+        for rows in rows {
+            index.append(rows);
+        }
+        index
+    }
+
+    fn ensure_capacity(&mut self, required: usize) {
+        if self.capacity >= required {
+            return;
+        }
+        let mut capacity = self.capacity.max(1);
+        while capacity < required {
+            capacity = capacity.saturating_mul(2);
+        }
+        self.capacity = capacity;
+        self.tree = vec![0; capacity.saturating_mul(2)];
+        for (index, rows) in self.values.iter().copied().enumerate() {
+            self.tree[capacity + index] = rows;
+        }
+        for index in (1..capacity).rev() {
+            self.tree[index] = self.tree[index * 2].saturating_add(self.tree[index * 2 + 1]);
+        }
+    }
+
+    fn append(&mut self, rows: usize) {
+        self.ensure_capacity(self.values.len().saturating_add(1));
+        self.values.push(rows);
+        self.set(self.values.len() - 1, rows);
+    }
+
+    fn set(&mut self, index: usize, rows: usize) {
+        let Some(value) = self.values.get_mut(index) else {
+            return;
+        };
+        *value = rows;
+        let mut tree_index = self.capacity + index;
+        self.tree[tree_index] = rows;
+        tree_index /= 2;
+        while tree_index > 0 {
+            self.tree[tree_index] =
+                self.tree[tree_index * 2].saturating_add(self.tree[tree_index * 2 + 1]);
+            tree_index /= 2;
+        }
+    }
+
+    fn truncate_last(&mut self) {
+        let Some(index) = self.values.len().checked_sub(1) else {
+            return;
+        };
+        self.set(index, 0);
+        self.values.pop();
+    }
+
+    fn prefix(&self, end: usize) -> usize {
+        let mut left = self.capacity;
+        let mut right = self.capacity + end.min(self.values.len());
+        let mut total = 0usize;
+        while left < right {
+            if left % 2 == 1 {
+                total = total.saturating_add(self.tree[left]);
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                total = total.saturating_add(self.tree[right]);
+            }
+            left /= 2;
+            right /= 2;
+        }
+        total
+    }
+
+    fn total(&self) -> usize {
+        self.prefix(self.values.len())
+    }
+
+    fn first_end_after(&self, target: usize) -> usize {
+        if self.values.is_empty() || target >= self.total() {
+            return self.values.len();
+        }
+        let mut node = 1usize;
+        let mut remaining = target;
+        while node < self.capacity {
+            let left_sum = self.tree[node * 2];
+            if remaining < left_sum {
+                node *= 2;
+            } else {
+                remaining -= left_sum;
+                node = node * 2 + 1;
+            }
+        }
+        (node - self.capacity).min(self.values.len())
+    }
+
+    fn first_end_at_or_after(&self, target: usize) -> usize {
+        if self.values.is_empty() || target > self.total() {
+            return self.values.len();
+        }
+        let mut node = 1usize;
+        let mut remaining = target;
+        while node < self.capacity {
+            let left_sum = self.tree[node * 2];
+            if remaining <= left_sum {
+                node *= 2;
+            } else {
+                remaining -= left_sum;
+                node = node * 2 + 1;
+            }
+        }
+        (node - self.capacity).min(self.values.len())
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 struct VisualLayoutIndex {
     wrap_width: Option<usize>,
     entries: Vec<LayoutEntry>,
-    offsets: Vec<usize>,
+    row_index: RowPrefixIndex,
+    output_entry_positions: VecDeque<usize>,
+    // Entries are append-only during the streaming hot path. A
+    // logical front avoids shifting the retained transcript on every cap
+    // eviction; old storage is compacted only when the retired prefix is
+    // large enough to amortize the copy.
+    front_entry: usize,
+    base_rows: usize,
+    base_output_index: usize,
     dirty: bool,
 }
 
+impl PartialEq for VisualLayoutIndex {
+    fn eq(&self, other: &Self) -> bool {
+        if self.wrap_width != other.wrap_width || self.dirty != other.dirty {
+            return false;
+        }
+        let normalized_state = |index: &VisualLayoutIndex| {
+            let active_len = index.active_len();
+            let entries = index
+                .entries
+                .iter()
+                .skip(index.front_entry)
+                .take(active_len)
+                .map(|entry| LayoutEntry {
+                    source: match entry.source {
+                        LayoutSource::Output(output_index) => LayoutSource::Output(
+                            output_index.saturating_sub(index.base_output_index),
+                        ),
+                        source => source,
+                    },
+                    kind: entry.kind,
+                    rows: entry.rows,
+                })
+                .collect::<Vec<_>>();
+            let row_values = index
+                .row_index
+                .values
+                .iter()
+                .skip(index.front_entry)
+                .take(active_len)
+                .copied()
+                .collect::<Vec<_>>();
+            let row_offsets = (0..=active_len)
+                .map(|end| {
+                    index
+                        .row_index
+                        .prefix(index.front_entry.saturating_add(end))
+                        .saturating_sub(index.base_rows)
+                })
+                .collect::<Vec<_>>();
+            let output_positions = index
+                .output_entry_positions
+                .iter()
+                .map(|position| position.saturating_sub(index.front_entry))
+                .collect::<Vec<_>>();
+            (entries, row_values, row_offsets, output_positions)
+        };
+        normalized_state(self) == normalized_state(other)
+    }
+}
+
+impl Eq for VisualLayoutIndex {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutEvictionError {
+    DirtyIndex,
+    WrongWidth,
+    InvalidOffsets,
+    UnexpectedStructure,
+}
+
 impl VisualLayoutIndex {
+    fn active_len(&self) -> usize {
+        self.entries.len().saturating_sub(self.front_entry)
+    }
+
+    fn active_entry(&self, index: usize) -> Option<&LayoutEntry> {
+        self.entries.get(self.front_entry.saturating_add(index))
+    }
+
+    fn current_output_index(&self, source_index: usize) -> Option<usize> {
+        source_index.checked_sub(self.base_output_index)
+    }
+
+    fn compact_if_needed(&mut self) {
+        const COMPACT_PREFIX: usize = 8_192;
+        if self.front_entry < COMPACT_PREFIX
+            || self.front_entry.saturating_mul(2) < self.entries.len()
+        {
+            return;
+        }
+        let old_base_output_index = self.base_output_index;
+        let old_front_entry = self.front_entry;
+        let active_entries = self.entries.split_off(self.front_entry);
+        self.entries = active_entries;
+        self.row_index = RowPrefixIndex::from_rows(self.entries.iter().map(|entry| entry.rows));
+        self.front_entry = 0;
+        self.base_rows = 0;
+        self.base_output_index = 0;
+        for position in &mut self.output_entry_positions {
+            *position = position.saturating_sub(old_front_entry);
+        }
+        for entry in &mut self.entries {
+            if let LayoutSource::Output(output_index) = &mut entry.source {
+                *output_index = output_index.saturating_sub(old_base_output_index);
+            }
+        }
+    }
+
     fn invalidate(&mut self) {
         self.dirty = true;
     }
@@ -197,46 +426,137 @@ impl VisualLayoutIndex {
     }
 
     fn total_rows(&self) -> usize {
-        self.offsets.last().copied().unwrap_or_default()
+        if self.active_len() == 0 {
+            0
+        } else {
+            self.row_index.total().saturating_sub(self.base_rows)
+        }
     }
 
     fn append_entry(&mut self, entry: LayoutEntry) {
-        let total = self
-            .offsets
-            .last()
-            .copied()
-            .unwrap_or_default()
-            .saturating_add(entry.rows);
+        self.row_index.append(entry.rows);
         self.entries.push(entry);
-        self.offsets.push(total);
+    }
+
+    fn append_output_entry(&mut self, entry: LayoutEntry) {
+        let physical_index = self.entries.len();
+        self.append_entry(entry);
+        self.output_entry_positions.push_back(physical_index);
+    }
+
+    fn evict_front_output(
+        &mut self,
+        wrap_width: usize,
+        output_len: usize,
+        has_separator_after_front: bool,
+    ) -> Result<usize, LayoutEvictionError> {
+        if self.dirty {
+            return Err(LayoutEvictionError::DirtyIndex);
+        }
+        if self.wrap_width != Some(wrap_width) {
+            return Err(LayoutEvictionError::WrongWidth);
+        }
+        if self.entries.len() != self.row_index.values.len()
+            || self.output_entry_positions.len() != output_len
+            || output_len == 0
+        {
+            return Err(LayoutEvictionError::InvalidOffsets);
+        }
+        let first = self.front_entry;
+        let first_entry = self.entries.get(first);
+        if first_entry.map(|entry| entry.rows == 0).unwrap_or(true)
+            || self.row_index.values.get(first).is_none()
+            || first_entry.map(|entry| entry.source)
+                != Some(LayoutSource::Output(self.base_output_index))
+        {
+            return Err(LayoutEvictionError::UnexpectedStructure);
+        }
+
+        let separator_present =
+            self.entries.get(first + 1).map(|entry| entry.source) == Some(LayoutSource::Separator);
+        if separator_present != has_separator_after_front
+            || (separator_present
+                && self.entries.get(first + 2).map(|entry| entry.source)
+                    != Some(LayoutSource::Output(self.base_output_index + 1)))
+            || (!separator_present
+                && output_len > 1
+                && self.entries.get(first + 1).map(|entry| entry.source)
+                    != Some(LayoutSource::Output(self.base_output_index + 1)))
+        {
+            return Err(LayoutEvictionError::UnexpectedStructure);
+        }
+
+        let remove_count = 1 + usize::from(separator_present);
+        let removed_rows = self
+            .row_index
+            .prefix(first + remove_count)
+            .saturating_sub(self.base_rows);
+        self.output_entry_positions.pop_front();
+        self.base_rows = self.row_index.prefix(first + remove_count);
+        self.base_output_index = self.base_output_index.saturating_add(1);
+        self.front_entry = self.front_entry.saturating_add(remove_count);
+        self.compact_if_needed();
+        Ok(removed_rows)
+    }
+
+    fn replace_output_rows(
+        &mut self,
+        wrap_width: usize,
+        output_index: usize,
+        rows: usize,
+    ) -> Result<(), LayoutEvictionError> {
+        if !self.is_valid_for(wrap_width)
+            || rows == 0
+            || self.entries.len() != self.row_index.values.len()
+        {
+            return Err(LayoutEvictionError::InvalidOffsets);
+        }
+        let Some(&entry_index) = self.output_entry_positions.get(output_index) else {
+            return Err(LayoutEvictionError::UnexpectedStructure);
+        };
+        if !matches!(
+            self.entries.get(entry_index).map(|entry| entry.source),
+            Some(LayoutSource::Output(_))
+        ) {
+            return Err(LayoutEvictionError::UnexpectedStructure);
+        }
+        self.entries[entry_index].rows = rows;
+        self.row_index.set(entry_index, rows);
+        Ok(())
     }
 
     fn entry_start(&self, index: usize) -> usize {
-        index
-            .checked_sub(1)
-            .map_or(0, |previous| self.offsets[previous])
+        let physical = self.front_entry.saturating_add(index);
+        self.row_index
+            .prefix(physical)
+            .saturating_sub(self.base_rows)
     }
 
     fn locate(&self, scroll_y: usize, content_height: usize) -> (usize, usize, usize) {
-        if self.entries.is_empty() {
+        if self.active_len() == 0 {
             return (0, 0, 0);
         }
         let total_rows = self.total_rows();
         let max_start = if content_height == 0 {
-            self.entry_start(self.entries.len().saturating_sub(1))
+            self.entry_start(self.active_len().saturating_sub(1))
         } else {
             total_rows
         };
         let target_start = scroll_y.min(max_start);
         let target_end = target_start.saturating_add(content_height.max(1));
-        let start = self.offsets.partition_point(|end| *end <= target_start);
-        let start = start.min(self.entries.len().saturating_sub(1));
+        let absolute_start = self.base_rows.saturating_add(target_start);
+        let start = self
+            .row_index
+            .first_end_after(absolute_start)
+            .saturating_sub(self.front_entry)
+            .min(self.active_len().saturating_sub(1));
         let end_exclusive = self
-            .offsets
-            .partition_point(|end| *end < target_end)
+            .row_index
+            .first_end_at_or_after(self.base_rows.saturating_add(target_end))
+            .saturating_sub(self.front_entry)
             .saturating_add(1)
             .max(start.saturating_add(1))
-            .min(self.entries.len());
+            .min(self.active_len());
         (
             start,
             end_exclusive.saturating_sub(start),
@@ -721,6 +1041,7 @@ pub struct App {
     pub turn_had_streamed_line: bool,
     pending_turn_model_text: Option<String>,
     next_turn_render_generation: u64,
+    last_turn_render_generation: Option<u64>,
     /// The last displayed streaming model line awaiting a finalized event.
     /// Keeping it across drain cycles lets transcript persistence wait for a
     /// real displacement or TurnEnd instead of writing every delta.
@@ -1104,6 +1425,7 @@ impl App {
             turn_had_streamed_line: false,
             pending_turn_model_text: None,
             next_turn_render_generation: 0,
+            last_turn_render_generation: None,
             pending_transcript_model_line: None,
             pending_transcript_reasoning_lines: None,
             deferred_priority_events: VecDeque::new(),
@@ -1163,7 +1485,7 @@ impl App {
     /// caused visible-row drift whenever that width diverged from the
     /// render-time width.
     pub fn push_output_with_kind(&mut self, line: Line<'static>, kind: BlockKind) {
-        let wrap_width = self.last_wrap_width();
+        let wrap_width = self.active_wrap_width();
         self._push_output_line(line, kind, wrap_width, true);
     }
 
@@ -1205,7 +1527,7 @@ impl App {
         let previous_kind = self.output_line_kinds.back().copied();
         let can_extend_layout = self.visual_layout_index.is_valid_for(wrap_width)
             && self.error_lines.is_empty()
-            && self.output_lines.len() < 10_000;
+            && self.output_lines.len() <= 10_000;
         self.needs_redraw = true;
         let line_id = self.allocate_output_line_id();
         self.output_lines.push_back(line);
@@ -1213,22 +1535,28 @@ impl App {
         self.output_line_kinds.push_back(kind);
         self.cached_visible_window = None;
         if enforce_transcript_limit && self.output_lines.len() > 10_000 {
-            let evicted_rows = if self.scroll_mode == ScrollMode::Manual {
-                let evicted_kind = *self
-                    .output_line_kinds
-                    .front()
-                    .expect("output line kinds must match output lines");
-                let separator_rows = self
-                    .output_line_kinds
-                    .get(1)
-                    .copied()
-                    .is_some_and(|next_kind| Self::should_insert_separator(evicted_kind, next_kind))
-                    as usize;
+            let evicted_kind = *self
+                .output_line_kinds
+                .front()
+                .expect("output line kinds must match output lines");
+            let has_separator_after_front = self
+                .output_line_kinds
+                .get(1)
+                .copied()
+                .is_some_and(|next_kind| Self::should_insert_separator(evicted_kind, next_kind));
+            let fallback_evicted_rows = || {
                 Self::output_row_visual_rows(self.output_lines.front(), evicted_kind, wrap_width)
-                    .saturating_add(separator_rows)
-            } else {
-                0
+                    .saturating_add(usize::from(has_separator_after_front))
             };
+            let incremental_eviction_result = self.error_lines.is_empty().then(|| {
+                self.visual_layout_index.evict_front_output(
+                    wrap_width,
+                    10_000,
+                    has_separator_after_front,
+                )
+            });
+            let incremental_eviction = incremental_eviction_result.and_then(Result::ok);
+            let evicted_rows = incremental_eviction.unwrap_or_else(fallback_evicted_rows);
             // Evict front line and buffer it for batched scrollback append.
             if let Some(line) = self.output_lines.front() {
                 let text = Self::line_to_string(line);
@@ -1279,9 +1607,19 @@ impl App {
             if self.scroll_mode == ScrollMode::Manual {
                 self.scroll_offset = self.scroll_offset.saturating_sub(evicted_rows);
             }
-            self.cached_wrap_width = None;
             self.cached_visible_window = None;
-            self.visual_layout_index.invalidate();
+            self.cached_window_fingerprint = (0, 0, 0, 0, 0, ScrollMode::Auto);
+            self.transcript_selection_row_sources.clear();
+            self.selection_surfaces.clear();
+            self.rendered_hyperlink_targets.clear();
+            self.transcript_selection_area = None;
+            if incremental_eviction.is_some() {
+                self.cached_visual_rows = self.visual_layout_index.total_rows();
+                self.cached_wrap_width = Some(wrap_width);
+            } else {
+                self.cached_wrap_width = None;
+                self.visual_layout_index.invalidate();
+            }
         } else if self.cached_wrap_width == Some(wrap_width) {
             // Hot path: keep the cached row count in sync for simple appends
             // so the next render does not need to rescan the whole transcript.
@@ -1296,7 +1634,7 @@ impl App {
             );
             self.cached_visual_rows = self.cached_visual_rows.saturating_add(added_rows);
         }
-        if can_extend_layout {
+        if can_extend_layout && self.visual_layout_index.is_valid_for(wrap_width) {
             if previous_kind.is_some_and(|previous| Self::should_insert_separator(previous, kind)) {
                 self.visual_layout_index.append_entry(LayoutEntry {
                     source: LayoutSource::Separator,
@@ -1304,8 +1642,11 @@ impl App {
                     rows: 1,
                 });
             }
-            self.visual_layout_index.append_entry(LayoutEntry {
-                source: LayoutSource::Output(self.output_lines.len().saturating_sub(1)),
+            self.visual_layout_index.append_output_entry(LayoutEntry {
+                source: LayoutSource::Output(
+                    self.visual_layout_index.base_output_index
+                        + self.output_lines.len().saturating_sub(1),
+                ),
                 kind,
                 rows: Self::output_row_visual_rows(self.output_lines.back(), kind, wrap_width),
             });
@@ -1385,13 +1726,29 @@ impl App {
                 if index + 1 < self.output_lines.len() {
                     // Interleaved reasoning must not displace the model's
                     // partial line. Keep its ID for asynchronous finalization.
-                    let wrap_width = self.last_wrap_width();
+                    let wrap_width = self.active_wrap_width();
                     let manual_anchor = self.manual_viewport_anchor(wrap_width);
+                    let replacement_rows =
+                        Self::output_row_visual_rows(Some(&line), BlockKind::Model, wrap_width);
+                    let layout_updated = self
+                        .visual_layout_index
+                        .replace_output_rows(wrap_width, index, replacement_rows)
+                        .is_ok();
                     self.output_lines[index] = line;
                     self.needs_redraw = true;
-                    self.cached_wrap_width = None;
                     self.cached_visible_window = None;
-                    self.visual_layout_index.invalidate();
+                    self.cached_window_fingerprint = (0, 0, 0, 0, 0, ScrollMode::Auto);
+                    self.transcript_selection_row_sources.clear();
+                    self.selection_surfaces.clear();
+                    self.rendered_hyperlink_targets.clear();
+                    self.transcript_selection_area = None;
+                    if layout_updated {
+                        self.cached_visual_rows = self.visual_layout_index.total_rows();
+                        self.cached_wrap_width = Some(wrap_width);
+                    } else {
+                        self.cached_wrap_width = None;
+                        self.visual_layout_index.invalidate();
+                    }
                     if let Some(anchor) = manual_anchor {
                         self.restore_manual_viewport_anchor(&anchor, wrap_width);
                     }
@@ -1435,7 +1792,7 @@ impl App {
             StreamKind::Reasoning => BlockKind::Reasoning,
             StreamKind::ToolOutput => BlockKind::ToolOutput,
         };
-        let wrap_width = self.last_wrap_width();
+        let wrap_width = self.active_wrap_width();
         let can_update_layout_incrementally = visual_line_count == 1
             && self.error_lines.is_empty()
             && self.visual_layout_index.is_valid_for(wrap_width);
@@ -1449,7 +1806,8 @@ impl App {
                 .is_some_and(|entry| matches!(entry.source, LayoutSource::Output(_)))
             {
                 self.visual_layout_index.entries.pop();
-                self.visual_layout_index.offsets.pop();
+                self.visual_layout_index.row_index.truncate_last();
+                self.visual_layout_index.output_entry_positions.pop_back();
                 if self
                     .visual_layout_index
                     .entries
@@ -1457,7 +1815,7 @@ impl App {
                     .is_some_and(|entry| entry.source == LayoutSource::Separator)
                 {
                     self.visual_layout_index.entries.pop();
-                    self.visual_layout_index.offsets.pop();
+                    self.visual_layout_index.row_index.truncate_last();
                 }
                 self.cached_visual_rows = self.visual_layout_index.total_rows();
             } else {
@@ -1944,6 +2302,7 @@ impl App {
         &mut self,
         markdown_text: String,
     ) -> Option<TurnRenderRequest> {
+        self.last_turn_render_generation = None;
         self.finish_reasoning_stream();
         let anchor = self.manual_viewport_anchor(self.last_wrap_width());
         let entries = std::mem::take(&mut self.turn_stream_entries);
@@ -1976,6 +2335,7 @@ impl App {
             .collect();
         self.pending_turn_model_text = Some(model_text);
         self.next_turn_render_generation = self.next_turn_render_generation.wrapping_add(1);
+        self.last_turn_render_generation = Some(self.next_turn_render_generation);
 
         Some(TurnRenderRequest {
             generation: self.next_turn_render_generation,
@@ -1984,8 +2344,13 @@ impl App {
             append: model_indices.is_empty(),
             turn_indicator: self.turn_indicator.take(),
             viewport_revision: self.viewport_revision,
+            turn_end_dequeued_at: Some(Instant::now()),
             anchor,
         })
+    }
+
+    pub(crate) fn take_last_turn_render_generation(&mut self) -> Option<u64> {
+        self.last_turn_render_generation.take()
     }
 
     pub(crate) fn apply_async_turn_render(
@@ -2933,8 +3298,6 @@ impl App {
         if self.last_content_width != content_width {
             self.last_content_width = content_width;
             self.viewport_revision = self.viewport_revision.saturating_add(1);
-            self.visual_layout_index.invalidate();
-            self.cached_wrap_width = None;
             self.cached_visible_window = None;
         }
     }
@@ -2973,7 +3336,7 @@ impl App {
     }
 
     pub fn clamp_to_content(&mut self) {
-        let total_rows = self.output_visual_rows(self.last_wrap_width());
+        let total_rows = self.output_visual_rows(self.active_wrap_width());
         let max_offset = Self::max_scroll_offset_for(total_rows, self.last_content_height);
 
         match self.scroll_mode {
@@ -3076,9 +3439,15 @@ impl App {
                     .entries
                     .iter()
                     .enumerate()
+                    .skip(self.visual_layout_index.front_entry)
                     .rev()
                     .find(|(_, entry)| entry.kind == BlockKind::BlockingPrompt)
-                    .map(|(index, _)| self.visual_layout_index.offsets[index])
+                    .map(|(index, _)| {
+                        self.visual_layout_index
+                            .row_index
+                            .prefix(index + 1)
+                            .saturating_sub(self.visual_layout_index.base_rows)
+                    })
             })
     }
 
@@ -3087,6 +3456,16 @@ impl App {
             80
         } else {
             Self::content_wrap_width(self.last_content_width)
+        }
+    }
+
+    fn active_wrap_width(&self) -> usize {
+        if self.visual_layout_index.dirty {
+            self.last_wrap_width()
+        } else {
+            self.visual_layout_index
+                .wrap_width
+                .unwrap_or_else(|| self.last_wrap_width())
         }
     }
 
@@ -3135,6 +3514,7 @@ impl App {
                 .len()
                 .saturating_add(self.error_lines.len()),
         );
+        let mut output_entry_positions = VecDeque::with_capacity(self.output_lines.len());
         let mut previous_kind = None;
 
         for (index, (line, kind)) in self
@@ -3151,6 +3531,7 @@ impl App {
                     rows: 1,
                 });
             }
+            output_entry_positions.push_back(entries.len());
             entries.push(LayoutEntry {
                 source: LayoutSource::Output(index),
                 kind: *kind,
@@ -3177,16 +3558,16 @@ impl App {
             previous_kind = Some(BlockKind::Error);
         }
 
-        let mut offsets = Vec::with_capacity(entries.len());
-        let mut total = 0usize;
-        for entry in &entries {
-            total = total.saturating_add(entry.rows);
-            offsets.push(total);
-        }
+        let row_index = RowPrefixIndex::from_rows(entries.iter().map(|entry| entry.rows));
+        let total = row_index.total();
         self.visual_layout_index = VisualLayoutIndex {
             wrap_width: Some(wrap_width),
             entries,
-            offsets,
+            row_index,
+            output_entry_positions,
+            front_entry: 0,
+            base_rows: 0,
+            base_output_index: 0,
             dirty: false,
         };
         self.cached_visual_rows = total;
@@ -3222,7 +3603,7 @@ impl App {
         content_height: usize,
     ) -> (usize, usize, usize) {
         self.ensure_visual_layout_index(wrap_width);
-        if self.visual_layout_index.entries.is_empty() {
+        if self.visual_layout_index.active_len() == 0 {
             return (0, 0, 0);
         }
         self.visual_layout_index.locate(scroll_y, content_height)
@@ -3358,13 +3739,16 @@ impl App {
         let scroll_y = self.resolved_scroll_y_for(total_rows, self.last_content_height);
         let (start, _, row_offset) = self.visual_layout_index.locate(scroll_y, 1);
         let mut entry_index = start;
-        if self.visual_layout_index.entries[start].source == LayoutSource::Separator {
+        if self.visual_layout_index.active_entry(start)?.source == LayoutSource::Separator {
             entry_index = entry_index.saturating_add(1);
         }
-        let entry = self.visual_layout_index.entries.get(entry_index)?;
+        let entry = self.visual_layout_index.active_entry(entry_index)?;
         let LayoutSource::Output(output_index) = entry.source else {
             return None;
         };
+        let output_index = self
+            .visual_layout_index
+            .current_output_index(output_index)?;
         let line = self.output_lines.get(output_index)?;
         // Only a viewport starting on the separator should restore there;
         // wrapped rows inside the following line retain their row offset.
@@ -3391,14 +3775,20 @@ impl App {
         if !self.visual_layout_index.is_valid_for(wrap_width) {
             return None;
         }
+        let source_output_index = self
+            .visual_layout_index
+            .base_output_index
+            .saturating_add(anchor.output_index);
         let (entry_index, entry) = self
             .visual_layout_index
             .entries
             .iter()
             .enumerate()
-            .find(|(_, entry)| entry.source == LayoutSource::Output(anchor.output_index))?;
-        let line_start = self.visual_layout_index.entry_start(entry_index);
-        let separator_before = entry_index > 0
+            .skip(self.visual_layout_index.front_entry)
+            .find(|(_, entry)| entry.source == LayoutSource::Output(source_output_index))?;
+        let logical_entry_index = entry_index.saturating_sub(self.visual_layout_index.front_entry);
+        let line_start = self.visual_layout_index.entry_start(logical_entry_index);
+        let separator_before = entry_index > self.visual_layout_index.front_entry
             && self.visual_layout_index.entries[entry_index - 1].source == LayoutSource::Separator;
         if anchor.separator_before && separator_before {
             return Some(line_start.saturating_sub(1));
@@ -3445,16 +3835,23 @@ impl App {
         &mut self,
         start_idx: usize,
         take_count: usize,
+        wrap_width: usize,
     ) -> Vec<Line<'static>> {
-        self.ensure_visual_layout_index(self.last_wrap_width());
+        self.ensure_visual_layout_index(wrap_width);
         let end_idx = start_idx
             .saturating_add(take_count)
-            .min(self.visual_layout_index.entries.len());
+            .min(self.visual_layout_index.active_len());
         let mut visible_lines = Vec::with_capacity(take_count);
         let mut hyperlink_targets = Vec::new();
-        for entry in &self.visual_layout_index.entries[start_idx..end_idx] {
+        for entry in &self.visual_layout_index.entries[self.visual_layout_index.front_entry
+            + start_idx
+            ..self.visual_layout_index.front_entry + end_idx]
+        {
             let line = match entry.source {
-                LayoutSource::Output(index) => self.output_lines.get(index),
+                LayoutSource::Output(index) => self
+                    .visual_layout_index
+                    .current_output_index(index)
+                    .and_then(|index| self.output_lines.get(index)),
                 LayoutSource::Error(index) => self.error_lines.get(index),
                 LayoutSource::Separator => None,
             };
@@ -3478,17 +3875,21 @@ impl App {
     ) -> Vec<Option<SelectionRowSource>> {
         let end_idx = start_idx
             .saturating_add(take_count)
-            .min(self.visual_layout_index.entries.len());
+            .min(self.visual_layout_index.active_len());
         let mut skipped_rows = visible_scroll_y;
         let mut row_sources = Vec::with_capacity(content_height);
-        for entry in &self.visual_layout_index.entries[start_idx..end_idx] {
+        for entry in &self.visual_layout_index.entries[self.visual_layout_index.front_entry
+            + start_idx
+            ..self.visual_layout_index.front_entry + end_idx]
+        {
             for row_in_line in 0..entry.rows {
                 if skipped_rows > 0 {
                     skipped_rows -= 1;
                 } else if row_sources.len() < content_height {
                     row_sources.push(match entry.source {
                         LayoutSource::Output(output_line_index) => Some(SelectionRowSource {
-                            output_line_index,
+                            output_line_index: output_line_index
+                                .saturating_sub(self.visual_layout_index.base_output_index),
                             row_in_line,
                         }),
                         LayoutSource::Error(_) | LayoutSource::Separator => None,
@@ -4020,7 +4421,8 @@ impl App {
         }
         {
             frame.render_widget(Clear, output_area);
-            let visible_lines = self.collect_output_rows_range(start_idx, visible_count);
+            let visible_lines =
+                self.collect_output_rows_range(start_idx, visible_count, wrap_width);
             let title = if self.in_scrollback {
                 " sned (scrollback) "
             } else {
@@ -4606,7 +5008,7 @@ mod tests {
         app.push_output_with_kind(Line::from("separator"), BlockKind::Separator);
         app.push_output_with_kind(Line::from("tool"), BlockKind::ToolOutput);
 
-        let rows = app.collect_output_rows_range(0, 3);
+        let rows = app.collect_output_rows_range(0, 3, app.last_wrap_width());
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].spans[0].content, "│");
         assert_eq!(rows[0].spans[0].style.fg, Some(theme::ACCENT));
@@ -5117,7 +5519,7 @@ mod tests {
         let (start, _, _) =
             app.visible_output_window(wrap_width, scroll_y, app.last_content_height);
         let first_visible = app
-            .collect_output_rows_range(start, 1)
+            .collect_output_rows_range(start, 1, wrap_width)
             .into_iter()
             .next()
             .expect("manual viewport should contain a transcript row");
@@ -5418,6 +5820,21 @@ mod tests {
             scroll_y <= 3,
             "local scroll offset should stay within the viewport"
         );
+    }
+
+    #[test]
+    fn test_visible_output_window_stops_at_exact_row_boundary() {
+        let mut app = App::new();
+        app.set_content_width(80);
+        app.push_plain("first");
+        app.push_plain("second");
+
+        let wrap_width = app.last_wrap_width();
+        let (start_idx, take_count, row_offset) = app.visible_output_window(wrap_width, 0, 1);
+
+        assert_eq!(start_idx, 0);
+        assert_eq!(take_count, 1);
+        assert_eq!(row_offset, 0);
     }
 
     #[test]
@@ -8126,6 +8543,179 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(peak_us, total_us);
         assert_eq!(app.take_layout_rebuild_timing(), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_transcript_cap_eviction_keeps_layout_incremental() {
+        let mut app = App::new();
+        app.set_content_width(80);
+        let wrap_width = app.last_wrap_width();
+        for index in 0..10_000 {
+            app.push_output_with_kind(Line::from(format!("history {index}")), BlockKind::Model);
+        }
+        let _ = app.output_visual_rows(wrap_width);
+        let _ = app.take_layout_rebuild_timing();
+
+        for index in 0..250 {
+            app.push_output_with_kind(Line::from(format!("new {index}")), BlockKind::Model);
+            assert!(app.visual_layout_index.is_valid_for(wrap_width));
+        }
+
+        assert_eq!(app.output_lines.len(), 10_000);
+        assert_eq!(app.output_lines.len(), app.output_line_ids.len());
+        assert_eq!(app.output_lines.len(), app.output_line_kinds.len());
+        assert_eq!(app.take_layout_rebuild_timing().1, 0);
+    }
+
+    #[test]
+    fn test_transcript_cap_drain_cycles_keep_layout_incremental() {
+        let mut app = App::new();
+        app.set_content_width(80);
+        let wrap_width = app.last_wrap_width();
+        for index in 0..10_000 {
+            app.push_stream_line(Line::from(format!("history {index}")), StreamKind::Model);
+        }
+        let _ = app.output_visual_rows(wrap_width);
+        let _ = app.take_layout_rebuild_timing();
+
+        for cycle in 0..5 {
+            for index in 0..128 {
+                app.push_stream_line(
+                    Line::from(format!("cycle {cycle} line {index}")),
+                    StreamKind::Model,
+                );
+            }
+            app.replace_last_stream_line(
+                Line::from(format!("cycle {cycle} pending")),
+                StreamKind::Model,
+            );
+            let _ = app.output_visual_rows(wrap_width);
+        }
+
+        assert_eq!(app.take_layout_rebuild_timing().1, 0);
+    }
+
+    #[test]
+    fn test_interleaved_model_update_keeps_capped_layout_incremental() {
+        let mut app = App::new();
+        app.set_content_width(40);
+        let wrap_width = app.last_wrap_width();
+        for index in 0..9_999 {
+            app.push_output(Line::from(format!("history {index}")));
+        }
+        app.push_stream_line(Line::from("partial"), StreamKind::Model);
+        app.push_output_with_kind(Line::from("tool tail"), BlockKind::ToolOutput);
+        let _ = app.output_visual_rows(wrap_width);
+        let _ = app.take_layout_rebuild_timing();
+
+        app.replace_last_stream_line(
+            Line::from("expanded model response that wraps onto more rows"),
+            StreamKind::Model,
+        );
+
+        assert!(app.visual_layout_index.is_valid_for(wrap_width));
+        assert_eq!(app.take_layout_rebuild_timing().1, 0);
+        let incremental_index = app.visual_layout_index.clone();
+        app.visual_layout_index.invalidate();
+        app.rebuild_visual_layout_index(wrap_width);
+        assert_eq!(incremental_index, app.visual_layout_index);
+    }
+
+    #[test]
+    fn test_incremental_eviction_matches_full_rebuild_with_separator() {
+        let mut incremental = App::new();
+        incremental.set_content_width(38);
+        let wrap_width = incremental.last_wrap_width();
+        incremental.push_output_with_kind(Line::from("command output"), BlockKind::CommandOutput);
+        incremental.push_output_with_kind(Line::from("tool header"), BlockKind::ToolHeader);
+        for index in 2..10_000 {
+            incremental.push_output_with_kind(
+                Line::from(format!("tool output {index}")),
+                BlockKind::ToolOutput,
+            );
+        }
+        let _ = incremental.output_visual_rows(wrap_width);
+        incremental.push_output_with_kind(Line::from("tail"), BlockKind::ToolOutput);
+        assert!(incremental.visual_layout_index.is_valid_for(wrap_width));
+
+        let mut rebuilt = incremental;
+        let incremental_index = rebuilt.visual_layout_index.clone();
+        rebuilt.visual_layout_index.invalidate();
+        rebuilt.rebuild_visual_layout_index(wrap_width);
+        assert_eq!(incremental_index, rebuilt.visual_layout_index);
+    }
+
+    #[test]
+    fn test_layout_eviction_rejection_is_transactional() {
+        let mut index = VisualLayoutIndex {
+            wrap_width: Some(80),
+            entries: vec![
+                LayoutEntry {
+                    source: LayoutSource::Output(0),
+                    kind: BlockKind::Model,
+                    rows: 1,
+                },
+                LayoutEntry {
+                    source: LayoutSource::Separator,
+                    kind: BlockKind::Separator,
+                    rows: 1,
+                },
+                LayoutEntry {
+                    source: LayoutSource::Separator,
+                    kind: BlockKind::Separator,
+                    rows: 1,
+                },
+            ],
+            row_index: RowPrefixIndex::from_rows([1, 1, 1]),
+            output_entry_positions: VecDeque::from([0]),
+            front_entry: 0,
+            base_rows: 0,
+            base_output_index: 0,
+            dirty: false,
+        };
+        let before = index.clone();
+
+        assert_eq!(
+            index.evict_front_output(80, 2, true),
+            Err(LayoutEvictionError::InvalidOffsets)
+        );
+        assert_eq!(index, before);
+    }
+
+    #[test]
+    fn test_completed_turn_render_survives_incremental_cap_eviction() {
+        let mut app = App::new();
+        app.set_content_width(80);
+        let wrap_width = app.last_wrap_width();
+        for index in 0..10_000 {
+            app.push_output(Line::from(format!("history {index}")));
+        }
+        let _ = app.output_visual_rows(wrap_width);
+        let _ = app.take_layout_rebuild_timing();
+
+        app.push_stream_line(Line::from("**first**"), StreamKind::Model);
+        app.push_stream_line(Line::from("second"), StreamKind::Model);
+        let request = app
+            .begin_async_turn_render("**first**\n\nsecond".to_string())
+            .expect("streamed turn should produce a render request");
+        let rendered = crate::cli::markdown::render_streamed_markdown("**first**\n\nsecond", true);
+        assert!(app.apply_async_turn_render(request, rendered));
+        let _ = app.output_visual_rows(wrap_width);
+
+        let tail = app
+            .output_lines
+            .iter()
+            .rev()
+            .take(2)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(tail, ["second", "first"]);
+        assert_eq!(app.output_lines.len(), 10_000);
+        assert_eq!(app.output_lines.len(), app.output_line_ids.len());
+        assert_eq!(app.output_lines.len(), app.output_line_kinds.len());
+        assert!(app.turn_stream_entries.is_empty());
+        assert!(app.visual_layout_index.is_valid_for(wrap_width));
+        assert!(app.take_layout_rebuild_timing().1 <= 1);
     }
 
     #[test]
