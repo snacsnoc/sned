@@ -251,9 +251,15 @@ const MAX_REASONING_SNAPSHOT_BYTES: usize = 64 * 1024;
 
 impl ReasoningMailbox {
     fn lock_pending(&self) -> std::sync::MutexGuard<'_, Option<String>> {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = None;
+                self.pending.clear_poison();
+                guard
+            }
+        }
     }
 
     fn append(&self, chunk: String) {
@@ -1336,7 +1342,8 @@ mod tests {
 
         let mailbox = ReasoningMailbox::default();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = mailbox.pending.lock().unwrap();
+            let mut guard = mailbox.pending.lock().unwrap();
+            *guard = Some("partial".to_string());
             panic!("simulate a panic while holding the mailbox lock");
         }));
 

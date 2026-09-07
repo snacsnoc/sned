@@ -3239,37 +3239,6 @@ impl App {
         result
     }
 
-    /// Drain output from the given index onward and keep the visual-row cache in sync.
-    pub fn drain_output_from(&mut self, start: usize) {
-        self.needs_redraw = true;
-        let start = start.min(self.output_lines.len());
-        if start >= self.output_lines.len() {
-            return;
-        }
-        self.output_lines.drain(start..);
-        self.output_line_ids.drain(start..);
-        self.output_line_kinds.drain(start..);
-        self.turn_stream_entries.retain(|(index, _)| *index < start);
-        self.last_stream_group = self
-            .last_stream_group
-            .and_then(|(group_start, count, kind)| {
-                if group_start >= start {
-                    None
-                } else if group_start.saturating_add(count) > start {
-                    Some((group_start, start - group_start, kind))
-                } else {
-                    Some((group_start, count, kind))
-                }
-            });
-        self.visual_layout_index.invalidate();
-        self.reasoning_partial_line.clear();
-        // Invalidate the visual-row cache: drain changes the line buffer,
-        // which can alter render-time separator insertion.
-        self.cached_wrap_width = None;
-        self.cached_visible_window = None;
-        self.refresh_pending_manual_viewport_anchor(self.last_wrap_width());
-    }
-
     pub fn pin_approval_bottom(&mut self) {
         self.needs_redraw = true;
         self.viewport_revision = self.viewport_revision.saturating_add(1);
@@ -5769,7 +5738,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_visual_rows_tracks_push_clear_and_drain() {
+    fn test_cached_visual_rows_tracks_push_and_clear() {
         let mut app = App::new();
         app.scrollback_file = None;
         app.set_content_width(24);
@@ -5792,35 +5761,9 @@ mod tests {
         assert_eq!(app.cached_visual_rows, second_total);
         assert!(second_total >= first_total);
 
-        app.drain_output_from(1);
-        let drained_total = app.total_visual_rows(wrap_width);
-        assert_eq!(app.cached_visual_rows, drained_total);
-
         app.clear_output().unwrap();
         assert_eq!(app.total_visual_rows(wrap_width), 0);
         assert_eq!(app.cached_visual_rows, 0);
-    }
-
-    #[test]
-    fn test_drain_output_from_keeps_surviving_stream_indices() {
-        let mut app = App::new();
-        app.push_plain("first");
-        app.push_plain("second");
-        app.push_plain("third");
-        app.turn_stream_entries = vec![
-            (0, StreamKind::Model),
-            (1, StreamKind::Model),
-            (2, StreamKind::Reasoning),
-        ];
-        app.last_stream_group = Some((1, 2, StreamKind::Model));
-
-        app.drain_output_from(2);
-
-        assert_eq!(
-            app.turn_stream_entries,
-            vec![(0, StreamKind::Model), (1, StreamKind::Model)]
-        );
-        assert_eq!(app.last_stream_group, Some((1, 1, StreamKind::Model)));
     }
 
     #[test]

@@ -184,6 +184,17 @@ fn markdown_cache() -> &'static Mutex<MarkdownCache> {
     CACHE.get_or_init(|| Mutex::new(MarkdownCache::new()))
 }
 
+fn lock_markdown_cache() -> std::sync::MutexGuard<'static, MarkdownCache> {
+    match markdown_cache().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = MarkdownCache::new();
+            guard
+        }
+    }
+}
+
 static MARKDOWN_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MARKDOWN_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -208,21 +219,14 @@ fn render_streamed_markdown_cached(
         code_line_limit,
         no_color: std::env::var_os("NO_COLOR").is_some(),
     };
-    if let Some(rendered) = markdown_cache()
-        .lock()
-        .expect("markdown cache poisoned")
-        .get(&key)
-    {
+    if let Some(rendered) = lock_markdown_cache().get(&key) {
         MARKDOWN_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return rendered;
     }
     MARKDOWN_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rendered =
         render_markdown_with_code_limit_timed(None, text, code_line_limit, syntax_highlight_us);
-    markdown_cache()
-        .lock()
-        .expect("markdown cache poisoned")
-        .insert(key, rendered.clone());
+    lock_markdown_cache().insert(key, rendered.clone());
     rendered
 }
 
