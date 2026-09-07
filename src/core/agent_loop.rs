@@ -1263,10 +1263,10 @@ impl AgentLoop {
         }
 
         // Record environment snapshot for task metadata
-        if let Some(ref tracker) = self.env_tracker {
-            if let Err(e) = tracker.record_environment() {
-                warn!(error = %e, "Failed to record environment snapshot");
-            }
+        if let Some(ref tracker) = self.env_tracker
+            && let Err(e) = tracker.record_environment()
+        {
+            warn!(error = %e, "Failed to record environment snapshot");
         }
 
         // Initialize shadow git repo for change tracking

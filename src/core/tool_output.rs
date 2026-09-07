@@ -263,14 +263,12 @@ pub fn format_tool_result_digest(
                 fg: Some(status_fg),
                 dim: false,
             }];
-            if is_error {
-                if let Some(detail) = first_error_detail(result_text) {
-                    lines.push(DigestLine {
-                        text: format!("    {detail}"),
-                        fg: Some(dim_fg),
-                        dim: true,
-                    });
-                }
+            if is_error && let Some(detail) = first_error_detail(result_text) {
+                lines.push(DigestLine {
+                    text: format!("    {detail}"),
+                    fg: Some(dim_fg),
+                    dim: true,
+                });
             }
             lines
         }

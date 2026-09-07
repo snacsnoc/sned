@@ -773,10 +773,8 @@ impl ReadFileHandler {
             if normalized_line.ends_with(b"\r") {
                 normalized_line.pop();
             }
-            if line_no == 1 {
-                if normalized_line.starts_with(&[0xef, 0xbb, 0xbf]) {
-                    normalized_line.drain(..3);
-                }
+            if line_no == 1 && normalized_line.starts_with(&[0xef, 0xbb, 0xbf]) {
+                normalized_line.drain(..3);
             }
             let normalized_line = String::from_utf8(normalized_line).map_err(|_| {
                 Self::ranged_read_too_large(path, &canonical_path, selected_bytes as u64, max_bytes)
@@ -1151,10 +1149,10 @@ impl ToolHandler for ReadFileHandler {
                 let mut state = ctx.state.lock().await;
                 Self::track_read_files(&mut state, &paths, &results);
                 let warnings = Self::read_loop_warnings(&state, &paths, &results);
-                return Ok(serde_json::Value::String(Self::append_warnings(
+                Ok(serde_json::Value::String(Self::append_warnings(
                     Self::format_results(results),
                     &warnings,
-                )));
+                )))
             }
         })
     }

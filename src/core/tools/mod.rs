@@ -682,13 +682,13 @@ pub fn coerce_string_array(
     }
 
     if let Some(s) = params.get(plural_key).and_then(|v| v.as_str()) {
-        if let Ok(serde_json::Value::Array(values)) = serde_json::from_str(s) {
-            if values.iter().all(serde_json::Value::is_string) {
-                return values
-                    .into_iter()
-                    .filter_map(|value| value.as_str().map(String::from))
-                    .collect();
-            }
+        if let Ok(serde_json::Value::Array(values)) = serde_json::from_str(s)
+            && values.iter().all(serde_json::Value::is_string)
+        {
+            return values
+                .into_iter()
+                .filter_map(|value| value.as_str().map(String::from))
+                .collect();
         }
         return vec![s.to_string()];
     }

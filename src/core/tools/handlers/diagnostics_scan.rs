@@ -239,10 +239,9 @@ impl DiagnosticsScanHandler {
                     if let Ok((_, stdout, _)) =
                         capture_diagnostics_command(eslint_command, diagnostics_output_limit())
                             .await
+                        && !stdout.is_empty()
                     {
-                        if !stdout.is_empty() {
-                            result.push_str(&stdout);
-                        }
+                        result.push_str(&stdout);
                     }
                 }
 

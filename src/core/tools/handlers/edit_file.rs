@@ -1541,14 +1541,11 @@ impl EditFileHandler {
                     range_insufficient_paths.insert(batch.absolute_path.clone());
                     total_failed += batch.edits.len();
                     all_results.push(format!(
-                        "File {}: batch rejected before applying edits. No edits were applied to this file.\n\n{}",
+                        "File {}: batch rejected before applying edits. No edits were applied to this file.\n\nFile {} is too large for edit_file ({}KB, max {}KB). A ranged read can inspect this file but cannot make an anchored edit safe. Ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE for a targeted edit. Use write_to_file only if you have the complete replacement content; do not use shell, Python, sed, or another out-of-band writer to bypass this limit.",
                         batch.display_path,
-                        format!(
-                            "File {} is too large for edit_file ({}KB, max {}KB). A ranged read can inspect this file but cannot make an anchored edit safe. Ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE for a targeted edit. Use write_to_file only if you have the complete replacement content; do not use shell, Python, sed, or another out-of-band writer to bypass this limit.",
-                            batch.display_path,
-                            metadata.len() / 1024,
-                            max_file_size / 1024
-                        )
+                        batch.display_path,
+                        metadata.len() / 1024,
+                        max_file_size / 1024
                     ));
                     continue;
                 }
