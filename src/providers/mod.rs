@@ -276,10 +276,34 @@ pub enum MessageContent {
 pub enum ApiStreamChunk {
     Text(ApiStreamTextChunk),
     Reasoning(ApiStreamReasoningChunk),
-    ToolCallStarted { call_id: String, name: String },
+    ToolCallStarted {
+        call_id: String,
+        name: String,
+    },
     ToolCalls(ApiStreamToolCallsChunk),
     Usage(ApiStreamUsageChunk),
+    /// Transport timing emitted once an OpenAI-compatible stream finishes.
+    /// This is telemetry, not model output, so consumers must not render it.
+    Timing(ApiStreamTiming),
     Error(String),
+}
+
+/// Aggregate transport measurements for one provider streaming attempt.
+///
+/// Durations share the provider request start as their origin where possible.
+/// The agent loop combines these with its decode and output measurements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ApiStreamTiming {
+    pub request_to_headers_us: u64,
+    pub headers_to_first_byte_us: Option<u64>,
+    pub stream_total_us: u64,
+    pub raw_sse_frames: u64,
+    pub empty_sse_frames: u64,
+    pub max_inter_raw_byte_gap_us: u64,
+    /// Captured by the provider immediately before the timing marker is sent.
+    /// Consumers must prefer this over channel-receipt time because the
+    /// bounded stream channel can add delivery latency under backpressure.
+    pub completed_at: Option<std::time::Instant>,
 }
 
 pub(crate) async fn send_chunk(

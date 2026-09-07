@@ -8,10 +8,238 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::fmt;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+#[derive(Clone, Copy, Debug)]
+pub struct TurnEndTiming {
+    pub(crate) provider_completed_at: Option<Instant>,
+    pub(crate) first_output_at: Option<Instant>,
+    pub(crate) emitted_at: Instant,
+}
+
+/// Bounded latency histogram used by timing reports. Buckets are in
+/// microseconds so reports can describe frame-cost tails without retaining a
+/// sample for every redraw.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct TimingHistogram {
+    #[serde(rename = "lt_1ms")]
+    lt_1ms: u64,
+    #[serde(rename = "1_2ms")]
+    one_to_2ms: u64,
+    #[serde(rename = "2_4ms")]
+    two_to_4ms: u64,
+    #[serde(rename = "4_8ms")]
+    four_to_8ms: u64,
+    #[serde(rename = "8_16ms")]
+    eight_to_16ms: u64,
+    #[serde(rename = "16_32ms")]
+    sixteen_to_32ms: u64,
+    #[serde(rename = "32_64ms")]
+    thirty_two_to_64ms: u64,
+    #[serde(rename = "gte_64ms")]
+    gte_64ms: u64,
+}
+
+impl TimingHistogram {
+    pub(crate) fn record(&mut self, elapsed_us: u64) {
+        match elapsed_us {
+            0..1_000 => self.lt_1ms += 1,
+            1_000..2_000 => self.one_to_2ms += 1,
+            2_000..4_000 => self.two_to_4ms += 1,
+            4_000..8_000 => self.four_to_8ms += 1,
+            8_000..16_000 => self.eight_to_16ms += 1,
+            16_000..32_000 => self.sixteen_to_32ms += 1,
+            32_000..64_000 => self.thirty_two_to_64ms += 1,
+            _ => self.gte_64ms += 1,
+        }
+    }
+}
+
+static TUI_TIMING_SINK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn timing_stderr_allowed() -> bool {
+    if TUI_TIMING_SINK_ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
+
+    !std::io::stderr().is_terminal()
+        || matches!(
+            std::env::var("SNED_TIMING_STDERR").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+}
+
+fn timing_file_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("SNED_TIMING_FILE")
+        && !path.trim().is_empty()
+    {
+        return Some(PathBuf::from(path));
+    }
+
+    TUI_TIMING_SINK_ACTIVE
+        .load(Ordering::Acquire)
+        .then(|| crate::storage::disk::get_data_dir().join("logs/sned-timing.jsonl"))
+}
+
+fn report_timing_write_error(error: &std::io::Error, kind: &str) {
+    if TUI_TIMING_SINK_ACTIVE.load(Ordering::Acquire) {
+        // The alternate screen owns stderr while the TUI is active. Do not
+        // route diagnostics there when the auxiliary timing sink fails.
+        let _ = (error, kind);
+    } else {
+        tracing::warn!(%error, kind, "failed to write timing output");
+    }
+}
+
+pub(crate) struct TuiTimingSinkGuard;
+
+impl Drop for TuiTimingSinkGuard {
+    fn drop(&mut self) {
+        TUI_TIMING_SINK_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) fn enter_tui_timing_sink() -> TuiTimingSinkGuard {
+    TUI_TIMING_SINK_ACTIVE.store(true, Ordering::Release);
+    TuiTimingSinkGuard
+}
+
+fn append_timing_line(path: &str, line: &str) -> std::io::Result<()> {
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")
+}
+
+pub(crate) fn emit_timing_text(line: &str) {
+    if !timing_enabled() {
+        return;
+    }
+    if let Some(path) = timing_file_path() {
+        if let Err(error) = append_timing_line(&path.to_string_lossy(), line) {
+            report_timing_write_error(&error, "text");
+        }
+    } else if timing_stderr_allowed() {
+        eprintln!("{line}");
+    }
+}
+
+/// Emits a machine-readable timing record without model content, prompts, or
+/// credentials.
+pub(crate) fn emit_timing_record(record: &impl serde::Serialize) {
+    if !timing_enabled() {
+        return;
+    }
+    match serde_json::to_string(record) {
+        Ok(record) => {
+            if let Some(path) = timing_file_path() {
+                if let Err(error) = append_timing_line(&path.to_string_lossy(), &record) {
+                    report_timing_write_error(&error, "record");
+                }
+            } else if timing_stderr_allowed() {
+                eprintln!("[timing-json] {record}");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "failed to serialize timing record"),
+    }
+}
+
+/// A benchmark runner supplies this so independent Sned processes can be
+/// joined without relying on prompts, task ids, or terminal output ordering.
+pub(crate) fn timing_run_id() -> Option<String> {
+    std::env::var("SNED_TIMING_RUN_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ProviderTimingRecord {
+    #[serde(rename = "type")]
+    pub(crate) record_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) turn: u32,
+    pub(crate) attempt: usize,
+    pub(crate) provider: String,
+    pub(crate) model: Option<String>,
+    pub(crate) stream: bool,
+    pub(crate) request_to_headers_us: u64,
+    pub(crate) headers_to_first_byte_us: Option<u64>,
+    pub(crate) request_to_first_chunk_us: Option<u64>,
+    pub(crate) first_chunk_to_displayable_text_us: Option<u64>,
+    pub(crate) displayable_text_to_output_us: Option<u64>,
+    pub(crate) stream_total_us: u64,
+    pub(crate) raw_sse_frames: u64,
+    pub(crate) decoded_chunks: u64,
+    pub(crate) text_chunks: u64,
+    pub(crate) reasoning_chunks: u64,
+    pub(crate) empty_sse_frames: u64,
+    pub(crate) max_inter_raw_byte_gap_us: u64,
+    pub(crate) max_inter_decoded_chunk_gap_us: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct TuiTimingRecord {
+    #[serde(rename = "type")]
+    pub(crate) record_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) turn: u32,
+    pub(crate) first_output_to_render_us: Option<u64>,
+    pub(crate) provider_stream_complete_to_turn_end_emit_us: Option<u64>,
+    pub(crate) turn_end_emit_to_dequeue_us: Option<u64>,
+    pub(crate) turn_end_dequeue_to_render_start_us: u64,
+    pub(crate) events_drained_before_turn_end: u64,
+    pub(crate) transcript_lines_at_turn_end: usize,
+    pub(crate) turn_render_worker_us: u64,
+    pub(crate) turn_render_syntax_highlight_us: u64,
+    pub(crate) turn_render_apply_us: u64,
+    pub(crate) layout_rebuild_us: u64,
+    pub(crate) layout_rebuild_count: u64,
+    pub(crate) drain_peak_us: u64,
+    pub(crate) draw_peak_us: u64,
+    pub(crate) drain_histogram: TimingHistogram,
+    pub(crate) draw_histogram: TimingHistogram,
+    /// True when this turn completed in a frame shared with a newer turn.
+    /// Its render work was coalesced, so frame metrics belong to that newer
+    /// generation rather than being duplicated here.
+    pub(crate) frame_coalesced: bool,
+    pub(crate) main_queue_peak: usize,
+    pub(crate) main_queue_backlog_peak: usize,
+    pub(crate) main_queue_backlog_cycles: u64,
+    pub(crate) priority_queue_peak: usize,
+    pub(crate) approval_queue_peak: usize,
+    pub(crate) dropped_events: u64,
+}
+
+/// A bounded progress sample distinguishes a large fixed backlog from drain
+/// throughput that degrades as the visible transcript grows.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct TuiDrainProgressRecord {
+    #[serde(rename = "type")]
+    pub(crate) record_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) turn: u32,
+    pub(crate) events_drained: u64,
+    pub(crate) main_queue_depth: usize,
+    pub(crate) priority_queue_depth: usize,
+    pub(crate) transcript_lines: usize,
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct ReasoningMailbox {
@@ -124,7 +352,10 @@ pub enum OutputEvent {
     ///
     /// In non-interactive output paths (e.g. one-shot/JSON), this is a
     /// no-op marker.
-    TurnEnd { accumulated_text: String },
+    TurnEnd {
+        accumulated_text: String,
+        timing: Option<TurnEndTiming>,
+    },
     /// A turn indicator line (e.g. "♦"). Emitted separately from
     /// streamed model text so that `finalize_turn_stream` does not
     /// strip it when re-rendering the turn as markdown.
@@ -837,7 +1068,8 @@ fn format_timing_phases_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        format_timing_phases, format_timing_phases_with_retries, non_interactive_approval_message,
+        ProviderTimingRecord, TimingHistogram, TuiTimingRecord, format_timing_phases,
+        format_timing_phases_with_retries, non_interactive_approval_message,
     };
     use std::time::{Duration, Instant};
 
@@ -912,6 +1144,76 @@ mod tests {
                     .any(|line| line.starts_with("[timing] preoutput_retry_elapsed_us="))
             );
         }
+    }
+
+    #[test]
+    fn test_machine_readable_timing_records_exclude_model_content() {
+        let mut histogram = TimingHistogram::default();
+        histogram.record(3_000);
+        let provider = ProviderTimingRecord {
+            record_type: "sned_timing_provider_attempt",
+            run_id: Some("run-fixture".to_string()),
+            session_id: "task-123".to_string(),
+            turn: 1,
+            attempt: 1,
+            provider: "openai".to_string(),
+            model: Some("fixture-model".to_string()),
+            stream: true,
+            request_to_headers_us: 100,
+            headers_to_first_byte_us: Some(200),
+            request_to_first_chunk_us: Some(300),
+            first_chunk_to_displayable_text_us: Some(400),
+            displayable_text_to_output_us: Some(500),
+            stream_total_us: 600,
+            raw_sse_frames: 2,
+            decoded_chunks: 2,
+            text_chunks: 1,
+            reasoning_chunks: 0,
+            empty_sse_frames: 0,
+            max_inter_raw_byte_gap_us: 50,
+            max_inter_decoded_chunk_gap_us: 60,
+        };
+        let tui = TuiTimingRecord {
+            record_type: "sned_timing_tui_turn",
+            run_id: Some("run-fixture".to_string()),
+            session_id: "task-123".to_string(),
+            turn: 1,
+            first_output_to_render_us: Some(16_000),
+            provider_stream_complete_to_turn_end_emit_us: Some(100),
+            turn_end_emit_to_dequeue_us: Some(200),
+            turn_end_dequeue_to_render_start_us: 25,
+            events_drained_before_turn_end: 4,
+            transcript_lines_at_turn_end: 3,
+            turn_render_worker_us: 300,
+            turn_render_syntax_highlight_us: 50,
+            turn_render_apply_us: 25,
+            layout_rebuild_us: 10,
+            layout_rebuild_count: 1,
+            drain_peak_us: 100,
+            draw_peak_us: 200,
+            drain_histogram: histogram.clone(),
+            draw_histogram: histogram,
+            frame_coalesced: false,
+            main_queue_peak: 3,
+            main_queue_backlog_peak: 2,
+            main_queue_backlog_cycles: 1,
+            priority_queue_peak: 0,
+            approval_queue_peak: 0,
+            dropped_events: 0,
+        };
+
+        let provider = serde_json::to_value(provider).expect("provider timing serializes");
+        let tui = serde_json::to_value(tui).expect("TUI timing serializes");
+
+        assert_eq!(provider["type"], "sned_timing_provider_attempt");
+        assert_eq!(provider["run_id"], "run-fixture");
+        assert_eq!(provider["request_to_headers_us"], 100);
+        assert_eq!(tui["type"], "sned_timing_tui_turn");
+        assert_eq!(tui["draw_histogram"]["2_4ms"], 1);
+        let serialized = format!("{provider}{tui}");
+        assert!(!serialized.contains("Authorization"));
+        assert!(!serialized.contains("prompt"));
+        assert!(!serialized.contains("response"));
     }
 
     #[test]
@@ -1112,6 +1414,7 @@ mod tests {
         drop(priority_rx);
         writer.emit(OutputEvent::TurnEnd {
             accumulated_text: "done".to_string(),
+            timing: None,
         });
         writer.emit(OutputEvent::Completion("done".to_string()));
         writer.emit(OutputEvent::ErrorBox("failed".to_string()));

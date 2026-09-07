@@ -153,6 +153,8 @@ fn append_tool_result_blocks(
     tool_id: String,
     result_output: ToolExecutionOutput,
 ) {
+    // Keep hook text beside its own result so per-tool context cannot be
+    // mistaken for instructions belonging to a later parallel tool.
     let truncated_text = truncate_tool_result(&result_output.text);
     blocks.push(UserContentBlock::ToolResult(
         crate::providers::ToolResultBlock {
@@ -446,21 +448,6 @@ fn print_code_block(
         }
     } else {
         output_writer.emit(OutputEvent::RawAnsi(rendered));
-    }
-}
-
-fn emit_turn_end(
-    output_writer: &crate::cli::output::OutputWriterArc,
-    json_output: bool,
-    markdown_text: &str,
-) {
-    if json_output {
-        return;
-    }
-
-    let accumulated_text = crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
-    if !accumulated_text.is_empty() {
-        output_writer.emit(OutputEvent::TurnEnd { accumulated_text });
     }
 }
 
@@ -890,6 +877,8 @@ impl AgentLoop {
         state.first_reasoning_chunk_time = None;
         state.first_displayable_text_time = None;
         state.first_output_emit_time = None;
+        state.provider_stream_completed_time = None;
+        state.turn_end_emitted_time = None;
     }
 
     async fn wait_for_stream_retry_delay(&self, delay: std::time::Duration) -> bool {
@@ -921,6 +910,37 @@ impl AgentLoop {
             }
         })
         .await;
+    }
+
+    async fn emit_turn_end(&self, markdown_text: &str) {
+        if self.config.json_output {
+            return;
+        }
+
+        let accumulated_text = crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
+        if accumulated_text.is_empty() {
+            return;
+        }
+
+        let timing = self.capture_turn_end_timing().await;
+        self.config.output_writer.emit(OutputEvent::TurnEnd {
+            accumulated_text,
+            timing,
+        });
+    }
+
+    async fn capture_turn_end_timing(&self) -> Option<crate::cli::output::TurnEndTiming> {
+        if !crate::cli::output::timing_enabled() {
+            return None;
+        }
+        let emitted_at = std::time::Instant::now();
+        let mut state = self.state.lock().await;
+        state.turn_end_emitted_time = Some(emitted_at);
+        Some(crate::cli::output::TurnEndTiming {
+            provider_completed_at: state.provider_stream_completed_time,
+            first_output_at: state.first_output_emit_time,
+            emitted_at,
+        })
     }
 
     async fn record_first_reasoning_chunk_time(&self) {
@@ -2203,6 +2223,11 @@ impl AgentLoop {
             let mut last_partial_flush_at: Option<std::time::Instant> = None;
             let mut stream_usage: Option<ApiReqInfo> = None;
             let mut preoutput_deadline_exceeded = false;
+            let mut decoded_chunks = 0u64;
+            let mut text_chunks = 0u64;
+            let mut reasoning_chunks = 0u64;
+            let mut max_inter_decoded_chunk_gap = std::time::Duration::ZERO;
+            let mut last_decoded_chunk_at: Option<std::time::Instant> = None;
 
             // Turn indicator is prepended to the first output line, not emitted separately,
             // so it appears on the same line as the start of the response.
@@ -2245,7 +2270,19 @@ impl AgentLoop {
                     return TurnResult::Cancelled;
                 }
 
-                if !first_chunk_received && !matches!(&chunk, ApiStreamChunk::Error(_)) {
+                if !matches!(&chunk, ApiStreamChunk::Timing(_) | ApiStreamChunk::Error(_)) {
+                    let now = std::time::Instant::now();
+                    if let Some(last_decoded_chunk_at) = last_decoded_chunk_at {
+                        max_inter_decoded_chunk_gap = max_inter_decoded_chunk_gap
+                            .max(now.duration_since(last_decoded_chunk_at));
+                    }
+                    last_decoded_chunk_at = Some(now);
+                    decoded_chunks = decoded_chunks.saturating_add(1);
+                }
+
+                if !first_chunk_received
+                    && !matches!(&chunk, ApiStreamChunk::Timing(_) | ApiStreamChunk::Error(_))
+                {
                     preoutput_elapsed_at_first_chunk
                         .get_or_insert_with(|| preoutput_retry_started_at.elapsed());
                     if crate::cli::output::timing_enabled() {
@@ -2259,6 +2296,7 @@ impl AgentLoop {
 
                 match chunk {
                     ApiStreamChunk::Text(text_chunk) => {
+                        text_chunks = text_chunks.saturating_add(1);
                         tracing::debug!(text = %text_chunk.text, "received text chunk");
                         if self.config.json_output {
                             substantive_stream_output_received |= !text_chunk.text.is_empty();
@@ -2437,6 +2475,7 @@ impl AgentLoop {
                         accumulated_text.push_str(&text_chunk.text);
                     }
                     ApiStreamChunk::Reasoning(reasoning_chunk) => {
+                        reasoning_chunks = reasoning_chunks.saturating_add(1);
                         substantive_stream_output_received |= !reasoning_chunk.reasoning.is_empty();
                         self.record_first_reasoning_chunk_time().await;
                         if self.config.json_output {
@@ -2601,6 +2640,61 @@ impl AgentLoop {
                             state.cumulative_cost += cost;
                         }
                     }
+                    ApiStreamChunk::Timing(provider_timing) => {
+                        if crate::cli::output::timing_enabled() {
+                            let mut state = self.state.lock().await;
+                            state.provider_stream_completed_time = provider_timing
+                                .completed_at
+                                .or_else(|| Some(std::time::Instant::now()));
+                            let request_to_first_chunk_us =
+                                state.request_sent_time.and_then(|request| {
+                                    state.first_provider_chunk_time.map(|chunk| {
+                                        chunk.duration_since(request).as_micros() as u64
+                                    })
+                                });
+                            let first_chunk_to_displayable_text_us =
+                                state.first_provider_chunk_time.and_then(|chunk| {
+                                    state.first_displayable_text_time.map(|displayable| {
+                                        displayable.duration_since(chunk).as_micros() as u64
+                                    })
+                                });
+                            let displayable_text_to_output_us =
+                                state.first_displayable_text_time.and_then(|displayable| {
+                                    state.first_output_emit_time.map(|output| {
+                                        output.duration_since(displayable).as_micros() as u64
+                                    })
+                                });
+                            crate::cli::output::emit_timing_record(
+                                &crate::cli::output::ProviderTimingRecord {
+                                    record_type: "sned_timing_provider_attempt",
+                                    run_id: crate::cli::output::timing_run_id(),
+                                    session_id: self.config.task_id.clone(),
+                                    turn: state.turns_completed.saturating_add(1),
+                                    attempt: stream_retry_attempt + 1,
+                                    provider: provider.name().to_string(),
+                                    model: self.resolve_active_model_id(),
+                                    stream: true,
+                                    request_to_headers_us: provider_timing.request_to_headers_us,
+                                    headers_to_first_byte_us: provider_timing
+                                        .headers_to_first_byte_us,
+                                    request_to_first_chunk_us,
+                                    first_chunk_to_displayable_text_us,
+                                    displayable_text_to_output_us,
+                                    stream_total_us: provider_timing.stream_total_us,
+                                    raw_sse_frames: provider_timing.raw_sse_frames,
+                                    decoded_chunks,
+                                    text_chunks,
+                                    reasoning_chunks,
+                                    empty_sse_frames: provider_timing.empty_sse_frames,
+                                    max_inter_raw_byte_gap_us: provider_timing
+                                        .max_inter_raw_byte_gap_us,
+                                    max_inter_decoded_chunk_gap_us: max_inter_decoded_chunk_gap
+                                        .as_micros()
+                                        as u64,
+                                },
+                            );
+                        }
+                    }
                     ApiStreamChunk::ToolCallStarted { call_id, name } => {
                         if !self.config.json_output && announced_tool_call_ids.insert(call_id) {
                             if !tool_call_detected {
@@ -2759,7 +2853,11 @@ impl AgentLoop {
                         }
                         if !substantive_stream_output_received {
                             retryable_stream_error_before_output = Some(err);
-                            break;
+                            // OpenAI-compatible providers emit the transport
+                            // timing marker after the error. Keep draining so
+                            // the failed attempt remains observable and the
+                            // retry decision happens only at stream end.
+                            continue;
                         }
                         stream_errored = true;
                         if self.config.json_output {
@@ -4350,15 +4448,13 @@ impl AgentLoop {
             let markdown_text = response_text.as_deref().unwrap_or("");
             if self.config.interactive_mode && !self.config.json_output && markdown_text.is_empty()
             {
+                let timing = self.capture_turn_end_timing().await;
                 self.config.output_writer.emit(OutputEvent::TurnEnd {
                     accumulated_text: String::new(),
+                    timing,
                 });
             } else {
-                emit_turn_end(
-                    &self.config.output_writer,
-                    self.config.json_output,
-                    markdown_text,
-                );
+                self.emit_turn_end(markdown_text).await;
             }
             if !self.config.interactive_mode
                 && !self.config.json_output
@@ -4392,11 +4488,7 @@ impl AgentLoop {
         } else {
             // Same turn-end signal for the "more turns coming" branch.
             let markdown_text = response_text.as_deref().unwrap_or("");
-            emit_turn_end(
-                &self.config.output_writer,
-                self.config.json_output,
-                markdown_text,
-            );
+            self.emit_turn_end(markdown_text).await;
             TurnResult::Continue
         }
     }
@@ -7371,7 +7463,10 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(events.iter().any(|event| {
             matches!(
                 event,
-                OutputEvent::TurnEnd { accumulated_text }
+                OutputEvent::TurnEnd {
+                    accumulated_text,
+                    ..
+                }
                     if accumulated_text.contains("```rust")
                         && accumulated_text.contains("fn line_65()")
             )
@@ -9980,7 +10075,10 @@ Irrespective of whether additional information or instructions are given, you ar
         }
 
         let accumulated_text = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| {
-            if let crate::cli::output::OutputEvent::TurnEnd { accumulated_text } = event {
+            if let crate::cli::output::OutputEvent::TurnEnd {
+                accumulated_text, ..
+            } = event
+            {
                 Some(accumulated_text)
             } else {
                 None

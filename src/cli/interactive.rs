@@ -965,7 +965,9 @@ fn apply_output_event(
                 }
             }
         }
-        OutputEvent::TurnEnd { accumulated_text } => {
+        OutputEvent::TurnEnd {
+            accumulated_text, ..
+        } => {
             flush_pending_model_update(app, pending_model_update, storage);
             if let Some(worker) = turn_render_worker {
                 if let Some(request) = app.begin_async_turn_render(accumulated_text) {
@@ -1191,6 +1193,70 @@ fn drain_output_queues(
     reasoning_mailbox: Option<&crate::cli::output::ReasoningMailbox>,
     turn_render_worker: Option<&TurnRenderWorker>,
 ) -> usize {
+    drain_output_queues_with_summary(
+        approval_rx,
+        priority_rx,
+        rx,
+        app,
+        storage,
+        reasoning_mailbox,
+        turn_render_worker,
+    )
+    .drained_events
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TurnEndBoundary {
+    dequeued_at: Instant,
+    events_drained: usize,
+    transcript_lines: usize,
+    timing: Option<crate::cli::output::TurnEndTiming>,
+    render_generation: Option<u64>,
+}
+
+fn turn_end_event_data(event: &OutputEvent) -> (bool, Option<crate::cli::output::TurnEndTiming>) {
+    match event {
+        OutputEvent::TurnEnd { timing, .. } => (true, *timing),
+        _ => (false, None),
+    }
+}
+
+fn record_turn_end_boundary(
+    is_turn_end: bool,
+    timing: Option<crate::cli::output::TurnEndTiming>,
+    render_generation: Option<u64>,
+    app: &App,
+    drained_events: usize,
+    saw_turn_end: &mut bool,
+    boundaries: &mut Vec<TurnEndBoundary>,
+) {
+    if is_turn_end {
+        *saw_turn_end = true;
+        boundaries.push(TurnEndBoundary {
+            dequeued_at: Instant::now(),
+            events_drained: drained_events,
+            transcript_lines: app.output_lines.len(),
+            timing,
+            render_generation,
+        });
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DrainOutputSummary {
+    drained_events: usize,
+    turn_end_boundaries: Vec<TurnEndBoundary>,
+}
+
+fn drain_output_queues_with_summary(
+    approval_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    priority_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    rx: &mut mpsc::Receiver<OutputEvent>,
+    app: &mut App,
+    storage: Option<&TaskStorage>,
+    reasoning_mailbox: Option<&crate::cli::output::ReasoningMailbox>,
+    turn_render_worker: Option<&TurnRenderWorker>,
+) -> DrainOutputSummary {
     const MAX_CRITICAL_EVENTS_PER_DRAIN: usize = 512;
     const MAX_DEFERRED_PRIORITY_EVENTS: usize = 1_024;
     #[cfg(not(test))]
@@ -1201,6 +1267,7 @@ fn drain_output_queues(
     let mut drained_events = 0usize;
     let mut saw_output = false;
     let mut saw_turn_end = false;
+    let mut turn_end_boundaries = Vec::new();
     let mut pending_model_update = app.take_pending_transcript_model_line();
     let mut pending_reasoning_lines = app.take_pending_transcript_reasoning_lines();
     let pending_reasoning_snapshot = reasoning_mailbox.and_then(|mailbox| mailbox.take());
@@ -1211,6 +1278,7 @@ fn drain_output_queues(
     while let Ok(event) = approval_rx.try_recv() {
         drained_events = drained_events.saturating_add(1);
         saw_output = true;
+        let (is_turn_end, turn_end_timing) = turn_end_event_data(&event);
         apply_output_event(
             app,
             event,
@@ -1218,6 +1286,17 @@ fn drain_output_queues(
             &mut pending_reasoning_lines,
             storage,
             turn_render_worker,
+        );
+        record_turn_end_boundary(
+            is_turn_end,
+            turn_end_timing,
+            is_turn_end
+                .then(|| app.take_last_turn_render_generation())
+                .flatten(),
+            app,
+            drained_events,
+            &mut saw_turn_end,
+            &mut turn_end_boundaries,
         );
     }
 
@@ -1237,7 +1316,7 @@ fn drain_output_queues(
                 "critical output backlog exceeded deferred priority limit"
             );
             saw_output = true;
-            saw_turn_end |= matches!(&event, OutputEvent::TurnEnd { .. });
+            let (is_turn_end, turn_end_timing) = turn_end_event_data(&event);
             apply_output_event(
                 app,
                 event,
@@ -1245,6 +1324,17 @@ fn drain_output_queues(
                 &mut pending_reasoning_lines,
                 storage,
                 turn_render_worker,
+            );
+            record_turn_end_boundary(
+                is_turn_end,
+                turn_end_timing,
+                is_turn_end
+                    .then(|| app.take_last_turn_render_generation())
+                    .flatten(),
+                app,
+                drained_events,
+                &mut saw_turn_end,
+                &mut turn_end_boundaries,
             );
         }
     }
@@ -1275,7 +1365,7 @@ fn drain_output_queues(
         };
         critical_budget = critical_budget.saturating_sub(1);
         saw_output = true;
-        saw_turn_end |= matches!(&event, OutputEvent::TurnEnd { .. });
+        let (is_turn_end, turn_end_timing) = turn_end_event_data(&event);
         apply_output_event(
             app,
             event,
@@ -1283,6 +1373,17 @@ fn drain_output_queues(
             &mut pending_reasoning_lines,
             storage,
             turn_render_worker,
+        );
+        record_turn_end_boundary(
+            is_turn_end,
+            turn_end_timing,
+            is_turn_end
+                .then(|| app.take_last_turn_render_generation())
+                .flatten(),
+            app,
+            drained_events,
+            &mut saw_turn_end,
+            &mut turn_end_boundaries,
         );
     }
 
@@ -1305,7 +1406,7 @@ fn drain_output_queues(
                     break;
                 };
                 critical_budget = critical_budget.saturating_sub(1);
-                saw_turn_end |= matches!(&priority_event, OutputEvent::TurnEnd { .. });
+                let (is_turn_end, turn_end_timing) = turn_end_event_data(&priority_event);
                 apply_output_event(
                     app,
                     priority_event,
@@ -1314,10 +1415,21 @@ fn drain_output_queues(
                     storage,
                     turn_render_worker,
                 );
+                record_turn_end_boundary(
+                    is_turn_end,
+                    turn_end_timing,
+                    is_turn_end
+                        .then(|| app.take_last_turn_render_generation())
+                        .flatten(),
+                    app,
+                    drained_events,
+                    &mut saw_turn_end,
+                    &mut turn_end_boundaries,
+                );
             }
         }
         saw_output = true;
-        saw_turn_end |= matches!(&event, OutputEvent::TurnEnd { .. });
+        let (is_turn_end, turn_end_timing) = turn_end_event_data(&event);
         apply_output_event(
             app,
             event,
@@ -1326,6 +1438,17 @@ fn drain_output_queues(
             storage,
             turn_render_worker,
         );
+        record_turn_end_boundary(
+            is_turn_end,
+            turn_end_timing,
+            is_turn_end
+                .then(|| app.take_last_turn_render_generation())
+                .flatten(),
+            app,
+            drained_events,
+            &mut saw_turn_end,
+            &mut turn_end_boundaries,
+        );
     }
     while critical_budget > 0 && drain_started.elapsed() < MAX_DRAIN_DURATION {
         let Some(event) = post_main_priority.pop_front() else {
@@ -1333,7 +1456,7 @@ fn drain_output_queues(
         };
         critical_budget = critical_budget.saturating_sub(1);
         saw_output = true;
-        saw_turn_end |= matches!(&event, OutputEvent::TurnEnd { .. });
+        let (is_turn_end, turn_end_timing) = turn_end_event_data(&event);
         apply_output_event(
             app,
             event,
@@ -1341,6 +1464,17 @@ fn drain_output_queues(
             &mut pending_reasoning_lines,
             storage,
             turn_render_worker,
+        );
+        record_turn_end_boundary(
+            is_turn_end,
+            turn_end_timing,
+            is_turn_end
+                .then(|| app.take_last_turn_render_generation())
+                .flatten(),
+            app,
+            drained_events,
+            &mut saw_turn_end,
+            &mut turn_end_boundaries,
         );
     }
     pre_main_priority.append(&mut post_main_priority);
@@ -1377,7 +1511,10 @@ fn drain_output_queues(
     if saw_turn_end && let Err(err) = app.flush_task_transcript() {
         tracing::warn!("Failed to flush completed task transcript: {err}");
     }
-    drained_events
+    DrainOutputSummary {
+        drained_events,
+        turn_end_boundaries,
+    }
 }
 
 #[cfg(test)]
@@ -3661,8 +3798,19 @@ struct TurnRenderWorker {
         TurnRenderRequest,
         Vec<Line<'static>>,
         crate::cli::markdown::MarkdownRenderTiming,
+        u64,
     )>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TurnRenderMetrics {
+    generation: u64,
+    applied: bool,
+    worker_us: u64,
+    syntax_highlight_us: u64,
+    apply_us: u64,
+    turn_end_to_render_start_us: u64,
 }
 
 impl TurnRenderWorker {
@@ -3673,11 +3821,19 @@ impl TurnRenderWorker {
             .name("sned-turn-renderer".to_string())
             .spawn(move || {
                 while let Ok(request) = request_rx.recv() {
+                    let worker_started = Instant::now();
                     let (rendered, timing) = crate::cli::markdown::render_streamed_markdown_timed(
                         &request.markdown_text,
                         true,
                     );
-                    if result_tx.send((request, rendered, timing)).is_err() {
+                    let turn_end_to_render_start_us = request
+                        .turn_end_dequeued_at
+                        .map(|dequeued| worker_started.duration_since(dequeued).as_micros() as u64)
+                        .unwrap_or_default();
+                    if result_tx
+                        .send((request, rendered, timing, turn_end_to_render_start_us))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -3697,13 +3853,18 @@ impl TurnRenderWorker {
         }
     }
 
-    fn apply_ready(&self, app: &mut App) -> (u64, u64, u64, u64, u64) {
+    fn apply_ready(&self, app: &mut App) -> (u64, u64, u64, u64, u64, u64, Vec<TurnRenderMetrics>) {
         let mut render_total_us: u64 = 0;
         let mut syntax_highlight_total_us: u64 = 0;
         let mut apply_total_us: u64 = 0;
         let mut apply_peak_us: u64 = 0;
+        let mut turn_end_to_render_start_total_us: u64 = 0;
         let mut count: u64 = 0;
-        while let Ok((request, rendered, render_timing)) = self.result_rx.try_recv() {
+        let mut metrics = Vec::new();
+        while let Ok((request, rendered, render_timing, queue_wait_us)) = self.result_rx.try_recv()
+        {
+            turn_end_to_render_start_total_us =
+                turn_end_to_render_start_total_us.saturating_add(queue_wait_us);
             render_total_us = render_total_us.saturating_add(render_timing.total_us);
             syntax_highlight_total_us =
                 syntax_highlight_total_us.saturating_add(render_timing.syntax_highlight_us);
@@ -3714,6 +3875,14 @@ impl TurnRenderWorker {
             apply_total_us = apply_total_us.saturating_add(apply_us);
             apply_peak_us = apply_peak_us.max(apply_us);
             count += 1;
+            metrics.push(TurnRenderMetrics {
+                generation,
+                applied,
+                worker_us: render_timing.total_us,
+                syntax_highlight_us: render_timing.syntax_highlight_us,
+                apply_us,
+                turn_end_to_render_start_us: queue_wait_us,
+            });
             if !applied {
                 tracing::debug!(generation, "discarded a stale asynchronous turn render");
             }
@@ -3724,6 +3893,8 @@ impl TurnRenderWorker {
             apply_total_us,
             count,
             apply_peak_us,
+            turn_end_to_render_start_total_us,
+            metrics,
         )
     }
 
@@ -3762,6 +3933,7 @@ async fn run_main_loop(
     use std::sync::Mutex as StdMutex;
 
     let timing_enabled = crate::cli::output::timing_enabled();
+    let _tui_timing_sink = crate::cli::output::enter_tui_timing_sink();
 
     struct TimingSummary {
         enabled: bool,
@@ -3774,8 +3946,12 @@ async fn run_main_loop(
         first_render_time: Option<std::time::Instant>,
         draw_total_us: u64,
         draw_count: u64,
+        draw_peak_us: u64,
+        draw_histogram: crate::cli::output::TimingHistogram,
         drain_total_us: u64,
         drain_count: u64,
+        drain_peak_us: u64,
+        drain_histogram: crate::cli::output::TimingHistogram,
         drain_events_total: u64,
         drain_events_peak: usize,
         output_lines_peak: usize,
@@ -3797,30 +3973,100 @@ async fn run_main_loop(
         layout_rebuild_peak_us: u64,
     }
 
+    struct TuiTurnTiming {
+        request_sent_time: Option<std::time::Instant>,
+        first_output_emit_time: Option<std::time::Instant>,
+        provider_stream_completed_time: Option<std::time::Instant>,
+        turn_end_emitted_time: Option<std::time::Instant>,
+        turn_end_dequeued_time: Option<std::time::Instant>,
+        turn_end_dequeue_to_render_start_us: u64,
+        events_drained_before_turn_end: u64,
+        last_progress_sample_events: u64,
+        transcript_lines_at_turn_end: usize,
+        turn_render_worker_us: u64,
+        turn_render_syntax_highlight_us: u64,
+        turn_render_apply_us: u64,
+        layout_rebuild_us: u64,
+        layout_rebuild_count: u64,
+        draw_peak_us: u64,
+        draw_histogram: crate::cli::output::TimingHistogram,
+        drain_peak_us: u64,
+        drain_histogram: crate::cli::output::TimingHistogram,
+        main_queue_peak: usize,
+        main_queue_backlog_peak: usize,
+        main_queue_backlog_cycles: u64,
+        priority_queue_peak: usize,
+        approval_queue_peak: usize,
+        dropped_events_at_start: u64,
+    }
+
+    impl TuiTurnTiming {
+        fn new(dropped_events_at_start: u64) -> Self {
+            Self {
+                request_sent_time: None,
+                first_output_emit_time: None,
+                provider_stream_completed_time: None,
+                turn_end_emitted_time: None,
+                turn_end_dequeued_time: None,
+                turn_end_dequeue_to_render_start_us: 0,
+                events_drained_before_turn_end: 0,
+                last_progress_sample_events: 0,
+                transcript_lines_at_turn_end: 0,
+                turn_render_worker_us: 0,
+                turn_render_syntax_highlight_us: 0,
+                turn_render_apply_us: 0,
+                layout_rebuild_us: 0,
+                layout_rebuild_count: 0,
+                draw_peak_us: 0,
+                draw_histogram: crate::cli::output::TimingHistogram::default(),
+                drain_peak_us: 0,
+                drain_histogram: crate::cli::output::TimingHistogram::default(),
+                main_queue_peak: 0,
+                main_queue_backlog_peak: 0,
+                main_queue_backlog_cycles: 0,
+                priority_queue_peak: 0,
+                approval_queue_peak: 0,
+                dropped_events_at_start,
+            }
+        }
+    }
+
+    struct PendingTuiTurnReport {
+        turn: u32,
+        boundary: TurnEndBoundary,
+        timing: TuiTurnTiming,
+        render_ready: bool,
+        frame_metrics_recorded: bool,
+        frame_coalesced: bool,
+    }
+
     impl Drop for TimingSummary {
         fn drop(&mut self) {
             if !self.enabled {
                 return;
             }
 
-            eprintln!(
+            crate::cli::output::emit_timing_text(&format!(
                 "[timing] draw: total={}us count={} avg={}us",
                 self.draw_total_us,
                 self.draw_count,
                 self.draw_total_us.saturating_div(self.draw_count),
-            );
-            eprintln!(
+            ));
+            crate::cli::output::emit_timing_text(&format!(
                 "[timing] drain: total={}us count={} avg={}us",
                 self.drain_total_us,
                 self.drain_count,
                 self.drain_total_us.saturating_div(self.drain_count),
-            );
-            eprintln!(
+            ));
+            crate::cli::output::emit_timing_text(&format!(
                 "[timing] drain_events: total={} peak={}",
                 self.drain_events_total, self.drain_events_peak,
-            );
-            eprintln!("[timing] output_lines_peak={}", self.output_lines_peak);
-            eprintln!(
+            ));
+            crate::cli::output::emit_timing_text(&format!(
+                "[timing] output_lines_peak={}",
+                self.output_lines_peak
+            ));
+            crate::cli::output::emit_timing_text(&format!(
                 "[timing] queue_peaks: main={} main_backlog={} backlog_cycles={} priority={} approval={} deferred_priority={}",
                 self.main_queue_peak,
                 self.main_queue_backlog_peak,
@@ -3828,32 +4074,32 @@ async fn run_main_loop(
                 self.priority_queue_peak,
                 self.approval_queue_peak,
                 self.deferred_priority_peak,
-            );
-            eprintln!(
+            ));
+            crate::cli::output::emit_timing_text(&format!(
                 "[timing] reasoning: chunks_received={} pending_bytes_peak={}",
                 self.reasoning_chunks_received, self.reasoning_pending_bytes_peak,
-            );
-            eprintln!(
+            ));
+            crate::cli::output::emit_timing_text(&format!(
                 "[timing] layout_rebuild: total={}us count={} peak={}us",
                 self.layout_rebuild_total_us,
                 self.layout_rebuild_count,
                 self.layout_rebuild_peak_us,
-            );
-            eprintln!(
+            ));
+            crate::cli::output::emit_timing_text(&format!(
                 "[timing] turn_render: worker_total={}us syntax_highlight={}us apply_total={}us count={} apply_peak={}us",
                 self.turn_render_total_us,
                 self.turn_render_syntax_highlight_us,
                 self.turn_render_apply_total_us,
                 self.turn_render_count,
                 self.turn_render_apply_peak_us,
-            );
+            ));
             let (markdown_hits, markdown_misses) = crate::cli::markdown::markdown_cache_stats();
             let (highlight_hits, highlight_misses) =
                 crate::cli::syntax_highlight::highlight_cache_stats();
-            eprintln!(
+            crate::cli::output::emit_timing_text(&format!(
                 "[timing] render_cache: markdown_hits={} markdown_misses={} highlight_hits={} highlight_misses={}",
                 markdown_hits, markdown_misses, highlight_hits, highlight_misses,
-            );
+            ));
 
             if let Some(session_start) = self.session_start_time {
                 for line in crate::cli::output::format_timing_phases(
@@ -3865,7 +4111,7 @@ async fn run_main_loop(
                     self.first_output_emit_time,
                     self.first_render_time,
                 ) {
-                    eprintln!("{line}");
+                    crate::cli::output::emit_timing_text(&line);
                 }
             }
         }
@@ -3893,8 +4139,12 @@ async fn run_main_loop(
         first_render_time: None,
         draw_total_us: 0,
         draw_count: 0,
+        draw_peak_us: 0,
+        draw_histogram: crate::cli::output::TimingHistogram::default(),
         drain_total_us: 0,
         drain_count: 0,
+        drain_peak_us: 0,
+        drain_histogram: crate::cli::output::TimingHistogram::default(),
         drain_events_total: 0,
         drain_events_peak: 0,
         output_lines_peak: 0,
@@ -3915,10 +4165,22 @@ async fn run_main_loop(
         turn_render_count: 0,
         turn_render_apply_peak_us: 0,
     };
+    let mut tui_turn = TuiTurnTiming::new(output_writer.dropped_count());
+    let mut completed_tui_turns = 0u32;
+    let mut pending_tui_turn_reports: VecDeque<PendingTuiTurnReport> = VecDeque::new();
+    let mut completed_render_metrics = HashMap::<u64, TurnRenderMetrics>::new();
+    let mut discarded_render_generations = std::collections::HashSet::new();
 
     loop {
-        let (render_us, syntax_highlight_us, apply_us, render_count, apply_peak_us) =
-            turn_render_worker.apply_ready(app);
+        let (
+            render_us,
+            syntax_highlight_us,
+            apply_us,
+            render_count,
+            apply_peak_us,
+            _queue_wait_us,
+            render_metrics,
+        ) = turn_render_worker.apply_ready(app);
         timing.turn_render_total_us = timing.turn_render_total_us.saturating_add(render_us);
         timing.turn_render_syntax_highlight_us = timing
             .turn_render_syntax_highlight_us
@@ -3927,6 +4189,27 @@ async fn run_main_loop(
             timing.turn_render_apply_total_us.saturating_add(apply_us);
         timing.turn_render_count = timing.turn_render_count.saturating_add(render_count);
         timing.turn_render_apply_peak_us = timing.turn_render_apply_peak_us.max(apply_peak_us);
+        for metric in render_metrics {
+            if !metric.applied {
+                discarded_render_generations.insert(metric.generation);
+                pending_tui_turn_reports
+                    .retain(|report| report.boundary.render_generation != Some(metric.generation));
+                continue;
+            }
+            completed_render_metrics.insert(metric.generation, metric);
+            if let Some(report) = pending_tui_turn_reports
+                .iter_mut()
+                .find(|report| report.boundary.render_generation == Some(metric.generation))
+            {
+                report.timing.turn_render_worker_us = metric.worker_us;
+                report.timing.turn_render_syntax_highlight_us = metric.syntax_highlight_us;
+                report.timing.turn_render_apply_us = metric.apply_us;
+                report.timing.turn_end_dequeue_to_render_start_us =
+                    metric.turn_end_to_render_start_us;
+                report.render_ready = true;
+                completed_render_metrics.remove(&metric.generation);
+            }
+        }
         timing.reasoning_pending_bytes_peak = timing
             .reasoning_pending_bytes_peak
             .max(reasoning_mailbox.pending_len());
@@ -3936,12 +4219,13 @@ async fn run_main_loop(
         {
             let t = std::time::Instant::now();
             let main_queue_before = output_rx.len();
+            let events_drained_before_this_pass = timing.drain_events_total;
             timing.main_queue_backlog_peak = timing.main_queue_backlog_peak.max(main_queue_before);
             if main_queue_before > 0 {
                 timing.main_queue_backlog_cycles =
                     timing.main_queue_backlog_cycles.saturating_add(1);
             }
-            let drained_events = drain_output_queues(
+            let drain_summary = drain_output_queues_with_summary(
                 approval_output_rx,
                 priority_output_rx,
                 output_rx,
@@ -3950,6 +4234,7 @@ async fn run_main_loop(
                 Some(&reasoning_mailbox),
                 Some(turn_render_worker),
             );
+            let drained_events = drain_summary.drained_events;
             // Lost transcript context remains visible because it may affect
             // whether the user can safely approve a pending operation.
             if output_writer.take_overflow_signal() {
@@ -3968,14 +4253,42 @@ async fn run_main_loop(
             let us = t.elapsed().as_micros() as u64;
             timing.drain_total_us += us;
             timing.drain_count += 1;
+            timing.drain_peak_us = timing.drain_peak_us.max(us);
+            timing.drain_histogram.record(us);
+            tui_turn.drain_peak_us = tui_turn.drain_peak_us.max(us);
+            tui_turn.drain_histogram.record(us);
             timing.drain_events_total = timing
                 .drain_events_total
                 .saturating_add(drained_events as u64);
+            tui_turn.events_drained_before_turn_end = tui_turn
+                .events_drained_before_turn_end
+                .saturating_add(drained_events as u64);
+            let next_progress_boundary = tui_turn.last_progress_sample_events.saturating_add(1_000);
+            if timing_enabled && tui_turn.events_drained_before_turn_end >= next_progress_boundary {
+                tui_turn.last_progress_sample_events = tui_turn.events_drained_before_turn_end;
+                crate::cli::output::emit_timing_record(
+                    &crate::cli::output::TuiDrainProgressRecord {
+                        record_type: "sned_timing_tui_drain_progress",
+                        run_id: crate::cli::output::timing_run_id(),
+                        session_id: task_id.clone(),
+                        turn: completed_tui_turns.saturating_add(1),
+                        events_drained: tui_turn.events_drained_before_turn_end,
+                        main_queue_depth: output_rx.len(),
+                        priority_queue_depth: priority_output_rx.len(),
+                        transcript_lines: app.output_lines.len(),
+                    },
+                );
+            }
             timing.drain_events_peak = timing.drain_events_peak.max(drained_events);
             let main_queue_len = output_rx.len();
             timing.main_queue_peak = timing.main_queue_peak.max(main_queue_len);
+            tui_turn.main_queue_peak = tui_turn.main_queue_peak.max(main_queue_len);
             timing.priority_queue_peak = timing.priority_queue_peak.max(priority_output_rx.len());
+            tui_turn.priority_queue_peak =
+                tui_turn.priority_queue_peak.max(priority_output_rx.len());
             timing.approval_queue_peak = timing.approval_queue_peak.max(approval_output_rx.len());
+            tui_turn.approval_queue_peak =
+                tui_turn.approval_queue_peak.max(approval_output_rx.len());
             timing.deferred_priority_peak = timing
                 .deferred_priority_peak
                 .max(app.deferred_priority_events.len());
@@ -3983,6 +4296,52 @@ async fn run_main_loop(
                 .reasoning_pending_bytes_peak
                 .max(reasoning_mailbox.pending_len());
             timing.reasoning_chunks_received = reasoning_mailbox.received_chunks();
+            if main_queue_before > 0 {
+                tui_turn.main_queue_backlog_cycles =
+                    tui_turn.main_queue_backlog_cycles.saturating_add(1);
+            }
+            tui_turn.main_queue_backlog_peak =
+                tui_turn.main_queue_backlog_peak.max(main_queue_before);
+            for mut boundary in drain_summary.turn_end_boundaries {
+                boundary.events_drained = events_drained_before_this_pass
+                    .saturating_add(boundary.events_drained as u64)
+                    .min(usize::MAX as u64) as usize;
+                tui_turn.turn_end_dequeued_time = Some(boundary.dequeued_at);
+                tui_turn.transcript_lines_at_turn_end = boundary.transcript_lines;
+                completed_tui_turns = completed_tui_turns.saturating_add(1);
+                if boundary
+                    .render_generation
+                    .is_some_and(|generation| discarded_render_generations.remove(&generation))
+                {
+                    continue;
+                }
+                let turn_timing = std::mem::replace(
+                    &mut tui_turn,
+                    TuiTurnTiming::new(output_writer.dropped_count()),
+                );
+                let render_ready = boundary
+                    .render_generation
+                    .is_none_or(|generation| completed_render_metrics.contains_key(&generation));
+                pending_tui_turn_reports.push_back(PendingTuiTurnReport {
+                    turn: completed_tui_turns,
+                    boundary,
+                    timing: turn_timing,
+                    render_ready,
+                    frame_metrics_recorded: false,
+                    frame_coalesced: false,
+                });
+                if render_ready
+                    && let Some(report) = pending_tui_turn_reports.back_mut()
+                    && let Some(generation) = report.boundary.render_generation
+                    && let Some(metric) = completed_render_metrics.remove(&generation)
+                {
+                    report.timing.turn_render_worker_us = metric.worker_us;
+                    report.timing.turn_render_syntax_highlight_us = metric.syntax_highlight_us;
+                    report.timing.turn_render_apply_us = metric.apply_us;
+                    report.timing.turn_end_dequeue_to_render_start_us =
+                        metric.turn_end_to_render_start_us;
+                }
+            }
         }
 
         while let Ok(update) = mention_search_rx.try_recv() {
@@ -4036,6 +4395,20 @@ async fn run_main_loop(
                     }
                     if timing.first_output_emit_time.is_none() {
                         timing.first_output_emit_time = state.first_output_emit_time;
+                    }
+                    if tui_turn.request_sent_time != state.request_sent_time {
+                        tui_turn = TuiTurnTiming::new(output_writer.dropped_count());
+                        tui_turn.request_sent_time = state.request_sent_time;
+                    }
+                    if tui_turn.first_output_emit_time.is_none() {
+                        tui_turn.first_output_emit_time = state.first_output_emit_time;
+                    }
+                    if tui_turn.provider_stream_completed_time.is_none() {
+                        tui_turn.provider_stream_completed_time =
+                            state.provider_stream_completed_time;
+                    }
+                    if tui_turn.turn_end_emitted_time.is_none() {
+                        tui_turn.turn_end_emitted_time = state.turn_end_emitted_time;
                     }
                 }
 
@@ -4100,13 +4473,117 @@ async fn run_main_loop(
                     last_draw_at = Some(std::time::Instant::now());
                     draw_retry_delay = BUSY_REDRAW_INTERVAL;
                     draw_retry_at = None;
-                    timing.draw_total_us += t.elapsed().as_micros() as u64;
+                    let draw_us = t.elapsed().as_micros() as u64;
+                    timing.draw_total_us += draw_us;
                     timing.draw_count += 1;
+                    timing.draw_peak_us = timing.draw_peak_us.max(draw_us);
+                    timing.draw_histogram.record(draw_us);
+                    tui_turn.draw_peak_us = tui_turn.draw_peak_us.max(draw_us);
+                    tui_turn.draw_histogram.record(draw_us);
                     if timing_enabled
                         && timing.first_render_time.is_none()
                         && timing.first_output_emit_time.is_some()
                     {
                         timing.first_render_time = Some(std::time::Instant::now());
+                    }
+                    let (layout_total_us, layout_count, layout_peak_us) =
+                        app.take_layout_rebuild_timing();
+                    timing.layout_rebuild_total_us = timing
+                        .layout_rebuild_total_us
+                        .saturating_add(layout_total_us);
+                    timing.layout_rebuild_count =
+                        timing.layout_rebuild_count.saturating_add(layout_count);
+                    timing.layout_rebuild_peak_us =
+                        timing.layout_rebuild_peak_us.max(layout_peak_us);
+                    tui_turn.layout_rebuild_us =
+                        tui_turn.layout_rebuild_us.saturating_add(layout_total_us);
+                    tui_turn.layout_rebuild_count =
+                        tui_turn.layout_rebuild_count.saturating_add(layout_count);
+                    let frame_generation = pending_tui_turn_reports
+                        .iter()
+                        .rev()
+                        .find(|report| {
+                            report.render_ready
+                                && !report.frame_metrics_recorded
+                                && report.boundary.render_generation.is_some()
+                        })
+                        .and_then(|report| report.boundary.render_generation);
+                    for report in &mut pending_tui_turn_reports {
+                        if report.render_ready && !report.frame_metrics_recorded {
+                            if report.boundary.render_generation == frame_generation {
+                                report.timing.layout_rebuild_us = layout_total_us;
+                                report.timing.layout_rebuild_count = layout_count;
+                                report.timing.draw_peak_us = draw_us;
+                                report.timing.draw_histogram.record(draw_us);
+                            } else {
+                                report.frame_coalesced = true;
+                            }
+                            report.frame_metrics_recorded = true;
+                        }
+                    }
+                    while pending_tui_turn_reports
+                        .front()
+                        .is_some_and(|report| report.render_ready && report.frame_metrics_recorded)
+                    {
+                        let report = pending_tui_turn_reports
+                            .pop_front()
+                            .expect("pending TUI report exists after readiness check");
+                        let turn = report.turn;
+                        let boundary = report.boundary;
+                        let frame_coalesced = report.frame_coalesced;
+                        let turn_timing = report.timing;
+                        let first_output_to_render_us = boundary
+                            .timing
+                            .and_then(|timing| timing.first_output_at)
+                            .map(|output| {
+                                boundary.dequeued_at.duration_since(output).as_micros() as u64
+                            });
+                        crate::cli::output::emit_timing_record(
+                            &crate::cli::output::TuiTimingRecord {
+                                record_type: "sned_timing_tui_turn",
+                                run_id: crate::cli::output::timing_run_id(),
+                                session_id: task_id.clone(),
+                                turn,
+                                first_output_to_render_us,
+                                provider_stream_complete_to_turn_end_emit_us: boundary
+                                    .timing
+                                    .and_then(|timing| {
+                                        timing.provider_completed_at.zip(Some(timing.emitted_at))
+                                    })
+                                    .map(|(complete, emitted)| {
+                                        emitted.duration_since(complete).as_micros() as u64
+                                    }),
+                                turn_end_emit_to_dequeue_us: boundary.timing.map(|timing| {
+                                    boundary
+                                        .dequeued_at
+                                        .duration_since(timing.emitted_at)
+                                        .as_micros() as u64
+                                }),
+                                turn_end_dequeue_to_render_start_us: turn_timing
+                                    .turn_end_dequeue_to_render_start_us,
+                                events_drained_before_turn_end: boundary.events_drained as u64,
+                                transcript_lines_at_turn_end: boundary.transcript_lines,
+                                turn_render_worker_us: turn_timing.turn_render_worker_us,
+                                turn_render_syntax_highlight_us: turn_timing
+                                    .turn_render_syntax_highlight_us,
+                                turn_render_apply_us: turn_timing.turn_render_apply_us,
+                                layout_rebuild_us: turn_timing.layout_rebuild_us,
+                                layout_rebuild_count: turn_timing.layout_rebuild_count,
+                                drain_peak_us: turn_timing.drain_peak_us,
+                                draw_peak_us: turn_timing.draw_peak_us,
+                                drain_histogram: turn_timing.drain_histogram,
+                                draw_histogram: turn_timing.draw_histogram,
+                                frame_coalesced,
+                                main_queue_peak: turn_timing.main_queue_peak,
+                                main_queue_backlog_peak: turn_timing.main_queue_backlog_peak,
+                                main_queue_backlog_cycles: turn_timing.main_queue_backlog_cycles,
+                                priority_queue_peak: turn_timing.priority_queue_peak,
+                                approval_queue_peak: turn_timing.approval_queue_peak,
+                                dropped_events: output_writer
+                                    .dropped_count()
+                                    .saturating_sub(turn_timing.dropped_events_at_start),
+                            },
+                        );
                     }
                     app.needs_redraw = false;
                 } else {
@@ -4116,13 +4593,6 @@ async fn run_main_loop(
                 }
             }
         }
-
-        let (layout_total_us, layout_count, layout_peak_us) = app.take_layout_rebuild_timing();
-        timing.layout_rebuild_total_us = timing
-            .layout_rebuild_total_us
-            .saturating_add(layout_total_us);
-        timing.layout_rebuild_count = timing.layout_rebuild_count.saturating_add(layout_count);
-        timing.layout_rebuild_peak_us = timing.layout_rebuild_peak_us.max(layout_peak_us);
 
         // Crossterm wakes immediately for input, so idle sessions can wait longer
         // without adding typing latency while busy streams keep their redraw cadence.
@@ -4959,6 +5429,37 @@ mod tests {
     use ratatui::text::Line;
     use serde::ser::{Error as _, Serialize, Serializer};
 
+    #[test]
+    fn test_drain_summary_marks_completed_turn_for_timing_report() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: "done".to_string(),
+            timing: None,
+        })
+        .unwrap();
+        tx.try_send(OutputEvent::TurnEnd {
+            accumulated_text: "done again".to_string(),
+            timing: None,
+        })
+        .unwrap();
+        let mut app = App::new();
+
+        let summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut rx,
+            &mut app,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(summary.drained_events, 2);
+        assert_eq!(summary.turn_end_boundaries.len(), 2);
+    }
+
     struct FlushFailsOnceBackend {
         inner: TestBackend,
         fail_flushes: usize,
@@ -5324,6 +5825,7 @@ mod tests {
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text:
                 "1. **Same-line duplicates.** STATUS.md had the line at lines 3 and 6.".into(),
+            timing: None,
         })
         .unwrap();
         drain_output(&mut rx, &mut app);
@@ -5426,6 +5928,7 @@ mod tests {
 
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: "partial".to_string(),
+            timing: None,
         })
         .unwrap();
         drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
@@ -5744,6 +6247,7 @@ mod tests {
         tx.try_send(OutputEvent::Line(Line::from(result))).unwrap();
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: result.to_string(),
+            timing: None,
         })
         .unwrap();
         priority_tx
@@ -6298,6 +6802,7 @@ mod tests {
             .unwrap();
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: streamed.to_string(),
+            timing: None,
         })
         .unwrap();
         tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
@@ -6327,6 +6832,7 @@ mod tests {
             .unwrap();
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: result.to_string(),
+            timing: None,
         })
         .unwrap();
         tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
@@ -6939,6 +7445,7 @@ mod tests {
         // when the turn finishes.
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: "**bold** text\n\nmore".to_string(),
+            timing: None,
         })
         .unwrap();
 
@@ -7018,6 +7525,7 @@ mod tests {
         .unwrap();
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: "Right — the plan is ready for your review.".to_string(),
+            timing: None,
         })
         .unwrap();
 
@@ -7060,6 +7568,7 @@ mod tests {
             .unwrap();
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: "I need more exploration before I can create the plan.".to_string(),
+            timing: None,
         })
         .unwrap();
 
@@ -7101,12 +7610,14 @@ mod tests {
             .unwrap();
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: code_turn.to_string(),
+            timing: None,
         })
         .unwrap();
         tx.try_send(OutputEvent::model_output("**next turn**"))
             .unwrap();
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: "**next turn**".to_string(),
+            timing: None,
         })
         .unwrap();
 
@@ -7150,6 +7661,7 @@ mod tests {
         }
         tx.try_send(OutputEvent::TurnEnd {
             accumulated_text: markdown.to_string(),
+            timing: None,
         })
         .unwrap();
 

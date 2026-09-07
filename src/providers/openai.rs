@@ -4,9 +4,9 @@
 //! `dirac/src/core/api/providers/openai-native.ts`.
 
 use crate::providers::{
-    ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
-    ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, MessageRole,
-    ModelInfo, OpenAiCompatibleModelInfo, PreoutputPolicy, Provider, ProviderError,
+    ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamTiming,
+    ApiStreamToolCall, ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk,
+    MessageRole, ModelInfo, OpenAiCompatibleModelInfo, PreoutputPolicy, Provider, ProviderError,
     ProviderHttpError, ProviderModel, ProviderRequest, ProviderTransport, apply_qwen_model_profile,
     is_retryable_stream_transport_error, normalize_reasoning_delta,
 };
@@ -399,6 +399,7 @@ fn format_stream_error_diagnostics(
     parts.join(", ")
 }
 
+#[cfg(test)]
 async fn next_stream_item_with_timeout<S>(
     stream: &mut S,
     timeout: Duration,
@@ -457,6 +458,7 @@ fn response_headers_timeout_for_request(stream: bool) -> Duration {
     }
 }
 
+#[cfg(test)]
 async fn next_stream_item_until_receiver_closed<S>(
     stream: &mut S,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
@@ -1247,8 +1249,21 @@ pub async fn parse_openai_sse_to_chunks(
     last_stop_reason: &mut Option<String>,
     model_info: Option<&crate::providers::OpenAiCompatibleModelInfo>,
     usage_sent: &mut bool,
-) {
-    for line in buffer.push_chunk(chunk) {
+) -> (u64, u64) {
+    let lines = buffer.push_chunk(chunk);
+    let frame_count = lines
+        .iter()
+        .filter(|line| line.trim_start().starts_with("data:"))
+        .count() as u64;
+    let empty_frame_count = lines
+        .iter()
+        .filter(|line| {
+            line.trim_start()
+                .strip_prefix("data:")
+                .is_some_and(|data| data.trim().is_empty())
+        })
+        .count() as u64;
+    for line in lines {
         process_openai_sse_line(
             &line,
             tx,
@@ -1264,6 +1279,7 @@ pub async fn parse_openai_sse_to_chunks(
     if let Some(err) = buffer.take_error() {
         send_chunk(tx, ApiStreamChunk::Error(err), "error").await;
     }
+    (frame_count, empty_frame_count)
 }
 
 pub async fn finish_openai_sse_to_chunks(
@@ -1275,8 +1291,16 @@ pub async fn finish_openai_sse_to_chunks(
     last_stop_reason: &mut Option<String>,
     model_info: Option<&crate::providers::OpenAiCompatibleModelInfo>,
     usage_sent: &mut bool,
-) {
+) -> (u64, u64) {
+    let mut frame_count = 0;
+    let mut empty_frame_count = 0;
     if let Some(line) = buffer.finish() {
+        frame_count += u64::from(line.trim_start().starts_with("data:"));
+        empty_frame_count += u64::from(
+            line.trim_start()
+                .strip_prefix("data:")
+                .is_some_and(|data| data.trim().is_empty()),
+        );
         process_openai_sse_line(
             &line,
             tx,
@@ -1343,6 +1367,7 @@ pub async fn finish_openai_sse_to_chunks(
         )
         .await;
     }
+    (frame_count, empty_frame_count)
 }
 
 impl Provider for OpenAiProvider {
@@ -1396,9 +1421,10 @@ impl Provider for OpenAiProvider {
             }
         };
 
+        let request_to_headers = request_started_at.elapsed();
         tracing::debug!(
             response_status = %response.status(),
-            headers_elapsed_ms = request_started_at.elapsed().as_millis(),
+            headers_elapsed_ms = request_to_headers.as_millis(),
             "OpenAI response headers received"
         );
 
@@ -1499,7 +1525,26 @@ impl Provider for OpenAiProvider {
         let model_info = self.config.model_info.clone();
 
         tokio::spawn(async move {
-            let mut stream = stream;
+            // Read and timestamp transport chunks independently of SSE parsing. The
+            // parser may await a downstream send, which must not be attributed to
+            // the provider's inter-byte gap.
+            const RAW_STREAM_CHANNEL_CAPACITY: usize = 256;
+            let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel(RAW_STREAM_CHANNEL_CAPACITY);
+            let raw_reader = tokio::spawn(async move {
+                let mut stream = stream;
+                loop {
+                    tokio::select! {
+                        _ = raw_tx.closed() => break,
+                        item = stream.next() => {
+                            let Some(result) = item else { break };
+                            let received_at = Instant::now();
+                            if raw_tx.send((result, received_at)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
             let mut sse_buffer = crate::providers::SseLineBuffer::default();
             let mut delta_state =
                 OpenAiStreamDeltaState::for_cumulative_text_stream(cumulative_text_stream);
@@ -1513,6 +1558,10 @@ impl Provider for OpenAiProvider {
             let mut usage_sent = false;
             let mut stream_errored = false;
             let mut first_byte_elapsed: Option<Duration> = None;
+            let mut raw_sse_frames = 0u64;
+            let mut empty_sse_frames = 0u64;
+            let mut max_inter_raw_byte_gap = Duration::ZERO;
+            let mut last_raw_byte_at: Option<Instant> = None;
 
             loop {
                 if tx.is_closed() {
@@ -1523,13 +1572,14 @@ impl Provider for OpenAiProvider {
                 } else {
                     first_byte_timeout
                 };
-                let Some(result) =
-                    next_stream_item_until_receiver_closed(&mut stream, &tx, timeout).await
-                else {
-                    break;
+                let next_raw = match timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, raw_rx.recv())
+                        .await
+                        .map_err(|_| timeout),
+                    None => Ok(raw_rx.recv().await),
                 };
-                let result = match result {
-                    Ok(Some(result)) => result,
+                let (result, received_at) = match next_raw {
+                    Ok(Some(item)) => item,
                     Ok(None) => break,
                     Err(timeout) => {
                         let phase = if first_byte_elapsed.is_some() {
@@ -1563,15 +1613,22 @@ impl Provider for OpenAiProvider {
                 };
                 match result {
                     Ok(bytes) => {
+                        if !bytes.is_empty() {
+                            if let Some(last_raw_byte_at) = last_raw_byte_at {
+                                max_inter_raw_byte_gap = max_inter_raw_byte_gap
+                                    .max(received_at.duration_since(last_raw_byte_at));
+                            }
+                            last_raw_byte_at = Some(received_at);
+                        }
                         if !bytes.is_empty() && first_byte_elapsed.is_none() {
-                            let elapsed = stream_started_at.elapsed();
+                            let elapsed = received_at.duration_since(stream_started_at);
                             tracing::debug!(
                                 first_byte_elapsed_ms = elapsed.as_millis(),
                                 "OpenAI SSE first response bytes received"
                             );
                             first_byte_elapsed = Some(elapsed);
                         }
-                        parse_openai_sse_to_chunks(
+                        let (frames, empty_frames) = parse_openai_sse_to_chunks(
                             bytes.as_ref(),
                             &mut sse_buffer,
                             &tx,
@@ -1583,6 +1640,8 @@ impl Provider for OpenAiProvider {
                             &mut usage_sent,
                         )
                         .await;
+                        raw_sse_frames += frames;
+                        empty_sse_frames += empty_frames;
                     }
                     Err(e) => {
                         let diagnostics = format_stream_error_diagnostics(
@@ -1615,7 +1674,7 @@ impl Provider for OpenAiProvider {
                 }
             }
             if !tx.is_closed() && !stream_errored {
-                finish_openai_sse_to_chunks(
+                let (frames, empty_frames) = finish_openai_sse_to_chunks(
                     &mut sse_buffer,
                     &tx,
                     &mut delta_state,
@@ -1626,7 +1685,28 @@ impl Provider for OpenAiProvider {
                     &mut usage_sent,
                 )
                 .await;
+                raw_sse_frames += frames;
+                empty_sse_frames += empty_frames;
             }
+            if !tx.is_closed() {
+                let _ = send_chunk(
+                    &tx,
+                    ApiStreamChunk::Timing(ApiStreamTiming {
+                        request_to_headers_us: request_to_headers.as_micros() as u64,
+                        headers_to_first_byte_us: first_byte_elapsed
+                            .map(|elapsed| elapsed.as_micros() as u64),
+                        stream_total_us: request_started_at.elapsed().as_micros() as u64,
+                        raw_sse_frames,
+                        empty_sse_frames,
+                        max_inter_raw_byte_gap_us: max_inter_raw_byte_gap.as_micros() as u64,
+                        completed_at: Some(std::time::Instant::now()),
+                    }),
+                    "timing",
+                )
+                .await;
+            }
+            raw_reader.abort();
+            let _ = raw_reader.await;
         });
 
         let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -3746,6 +3826,70 @@ data: [DONE]
             ApiStreamChunk::Usage(usage)
                 if usage.output_tokens == 0
                     && usage.stop_reason.as_deref() == Some("stop")
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_stream_emits_one_transport_timing_chunk_after_sse() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let sse_body = br#"data: {"id":"fixture","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request);
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                sse_body.len()
+            )
+            .unwrap();
+            socket.write_all(sse_body).unwrap();
+        });
+
+        let provider = OpenAiProvider::new(OpenAiConfig {
+            api_key: "test-key".to_string(),
+            base_url: Some(format!("http://{address}")),
+            model_id: "fixture-model".to_string(),
+            model_info: None,
+            reasoning_effort: None,
+            extra_body: None,
+            custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
+            provider_name: None,
+        })
+        .unwrap();
+        let request = ProviderRequest {
+            system_prompt: "Be concise.".to_string(),
+            messages: vec![],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let mut stream = provider.create_message(request).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+        server.join().unwrap();
+
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+                ApiStreamChunk::Timing(timing)
+                    if timing.raw_sse_frames >= 2
+                        && timing.headers_to_first_byte_us.is_some()
+                        && timing.stream_total_us >= timing.request_to_headers_us
+                        && timing.completed_at.is_some()
         )));
     }
 

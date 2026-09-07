@@ -131,6 +131,10 @@ pub struct TaskState {
     pub first_displayable_text_time: Option<std::time::Instant>,
     /// Timestamp when the first model output was emitted to the output writer.
     pub first_output_emit_time: Option<std::time::Instant>,
+    /// Timestamp after the provider has finished yielding this attempt's stream.
+    pub provider_stream_completed_time: Option<std::time::Instant>,
+    /// Timestamp immediately before the final streamed turn is handed to the TUI.
+    pub turn_end_emitted_time: Option<std::time::Instant>,
     /// Cumulative input tokens across all turns.
     pub cumulative_tokens_in: u32,
     /// Cumulative output tokens across all turns.
@@ -221,6 +225,8 @@ impl Default for TaskState {
             first_reasoning_chunk_time: None,
             first_displayable_text_time: None,
             first_output_emit_time: None,
+            provider_stream_completed_time: None,
+            turn_end_emitted_time: None,
             cumulative_tokens_in: 0,
             cumulative_tokens_out: 0,
             cumulative_cache_writes: 0,
