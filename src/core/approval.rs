@@ -2200,7 +2200,12 @@ pub async fn prompt_for_combined_approval(
 ) -> io::Result<ApprovalResult> {
     let stdin = io::stdin();
     // SECURITY (F-01): Non-interactive stdin DENIES by default
-    if std::env::var("SNED_APPROVAL_DENY").is_ok() || !stdin.is_terminal() {
+    #[cfg(test)]
+    let input_available =
+        stdin.is_terminal() || APPROVAL_INPUT_AVAILABLE_OVERRIDE.load(Ordering::SeqCst);
+    #[cfg(not(test))]
+    let input_available = stdin.is_terminal();
+    if std::env::var("SNED_APPROVAL_DENY").is_ok() || !input_available {
         return Ok(ApprovalResult::Denied);
     }
 

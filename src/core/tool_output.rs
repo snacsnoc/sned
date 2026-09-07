@@ -480,8 +480,10 @@ pub fn summarize_single_section(section: &str) -> String {
         );
     }
 
-    if section.contains("large-file snapshot anchors") {
-        out.push_str("\nLarge-file snapshot anchors expire after any edit, including anchors for untouched lines; use the edit result or read_file again.");
+    if section.contains("large-file snapshot anchors")
+        || section.contains("ordinary Word§ anchors remain inspection-only")
+    {
+        out.push_str("\nLarge-file Word§ anchors are inspection-only. Use the complete sha256 revision from read_file with start_line, end_line, and expected_text for a targeted edit.");
     }
 
     out
@@ -639,12 +641,12 @@ mod tests {
     }
 
     #[test]
-    fn pruned_read_retains_large_file_snapshot_expiry() {
+    fn pruned_read_retains_large_file_revision_edit_guidance() {
         let summary = summarize_single_section(
             "[File: large.txt, Hash: abc]\nLabcN1§old\n[Note: These large-file snapshot anchors are valid only for this file version.]",
         );
-        assert!(summary.contains("expire after any edit"));
-        assert!(summary.contains("including anchors for untouched lines"));
+        assert!(summary.contains("Word§ anchors are inspection-only"));
+        assert!(summary.contains("complete sha256 revision"));
     }
 
     #[test]

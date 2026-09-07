@@ -1070,7 +1070,7 @@ async fn native_workflow_c_guards_preserve_escapes() {
 }
 
 #[tokio::test]
-async fn native_workflow_oversized_read_is_explicitly_inspection_only() {
+async fn native_workflow_oversized_anchor_read_exposes_revision_editing() {
     let w = Workflow::new("x\n".repeat(300_000).as_bytes());
     let output = ToolHandler::execute(
         &ReadFileHandler::new(),
@@ -1079,7 +1079,8 @@ async fn native_workflow_oversized_read_is_explicitly_inspection_only() {
     )
     .await
     .unwrap();
-    assert!(output.as_str().unwrap().contains("inspection only"));
+    assert!(output.as_str().unwrap().contains("[Revision: sha256:"));
+    assert!(output.as_str().unwrap().contains("inspection-only"));
     let anchors = w.read(Some((1, 2))).await;
     let error = w
         .edit(json!([{"anchor": anchors[0], "text": "no"}]))

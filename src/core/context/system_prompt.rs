@@ -202,9 +202,9 @@ impl PromptBuilder {
         if self.has_tool(SnedTool::EditFile) {
             prompt.push_str(
                 "- For `edit_file`, use the current tracked state from a file read or successful edit result and copy one exact, complete `Word§line content` anchor from that tool output, including its prefix; never invent an anchor prefix or use a line number alone.\n\
-                 - Different prefixes distinguish identical-content occurrences in the current tracked state. Prefer batching independent edits from the same snapshot in one `edit_file` call, including in sequential tool mode, unless the task requires sequential edits. Explicit workflow requirements override batching defaults. Unchanged tracked occurrences retain their anchors across edits; a fresh read is not required for each edit. Dependent edits use the updated result. Large-file snapshot anchors expire after any edit; use newly returned anchors or read again.\n\
+                 - Different prefixes distinguish identical-content occurrences in the current tracked state. Prefer batching independent edits from the same snapshot in one `edit_file` call, including in sequential tool mode, unless the task requires sequential edits. Explicit workflow requirements override batching defaults. Unchanged tracked occurrences retain their anchors across edits; a fresh read is not required for each edit. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; its Word§ snapshot anchors are inspection-only.\n\
                  - In an `edit_file` edit, put replacement text in `text`; the optional `content` field is only an exact array of interior lines for duplicate-anchor disambiguation, never a replacement string.\n\
-                 - After a stale, unknown, malformed, or ambiguous edit error, call `read_file` again before retrying. Do not repeat the same anchor.\n",
+                 - After a stale or unknown anchor error, call `read_file` again before retrying. Correct malformed input, whitespace mismatches, overlaps, and duplicate insertions without rereading unless the returned recovery metadata explicitly requires it.\n",
             );
         }
         if self.has_tool(SnedTool::WriteToFile) {

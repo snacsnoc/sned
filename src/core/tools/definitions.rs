@@ -95,7 +95,7 @@ impl ToolSchema {
 pub fn read_file_schema() -> ToolSchema {
     ToolSchema {
         name: "read_file",
-        description: "Read files/ranges as Word§source lines for edit_file. Copy exactly; prefixes distinguish duplicate occurrences. Above SNED_MAX_FILE_READ_SIZE (default 512KB), reads and structural output are inspection-only; restart with a higher limit to edit.",
+        description: "Read files/ranges as Word§source lines for edit_file. Copy exactly; prefixes distinguish duplicate occurrences. Above SNED_MAX_FILE_READ_SIZE (default 512KB), a ranged read also returns a complete sha256 revision for memory-bounded line-range editing; its Word§ anchors remain inspection-only.",
         parameters: vec![
             ToolParameter {
                 name: "paths",
@@ -215,7 +215,7 @@ pub fn search_files_schema() -> ToolSchema {
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
-        description: "Edit existing files; does not create files. Use exact anchors from reads or successful edits. Batch independent edits from one snapshot. Untouched tracked anchors remain valid; large-file snapshot anchors expire after any edit: use new anchors or reread. Failures withhold that file; other files may apply. Reread after anchor errors. Oversized files need higher SNED_MAX_FILE_READ_SIZE; no shell bypass. text replaces; content disambiguates. Use write_to_file to create/full-rewrite.",
+        description: "Edit existing files; does not create files. Use exact anchors from reads or successful edits. Batch independent edits from one snapshot. Untouched tracked anchors remain valid. For oversized files, use the complete sha256 revision from a ranged read with start_line/end_line/expected_text; Sned streams a same-directory atomic replacement. Failures withhold that file; other anchored files may apply. Reread only when recovery metadata requires it. Use write_to_file to create/full-rewrite.",
         parameters: vec![ToolParameter {
             name: "files",
             required: true,
@@ -227,6 +227,10 @@ pub fn edit_file_schema() -> ToolSchema {
                     "path": {
                         "type": "string",
                         "description": "Path of an existing file relative to workspace root; create via write_to_file."
+                    },
+                    "expected_file_hash": {
+                        "type": "string",
+                        "description": "Optional complete sha256:<digest> from a large ranged read. When present, submit exactly one file and use line-range selectors instead of anchors."
                     },
                     "edits": {
                         "type": "array",
@@ -247,6 +251,20 @@ pub fn edit_file_schema() -> ToolSchema {
                                     "type": "string",
                                     "description": "Optional for a single-line replace; required for a range/fingerprint. Inclusive endpoint: copy one exact Word§source line from current read/edit output."
                                 },
+                                "start_line": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "1-based inclusive start line for revision-checked editing; use only with expected_file_hash."
+                                },
+                                "end_line": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "1-based inclusive end line. Defaults to start_line; insertions require one line."
+                                },
+                                "expected_text": {
+                                    "type": "string",
+                                    "description": "Exact selected logical lines joined with LF. Required with start_line; whitespace is significant."
+                                },
                                 "content": {
                                     "type": "array",
                                     "items": { "type": "string" },
@@ -257,7 +275,11 @@ pub fn edit_file_schema() -> ToolSchema {
                                     "description": "Replacement text; use \\n for new lines. In insertions, leading and trailing blank lines count in duplicate checks."
                                 }
                             },
-                            "required": ["anchor", "text"]
+                            "required": ["text"],
+                            "anyOf": [
+                                {"required": ["anchor"]},
+                                {"required": ["start_line", "expected_text"]}
+                            ]
                         }
                     }
                 },
@@ -1060,7 +1082,12 @@ mod tests {
                 )
         );
         assert!(!required.iter().any(|field| field == "edit_type"));
-        assert!(required.iter().any(|field| field == "anchor"));
+        assert!(!required.iter().any(|field| field == "anchor"));
+        assert!(required.iter().any(|field| field == "text"));
+        assert_eq!(properties["start_line"]["minimum"], 1);
+        assert_eq!(properties["expected_text"]["type"], "string");
+        assert_eq!(edit["anyOf"][0]["required"][0], "anchor");
+        assert_eq!(edit["anyOf"][1]["required"][0], "start_line");
         assert!(
             schema
                 .description
@@ -1071,12 +1098,8 @@ mod tests {
                 .description
                 .contains("Untouched tracked anchors remain valid")
         );
-        assert!(
-            schema
-                .description
-                .contains("snapshot anchors expire after any edit")
-        );
-        assert!(schema.description.contains("Reread after anchor errors"));
+        assert!(schema.description.contains("revision from a ranged read"));
+        assert!(schema.description.contains("recovery metadata requires it"));
     }
 
     #[test]

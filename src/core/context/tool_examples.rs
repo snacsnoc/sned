@@ -16,10 +16,10 @@ EXAMPLE TOOL CALLS
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
 - run/test: tool=execute_command args={\"commands\": [\"cargo test --no-fail-fast\"]} (commands is a literal JSON array, not a string containing an array)
 - complex run-only logic: tool=execute_command args={\"script\": \"...\", \"language\": \"python\"}
-- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. Large-file snapshot anchors expire after any edit; use newly returned anchors or read again.
+- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; Word§ snapshot anchors are inspection-only.
 - edit_file uses text for replacement text. Its optional content field is only an array of exact interior lines for a duplicate-anchor fingerprint; it is not the replacement string.
 - Use file tools for workspace changes. Use execute_command for inspection, builds, tests, and other execution; do not replace a file edit with shell redirection, a heredoc, or an ad-hoc Python/sed rewrite.
-- retry after tool failure: read the complete error, correct the named argument, and call the same tool again. For a stale or unknown edit anchor, call read_file again before retrying.
+- retry after tool failure: read the complete error, correct the named argument, and call the same tool again. Only stale or unknown anchor recovery requires read_file; malformed input, whitespace mismatch, overlap, and duplicate insertion do not.
 ";
 
 const WRITE_ONLY_TOOL_EXAMPLES: &str = "\
@@ -35,9 +35,9 @@ EXAMPLE TOOL CALLS
 - search/find: tool=search_files args={\"regex\": \"fn handle_error\", \"path\": \"src\"}
 - edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
-- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. Large-file snapshot anchors expire after any edit; use newly returned anchors or read again.
+- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; Word§ snapshot anchors are inspection-only.
 - edit_file uses text for replacement text. Its optional content field is only an array of exact interior lines for a duplicate-anchor fingerprint; it is not the replacement string.
-- retry after a stale or unknown edit anchor: call read_file again before retrying.
+- retry after a stale or unknown edit anchor: call read_file again before retrying. Correct validation-only failures without rereading.
 ";
 
 const PLAN_TOOL_EXAMPLES: &str = "\
@@ -102,7 +102,8 @@ mod tests {
             let examples = tool_examples_for_model(None, Some(profile)).unwrap();
             assert!(examples.contains("current tracked state"));
             assert!(examples.contains("same snapshot in one edit_file call"));
-            assert!(examples.contains("Large-file snapshot anchors expire after any edit"));
+            assert!(examples.contains("ranged read's complete sha256 revision"));
+            assert!(examples.contains("Word§ snapshot anchors are inspection-only"));
             assert!(!examples.contains("immediately preceding"));
         }
     }

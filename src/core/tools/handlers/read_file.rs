@@ -11,7 +11,9 @@
 
 use crate::core::agent_loop::TaskState;
 use crate::core::file_editor::{AnchorStateManager, normalize_file_content, split_content_lines};
-use crate::core::hash_utils::{ANCHOR_GUIDANCE, content_hash, format_line_with_hash};
+use crate::core::hash_utils::{
+    ANCHOR_GUIDANCE, anchor_guidance, content_hash, format_line_with_hash,
+};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use futures::StreamExt;
 use std::future::Future;
@@ -24,6 +26,38 @@ pub(crate) fn max_file_read_size() -> usize {
     *MAX.get_or_init(|| {
         max_file_read_size_from_value(std::env::var("SNED_MAX_FILE_READ_SIZE").ok().as_deref())
     })
+}
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    limit: usize,
+) -> Result<usize, std::io::Error> {
+    use tokio::io::AsyncBufReadExt;
+
+    line.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(line.len());
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line exceeds the supported range size",
+            ));
+        }
+        let has_newline = available[take - 1] == b'\n';
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if has_newline {
+            return Ok(line.len());
+        }
+    }
 }
 
 const DEFAULT_MAX_FILE_READ_SIZE: usize = 512 * 1024;
@@ -442,13 +476,13 @@ impl ReadFileHandler {
         };
         let hash = content_hash(&hash_content);
 
+        let guidance = if refreshes_edit_context {
+            anchor_guidance(lines_for_reconcile.len())
+        } else {
+            ANCHOR_GUIDANCE.to_string()
+        };
         let mut content =
-            format!("[File: {display_path}, Hash: {hash}]\n{ANCHOR_GUIDANCE}\n{anchored_content}");
-        if refreshes_edit_context
-            && lines_for_reconcile.len() > crate::core::file_editor::MAX_TRACKED_LINES
-        {
-            content.push_str("\n[Note: These large-file snapshot anchors are valid only for this file version. After any edit, use the newly returned anchors or read_file again; old anchors cannot be reused even for unchanged lines.]");
-        }
+            format!("[File: {display_path}, Hash: {hash}]\n{guidance}\n{anchored_content}");
         if let Some(note) = clamping_note {
             content = format!("{note}\n{content}");
         }
@@ -653,7 +687,7 @@ impl ReadFileHandler {
             }
         };
 
-        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::io::BufReader;
 
         let file = match tokio::fs::File::open(&canonical_path).await {
             Ok(file) => file,
@@ -674,15 +708,27 @@ impl ReadFileHandler {
         let requested_start = start_line.unwrap_or(1).max(1);
         let requested_end = end_line.unwrap_or(usize::MAX);
         let mut reader = BufReader::new(file);
-        let mut line = String::new();
+        let mut line = Vec::new();
         let mut line_no = 0usize;
         let mut selected_lines = Vec::new();
         let mut selected_bytes = 0usize;
+        let mut ended_with_newline = false;
+        let mut requested_range_complete = false;
+        let mut revision = sha2::Sha256::new();
+        use sha2::Digest;
+        use tokio::io::AsyncReadExt;
 
         loop {
-            line.clear();
-            let read = match reader.read_line(&mut line).await {
+            let read = match read_bounded_line(&mut reader, &mut line, max_bytes.max(1)).await {
                 Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(Self::ranged_read_too_large(
+                        path,
+                        &canonical_path,
+                        max_bytes.saturating_add(1) as u64,
+                        max_bytes,
+                    ));
+                }
                 Err(e) => {
                     let err = crate::cli::actionable_errors::file_not_found(path, &e.to_string());
                     return Err(FileReadResult {
@@ -699,13 +745,15 @@ impl ReadFileHandler {
             if read == 0 {
                 break;
             }
+            revision.update(&line);
+            ended_with_newline = line.ends_with(b"\n");
 
             line_no = line_no.saturating_add(1);
             if line_no < requested_start {
                 continue;
             }
             if line_no > requested_end {
-                break;
+                continue;
             }
 
             selected_bytes = selected_bytes.saturating_add(read);
@@ -718,27 +766,70 @@ impl ReadFileHandler {
                 ));
             }
 
-            if line.ends_with('\n') {
-                line.pop();
+            let mut normalized_line = line.clone();
+            if normalized_line.ends_with(b"\n") {
+                normalized_line.pop();
             }
-            if line.ends_with('\r') {
-                line.pop();
+            if normalized_line.ends_with(b"\r") {
+                normalized_line.pop();
             }
             if line_no == 1 {
-                line = line.strip_prefix('\u{feff}').unwrap_or(&line).to_string();
+                if normalized_line.starts_with(&[0xef, 0xbb, 0xbf]) {
+                    normalized_line.drain(..3);
+                }
             }
-            selected_lines.push(line.clone());
+            let normalized_line = String::from_utf8(normalized_line).map_err(|_| {
+                Self::ranged_read_too_large(path, &canonical_path, selected_bytes as u64, max_bytes)
+            })?;
+            selected_lines.push(normalized_line);
+
+            if requested_end != usize::MAX && line_no >= requested_end {
+                requested_range_complete = true;
+                // The full revision still covers the tail, but lines outside the
+                // requested range must not inherit its decoding or size limits.
+                let mut tail = [0u8; 64 * 1024];
+                loop {
+                    let tail_len = reader.read(&mut tail).await.map_err(|error| {
+                        let err =
+                            crate::cli::actionable_errors::file_not_found(path, &error.to_string());
+                        FileReadResult {
+                            path: path.to_string(),
+                            canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
+                            content: String::new(),
+                            hash: String::new(),
+                            success: false,
+                            refreshes_edit_context: false,
+                            error: Some(err.display()),
+                        }
+                    })?;
+                    if tail_len == 0 {
+                        break;
+                    }
+                    revision.update(&tail[..tail_len]);
+                }
+                break;
+            }
         }
 
+        // `split_content_lines` exposes the empty logical line after a
+        // terminating newline. Keep that line addressable in large-file
+        // ranged reads so the editor and reader use the same coordinates.
+        if !requested_range_complete && ended_with_newline {
+            line_no = line_no.saturating_add(1);
+            if line_no >= requested_start && line_no <= requested_end {
+                selected_lines.push(String::new());
+            }
+        }
+
+        let revision = format!("sha256:{:x}", revision.finalize());
         let clamping_note = if requested_start > line_no && line_no > 0 {
             Some(format!(
-                "[Note: start_line was beyond the end of this large file (file has {line_no} lines); no requested lines were available.]"
+                "[Revision: {revision}]\n[Note: start_line was beyond the end of this large file (file has {line_no} lines); no requested lines were available.]"
             ))
         } else {
-            Some(
-                "[Note: This file exceeds the full-read limit. These range-local anchors are for inspection only and do not authorize edit_file. For a targeted edit, ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE. Use write_to_file only with complete replacement content; do not use shell or ad-hoc scripts to bypass this limit.]"
-                    .to_string(),
-            )
+            Some(format!(
+                "[Revision: {revision}]\n[Note: This file exceeds the full-read limit. Use expected_file_hash with revision-checked line ranges for a targeted edit; ordinary Word§ anchors remain inspection-only for this snapshot.]"
+            ))
         };
 
         let hash_content = selected_lines.join("\n");
@@ -1522,6 +1613,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_large_range_can_read_trailing_logical_line() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let mut data = "padding\n".repeat(70_000);
+        data.push_str("target\n");
+        temp_file.write_all(data.as_bytes()).unwrap();
+
+        let (_, selected_lines, _, _, _, _, _) = ReadFileHandler::new()
+            .read_large_lines_range(
+                temp_file.path().to_str().unwrap(),
+                Some(70_002),
+                Some(70_002),
+                max_file_read_size(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected_lines, vec![String::new()]);
+    }
+
+    #[tokio::test]
     async fn test_read_file_allows_small_line_range_in_oversized_file() {
         let mut temp_file = NamedTempFile::new().unwrap();
         for i in 1..=60_000 {
@@ -1550,7 +1660,37 @@ mod tests {
         assert!(
             result
                 .content
-                .contains("range-local anchors are for inspection only")
+                .contains("ordinary Word§ anchors remain inspection-only")
+        );
+        use sha2::Digest;
+        let expected = format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(std::fs::read(temp_file.path()).unwrap())
+        );
+        assert!(result.content.contains(&format!("[Revision: {expected}]")));
+    }
+
+    #[tokio::test]
+    async fn test_large_range_hashes_oversized_tail_without_line_validation() {
+        use sha2::Digest;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let mut data = b"header one\nheader two\n".to_vec();
+        data.extend(std::iter::repeat_n(b'x', 2048));
+        data.extend_from_slice(b"\ntail\n");
+        temp_file.write_all(&data).unwrap();
+
+        let (_, selected_lines, note, _, _, _, _) = ReadFileHandler::new()
+            .read_large_lines_range(temp_file.path().to_str().unwrap(), Some(1), Some(2), 1024)
+            .await
+            .expect("a large line after the requested range must not reject the read");
+
+        assert_eq!(selected_lines, vec!["header one", "header two"]);
+        let expected_revision = format!("sha256:{:x}", sha2::Sha256::digest(&data));
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains(&expected_revision)),
+            "the revision must cover the complete raw file"
         );
     }
 

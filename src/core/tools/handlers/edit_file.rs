@@ -34,6 +34,27 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[derive(Debug, Clone)]
+struct RevisionRangeEdit {
+    edit_type: String,
+    start_line: usize,
+    end_line: usize,
+    expected_text: String,
+    text: String,
+}
+
+struct StagedRangeEdit {
+    path: String,
+    expected_revision: String,
+    output_revision: String,
+    temp_path: PathBuf,
+    applied_count: usize,
+    lines_added: usize,
+    lines_removed: usize,
+}
+
+const MAX_REVISION_RANGE_LINE_BYTES: usize = MAX_FINGERPRINT_CONTENT_BYTES;
+
 fn max_edit_file_size() -> u64 {
     crate::core::tools::handlers::read_file::max_file_read_size() as u64
 }
@@ -300,7 +321,15 @@ impl EditFileHandler {
             .as_ref()
             .into_iter()
             .flatten()
-            .filter_map(|file| file.get("path").and_then(|path| path.as_str()))
+            .filter_map(|file| {
+                file.get("path").and_then(|path| path.as_str()).or_else(|| {
+                    file.get("edits")
+                        .and_then(|edits| edits.as_array())
+                        .and_then(|edits| edits.first())
+                        .and_then(|edit| edit.get("path"))
+                        .and_then(|path| path.as_str())
+                })
+            })
             .map(str::to_string)
             .collect::<Vec<_>>();
         if requested_paths.is_empty()
@@ -749,6 +778,407 @@ impl EditFileHandler {
         }
         (errors, stale_paths)
     }
+
+    fn parse_revision_range_edits(
+        file: &serde_json::Value,
+    ) -> Result<(String, Vec<RevisionRangeEdit>), ToolError> {
+        let revision = file
+            .get("expected_file_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ToolError::InvalidInput(
+                    "Revision-checked line edits require expected_file_hash from read_file output."
+                        .into(),
+                )
+            })?;
+        let digest = revision.strip_prefix("sha256:").unwrap_or(revision);
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ToolError::InvalidInput(
+                "expected_file_hash must be a complete sha256:<64 hexadecimal digits> revision from read_file.".into(),
+            ));
+        }
+        let raw = file
+            .get("edits")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                ToolError::InvalidInput(
+                    "Revision-checked line edits require a non-empty edits array.".into(),
+                )
+            })?;
+        if raw.is_empty() {
+            return Err(ToolError::InvalidInput(
+                "Revision-checked line edits require a non-empty edits array.".into(),
+            ));
+        }
+        let mut edits = Vec::with_capacity(raw.len());
+        for value in raw {
+            let start_line = value
+                .get("start_line")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    ToolError::InvalidInput(
+                        "Each revision-checked edit requires a positive start_line.".into(),
+                    )
+                })?;
+            let end_line = value
+                .get("end_line")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(start_line);
+            if start_line == 0 || end_line < start_line {
+                return Err(ToolError::InvalidInput(
+                    "Line ranges are 1-based and inclusive; end_line must be at least start_line."
+                        .into(),
+                ));
+            }
+            let edit_type = value
+                .get("edit_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("replace");
+            Self::validate_edit_type(edit_type)?;
+            if edit_type != "replace" && start_line != end_line {
+                return Err(ToolError::InvalidInput(
+                    "insert_before and insert_after require a single-line range.".into(),
+                ));
+            }
+            let expected_text = value
+                .get("expected_text")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    ToolError::InvalidInput(
+                        "Each revision-checked edit requires exact expected_text.".into(),
+                    )
+                })?;
+            let text = value.get("text").and_then(serde_json::Value::as_str)
+                .ok_or_else(|| ToolError::InvalidInput("Each revision-checked edit requires replacement text, including an empty string for deletion.".into()))?;
+            if expected_text.len() > MAX_FINGERPRINT_CONTENT_BYTES
+                || text.len() > MAX_FINGERPRINT_CONTENT_BYTES
+            {
+                return Err(ToolError::InvalidInput("A revision-checked edit is limited to 1 MiB of expected or replacement text; use a narrower range.".into()));
+            }
+            edits.push(RevisionRangeEdit {
+                edit_type: edit_type.into(),
+                start_line,
+                end_line,
+                expected_text: expected_text.into(),
+                text: text.into(),
+            });
+        }
+        edits.sort_by_key(|edit| (edit.start_line, edit.end_line));
+        for pair in edits.windows(2) {
+            if pair[1].start_line <= pair[0].end_line {
+                return Err(ToolError::InvalidInput(
+                    "Revision-checked edit ranges must not overlap or share an insertion point."
+                        .into(),
+                ));
+            }
+        }
+        Ok((format!("sha256:{}", digest.to_ascii_lowercase()), edits))
+    }
+
+    async fn sha256_file(path: &Path) -> Result<String, ToolError> {
+        use sha2::Digest;
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::open(path).await.map_err(|error| {
+            ToolError::ExecutionFailed(format!(
+                "Failed to open {} for revision verification: {error}",
+                path.display()
+            ))
+        })?;
+        let mut digest = sha2::Sha256::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).await.map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "Failed to read {} for revision verification: {error}",
+                    path.display()
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(format!("sha256:{:x}", digest.finalize()))
+    }
+
+    fn normalized_source_line(raw: &[u8], line_number: usize) -> Result<String, ToolError> {
+        let mut line = raw;
+        if line.ends_with(b"\n") {
+            line = &line[..line.len() - 1];
+        }
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        if line_number == 1 && line.starts_with(&[0xef, 0xbb, 0xbf]) {
+            line = &line[3..];
+        }
+        String::from_utf8(line.to_vec()).map_err(|_| {
+            ToolError::InvalidInput(
+                "Revision-checked line editing currently requires UTF-8 source text.".into(),
+            )
+        })
+    }
+
+    async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+        reader: &mut R,
+        line: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<usize, std::io::Error> {
+        use tokio::io::AsyncBufReadExt;
+
+        line.clear();
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(line.len());
+            }
+            let take = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(take) > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "revision-checked line exceeds the supported size",
+                ));
+            }
+            let has_newline = available[take - 1] == b'\n';
+            line.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            if has_newline {
+                return Ok(line.len());
+            }
+        }
+    }
+
+    async fn stage_revision_range_edit(
+        path: &Path,
+        display_path: &str,
+        expected_revision: &str,
+        edits: &[RevisionRangeEdit],
+    ) -> Result<StagedRangeEdit, ToolError> {
+        use sha2::Digest;
+        use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+        let source = tokio::fs::File::open(path).await.map_err(|error| {
+            ToolError::ExecutionFailed(format!("Failed to open {display_path}: {error}"))
+        })?;
+        let metadata = source.metadata().await.map_err(|error| {
+            ToolError::ExecutionFailed(format!("Failed to inspect {display_path}: {error}"))
+        })?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let temp_path = parent.join(format!(".{name}.sned-range-{}.tmp", fastrand::u64(..)));
+        let temp = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("Failed to stage {display_path}: {error}"))
+            })?;
+        if let Err(error) = temp.set_permissions(metadata.permissions()).await {
+            drop(temp);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(ToolError::ExecutionFailed(format!(
+                "Failed to preserve permissions for {display_path}: {error}"
+            )));
+        }
+        let mut reader = BufReader::new(source);
+        let mut writer = BufWriter::new(temp);
+        let mut source_digest = sha2::Sha256::new();
+        let mut raw = Vec::new();
+        let mut line_number = 0usize;
+        let mut edit_index = 0usize;
+        let mut captured = Vec::new();
+        let mut captured_raw = Vec::new();
+        let mut newline = b"\n".to_vec();
+        let mut ended_with_newline = false;
+        let mut previous_source_lines = std::collections::VecDeque::new();
+        let mut pending_after_check: Option<(Vec<String>, usize)> = None;
+        let mut applied_count = 0usize;
+        let mut lines_added = 0usize;
+        let mut lines_removed = 0usize;
+        let mut deleted_range_end = None;
+        let result: Result<(), ToolError> = async {
+            loop {
+                let read = Self::read_bounded_line(
+                    &mut reader,
+                    &mut raw,
+                    MAX_REVISION_RANGE_LINE_BYTES,
+                )
+                .await
+                .map_err(|error| {
+                    ToolError::InvalidInput(format!(
+                        "Failed to read {display_path}: {error}. Use a narrower range."
+                    ))
+                })?;
+                let synthetic_trailing_line = read == 0 && ended_with_newline;
+                if read == 0 && !synthetic_trailing_line {
+                    break;
+                }
+                if !synthetic_trailing_line {
+                    source_digest.update(&raw);
+                }
+                line_number += 1;
+                if line_number == 1 && raw.ends_with(b"\r\n") { newline = b"\r\n".to_vec(); }
+                let normalized_line = Self::normalized_source_line(&raw, line_number)?;
+                if let Some((expected_lines, matched)) = pending_after_check.as_mut() {
+                    if normalized_line == expected_lines[*matched] {
+                        *matched += 1;
+                        if *matched == expected_lines.len() {
+                            return Err(ToolError::InvalidInput(format!(
+                                "insert_after for {display_path} would duplicate the adjacent source lines; use a range replacement instead."
+                            )));
+                        }
+                    } else {
+                        pending_after_check = None;
+                    }
+                }
+                let active = edits.get(edit_index);
+                if active.is_some_and(|edit| line_number >= edit.start_line && line_number <= edit.end_line) {
+                    captured.push(normalized_line.clone());
+                    captured_raw.extend_from_slice(&raw);
+                    if line_number == active.unwrap().end_line {
+                        let edit = active.unwrap();
+                        if captured.join("\n") != edit.expected_text {
+                            return Err(ToolError::InvalidInput(format!("expected_text did not match {display_path} lines {}-{}. The file was not changed; correct the range/text using the current read output.", edit.start_line, edit.end_line)));
+                        }
+                        let had_terminator = captured_raw.ends_with(b"\n");
+                        let replacement_text = strip_hashes(&edit.text).replace("\r\n", "\n");
+                        let replacement_lines = if replacement_text.is_empty() {
+                            Vec::new()
+                        } else {
+                            crate::core::file_editor::split_content_lines(&replacement_text)
+                        };
+                        let replacement = replacement_lines
+                            .join(std::str::from_utf8(&newline).unwrap())
+                            .into_bytes();
+                        let had_bom = edit.start_line == 1 && captured_raw.starts_with(&[0xef, 0xbb, 0xbf]);
+                        let original_without_bom = if had_bom { &captured_raw[3..] } else { &captured_raw[..] };
+                        if had_bom { writer.write_all(&[0xef, 0xbb, 0xbf]).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?; }
+                        let unchanged = edit.edit_type == "replace"
+                            && captured == replacement_lines;
+                        if matches!(edit.edit_type.as_str(), "insert_before" | "insert_after")
+                            && !replacement_lines.is_empty()
+                        {
+                            if replacement_lines.iter().any(|line| line == &captured[0]) {
+                                return Err(ToolError::InvalidInput(format!(
+                                    "{} for {display_path} would duplicate the anchored source line; use a range replacement instead.",
+                                    edit.edit_type
+                                )));
+                            }
+                            if edit.edit_type == "insert_before"
+                                && previous_source_lines.len() >= replacement_lines.len()
+                                && previous_source_lines
+                                    .iter()
+                                    .rev()
+                                    .take(replacement_lines.len())
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .eq(replacement_lines.iter())
+                            {
+                                return Err(ToolError::InvalidInput(format!(
+                                    "insert_before for {display_path} would duplicate adjacent source lines; use a range replacement instead."
+                                )));
+                            }
+                        }
+                        match edit.edit_type.as_str() {
+                            "insert_before" => {
+                                if !replacement_lines.is_empty() {
+                                    writer.write_all(&replacement).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                                    writer.write_all(&newline).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                                    applied_count += 1;
+                                    lines_added += replacement_lines.len();
+                                }
+                                writer.write_all(original_without_bom).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                            }
+                            "insert_after" => {
+                                writer.write_all(original_without_bom).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                                if !replacement_lines.is_empty() {
+                                    if !had_terminator { writer.write_all(&newline).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?; }
+                                    writer.write_all(&replacement).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                                    if had_terminator { writer.write_all(&newline).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?; }
+                                    applied_count += 1;
+                                    lines_added += replacement_lines.len();
+                                    pending_after_check = Some((replacement_lines.clone(), 0));
+                                }
+                            }
+                            _ => {
+                                if unchanged {
+                                    writer.write_all(original_without_bom).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                                } else {
+                                    writer.write_all(&replacement).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                                    if had_terminator && !replacement_lines.is_empty() { writer.write_all(&newline).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?; }
+                                    applied_count += 1;
+                                    lines_added += replacement_lines.len();
+                                    lines_removed += captured.len();
+                                    deleted_range_end = replacement_lines.is_empty().then_some(edit.end_line);
+                                }
+                            }
+                        }
+                        captured.clear(); captured_raw.clear(); edit_index += 1;
+                    }
+                } else {
+                    writer.write_all(&raw).await.map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                }
+                previous_source_lines.push_back(normalized_line);
+                while previous_source_lines.len() > 16 {
+                    previous_source_lines.pop_front();
+                }
+                ended_with_newline = !synthetic_trailing_line && raw.ends_with(b"\n");
+            }
+            if edit_index != edits.len() { return Err(ToolError::InvalidInput(format!("A revision-checked range for {display_path} extends beyond the file's {line_number} lines."))); }
+            let actual = format!("sha256:{:x}", source_digest.finalize());
+            if actual != expected_revision { return Err(ToolError::ExecutionFailedWithMetadata(format!("File {display_path} changed since the ranged read (expected {expected_revision}, found {actual}). Read the range again before retrying."), ToolFailureMetadata { class: ToolFailureClass::AnchorInvalid, affected_paths: vec![path.to_string_lossy().into_owned()], required_next_step: Some(ToolRequiredNextStep::ReadFile) })); }
+            writer.flush().await.map_err(|error| ToolError::ExecutionFailed(format!("Failed to flush staged output for {display_path}: {error}")))?;
+            if deleted_range_end == Some(line_number) {
+                let current_len = writer
+                    .get_ref()
+                    .metadata()
+                    .await
+                    .map_err(|error| ToolError::ExecutionFailed(format!("Failed to inspect staged output for {display_path}: {error}")))?
+                    .len();
+                let newline_len = newline.len() as u64;
+                if current_len >= newline_len {
+                    writer
+                        .get_mut()
+                        .set_len(current_len - newline_len)
+                        .await
+                        .map_err(|error| ToolError::ExecutionFailed(format!("Failed to preserve EOF semantics for {display_path}: {error}")))?;
+                }
+            }
+            writer.get_ref().sync_all().await.map_err(|error| ToolError::ExecutionFailed(format!("Failed to sync staged output for {display_path}: {error}")))?;
+            Ok(())
+        }.await;
+        if let Err(error) = result {
+            drop(writer);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(error);
+        }
+        drop(writer);
+        let output_revision = match Self::sha256_file(&temp_path).await {
+            Ok(revision) => revision,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(error);
+            }
+        };
+        Ok(StagedRangeEdit {
+            path: path.to_string_lossy().into_owned(),
+            expected_revision: expected_revision.into(),
+            output_revision,
+            temp_path,
+            applied_count,
+            lines_added,
+            lines_removed,
+        })
+    }
 }
 
 impl EditFileHandler {
@@ -758,6 +1188,7 @@ impl EditFileHandler {
         params: serde_json::Value,
         workspace_root: &Path,
         allowed_external_roots: &[std::path::PathBuf],
+        _file_locks: Vec<crate::core::file_editor::FileEditGuard>,
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
         explicitly_approved: bool,
@@ -801,6 +1232,146 @@ impl EditFileHandler {
             } else {
                 Err(ToolError::InvalidInput("No files specified. The 'files' parameter must be an array of objects with 'path' and 'edits' fields.".to_string()))
             };
+        }
+
+        if files
+            .iter()
+            .any(|file| file.get("expected_file_hash").is_some())
+        {
+            if files.len() != 1 {
+                return Err(ToolError::InvalidInput(
+                    "Revision-checked line-range editing currently accepts exactly one file per edit_file call so its streamed atomic replacement cannot be mixed with another file transaction."
+                        .into(),
+                ));
+            }
+            let file = &files[0];
+            let display_path = Self::file_entry_path(file).map_err(ToolError::InvalidInput)?;
+            let path = self.resolve_path(workspace_root, allowed_external_roots, display_path)?;
+            let (expected_revision, edits) = Self::parse_revision_range_edits(file)?;
+
+            if !explicitly_approved {
+                let should_prompt = if let Some(ref manager) = self.approval_manager {
+                    manager
+                        .lock()
+                        .await
+                        .should_prompt_with_path(SnedTool::EditFile, Some(display_path))
+                } else {
+                    false
+                };
+                if should_prompt {
+                    let preview = format!(
+                        "Revision-checked streamed edit of {display_path}: {} edit(s)",
+                        edits.len()
+                    );
+                    match prompt_for_combined_approval(1, edits.len(), &preview, output_writer)
+                        .await
+                    {
+                        Ok(crate::core::approval::ApprovalResult::Denied) => {
+                            return Ok(crate::core::approval::format_denial_message(
+                                SnedTool::EditFile.name(),
+                            ));
+                        }
+                        Ok(crate::core::approval::ApprovalResult::Always) => {
+                            if let Some(ref manager) = self.approval_manager {
+                                manager.lock().await.auto_approve(SnedTool::EditFile, None);
+                            }
+                        }
+                        Ok(crate::core::approval::ApprovalResult::Approved) => {}
+                        Ok(crate::core::approval::ApprovalResult::AllowExternalDirectory) => {
+                            return Err(ToolError::ExecutionFailed(
+                                "External directory approval must be handled before edit_file runs"
+                                    .into(),
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(ToolError::ExecutionFailed(
+                                crate::core::approval::format_approval_error(None, &error),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let staged = Self::stage_revision_range_edit(
+                Path::new(&path),
+                display_path,
+                &expected_revision,
+                &edits,
+            )
+            .await?;
+
+            let current_revision = match Self::sha256_file(Path::new(&path)).await {
+                Ok(revision) => revision,
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&staged.temp_path).await;
+                    return Err(error);
+                }
+            };
+            if current_revision != staged.expected_revision {
+                let _ = tokio::fs::remove_file(&staged.temp_path).await;
+                return Err(ToolError::ExecutionFailedWithMetadata(
+                    format!(
+                        "File {display_path} changed after the ranged edit was prepared. Read the range again before retrying."
+                    ),
+                    ToolFailureMetadata {
+                        class: ToolFailureClass::AnchorInvalid,
+                        affected_paths: vec![path],
+                        required_next_step: Some(ToolRequiredNextStep::ReadFile),
+                    },
+                ));
+            }
+            if staged.applied_count == 0 {
+                let _ = tokio::fs::remove_file(&staged.temp_path).await;
+                return Ok(format!(
+                    "Edited 1 file(s): 0 edit(s) applied.\n\nNo changes were applied; the revision remains {}.",
+                    staged.output_revision
+                ));
+            }
+            if let Err(error) = tokio::fs::rename(&staged.temp_path, &staged.path).await {
+                let _ = tokio::fs::remove_file(&staged.temp_path).await;
+                return Err(ToolError::ExecutionFailed(format!(
+                    "Failed to atomically replace {display_path}: {error}"
+                )));
+            }
+            anchor_mgr.invalidate_state(&staged.path, task_id);
+            {
+                let mut task = state.lock().await;
+                let key = crate::core::tools::canonical_path_key(Path::new(&staged.path));
+                task.file_content_cache.pop(&key);
+                task.must_reread_before_edit.insert(key);
+                task.file_context_tracker
+                    .mark_file_as_edited_by_sned(Path::new(&staged.path));
+            }
+            if let Some(symbol_index_service) = &self.symbol_index_service {
+                let index_root = tokio::fs::canonicalize(workspace_root)
+                    .await
+                    .unwrap_or_else(|_| workspace_root.to_path_buf());
+                let absolute_path = Path::new(&staged.path);
+                if let Ok(rel_path) = absolute_path.strip_prefix(&index_root) {
+                    let indexed_content = tokio::fs::read_to_string(absolute_path).await.map_err(
+                        |error| {
+                            ToolError::ExecutionFailed(format!(
+                                "Content was applied to {display_path}, but it could not be read for symbol-index refresh: {error}"
+                            ))
+                        },
+                    )?;
+                    crate::services::symbol_index::index_file_after_write(
+                        Arc::clone(symbol_index_service),
+                        &index_root,
+                        &rel_path.to_string_lossy(),
+                        &indexed_content,
+                    )
+                    .await;
+                }
+            }
+            return Ok(format!(
+                "Edited 1 file(s): {} edit(s) applied.\n\nApplied {} edit(s) successfully (+{}, -{} lines). New revision: {}. Untouched lines retain their anchors. Inserted and changed lines have new anchors shown below. The source was streamed through a same-directory temporary file and replaced atomically; permissions and original line-ending style were preserved.",
+                staged.applied_count,
+                staged.applied_count,
+                staged.lines_added,
+                staged.lines_removed,
+                staged.output_revision
+            ));
         }
 
         let processor = BatchProcessor::new(DiffMode::AdditionsOnly);
@@ -2182,6 +2753,7 @@ impl ToolHandler for EditFileHandler {
                     params,
                     ctx.workspace_root.as_path(),
                     &ctx.allowed_external_roots,
+                    _file_locks,
                     &ctx.anchor_mgr,
                     Some(ctx.task_id.as_str()),
                     ctx.explicitly_approved,
@@ -2214,6 +2786,19 @@ mod tests {
     static TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+    fn revision_stage_files(directory: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".sned-range-") && name.ends_with(".tmp"))
+            })
+            .collect()
+    }
+
     #[test]
     fn test_edit_file_handler_creation() {
         let handler = EditFileHandler::new();
@@ -2242,6 +2827,338 @@ mod tests {
                 .to_string()
                 .contains("No files specified")
         );
+    }
+
+    #[tokio::test]
+    async fn revision_checked_range_edit_streams_oversized_crlf_file() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let mut original = Vec::from(&b"\xef\xbb\xbf"[..]);
+        original.extend_from_slice("padding\r\n".repeat(70_000).as_bytes());
+        original.extend_from_slice(b"target");
+        assert!(original.len() > max_edit_file_size() as usize);
+        std::fs::write(&path, &original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o744)).unwrap();
+        }
+        let revision = format!("sha256:{:x}", sha2::Sha256::digest(&original));
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::with_cache_file(dir.path().join("anchors.json")),
+            false,
+            "range-task".into(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({"files":[{
+                "path":"large.txt",
+                "expected_file_hash":revision,
+                "edits":[{"start_line":70001,"end_line":70001,"expected_text":"target","text":"updated"}]
+            }]}),
+        )
+        .await
+        .unwrap();
+        assert!(result.as_str().unwrap().contains("New revision: sha256:"));
+        let mut expected = Vec::from(&b"\xef\xbb\xbf"[..]);
+        expected.extend_from_slice("padding\r\n".repeat(70_000).as_bytes());
+        expected.extend_from_slice(b"updated");
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o744
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revision_checked_range_edit_rejects_stale_revision_without_writing() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let revision = format!("sha256:{:x}", sha2::Sha256::digest(b"older\n"));
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::with_cache_file(dir.path().join("anchors.json")),
+            false,
+            "range-task".into(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let error = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({"files":[{
+                "path":"file.txt",
+                "expected_file_hash":revision,
+                "edits":[{"start_line":2,"expected_text":"two","text":"changed"}]
+            }]}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.metadata().unwrap().required_next_step,
+            Some(ToolRequiredNextStep::ReadFile)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\n");
+    }
+
+    #[tokio::test]
+    async fn revision_checked_range_edit_denial_creates_no_staged_file() {
+        use crate::cli::output::{ChannelOutputWriter, OutputEvent};
+        use sha2::Digest;
+
+        let _edit_guard = TEST_MUTEX.lock().await;
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let _input_override = crate::core::approval::override_approval_input_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        let original = b"one\ntwo\n";
+        std::fs::write(&path, original).unwrap();
+        let revision = format!("sha256:{:x}", sha2::Sha256::digest(original));
+        let approval_manager = Arc::new(tokio::sync::Mutex::new(
+            crate::core::approval::ApprovalManager::new().with_yolo(false),
+        ));
+        let handler = EditFileHandler::new().with_approval_manager(approval_manager.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let channel_writer = Arc::new(ChannelOutputWriter::new(tx));
+        let mut approval_rx = channel_writer.take_approval_rx().unwrap();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            Some(approval_manager.clone()),
+            dir.path().to_path_buf(),
+            AnchorStateManager::with_cache_file(dir.path().join("anchors.json")),
+            false,
+            "range-approval-task".into(),
+            None,
+            false,
+            channel_writer,
+        );
+        let params = serde_json::json!({"files":[{
+            "path":"file.txt",
+            "expected_file_hash":revision,
+            "edits":[{"start_line":2,"expected_text":"two","text":"changed"}]
+        }]});
+        let execution =
+            tokio::spawn(async move { ToolHandler::execute(&handler, &ctx, params).await });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), approval_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let OutputEvent::ApprovalRequested(request) = event else {
+            panic!("expected approval request");
+        };
+        assert!(revision_stage_files(dir.path()).is_empty());
+        assert!(request.respond(crate::core::approval::ApprovalResult::Denied));
+        let result = execution.await.unwrap().unwrap();
+
+        assert!(result.as_str().unwrap().contains("denied"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(revision_stage_files(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn revision_checked_range_edit_interrupted_approval_creates_no_staged_file() {
+        use crate::cli::output::{ChannelOutputWriter, OutputEvent};
+        use sha2::Digest;
+
+        let _edit_guard = TEST_MUTEX.lock().await;
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let _input_override = crate::core::approval::override_approval_input_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        let original = b"one\ntwo\n";
+        std::fs::write(&path, original).unwrap();
+        let revision = format!("sha256:{:x}", sha2::Sha256::digest(original));
+        let approval_manager = Arc::new(tokio::sync::Mutex::new(
+            crate::core::approval::ApprovalManager::new().with_yolo(false),
+        ));
+        let handler = EditFileHandler::new().with_approval_manager(approval_manager.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let channel_writer = Arc::new(ChannelOutputWriter::new(tx));
+        let mut approval_rx = channel_writer.take_approval_rx().unwrap();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            Some(approval_manager.clone()),
+            dir.path().to_path_buf(),
+            AnchorStateManager::with_cache_file(dir.path().join("anchors.json")),
+            false,
+            "range-approval-task".into(),
+            None,
+            false,
+            channel_writer,
+        );
+        let params = serde_json::json!({"files":[{
+            "path":"file.txt",
+            "expected_file_hash":revision,
+            "edits":[{"start_line":2,"expected_text":"two","text":"changed"}]
+        }]});
+        let execution =
+            tokio::spawn(async move { ToolHandler::execute(&handler, &ctx, params).await });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), approval_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let OutputEvent::ApprovalRequested(request) = event else {
+            panic!("expected approval request");
+        };
+        assert!(revision_stage_files(dir.path()).is_empty());
+        execution.abort();
+        let _ = request.respond(crate::core::approval::ApprovalResult::Denied);
+        assert!(execution.await.unwrap_err().is_cancelled());
+
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(revision_stage_files(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn revision_checked_range_edit_preserves_logical_newlines() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        let original = b"head\nold\nnext\n";
+        std::fs::write(&path, original).unwrap();
+        let revision = format!("sha256:{:x}", sha2::Sha256::digest(original));
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::with_cache_file(dir.path().join("anchors.json")),
+            false,
+            "range-task".into(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let result = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({"files":[{
+                "path":"file.txt",
+                "expected_file_hash":revision,
+                "edits":[{"start_line":2,"expected_text":"old","text":"replacement\n"}]
+            }]}),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result
+                .as_str()
+                .unwrap()
+                .contains("Applied 1 edit(s) successfully")
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"head\nreplacement\n\nnext\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn revision_checked_range_delete_preserves_logical_eof() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        for (name, original, expected, line, expected_text) in [
+            (
+                "unterminated.txt",
+                b"a\nb".as_slice(),
+                b"a".as_slice(),
+                2,
+                "b",
+            ),
+            (
+                "terminated.txt",
+                b"a\nb\n".as_slice(),
+                b"a\nb".as_slice(),
+                3,
+                "",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, original).unwrap();
+            let revision = format!("sha256:{:x}", sha2::Sha256::digest(original));
+            let edit = RevisionRangeEdit {
+                edit_type: "replace".into(),
+                start_line: line,
+                end_line: line,
+                expected_text: expected_text.into(),
+                text: String::new(),
+            };
+            let staged =
+                EditFileHandler::stage_revision_range_edit(&path, name, &revision, &[edit])
+                    .await
+                    .unwrap();
+            assert_eq!(std::fs::read(&staged.temp_path).unwrap(), expected);
+            tokio::fs::remove_file(staged.temp_path).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn revision_checked_empty_insertion_is_a_noop_and_duplicate_is_rejected() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        let original = b"head\nnext\n";
+        std::fs::write(&path, original).unwrap();
+        let revision = format!("sha256:{:x}", sha2::Sha256::digest(original));
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::with_cache_file(dir.path().join("anchors.json")),
+            false,
+            "range-task".into(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+        let no_op = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({"files":[{
+                "path":"file.txt",
+                "expected_file_hash":revision,
+                "edits":[{"edit_type":"insert_before","start_line":2,"expected_text":"next","text":""}]
+            }]}),
+        )
+        .await
+        .unwrap();
+        assert!(no_op.as_str().unwrap().contains("0 edit(s) applied"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let revision = format!("sha256:{:x}", sha2::Sha256::digest(original));
+        let duplicate = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({"files":[{
+                "path":"file.txt",
+                "expected_file_hash":revision,
+                "edits":[{"edit_type":"insert_after","start_line":1,"expected_text":"head","text":"next"}]
+            }]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("duplicate"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[tokio::test]
@@ -2464,7 +3381,7 @@ mod tests {
         let anchor_mgr = AnchorStateManager::new();
         let anchors = anchor_mgr.reconcile(
             file_path.to_str().unwrap(),
-            &[raw_content.trim_end().to_string()],
+            &crate::core::file_editor::split_content_lines(raw_content),
             Some("test-task"),
         );
         let ctx = ToolContext::new(
@@ -3942,7 +4859,7 @@ mod tests {
 
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = original.lines().map(String::from).collect();
+        let lines = crate::core::file_editor::split_content_lines(original);
         let anchors =
             anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("lock-contention"));
         let ctx = ToolContext::new(
@@ -5983,10 +6900,9 @@ edition = "2021"
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines: Vec<String> = "static int\nload_ax_hiservices(void)\n{"
-            .lines()
-            .map(|s| s.to_string())
-            .collect();
+        let lines = crate::core::file_editor::split_content_lines(
+            "static int\nload_ax_hiservices(void)\n{\n",
+        );
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("regr-task"));
         let first_anchor = format!("{}§static int", anchors[0]);
         let concatenated = format!(
@@ -6616,6 +7532,16 @@ edition = "2021"
         assert_eq!(
             EditFileHandler::requested_paths_for_locking(&params),
             vec!["src/board.c"]
+        );
+
+        let nested_path = serde_json::json!({
+            "files": [{
+                "edits": [{"path": "src/nested.c", "anchor": "x§foo", "text": "bar"}]
+            }]
+        });
+        assert_eq!(
+            EditFileHandler::requested_paths_for_locking(&nested_path),
+            vec!["src/nested.c"]
         );
     }
 

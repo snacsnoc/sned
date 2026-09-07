@@ -40,7 +40,7 @@ pub const ANCHOR_GUIDANCE: &str = "[Anchors: Copy the complete prefix§source li
 pub(crate) fn anchor_guidance(line_count: usize) -> String {
     if line_count > crate::core::file_editor::MAX_TRACKED_LINES {
         format!(
-            "{ANCHOR_GUIDANCE}\n[Note: Large-file snapshot anchors expire after any edit, including anchors for unchanged lines; use newly returned anchors or read again.]"
+            "{ANCHOR_GUIDANCE}\n[Note: Large-file snapshot anchors expire after any edit, including anchors for unchanged lines; old anchors cannot be reused. Use newly returned anchors or read_file again.]"
         )
     } else {
         ANCHOR_GUIDANCE.to_string()
