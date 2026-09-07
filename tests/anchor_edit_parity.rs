@@ -7,9 +7,13 @@ fn lines(content: &str) -> Vec<String> {
     split_content_lines(content)
 }
 
-fn anchor_lines(absolute_path: &str, content: &str, task_id: &str) -> Vec<String> {
+fn anchor_lines(
+    anchor_mgr: &AnchorStateManager,
+    absolute_path: &str,
+    content: &str,
+    task_id: &str,
+) -> Vec<String> {
     let content_lines = lines(content);
-    let anchor_mgr = AnchorStateManager::new();
     let anchors = anchor_mgr.reconcile(absolute_path, &content_lines, Some(task_id));
     content_lines
         .into_iter()
@@ -22,7 +26,8 @@ fn anchor_lines(absolute_path: &str, content: &str, task_id: &str) -> Vec<String
 fn anchor_reconcile_matches_ts_semantics() {
     let task_id = "parity-anchor";
     let path = "/tmp/sned-anchor-parity.txt";
-    let anchor_mgr = AnchorStateManager::new();
+    let cache = tempfile::tempdir().unwrap();
+    let anchor_mgr = AnchorStateManager::with_cache_file(cache.path().join("anchors.json"));
     anchor_mgr.reset(Some(task_id));
 
     let initial = lines("line 1\nline 2\nline 3");
@@ -54,7 +59,7 @@ fn anchor_reconcile_matches_ts_semantics() {
     assert_eq!(anchors4[1], anchors3[3]);
 
     let other_task_anchors = anchor_mgr.reconcile(path, &initial, Some("parity-anchor-2"));
-    assert_eq!(anchors4[0], other_task_anchors[0]);
+    assert_ne!(anchors4[0], other_task_anchors[0]);
 }
 
 #[test]
@@ -63,9 +68,10 @@ fn edit_executor_validation_messages_documents_deliberate_divergence() {
     let content = "line 1\nline 2\nline 3";
     let content_lines = lines(content);
     let task_id = "parity-edit";
-    let anchor_mgr = AnchorStateManager::new();
+    let cache = tempfile::tempdir().unwrap();
+    let anchor_mgr = AnchorStateManager::with_cache_file(cache.path().join("anchors.json"));
     anchor_mgr.reset(Some(task_id));
-    let anchored = anchor_lines("/tmp/sned-edit-parity.txt", content, task_id);
+    let anchored = anchor_lines(&anchor_mgr, "/tmp/sned-edit-parity.txt", content, task_id);
     let line_hashes: Vec<String> = anchored
         .iter()
         .map(|line| line.split('§').next().unwrap().to_string())
@@ -146,7 +152,8 @@ fn file_editor_documents_atomic_divergence_from_ts_partial_success() {
     let task_id = "parity-file-editor";
     let path = "/tmp/sned-file-editor-parity.txt";
     let content = "line 1\nline 2\nline 3\nline 4\nline 5";
-    let anchor_mgr = AnchorStateManager::new();
+    let cache = tempfile::tempdir().unwrap();
+    let anchor_mgr = AnchorStateManager::with_cache_file(cache.path().join("anchors.json"));
     anchor_mgr.reset(Some(task_id));
 
     let current_hashes = anchor_mgr.reconcile(path, &lines(content), Some(task_id));
@@ -219,7 +226,8 @@ fn file_editor_preserves_trailing_newline_semantics() {
     let task_id = "parity-trailing-newline";
     let path = "/tmp/sned-trailing-newline-parity.txt";
     let content = "line 1\nline 2\n";
-    let anchor_mgr = AnchorStateManager::new();
+    let cache = tempfile::tempdir().unwrap();
+    let anchor_mgr = AnchorStateManager::with_cache_file(cache.path().join("anchors.json"));
     anchor_mgr.reset(Some(task_id));
 
     let current_hashes = anchor_mgr.reconcile(path, &lines(content), Some(task_id));

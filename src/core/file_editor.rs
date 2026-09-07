@@ -21,7 +21,6 @@ use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::core::anchor_dictionary::ANCHOR_DICTIONARY;
 use crate::core::hash_utils::{
     ANCHOR_DELIMITER, compute_hashes, find_glued_anchor_in_lines, split_anchor, strip_hashes,
 };
@@ -412,10 +411,19 @@ struct TrackedDocument {
     generation: u64,
     hashes: Vec<u64>,
     anchors: Vec<String>,
-    /// Tracks used words in insertion order for LRU eviction.
-    /// VecDeque maintains insertion order, HashSet provides O(1) lookup.
+    /// Legacy allocator state. Read for migration only; new publications clear it.
+    #[serde(default)]
     used_words: VecDeque<String>,
+    #[serde(default)]
     used_words_set: HashSet<String>,
+    /// New identities use this stable per-document namespace and counter.
+    #[serde(default)]
+    anchor_namespace: Option<String>,
+    #[serde(default)]
+    next_anchor_id: u64,
+    /// Recently retired identities are diagnostic only and never resolve.
+    #[serde(default)]
+    retired_anchors: VecDeque<String>,
 }
 
 /// Global anchor state storage.
@@ -423,7 +431,6 @@ struct TrackedDocument {
 struct AnchorStorage {
     tasks: IndexMap<String, IndexMap<String, TrackedDocument>>,
     persisted_tasks: IndexMap<String, IndexMap<String, TrackedDocument>>,
-    dictionary: Vec<String>,
     cache_file: std::path::PathBuf,
 }
 
@@ -461,7 +468,6 @@ impl AnchorStorage {
                     return Self {
                         persisted_tasks: tasks.clone(),
                         tasks,
-                        dictionary: Vec::new(),
                         cache_file: anchors_file,
                     };
                 }
@@ -474,7 +480,6 @@ impl AnchorStorage {
         Self {
             tasks: IndexMap::new(),
             persisted_tasks: IndexMap::new(),
-            dictionary: Vec::new(),
             cache_file: anchors_file,
         }
     }
@@ -484,7 +489,6 @@ impl AnchorStorage {
         Self {
             tasks: IndexMap::new(),
             persisted_tasks: IndexMap::new(),
-            dictionary: Vec::new(),
             cache_file: crate::storage::disk::get_data_dir().join("cache/anchors.json"),
         }
     }
@@ -602,24 +606,13 @@ impl AnchorStorage {
             }
         }
     }
-
-    fn get_dictionary(&mut self) -> &[String] {
-        if self.dictionary.is_empty() {
-            self.dictionary = ANCHOR_DICTIONARY
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-        }
-        &self.dictionary
-    }
 }
 
 pub(crate) const MAX_TRACKED_LINES: usize = 5000;
 const MAX_TRACKED_FILES: usize = 1024;
 const MAX_TRACKED_TASKS: usize = 50;
 
-/// Maximum used words per file to prevent HashSet bloat.
-const MAX_USED_WORDS: usize = 5000;
+const MAX_RETIRED_ANCHORS: usize = 128;
 
 // ============================================================================
 // File Locking for Concurrency Safety
@@ -933,12 +926,85 @@ fn snapshot_line_anchors(lines: &[String]) -> Vec<String> {
 }
 
 impl AnchorStateManager {
+    fn state_path(path: &str) -> String {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(path))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn new_anchor_namespace() -> String {
+        std::iter::repeat_with(fastrand::alphanumeric)
+            .take(12)
+            .collect()
+    }
+
+    fn encode_base36(mut value: u64) -> String {
+        const DIGITS: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        if value == 0 {
+            return "0".into();
+        }
+        let mut encoded = Vec::new();
+        while value > 0 {
+            encoded.push(DIGITS[(value % 36) as usize]);
+            value /= 36;
+        }
+        encoded.reverse();
+        String::from_utf8(encoded).expect("base36 digits are ASCII")
+    }
+
+    fn migrate_allocator_state(document: &mut TrackedDocument, live_anchors: &[String]) {
+        if document.anchor_namespace.is_none() {
+            document.anchor_namespace = Some(Self::new_anchor_namespace());
+            let live: HashSet<&str> = live_anchors.iter().map(String::as_str).collect();
+            for identity in document.used_words.iter().rev() {
+                if !live.contains(identity.as_str()) && !document.retired_anchors.contains(identity)
+                {
+                    document.retired_anchors.push_front(identity.clone());
+                    if document.retired_anchors.len() >= MAX_RETIRED_ANCHORS {
+                        break;
+                    }
+                }
+            }
+        }
+        document.used_words.clear();
+        document.used_words_set.clear();
+        while document.retired_anchors.len() > MAX_RETIRED_ANCHORS {
+            document.retired_anchors.pop_front();
+        }
+    }
+
+    fn allocate_identity(document: &mut TrackedDocument) -> Result<String, AnchorTransitionError> {
+        if document.anchor_namespace.is_none() {
+            let live = document.anchors.clone();
+            Self::migrate_allocator_state(document, &live);
+        }
+        loop {
+            let counter = document.next_anchor_id;
+            document.next_anchor_id = counter.checked_add(1).ok_or_else(|| {
+                AnchorTransitionError::Validation("anchor identity counter exhausted".into())
+            })?;
+            let identity = format!(
+                "A{}N{}",
+                document.anchor_namespace.as_deref().unwrap_or_default(),
+                Self::encode_base36(counter)
+            );
+            if !document.anchors.contains(&identity)
+                && !document.retired_anchors.contains(&identity)
+            {
+                return Ok(identity);
+            }
+        }
+    }
+
     pub fn observe_snapshot(
         &self,
         absolute_path: &str,
         raw_content: &str,
         task_id: Option<&str>,
     ) -> Result<AnchorSnapshot, AnchorTransitionError> {
+        let absolute_path = Self::state_path(absolute_path);
+        let absolute_path = absolute_path.as_str();
         let task_id = task_id.unwrap_or("default");
         let (normalized, _) = normalize_file_content(raw_content);
         let lines = split_content_lines(&normalized);
@@ -970,6 +1036,9 @@ impl AnchorStateManager {
                 anchors: snapshot_line_anchors(&lines),
                 used_words: VecDeque::new(),
                 used_words_set: HashSet::new(),
+                anchor_namespace: None,
+                next_anchor_id: 0,
+                retired_anchors: VecDeque::new(),
             }
         } else if let Some(document) = &expected {
             if document.hashes != hashes || document.anchors.len() != lines.len() {
@@ -979,22 +1048,19 @@ impl AnchorStateManager {
             }
             document.clone()
         } else {
-            let dictionary: Vec<String> = ANCHOR_DICTIONARY
-                .iter()
-                .map(|word| (*word).to_string())
-                .collect();
             let mut document = TrackedDocument {
                 generation: 0,
                 hashes,
                 anchors: Vec::new(),
                 used_words: VecDeque::new(),
                 used_words_set: HashSet::new(),
+                anchor_namespace: Some(Self::new_anchor_namespace()),
+                next_anchor_id: 0,
+                retired_anchors: VecDeque::new(),
             };
-            for hash in &document.hashes {
-                let word = self.get_word_for_hash(*hash, &document.used_words_set, &dictionary);
-                document.anchors.push(word.clone());
-                document.used_words.push_back(word.clone());
-                document.used_words_set.insert(word);
+            for _ in 0..document.hashes.len() {
+                let identity = Self::allocate_identity(&mut document)?;
+                document.anchors.push(identity);
             }
             document
         };
@@ -1028,11 +1094,8 @@ impl AnchorStateManager {
                 "provenance line count differs from content".into(),
             ));
         }
-        let dictionary: Vec<String> = ANCHOR_DICTIONARY
-            .iter()
-            .map(|word| (*word).to_string())
-            .collect();
         let mut document = snapshot.document.clone();
+        Self::migrate_allocator_state(&mut document, &snapshot.anchors);
         document.hashes = compute_hashes(&lines);
         document.anchors.clear();
         let mut previous = None;
@@ -1054,14 +1117,7 @@ impl AnchorStateManager {
             } else if let Some(origin) = origin.filter(|_| !snapshot.snapshot_mode) {
                 snapshot.document.anchors[origin].clone()
             } else {
-                let word = self.get_word_for_hash(
-                    document.hashes[index],
-                    &document.used_words_set,
-                    &dictionary,
-                );
-                document.used_words.push_back(word.clone());
-                document.used_words_set.insert(word.clone());
-                word
+                Self::allocate_identity(&mut document)?
             };
             document.anchors.push(word);
         }
@@ -1077,7 +1133,15 @@ impl AnchorStateManager {
             .iter()
             .filter(|word| !live_words.contains(word))
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
+        for identity in &retired_identities {
+            if !document.retired_anchors.contains(identity) {
+                document.retired_anchors.push_back(identity.clone());
+            }
+        }
+        while document.retired_anchors.len() > MAX_RETIRED_ANCHORS {
+            document.retired_anchors.pop_front();
+        }
         let transition = AnchorTransition {
             absolute_path: snapshot.absolute_path.clone(),
             task_id: snapshot.task_id.clone(),
@@ -1144,6 +1208,8 @@ impl AnchorStateManager {
     /// anchors. Never repair this failure with a best-effort cache write/delete:
     /// a fresh observation rejects mismatched content until a reread reconciles it.
     pub fn invalidate_state(&self, absolute_path: &str, task_id: Option<&str>) {
+        let absolute_path = Self::state_path(absolute_path);
+        let absolute_path = absolute_path.as_str();
         let mut storage = self.storage();
         let task_id = task_id.unwrap_or("default");
         if let Some(files) = storage.tasks.get_mut(task_id) {
@@ -1246,9 +1312,24 @@ impl AnchorStateManager {
         Ok(())
     }
 
+    #[cfg(not(test))]
     #[must_use]
     pub fn new() -> Self {
         Self::with_cache_file(crate::storage::disk::get_data_dir().join("cache/anchors.json"))
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn new() -> Self {
+        static TEST_CACHE: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
+            tempfile::Builder::new()
+                .prefix("sned-anchor-test-")
+                .tempdir()
+                .expect("create isolated anchor test cache")
+                .keep()
+                .join("anchors.json")
+        });
+        Self::with_cache_file(TEST_CACHE.clone())
     }
 
     /// Keeps independent sessions/tests from sharing a process-global cache location.
@@ -1261,65 +1342,6 @@ impl AnchorStateManager {
 
     fn storage(&self) -> parking_lot::MutexGuard<'_, AnchorStorage> {
         self.storage.lock()
-    }
-
-    /// Gets a unique word deterministically based on line content hash.
-    ///
-    /// Uses the hash to select words from the dictionary, applying a salt counter
-    /// on collision to find an unused combination.
-    #[allow(clippy::unused_self)]
-    fn get_word_for_hash(
-        &self,
-        line_hash: u64,
-        used_words_set: &HashSet<String>,
-        dictionary: &[String],
-    ) -> String {
-        let dict_len = dictionary.len();
-        let mut salt = 0u64;
-
-        loop {
-            // Mix salt into hash for collision resolution
-            let mixed_hash = line_hash.wrapping_add(salt.wrapping_mul(0x9e37_79b9));
-
-            // Select two words deterministically from hash
-            let idx1 = (mixed_hash as usize) % dict_len;
-            let idx2 = ((mixed_hash >> 16) as usize) % dict_len;
-
-            let w1 = &dictionary[idx1];
-            let w2 = &dictionary[idx2];
-            let word = format!("{w1}{w2}");
-
-            if !used_words_set.contains(&word) {
-                return word;
-            }
-
-            salt = salt.wrapping_add(1);
-
-            // Extreme fallback: three-word combinations if two-word fails repeatedly
-            if salt > 1000 {
-                let idx3 = ((mixed_hash >> 8) as usize) % dict_len;
-                let w3 = &dictionary[idx3];
-                let word3 = format!("{w1}{w2}{w3}");
-                if !used_words_set.contains(&word3) {
-                    return word3;
-                }
-            }
-
-            // Safety: prevent infinite loop (should never reach this in practice)
-            if salt > 10000 {
-                break;
-            }
-        }
-
-        // Retired words remain reserved, including exhausted dictionary candidates.
-        let mut suffix = used_words_set.len();
-        loop {
-            let word = format!("Word{line_hash:08x}N{suffix}");
-            if !used_words_set.contains(&word) {
-                return word;
-            }
-            suffix += 1;
-        }
     }
 
     fn get_task_state(&self, task_id: &str) -> IndexMap<String, TrackedDocument> {
@@ -1432,6 +1454,8 @@ impl AnchorStateManager {
         current_lines: &[String],
         task_id: Option<&str>,
     ) -> Result<Vec<String>, AnchorTransitionError> {
+        let absolute_path = Self::state_path(absolute_path);
+        let absolute_path = absolute_path.as_str();
         let task_id = task_id.unwrap_or("default");
 
         if current_lines.len() > MAX_TRACKED_LINES {
@@ -1516,53 +1540,39 @@ impl AnchorStateManager {
 
         // First time seeing this file? Assign unique anchors to every line.
         if tracked.is_none() {
-            let dict = {
-                let mut storage = self.storage();
-                storage.get_dictionary().to_vec()
-            };
-
-            // Assign unique anchors deterministically based on line content hash
-            let mut used_words_vec: VecDeque<String> = VecDeque::new();
-            let mut used_words_set: HashSet<String> = HashSet::new();
-            let mut anchors: Vec<String> = Vec::with_capacity(current_hashes.len());
-            for hash in &current_hashes {
-                let word = self.get_word_for_hash(*hash, &used_words_set, &dict);
-                used_words_vec.push_back(word.clone());
-                used_words_set.insert(word.clone());
-                anchors.push(word);
-            }
-
-            let tracked = TrackedDocument {
+            let mut tracked = TrackedDocument {
                 generation: 0,
                 hashes: current_hashes,
-                anchors,
-                used_words: used_words_vec,
-                used_words_set,
+                anchors: Vec::new(),
+                used_words: VecDeque::new(),
+                used_words_set: HashSet::new(),
+                anchor_namespace: Some(Self::new_anchor_namespace()),
+                next_anchor_id: 0,
+                retired_anchors: VecDeque::new(),
             };
+            for _ in 0..tracked.hashes.len() {
+                let identity = Self::allocate_identity(&mut tracked)?;
+                tracked.anchors.push(identity);
+            }
             let anchors = tracked.anchors.clone();
             self.update_state(absolute_path, tracked, task_id);
             self.save();
             return Ok(anchors);
         }
 
-        let tracked = tracked.unwrap();
+        let mut tracked = tracked.unwrap();
+        let old_anchors = tracked.anchors.clone();
+        Self::migrate_allocator_state(&mut tracked, &old_anchors);
         let document_changed = tracked.hashes != current_hashes;
 
         // Run diff on hashes
         let changes = diff_arrays(&tracked.hashes, &current_hashes);
 
         let mut new_anchors: Vec<String> = Vec::new();
-        let mut new_used_words_vec = tracked.used_words.clone();
-        let mut new_used_words_set = tracked.used_words_set.clone();
-
-        // Get dictionary for hash-based word selection
-        let dict = {
-            let mut storage = self.storage();
-            storage.get_dictionary().to_vec()
-        };
+        let mut next_document = tracked.clone();
+        next_document.anchors.clear();
 
         let mut old_idx = 0;
-        let mut new_idx = 0;
         let mut old_counts = HashMap::new();
         let mut new_counts = HashMap::new();
         for hash in &tracked.hashes {
@@ -1575,14 +1585,11 @@ impl AnchorStateManager {
         for change in changes {
             match change {
                 DiffChange::Added(count) => {
-                    for i in 0..count {
-                        let line_hash = current_hashes[new_idx + i];
-                        let word = self.get_word_for_hash(line_hash, &new_used_words_set, &dict);
-                        new_anchors.push(word.clone());
-                        new_used_words_vec.push_back(word.clone());
-                        new_used_words_set.insert(word);
+                    for _ in 0..count {
+                        let identity = Self::allocate_identity(&mut next_document)?;
+                        new_anchors.push(identity.clone());
+                        next_document.anchors.push(identity);
                     }
-                    new_idx += count;
                 }
                 DiffChange::Removed(count) => {
                     old_idx += count;
@@ -1596,34 +1603,33 @@ impl AnchorStateManager {
                             && (old_counts[&hash] > 1
                                 || new_counts.get(&hash).copied().unwrap_or(0) > 1)
                         {
-                            self.get_word_for_hash(hash, &new_used_words_set, &dict)
+                            Self::allocate_identity(&mut next_document)?
                         } else {
                             tracked.anchors[old_idx].clone()
                         };
                         new_anchors.push(preserved_word.clone());
-                        new_used_words_vec.push_back(preserved_word.clone());
-                        new_used_words_set.insert(preserved_word);
+                        next_document.anchors.push(preserved_word);
                         old_idx += 1;
                     }
-                    new_idx += count;
                 }
             }
         }
 
-        // Cap used_words_vec to MAX_USED_WORDS to prevent unbounded growth
-        // in repeated reconcile cycles where new_used_words_vec accumulates entries.
-        new_used_words_vec = new_used_words_vec
-            .into_iter()
-            .take(MAX_USED_WORDS)
-            .collect();
-
-        let tracked = TrackedDocument {
-            generation: tracked.generation.saturating_add(1),
-            hashes: current_hashes,
-            anchors: new_anchors,
-            used_words: new_used_words_vec,
-            used_words_set: new_used_words_set,
-        };
+        let live: HashSet<&str> = new_anchors.iter().map(String::as_str).collect();
+        for identity in old_anchors {
+            if !live.contains(identity.as_str())
+                && !next_document.retired_anchors.contains(&identity)
+            {
+                next_document.retired_anchors.push_back(identity);
+            }
+        }
+        while next_document.retired_anchors.len() > MAX_RETIRED_ANCHORS {
+            next_document.retired_anchors.pop_front();
+        }
+        next_document.generation = tracked.generation.saturating_add(1);
+        next_document.hashes = current_hashes;
+        next_document.anchors = new_anchors;
+        let tracked = next_document;
         let anchors = tracked.anchors.clone();
         self.update_state(absolute_path, tracked, task_id);
 
@@ -1636,24 +1642,27 @@ impl AnchorStateManager {
     /// Returns true if the file is currently being tracked.
     #[must_use]
     pub fn is_tracking(&self, absolute_path: &str, task_id: Option<&str>) -> bool {
+        let absolute_path = Self::state_path(absolute_path);
         let task_id = task_id.unwrap_or("default");
         let state = self.get_task_state(task_id);
-        state.contains_key(absolute_path)
+        state.contains_key(&absolute_path)
     }
 
     /// Gets current anchors for a file if it's being tracked.
     #[must_use]
     pub fn get_anchors(&self, absolute_path: &str, task_id: Option<&str>) -> Option<Vec<String>> {
+        let absolute_path = Self::state_path(absolute_path);
         let task_id = task_id.unwrap_or("default");
         let state = self.get_task_state(task_id);
-        state.get(absolute_path).map(|t| t.anchors.clone())
+        state.get(&absolute_path).map(|t| t.anchors.clone())
     }
 
     /// Clear state for a file.
     pub fn clear_state(&self, absolute_path: &str, task_id: Option<&str>) {
+        let absolute_path = Self::state_path(absolute_path);
         let task_id = task_id.unwrap_or("default");
         let mut state = self.get_task_state(task_id);
-        state.shift_remove(absolute_path);
+        state.shift_remove(&absolute_path);
         let mut storage = self.storage();
         storage.tasks.insert(task_id.to_string(), state);
         drop(storage);
@@ -2751,6 +2760,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
         let content = "same\nleft\nsame\nright\nsame\n";
+        manager
+            .reconcile_checked("duplicates", &split_content_lines(content), Some("staged"))
+            .unwrap();
         let before = manager
             .observe_snapshot("duplicates", content, Some("staged"))
             .unwrap();
@@ -2784,7 +2796,7 @@ mod tests {
             vec![before.anchors[1].clone()]
         );
         assert_eq!(transition.edit_ranges.len(), 2);
-        assert!(!manager.is_tracking("duplicates", Some("staged")));
+        assert!(manager.is_tracking("duplicates", Some("staged")));
         manager
             .commit_transitions_checked(&[transition.clone()])
             .unwrap();
@@ -2844,6 +2856,9 @@ mod tests {
     fn staged_raw_digest_is_distinct_from_normalized_identity() {
         let dir = tempfile::tempdir().unwrap();
         let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        manager
+            .reconcile_checked("format", &split_content_lines("one\ntwo\n"), None)
+            .unwrap();
         let unix = manager
             .observe_snapshot("format", "one\ntwo\n", None)
             .unwrap();
@@ -3189,18 +3204,15 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_dictionary_never_reuses_a_reserved_anchor() {
+    fn monotonic_allocator_never_reuses_a_retired_anchor() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
-        let dictionary = vec!["Only".to_string()];
-        let mut reserved: HashSet<String> = ["OnlyOnly", "OnlyOnlyOnly", "Word00000007"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        for _ in 0..3 {
-            let word = mgr.get_word_for_hash(7, &reserved, &dictionary);
-            assert!(reserved.insert(word));
-        }
+        let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        let first = manager.reconcile("file", &["first".into()], Some("task"));
+        let second = manager.reconcile("file", &["second".into()], Some("task"));
+        let third = manager.reconcile("file", &["third".into()], Some("task"));
+        assert_ne!(first, second);
+        assert_ne!(first, third);
+        assert_ne!(second, third);
     }
     use std::collections::HashSet;
 
@@ -3426,9 +3438,7 @@ mod tests {
         let anchors1 = anchor_mgr.reconcile("/tmp/scope1.py", &lines, Some("scope_task1"));
         let anchors2 = anchor_mgr.reconcile("/tmp/scope2.py", &lines, Some("scope_task2"));
 
-        // With deterministic hash-based selection, same content produces same anchors.
-        // Task scoping is verified by checking that each task maintains independent state.
-        assert_eq!(anchors1[0], anchors2[0]); // Deterministic: same content → same anchor
+        assert_ne!(anchors1[0], anchors2[0]);
 
         // Verify state is still scoped: modifying one task doesn't affect the other
         let modified_lines = vec!["def hello():".to_string(), "    pass".to_string()];
@@ -3947,50 +3957,18 @@ mod tests {
     }
 
     #[test]
-    fn test_used_words_eviction_is_lru_not_alphabetical() {
-        use std::collections::{HashSet, VecDeque};
-
-        let mut used_words_vec: VecDeque<String> = VecDeque::new();
-        let mut used_words_set: HashSet<String> = HashSet::new();
-
-        // Insert words in a specific order (not alphabetical)
-        let insert_order = vec!["Zebra", "Apple", "Mango", "Banana", "Cherry"];
-        for word in &insert_order {
-            used_words_vec.push_back(word.to_string());
-            used_words_set.insert(word.to_string());
+    fn retired_anchor_diagnostics_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        for revision in 0..(MAX_RETIRED_ANCHORS + 64) {
+            let _ = manager.reconcile("file", &[format!("revision {revision}")], Some("task"));
         }
-
-        // Simulate eviction when exceeding MAX_USED_WORDS (we'll use a smaller threshold for testing)
-        const TEST_MAX_USED_WORDS: usize = 3;
-        if used_words_vec.len() > TEST_MAX_USED_WORDS {
-            let to_remove_count = (used_words_vec.len() - TEST_MAX_USED_WORDS).div_ceil(2);
-            for _ in 0..to_remove_count {
-                if let Some(word) = used_words_vec.pop_front() {
-                    used_words_set.remove(&word);
-                }
-            }
-        }
-
-        // Verify that the oldest-inserted words were removed, not alphabetically first
-        // "Zebra" (first inserted) should be removed, not "Apple" (alphabetically first)
-        assert!(
-            !used_words_set.contains("Zebra"),
-            "Zebra (oldest-inserted) should be evicted"
-        );
-        assert!(
-            used_words_set.contains("Apple"),
-            "Apple (newer) should remain"
-        );
-        assert!(
-            used_words_set.contains("Cherry"),
-            "Cherry (newest) should remain"
-        );
-
-        // Verify VecDeque maintains insertion order for remaining elements
-        let remaining: Vec<String> = used_words_vec.into_iter().collect();
-        assert!(remaining.contains(&"Mango".to_string()));
-        assert!(remaining.contains(&"Banana".to_string()));
-        assert!(remaining.contains(&"Cherry".to_string()));
+        let tasks = AnchorStorage::read_tasks(&cache).unwrap();
+        let document = &tasks["task"]["file"];
+        assert!(document.retired_anchors.len() <= MAX_RETIRED_ANCHORS);
+        assert!(document.used_words.is_empty());
+        assert!(document.used_words_set.is_empty());
     }
 
     #[test]
