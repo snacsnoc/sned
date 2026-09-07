@@ -388,25 +388,35 @@ fn apply_context_history_updates(
     messages_to_update.extend_from_slice(first_chunk);
     messages_to_update.extend_from_slice(second_chunk);
 
-    // Keep the summary from splitting an immediate tool-use/tool-result pair at the
-    // truncation boundary. When the first kept assistant message issues a tool and the
-    // next kept user message contains the matching result, the summary must come after
-    // that pair so the provider still sees adjacent tool blocks.
-    let summary_insert_index = if compacted_summary.is_some()
-        && messages_to_update.len() > 2
-        && messages_to_update[1].role == MessageRole::Assistant
-        && matches!(
-            messages_to_update[1].content,
-            MessageContent::AssistantBlocks(ref blocks)
-                if blocks.iter().any(|block| matches!(block, AssistantContentBlock::ToolUse(_)))
-        )
-        && messages_to_update[2].role == MessageRole::User
-        && matches!(
-            messages_to_update[2].content,
-            MessageContent::UserBlocks(ref blocks)
-                if blocks.iter().any(|block| matches!(block, UserContentBlock::ToolResult(_)))
-        ) {
-        3
+    // Keep the summary after the first retained tool turn. Legacy hook text
+    // may sit between the assistant tool call and its result, but it must not
+    // become a reason to split that provider-required pair.
+    let summary_insert_index = if compacted_summary.is_some() && messages_to_update.len() > 2 {
+        let tool_use_ids = assistant_tool_use_ids(&messages_to_update[1]);
+        if !tool_use_ids.is_empty() {
+            let mut tool_result_index = 2;
+            while tool_result_index < messages_to_update.len()
+                && messages_to_update[tool_result_index].role == MessageRole::User
+                && matches!(
+                    &messages_to_update[tool_result_index].content,
+                    MessageContent::Text(text) if legacy_hook_context_text(text)
+                )
+            {
+                tool_result_index += 1;
+            }
+            if tool_result_index < messages_to_update.len()
+                && user_message_has_tool_result_for(
+                    &messages_to_update[tool_result_index],
+                    &tool_use_ids,
+                )
+            {
+                tool_result_index + 1
+            } else {
+                2.min(messages_to_update.len())
+            }
+        } else {
+            2.min(messages_to_update.len())
+        }
     } else {
         2.min(messages_to_update.len())
     };
@@ -1113,6 +1123,85 @@ mod tests {
         assert!(
             matches!(truncated[3].content, MessageContent::Text(ref text) if text == "Test summary")
         );
+    }
+
+    #[test]
+    fn test_condense_keeps_summary_after_legacy_hook_tool_pair() {
+        let tool_use = AssistantContentBlock::ToolUse(crate::providers::ToolUseBlock {
+            id: "tool-legacy".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "fixture.txt"}),
+            shared: crate::providers::SharedContentFields {
+                call_id: None,
+                signature: None,
+            },
+            reasoning_details: None,
+        });
+        let tool_result = UserContentBlock::ToolResult(crate::providers::ToolResultBlock {
+            tool_use_id: "tool-legacy".to_string(),
+            content: crate::providers::ToolResultContent::Text("ok".to_string()),
+            shared: crate::providers::SharedContentFields {
+                call_id: None,
+                signature: None,
+            },
+        });
+        let messages = vec![
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("Initial task".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![tool_use]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(
+                    "[Hook context from PreToolUse]: before read".to_string(),
+                ),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![tool_result]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ];
+
+        let summary = CompactedSummary::new("Earlier context".to_string(), 1);
+        let truncated = get_truncated_messages(&messages, None, Some(&summary));
+
+        assert_eq!(truncated.len(), 4);
+        assert!(matches!(
+            truncated[1].content,
+            MessageContent::AssistantBlocks(_)
+        ));
+        let MessageContent::UserBlocks(blocks) = &truncated[2].content else {
+            panic!("expected the normalized tool-result message");
+        };
+        assert!(matches!(blocks[0], UserContentBlock::ToolResult(_)));
+        assert!(matches!(
+            &blocks[1],
+            UserContentBlock::Text(text) if text.text.contains("before read")
+        ));
+        assert!(matches!(
+            &truncated[3].content,
+            MessageContent::Text(text) if text == "Earlier context"
+        ));
     }
 
     #[test]

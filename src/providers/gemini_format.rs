@@ -597,6 +597,47 @@ mod tests {
         assert_eq!(gemini[1].parts[1].text.as_deref(), Some("hook for call-1"));
         assert!(gemini[1].parts[2].function_response.is_some());
         assert_eq!(gemini[1].parts[3].text.as_deref(), Some("hook for call-2"));
+
+        // Compacted legacy histories append recovered hook text after all
+        // results. Gemini still receives every function response before the
+        // informational text, so this representation remains valid.
+        let normalized_legacy = convert_to_gemini_contents(&[
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    tool_use("call-1"),
+                    tool_use("call-2"),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![
+                    tool_result("call-1"),
+                    tool_result("call-2"),
+                    hook_text("hook for call-1"),
+                    hook_text("hook for call-2"),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ]);
+        assert_eq!(normalized_legacy.len(), 2);
+        assert!(normalized_legacy[1].parts[0].function_response.is_some());
+        assert!(normalized_legacy[1].parts[1].function_response.is_some());
+        assert_eq!(
+            normalized_legacy[1].parts[2].text.as_deref(),
+            Some("hook for call-1")
+        );
+        assert_eq!(
+            normalized_legacy[1].parts[3].text.as_deref(),
+            Some("hook for call-2")
+        );
     }
 
     #[test]
