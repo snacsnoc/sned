@@ -197,7 +197,7 @@ pub(crate) fn markdown_cache_stats() -> (u64, u64) {
 fn render_streamed_markdown_cached(
     text: &str,
     interactive_mode: bool,
-    mut syntax_highlight_us: Option<&mut u64>,
+    syntax_highlight_us: Option<&mut u64>,
 ) -> Vec<Line<'static>> {
     let code_line_limit = Some(crate::core::agent_types::code_block_display_limit(
         interactive_mode,
@@ -217,12 +217,8 @@ fn render_streamed_markdown_cached(
         return rendered;
     }
     MARKDOWN_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let rendered = render_markdown_with_code_limit_timed(
-        None,
-        text,
-        code_line_limit,
-        syntax_highlight_us.as_deref_mut(),
-    );
+    let rendered =
+        render_markdown_with_code_limit_timed(None, text, code_line_limit, syntax_highlight_us);
     markdown_cache()
         .lock()
         .expect("markdown cache poisoned")

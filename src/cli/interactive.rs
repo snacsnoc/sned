@@ -64,9 +64,10 @@ fn adaptive_main_event_budget(backlog: usize) -> usize {
         return MAX_MAIN_EVENTS_PER_DRAIN;
     }
 
-    (backlog / 4)
-        .max(MAX_MAIN_EVENTS_PER_DRAIN)
-        .min(MAX_ADAPTIVE_MAIN_EVENTS_PER_DRAIN)
+    (backlog / 4).clamp(
+        MAX_MAIN_EVENTS_PER_DRAIN,
+        MAX_ADAPTIVE_MAIN_EVENTS_PER_DRAIN,
+    )
 }
 
 fn parse_output_channel_capacity(raw: Option<&str>) -> usize {
@@ -775,10 +776,10 @@ fn persist_transcript_line(
         if let Err(error) = app.enqueue_task_transcript(entries) {
             tracing::warn!(error = %error, "Failed to queue transcript entries");
         }
-    } else if let Some(storage) = storage {
-        if let Err(error) = storage.write_transcript_entries(&entries) {
-            tracing::warn!(error = %error, "Failed to persist transcript entries");
-        }
+    } else if let Some(storage) = storage
+        && let Err(error) = storage.write_transcript_entries(&entries)
+    {
+        tracing::warn!(error = %error, "Failed to persist transcript entries");
     }
 }
 
@@ -1598,10 +1599,8 @@ fn draw_tui_frame<B: ratatui::backend::Backend>(
     terminal_desynced: &mut bool,
 ) -> anyhow::Result<DrawFrameResult> {
     let recovering = *terminal_desynced;
-    if recovering {
-        if let Err(error) = terminal.clear() {
-            return handle_tui_frame_error(app, error, debug, "TUI recovery clear failed");
-        }
+    if recovering && let Err(error) = terminal.clear() {
+        return handle_tui_frame_error(app, error, debug, "TUI recovery clear failed");
     }
 
     match terminal.draw(|f| app.render(f)) {

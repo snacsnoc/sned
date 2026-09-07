@@ -250,6 +250,12 @@ pub(crate) struct ReasoningMailbox {
 const MAX_REASONING_SNAPSHOT_BYTES: usize = 64 * 1024;
 
 impl ReasoningMailbox {
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn append(&self, chunk: String) {
         self.received_chunks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -259,7 +265,7 @@ impl ReasoningMailbox {
 
         let mut chunk = chunk;
         Self::retain_tail(&mut chunk);
-        let mut pending = self.pending.lock().expect("reasoning mailbox poisoned");
+        let mut pending = self.lock_pending();
         match pending.as_mut() {
             Some(existing) => {
                 existing.push_str(&chunk);
@@ -282,25 +288,15 @@ impl ReasoningMailbox {
     }
 
     pub(crate) fn take(&self) -> Option<String> {
-        self.pending
-            .lock()
-            .expect("reasoning mailbox poisoned")
-            .take()
+        self.lock_pending().take()
     }
 
     pub(crate) fn is_pending(&self) -> bool {
-        self.pending
-            .lock()
-            .expect("reasoning mailbox poisoned")
-            .is_some()
+        self.lock_pending().is_some()
     }
 
     pub(crate) fn pending_len(&self) -> usize {
-        self.pending
-            .lock()
-            .expect("reasoning mailbox poisoned")
-            .as_ref()
-            .map_or(0, String::len)
+        self.lock_pending().as_ref().map_or(0, String::len)
     }
 
     pub(crate) fn received_chunks(&self) -> u64 {
@@ -1332,6 +1328,20 @@ mod tests {
 
         assert_eq!(mailbox.received_chunks(), 100_000);
         assert!(mailbox.pending_len() <= MAX_REASONING_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn test_reasoning_mailbox_recovers_from_poisoned_lock() {
+        use super::ReasoningMailbox;
+
+        let mailbox = ReasoningMailbox::default();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mailbox.pending.lock().unwrap();
+            panic!("simulate a panic while holding the mailbox lock");
+        }));
+
+        mailbox.append("still usable".to_string());
+        assert_eq!(mailbox.take().as_deref(), Some("still usable"));
     }
 
     #[test]

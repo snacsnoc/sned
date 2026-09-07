@@ -1486,7 +1486,7 @@ impl App {
     /// render-time width.
     pub fn push_output_with_kind(&mut self, line: Line<'static>, kind: BlockKind) {
         let wrap_width = self.active_wrap_width();
-        self._push_output_line(line, kind, wrap_width, true);
+        self._push_output_line(line, kind, wrap_width);
     }
 
     pub(crate) fn take_pending_transcript_model_line(&mut self) -> Option<Line<'static>> {
@@ -1517,13 +1517,7 @@ impl App {
     /// kind tag.  `output_line_kinds` is kept in lockstep with
     /// `output_lines` so render-time grouping can walk both buffers
     /// with the same indices.
-    fn _push_output_line(
-        &mut self,
-        line: Line<'static>,
-        kind: BlockKind,
-        wrap_width: usize,
-        enforce_transcript_limit: bool,
-    ) {
+    fn _push_output_line(&mut self, line: Line<'static>, kind: BlockKind, wrap_width: usize) {
         let previous_kind = self.output_line_kinds.back().copied();
         let can_extend_layout = self.visual_layout_index.is_valid_for(wrap_width)
             && self.error_lines.is_empty()
@@ -1534,7 +1528,7 @@ impl App {
         self.output_line_ids.push_back(line_id);
         self.output_line_kinds.push_back(kind);
         self.cached_visible_window = None;
-        if enforce_transcript_limit && self.output_lines.len() > 10_000 {
+        if self.output_lines.len() > 10_000 {
             let evicted_kind = *self
                 .output_line_kinds
                 .front()
@@ -3255,8 +3249,19 @@ impl App {
         self.output_lines.drain(start..);
         self.output_line_ids.drain(start..);
         self.output_line_kinds.drain(start..);
+        self.turn_stream_entries.retain(|(index, _)| *index < start);
+        self.last_stream_group = self
+            .last_stream_group
+            .and_then(|(group_start, count, kind)| {
+                if group_start >= start {
+                    None
+                } else if group_start.saturating_add(count) > start {
+                    Some((group_start, start - group_start, kind))
+                } else {
+                    Some((group_start, count, kind))
+                }
+            });
         self.visual_layout_index.invalidate();
-        self.last_stream_group = None;
         self.reasoning_partial_line.clear();
         // Invalidate the visual-row cache: drain changes the line buffer,
         // which can alter render-time separator insertion.
@@ -5794,6 +5799,28 @@ mod tests {
         app.clear_output().unwrap();
         assert_eq!(app.total_visual_rows(wrap_width), 0);
         assert_eq!(app.cached_visual_rows, 0);
+    }
+
+    #[test]
+    fn test_drain_output_from_keeps_surviving_stream_indices() {
+        let mut app = App::new();
+        app.push_plain("first");
+        app.push_plain("second");
+        app.push_plain("third");
+        app.turn_stream_entries = vec![
+            (0, StreamKind::Model),
+            (1, StreamKind::Model),
+            (2, StreamKind::Reasoning),
+        ];
+        app.last_stream_group = Some((1, 2, StreamKind::Model));
+
+        app.drain_output_from(2);
+
+        assert_eq!(
+            app.turn_stream_entries,
+            vec![(0, StreamKind::Model), (1, StreamKind::Model)]
+        );
+        assert_eq!(app.last_stream_group, Some((1, 1, StreamKind::Model)));
     }
 
     #[test]
