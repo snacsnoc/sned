@@ -451,7 +451,11 @@ pub async fn search_workspace_files_with_status(
         });
     }
 
-    let query_lower = query.to_lowercase();
+    // Mentions are rendered as `@/path` so the context expander can distinguish
+    // workspace-relative paths from ordinary text. The search index stores
+    // workspace-relative paths without that marker, so ignore it only while
+    // scoring. Keep the slash in the input buffer for mention expansion.
+    let query_lower = query.trim_start_matches('/').to_lowercase();
     let query_bytes = query_lower.into_bytes();
     let mut scored: Vec<_> = items
         .iter()
@@ -848,6 +852,15 @@ mod tests {
 
         let results = search_workspace_files("main", workspace.to_str().unwrap(), 10).await;
         assert!(!results.is_empty(), "Should find main.rs");
+
+        // The picker inserts workspace-relative mentions as `@/path`. The
+        // slash is syntax, not part of the indexed path, so searching with it
+        // must return the same result as the bare path query.
+        let results = search_workspace_files("/main", workspace.to_str().unwrap(), 10).await;
+        assert!(
+            !results.is_empty(),
+            "Should find main.rs after mention insertion"
+        );
 
         let results = search_workspace_files("readme", workspace.to_str().unwrap(), 10).await;
         assert!(!results.is_empty(), "Should find README.md");
