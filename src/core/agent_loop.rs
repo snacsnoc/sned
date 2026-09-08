@@ -64,7 +64,8 @@ const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
 
 use crate::core::plan_state::PlanStepStatus;
 use crate::core::stream_parsing::{
-    extract_response_text, split_model_output, truncate_json_arguments,
+    FenceDelimiter, ThinkOpenKind, classify_think_start, extract_response_text, is_think_end,
+    parse_fence_start, split_model_output, truncate_json_arguments,
 };
 use crate::core::tool_output::{
     extract_edit_stats_detailed, format_heat_map, format_heat_map_plain, format_tool_call_lines,
@@ -86,6 +87,238 @@ const MAX_STREAM_RETRY_ATTEMPTS: usize = DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILUR
 const PARTIAL_MODEL_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
 use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
+
+const THINKING_OPEN_TAGS: [&str; 2] = ["<think>", "<!-- think -->"];
+const THINKING_CLOSE_TAGS: [&str; 2] = ["</think>", "<!-- /think -->"];
+
+#[derive(Debug, Default)]
+struct ThinkingTagStreamFilter {
+    pending: String,
+    hidden: String,
+    think_open_kind: Option<ThinkOpenKind>,
+    fence_marker: Option<FenceDelimiter>,
+    at_line_start: bool,
+}
+
+impl ThinkingTagStreamFilter {
+    fn new() -> Self {
+        Self {
+            at_line_start: true,
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, chunk: &str) -> String {
+        let mut input = std::mem::take(&mut self.pending);
+        input.push_str(chunk);
+        let mut visible = String::new();
+        let mut pos = 0;
+
+        loop {
+            if pos == input.len() {
+                break;
+            }
+            let remaining = &input[pos..];
+
+            if self.think_open_kind == Some(ThinkOpenKind::CodeFenceThink) {
+                if self.at_line_start {
+                    if let Some((line, consumed)) = complete_stream_line(remaining) {
+                        if is_think_end(line, ThinkOpenKind::CodeFenceThink) {
+                            pos += consumed;
+                            self.think_open_kind = None;
+                            self.at_line_start = true;
+                            continue;
+                        }
+                    } else if could_be_fenced_think_line(remaining, "```") {
+                        break;
+                    }
+                }
+                let ch = remaining
+                    .chars()
+                    .next()
+                    .expect("remaining input is not empty");
+                self.hidden.push(ch);
+                pos += ch.len_utf8();
+                self.at_line_start = ch == '\n';
+                continue;
+            }
+
+            if self.think_open_kind == Some(ThinkOpenKind::TagOrUnicode) {
+                if let Some(tag) = complete_prefix(remaining, &THINKING_CLOSE_TAGS) {
+                    pos += tag.len();
+                    self.think_open_kind = None;
+                    continue;
+                }
+                if has_partial_prefix(remaining, &THINKING_CLOSE_TAGS) {
+                    break;
+                }
+                let ch = remaining
+                    .chars()
+                    .next()
+                    .expect("remaining input is not empty");
+                self.hidden.push(ch);
+                pos += ch.len_utf8();
+                continue;
+            }
+
+            if self.at_line_start {
+                if self.fence_marker.is_none() {
+                    if let Some((line, consumed)) = complete_stream_line(remaining) {
+                        if classify_think_start(line) == Some(ThinkOpenKind::CodeFenceThink) {
+                            pos += consumed;
+                            self.think_open_kind = Some(ThinkOpenKind::CodeFenceThink);
+                            self.at_line_start = true;
+                            continue;
+                        }
+                    } else if could_be_fenced_think_line(remaining, "```think") {
+                        break;
+                    }
+                }
+                match fence_prefix(remaining, self.fence_marker) {
+                    FencePrefix::Complete(fence) => {
+                        self.fence_marker = match self.fence_marker {
+                            Some(_) => None,
+                            None => Some(fence),
+                        };
+                        self.at_line_start = false;
+                    }
+                    FencePrefix::Partial => break,
+                    FencePrefix::NotFence => self.at_line_start = false,
+                }
+            }
+
+            if self.fence_marker.is_none() {
+                if let Some(tag) = complete_prefix(remaining, &THINKING_OPEN_TAGS) {
+                    pos += tag.len();
+                    self.think_open_kind = Some(ThinkOpenKind::TagOrUnicode);
+                    continue;
+                }
+                if has_partial_prefix(remaining, &THINKING_OPEN_TAGS) {
+                    break;
+                }
+            }
+
+            let ch = remaining
+                .chars()
+                .next()
+                .expect("remaining input is not empty");
+            pos += ch.len_utf8();
+            visible.push(ch);
+            if ch == '\n' {
+                self.at_line_start = true;
+            }
+        }
+
+        self.pending.push_str(&input[pos..]);
+
+        visible
+    }
+
+    fn finish(&mut self) -> String {
+        if self.think_open_kind == Some(ThinkOpenKind::CodeFenceThink) {
+            if is_think_end(&self.pending, ThinkOpenKind::CodeFenceThink) {
+                self.pending.clear();
+                self.think_open_kind = None;
+            } else {
+                self.hidden.push_str(&self.pending);
+                self.pending.clear();
+            }
+            String::new()
+        } else if self.think_open_kind == Some(ThinkOpenKind::TagOrUnicode) {
+            self.hidden.push_str(&self.pending);
+            self.pending.clear();
+            String::new()
+        } else if classify_think_start(&self.pending) == Some(ThinkOpenKind::CodeFenceThink) {
+            self.pending.clear();
+            self.think_open_kind = Some(ThinkOpenKind::CodeFenceThink);
+            String::new()
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+
+    fn take_hidden(&mut self) -> Option<String> {
+        (!self.hidden.is_empty()).then(|| std::mem::take(&mut self.hidden))
+    }
+}
+
+fn complete_stream_line(input: &str) -> Option<(&str, usize)> {
+    let newline = input.find('\n')?;
+    let line = input[..newline]
+        .strip_suffix('\r')
+        .unwrap_or(&input[..newline]);
+    Some((line, newline + 1))
+}
+
+fn could_be_fenced_think_line(input: &str, marker: &str) -> bool {
+    let trimmed = input.trim_start_matches(' ');
+    let indent = input.len() - trimmed.len();
+    indent <= 3
+        && (marker.starts_with(trimmed)
+            || (trimmed.starts_with(marker) && trimmed[marker.len()..].trim().is_empty()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencePrefix {
+    Complete(FenceDelimiter),
+    Partial,
+    NotFence,
+}
+
+fn complete_prefix<'a>(input: &str, tags: &'a [&str]) -> Option<&'a str> {
+    tags.iter().copied().find(|tag| input.starts_with(tag))
+}
+
+fn has_partial_prefix(input: &str, tags: &[&str]) -> bool {
+    tags.iter().any(|tag| tag.starts_with(input))
+}
+
+fn fence_prefix(input: &str, active_fence: Option<FenceDelimiter>) -> FencePrefix {
+    let line_end = input.find('\n');
+    let line = line_end.map_or(input, |end| &input[..end]);
+
+    if let Some((candidate, suffix)) = parse_fence_start(line) {
+        if let Some(opener) = active_fence {
+            if candidate.marker != opener.marker {
+                return FencePrefix::NotFence;
+            }
+            if candidate.run_length >= opener.run_length
+                && suffix.trim().is_empty()
+                && (line_end.is_some() || !suffix.is_empty())
+            {
+                return FencePrefix::Complete(candidate);
+            }
+            if line_end.is_none() && suffix.is_empty() {
+                return FencePrefix::Partial;
+            }
+            return FencePrefix::NotFence;
+        }
+
+        if line_end.is_none() && suffix.is_empty() {
+            return FencePrefix::Partial;
+        }
+        return FencePrefix::Complete(candidate);
+    }
+
+    let bytes = line.as_bytes();
+    let indent = bytes.iter().take_while(|&&byte| byte == b' ').count();
+    if indent > 3 || indent == bytes.len() {
+        return if indent <= 3 {
+            FencePrefix::Partial
+        } else {
+            FencePrefix::NotFence
+        };
+    }
+    let rest = &bytes[indent..];
+    let marker = rest[0];
+    if !matches!(marker, b'`' | b'~')
+        || active_fence.is_some_and(|fence| fence.marker != marker)
+        || !rest.iter().all(|&byte| byte == marker)
+    {
+        return FencePrefix::NotFence;
+    }
+    FencePrefix::Partial
+}
 
 async fn wait_for_cancellation(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -2026,6 +2259,8 @@ impl AgentLoop {
         let mut preoutput_elapsed_at_first_chunk: Option<std::time::Duration> = None;
         let (
             accumulated_text,
+            filtered_text,
+            leaked_thinking,
             accumulated_reasoning,
             accumulated_signature,
             accumulated_text_signature,
@@ -2196,6 +2431,7 @@ impl AgentLoop {
 
             // 4. Process stream chunks
             let mut accumulated_text = String::new();
+            let mut filtered_text = String::new();
             let mut first_chunk_received = false;
             let mut accumulated_reasoning = String::new();
             let mut accumulated_signature: Option<String> = None;
@@ -2218,7 +2454,7 @@ impl AgentLoop {
             let mut retryable_stream_error_before_output: Option<String> = None;
             let mut non_retryable_stream_error: Option<String> = None;
             let mut substantive_stream_output_received = false;
-            let mut in_thinking_tag = false;
+            let mut thinking_tag_filter = ThinkingTagStreamFilter::new();
             let mut partial_line_displayed = false;
             let mut last_partial_flush_at: Option<std::time::Instant> = None;
             let mut stream_usage: Option<ApiReqInfo> = None;
@@ -2298,6 +2534,8 @@ impl AgentLoop {
                     ApiStreamChunk::Text(text_chunk) => {
                         text_chunks = text_chunks.saturating_add(1);
                         tracing::debug!(text = %text_chunk.text, "received text chunk");
+                        let processed = thinking_tag_filter.push(&text_chunk.text);
+                        filtered_text.push_str(&processed);
                         if self.config.json_output {
                             substantive_stream_output_received |= !text_chunk.text.is_empty();
                             tracing::info!(
@@ -2310,51 +2548,6 @@ impl AgentLoop {
                                 .to_string()
                             );
                         } else {
-                            // Check for thinking tags and suppress content between them
-                            let text = &text_chunk.text;
-                            let mut processed = String::new();
-                            let mut pos = 0;
-
-                            while pos < text.len() {
-                                // Check for thinking start tag
-                                if !in_thinking_tag {
-                                    if let Some(tag_start) = text[pos..].find("<!-- think -->") {
-                                        let abs_start = pos + tag_start;
-                                        processed.push_str(&text[pos..abs_start]);
-                                        in_thinking_tag = true;
-                                        pos = abs_start + "<!-- think -->".len();
-                                        continue;
-                                    } else if let Some(tag_start) = text[pos..].find("<think>") {
-                                        let abs_start = pos + tag_start;
-                                        processed.push_str(&text[pos..abs_start]);
-                                        in_thinking_tag = true;
-                                        pos = abs_start + "<think>".len();
-                                        continue;
-                                    }
-                                }
-
-                                // Check for thinking end tag
-                                if in_thinking_tag {
-                                    if let Some(tag_start) = text[pos..].find("<!-- /think -->") {
-                                        let abs_start = pos + tag_start;
-                                        in_thinking_tag = false;
-                                        pos = abs_start + "<!-- /think -->".len();
-                                        continue;
-                                    } else if let Some(tag_start) = text[pos..].find("</think>") {
-                                        let abs_start = pos + tag_start;
-                                        in_thinking_tag = false;
-                                        pos = abs_start + "</think>".len();
-                                        continue;
-                                    }
-                                    // Skip content while inside thinking tag
-                                    pos = text.len();
-                                } else {
-                                    // Not in thinking tag, output remaining text
-                                    processed.push_str(&text[pos..]);
-                                    pos = text.len();
-                                }
-                            }
-
                             // Only display non-thinking content
                             if !processed.is_empty() {
                                 substantive_stream_output_received = true;
@@ -2878,6 +3071,13 @@ impl AgentLoop {
                 }
             }
 
+            let filtered_tail = thinking_tag_filter.finish();
+            filtered_text.push_str(&filtered_tail);
+            if !self.config.json_output {
+                display_buffer.push_str(&filtered_tail);
+            }
+            let leaked_thinking = thinking_tag_filter.take_hidden();
+
             // Final flush: print any remaining buffered content and ensure newline
             if in_code_block && !self.config.json_output {
                 let remaining = display_buffer.trim_end().to_string();
@@ -3020,6 +3220,8 @@ impl AgentLoop {
             }
             break (
                 accumulated_text,
+                filtered_text,
+                leaked_thinking,
                 accumulated_reasoning,
                 accumulated_signature,
                 accumulated_text_signature,
@@ -3084,8 +3286,8 @@ impl AgentLoop {
         // Split raw model text into thinking + response.
         // DeepSeek/Wafer embed thinking tags in delta.content; use the
         // response part for completion output so hidden thinking stays hidden.
-        let (extracted_thinking, _) = split_model_output(&accumulated_text);
-        let response_text = extract_response_text(&accumulated_text);
+        let (fenced_thinking, _) = split_model_output(&filtered_text);
+        let response_text = extract_response_text(&filtered_text);
         // A response that accompanies tool calls is an intermediate handoff,
         // not the completed model response that `/full` should recover.
         if prepared_tool_calls.is_empty() {
@@ -3115,6 +3317,11 @@ impl AgentLoop {
             // Merge extracted thinking with any reasoning from the provider.
             // If the provider already sent reasoning_content, prepend any
             // thinking extracted from delta.content (rare but possible).
+            let extracted_thinking = match (leaked_thinking, fenced_thinking) {
+                (Some(leaked), Some(fenced)) => Some(format!("{leaked}\n{fenced}")),
+                (Some(leaked), None) => Some(leaked),
+                (None, fenced) => fenced,
+            };
             let merged_thinking = match (extracted_thinking, accumulated_reasoning.is_empty()) {
                 (Some(t), true) => Some(t),
                 (Some(t), false) => Some(format!("{t}\n{accumulated_reasoning}")),
@@ -5509,21 +5716,338 @@ fn truncate_old_thinking_blocks(history: &mut [StorageMessage]) {
 
         for block in blocks {
             if let AssistantContentBlock::Thinking(thinking_block) = block {
-                // Truncate by character count (approximate token proxy)
-                // 1 token ≈ 4 chars for English text
-                let char_limit = limit * 4;
-                if thinking_block.thinking.len() > char_limit {
-                    thinking_block.thinking.truncate(char_limit);
-                    thinking_block.thinking.push_str("\n\n[truncated]");
-                }
+                truncate_thinking_text(&mut thinking_block.thinking, limit);
             }
         }
+    }
+}
+
+fn truncate_thinking_text(thinking: &mut String, token_limit: usize) {
+    // Token limits are approximate, but truncation must use a valid byte
+    // boundary because provider reasoning can contain multibyte text.
+    let byte_limit = token_limit.saturating_mul(4);
+    if thinking.len() > byte_limit {
+        let safe_limit = thinking.floor_char_boundary(byte_limit);
+        thinking.truncate(safe_limit);
+        thinking.push_str("\n\n[truncated]");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn filter_thinking_chunks(chunks: &[&str]) -> String {
+        let mut filter = ThinkingTagStreamFilter::new();
+        let mut visible = String::new();
+        for chunk in chunks {
+            visible.push_str(&filter.push(chunk));
+        }
+        visible.push_str(&filter.finish());
+        visible
+    }
+
+    #[test]
+    fn thinking_tags_are_filtered_at_every_stream_split_boundary() {
+        for (open, close) in [
+            ("<think>", "</think>"),
+            ("<!-- think -->", "<!-- /think -->"),
+        ] {
+            let input = format!("before{open}hidden{close}after");
+            let expected = "beforeafter";
+            for split in 0..=input.len() {
+                if !input.is_char_boundary(split) {
+                    continue;
+                }
+                assert_eq!(
+                    filter_thinking_chunks(&[&input[..split], &input[split..]]),
+                    expected,
+                    "failed at byte split {split} for {open}"
+                );
+            }
+
+            for open_split in 0..=open.len() {
+                for close_split in 0..=close.len() {
+                    assert_eq!(
+                        filter_thinking_chunks(&[
+                            "before",
+                            &open[..open_split],
+                            &open[open_split..],
+                            "hidden",
+                            &close[..close_split],
+                            &close[close_split..],
+                            "after",
+                        ]),
+                        expected,
+                        "failed at delimiter splits {open_split}/{close_split} for {open}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_filter_handles_multiple_tags_and_unfinished_eof() {
+        assert_eq!(
+            filter_thinking_chunks(&[
+                "a<th",
+                "ink>one</think>b<!-- thi",
+                "nk -->two<!-- /think -->c",
+            ]),
+            "abc"
+        );
+        assert_eq!(filter_thinking_chunks(&["visible<thi"]), "visible<thi");
+        assert_eq!(
+            filter_thinking_chunks(&["visible<think>unfinished reasoning"]),
+            "visible"
+        );
+        assert_eq!(
+            filter_thinking_chunks(&["visible<think>hidden</thi"]),
+            "visible"
+        );
+    }
+
+    #[test]
+    fn thinking_filter_retains_only_a_partial_delimiter_between_chunks() {
+        let mut filter = ThinkingTagStreamFilter::new();
+        assert_eq!(filter.push(&"x".repeat(100_000)), "x".repeat(100_000));
+        assert!(filter.pending.len() < "<!-- think -->".len());
+        assert_eq!(filter.push("<thi"), "");
+        assert_eq!(filter.pending, "<thi");
+    }
+
+    #[test]
+    fn thinking_tags_inside_streamed_fences_remain_visible() {
+        let expected = concat!(
+            "before\n",
+            "```html\n",
+            "<think>literal</think>\n",
+            "<!-- think -->literal<!-- /think -->\n",
+            "```\n",
+            "after"
+        );
+        let chunks = [
+            "before\n``",
+            "`html\n<th",
+            "ink>literal</think>\n<!-- thi",
+            "nk -->literal<!-- /think -->\n`",
+            "``\nafter",
+        ];
+        assert_eq!(filter_thinking_chunks(&chunks), expected);
+
+        assert_eq!(
+            filter_thinking_chunks(&["~~~text\n<thi", "nk>literal</think>\n~~~\n"]),
+            "~~~text\n<think>literal</think>\n~~~\n"
+        );
+    }
+
+    #[test]
+    fn fenced_thinking_is_hidden_at_every_stream_split_boundary() {
+        let input = "before\n```think\nhidden\n```\nafter";
+        for split in 0..=input.len() {
+            assert_eq!(
+                filter_thinking_chunks(&[&input[..split], &input[split..]]),
+                "before\nafter",
+                "failed at byte split {split}"
+            );
+        }
+        assert_eq!(
+            split_model_output(input),
+            (
+                Some("hidden".to_string()),
+                Some("before\nafter".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn literal_fence_closing_matches_final_parser() {
+        let input = concat!(
+            "before\n",
+            "````\n",
+            "```think\n",
+            "literal thinking marker\n",
+            "```python\n",
+            "still literal\n",
+            "````\n",
+            "after"
+        );
+        for split in 0..=input.len() {
+            assert_eq!(
+                filter_thinking_chunks(&[&input[..split], &input[split..]]),
+                input,
+                "failed at byte split {split}"
+            );
+        }
+
+        let indented = "    ```think\nhidden\n    ```\nafter";
+        assert_eq!(filter_thinking_chunks(&[indented]), indented);
+    }
+
+    #[tokio::test]
+    async fn fenced_thinking_matches_displayed_and_persisted_output() {
+        let responses = vec![vec![
+            ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "before\n``".to_string(),
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "`thi".to_string(),
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "nk\nhidden\n`".to_string(),
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "``\nafter".to_string(),
+                id: None,
+                signature: None,
+            }),
+        ]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority output receiver should be available");
+        let mut config = test_agent_config(provider, "test-fenced-thinking");
+        config.output_writer = writer;
+        let mut agent = AgentLoop::new(config);
+
+        let _ = agent.execute_turn().await;
+
+        let events = drain_output_events(&mut priority_rx, &mut rx);
+        let rendered = events
+            .iter()
+            .filter_map(|event| match event {
+                OutputEvent::Line(line) | OutputEvent::ModelUpdateLine(line) => {
+                    Some(line.to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("before"), "{rendered}");
+        assert!(rendered.contains("after"), "{rendered}");
+        assert!(!rendered.contains("hidden"), "{rendered}");
+        assert!(!rendered.contains("```think"), "{rendered}");
+
+        let history = agent.conversation_history.lock().await;
+        let blocks = history
+            .iter()
+            .rev()
+            .find_map(|message| match &message.content {
+                MessageContent::AssistantBlocks(blocks) => Some(blocks),
+                _ => None,
+            })
+            .expect("expected assistant block history");
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            AssistantContentBlock::Text(text) if text.text == "before\nafter"
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            AssistantContentBlock::Thinking(thinking) if thinking.thinking == "hidden\n"
+        )));
+    }
+
+    #[tokio::test]
+    async fn structured_reasoning_interleaves_with_split_thinking_tags() {
+        let responses = vec![vec![
+            ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "before<th".to_string(),
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
+                reasoning: "structured reasoning".to_string(),
+                details: None,
+                signature: None,
+                redacted_data: None,
+                id: Some("reasoning-1".to_string()),
+            }),
+            ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "ink>hidden</thi".to_string(),
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
+                reasoning: " continues".to_string(),
+                details: None,
+                signature: None,
+                redacted_data: None,
+                id: Some("reasoning-2".to_string()),
+            }),
+            ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "nk>after\n".to_string(),
+                id: None,
+                signature: None,
+            }),
+        ]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority output receiver should be available");
+        let mut config = test_agent_config(provider, "test-split-thinking-with-reasoning");
+        config.output_writer = writer;
+        let mut agent = AgentLoop::new(config);
+
+        let _ = agent.execute_turn().await;
+
+        let events = drain_output_events(&mut priority_rx, &mut rx);
+        let rendered = events
+            .iter()
+            .filter_map(|event| match event {
+                OutputEvent::Line(line) | OutputEvent::ModelUpdateLine(line) => {
+                    Some(line.to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reasoning = events
+            .iter()
+            .filter_map(|event| match event {
+                OutputEvent::ReasoningChunk(chunk) => Some(chunk.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        assert!(rendered.contains("beforeafter"), "{rendered}");
+        assert!(!rendered.contains("hidden"), "{rendered}");
+        assert_eq!(reasoning, "structured reasoning continues");
+
+        let history = agent.conversation_history.lock().await;
+        let blocks = history
+            .iter()
+            .rev()
+            .find_map(|message| match &message.content {
+                MessageContent::AssistantBlocks(blocks) => Some(blocks),
+                _ => None,
+            })
+            .expect("expected assistant block history");
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            AssistantContentBlock::Text(text) if text.text == "beforeafter"
+        )));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            AssistantContentBlock::Thinking(thinking)
+                if thinking.thinking == "hidden\nstructured reasoning continues"
+        )));
+    }
     use crate::core::tool_output::{
         format_tool_summary, normalize_path_for_matching, summarize_single_section,
     };
@@ -10504,6 +11028,19 @@ Irrespective of whether additional information or instructions are given, you ar
         } else {
             panic!("Second message should have AssistantBlocks");
         }
+    }
+
+    #[test]
+    fn test_truncate_old_thinking_blocks_preserves_utf8_boundaries() {
+        let mut thinking = "界".repeat(4);
+        truncate_thinking_text(&mut thinking, 2);
+
+        assert_eq!(thinking.chars().take_while(|ch| *ch == '界').count(), 2);
+        assert!(thinking.ends_with("\n\n[truncated]"));
+
+        let mut short = "界".to_string();
+        truncate_thinking_text(&mut short, usize::MAX);
+        assert_eq!(short, "界");
     }
 
     #[test]

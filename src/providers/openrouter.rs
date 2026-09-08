@@ -565,20 +565,23 @@ mod tests {
 
     #[test]
     fn test_openrouter_model_info_qwen_family() {
-        for model_id in [
-            "qwen3.6-35b-a3b",
-            "qwen/qwen3.6-35b-a3b",
-            "qwen/qwen3.5-27b",
-        ] {
+        for model_id in ["qwen3-coder-next", "qwen/qwen3-coder-next"] {
             let info = get_openrouter_model_info(model_id);
             assert_eq!(info.base.context_window, Some(262_144));
-            assert_eq!(info.base.max_tokens, Some(65_536));
+            assert_eq!(info.base.max_tokens, Some(32_768));
             assert_eq!(info.base.supports_tools, Some(true));
             assert_eq!(info.base.supports_images, Some(false));
             assert!(!info.base.supports_prompt_cache);
-            assert_eq!(info.base.supports_reasoning, Some(true));
+            assert_eq!(info.base.supports_reasoning, Some(false));
             assert_eq!(info.supports_reasoning_effort, Some(false));
         }
+    }
+
+    #[test]
+    fn test_openrouter_unknown_qwen_keeps_generic_limits() {
+        let info = get_openrouter_model_info("qwen/qwen3.6-35b-a3b");
+        assert_eq!(info.base.context_window, Some(32_768));
+        assert_eq!(info.base.max_tokens, Some(8192));
     }
 
     #[test]

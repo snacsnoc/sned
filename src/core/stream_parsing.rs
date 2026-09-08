@@ -1,6 +1,6 @@
 //! Stream parsing and thinking-section detection for model output.
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThinkOpenKind {
     /// Opened by ```think — only ``` closes it (code fences inside thinking are preserved)
     CodeFenceThink,
@@ -8,12 +8,63 @@ pub enum ThinkOpenKind {
     TagOrUnicode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FenceDelimiter {
+    pub marker: u8,
+    pub run_length: usize,
+}
+
+/// Parse a Markdown-style fence at the start of a line.
+///
+/// Sned accepts up to three leading spaces, matching the streaming filter and
+/// the final-output parser. The suffix is returned so callers can distinguish
+/// an opening fence's info string from a closing fence.
+#[must_use]
+pub fn parse_fence_start(line: &str) -> Option<(FenceDelimiter, &str)> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let bytes = line.as_bytes();
+    let indent = bytes.iter().take_while(|&&byte| byte == b' ').count();
+    if indent > 3 || indent == bytes.len() {
+        return None;
+    }
+
+    let marker = match bytes[indent] {
+        b'`' | b'~' => bytes[indent],
+        _ => return None,
+    };
+    let run_length = bytes[indent..]
+        .iter()
+        .take_while(|&&byte| byte == marker)
+        .count();
+    if run_length < 3 {
+        return None;
+    }
+
+    Some((
+        FenceDelimiter { marker, run_length },
+        &line[indent + run_length..],
+    ))
+}
+
+#[must_use]
+pub fn is_fence_closer(line: &str, opener: FenceDelimiter) -> bool {
+    let Some((candidate, suffix)) = parse_fence_start(line) else {
+        return false;
+    };
+    candidate.marker == opener.marker
+        && candidate.run_length >= opener.run_length
+        && suffix.trim().is_empty()
+}
+
 #[must_use]
 pub fn classify_think_start(line: &str) -> Option<ThinkOpenKind> {
-    let trimmed = line.trim();
-    if trimmed == "```think" {
+    if let Some((fence, suffix)) = parse_fence_start(line)
+        && fence.marker == b'`'
+        && fence.run_length == 3
+        && suffix.trim() == "think"
+    {
         Some(ThinkOpenKind::CodeFenceThink)
-    } else if trimmed.starts_with("<think>") || trimmed.starts_with("<!-- think -->") {
+    } else if line.trim().starts_with("<think>") || line.trim().starts_with("<!-- think -->") {
         Some(ThinkOpenKind::TagOrUnicode)
     } else {
         None
@@ -21,20 +72,11 @@ pub fn classify_think_start(line: &str) -> Option<ThinkOpenKind> {
 }
 
 #[must_use]
-pub fn is_think_end(line: &str, open_kind: ThinkOpenKind) -> bool {
+pub fn is_think_end(line: &str, _open_kind: ThinkOpenKind) -> bool {
     let trimmed = line.trim();
-    // These end markers are unambiguous — always valid regardless of how thinking started
-    let is_explicit_end = trimmed == "</think>" || trimmed == "<!-- /think -->";
-    if is_explicit_end {
-        return true;
-    }
-    // ``` is only a think-end if thinking was NOT opened by ```think.
-    // When opened by ```think, a bare ``` inside the thinking section is
-    // just a code fence and should not terminate thinking.
-    match open_kind {
-        ThinkOpenKind::TagOrUnicode => trimmed == "```",
-        ThinkOpenKind::CodeFenceThink => false,
-    }
+    // Explicit tags work for either thinking syntax; only a bare three-backtick
+    // line closes fenced thinking.
+    trimmed == "</think>" || trimmed == "<!-- /think -->" || trimmed == "```"
 }
 
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
@@ -284,11 +326,28 @@ pub fn split_model_output(text: &str) -> (Option<String>, Option<String>) {
     let mut response: Option<String> = None;
     let mut in_think = false;
     let mut think_open_kind: Option<ThinkOpenKind> = None;
+    let mut literal_fence: Option<FenceDelimiter> = None;
     let mut think_lines: Vec<&str> = Vec::new();
     let mut response_lines: Vec<&str> = Vec::new();
 
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(opener) = literal_fence {
+            response_lines.push(line);
+            if is_fence_closer(line, opener) {
+                literal_fence = None;
+            }
+            continue;
+        }
+        if !in_think && let Some((fence, suffix)) = parse_fence_start(line) {
+            let is_thinking_fence =
+                fence.marker == b'`' && fence.run_length == 3 && suffix.trim() == "think";
+            if !is_thinking_fence {
+                literal_fence = Some(fence);
+                response_lines.push(line);
+                continue;
+            }
+        }
         if let Some(kind) = classify_think_start(line) {
             in_think = true;
             think_open_kind = Some(kind);
@@ -455,8 +514,10 @@ mod tests {
 
     #[test]
     fn test_is_think_end_code_fence_depends_on_open_kind() {
-        assert!(!is_think_end("```", ThinkOpenKind::CodeFenceThink));
+        assert!(is_think_end("```", ThinkOpenKind::CodeFenceThink));
         assert!(is_think_end("```", ThinkOpenKind::TagOrUnicode));
+        assert!(!is_think_end("````", ThinkOpenKind::CodeFenceThink));
+        assert!(!is_think_end("```python", ThinkOpenKind::CodeFenceThink));
     }
 
     #[test]
@@ -480,6 +541,43 @@ mod tests {
         let (thinking, response) = split_model_output(input);
         assert_eq!(thinking, Some("Thinking content".to_string()));
         assert_eq!(response, Some("Response content".to_string()));
+    }
+
+    #[test]
+    fn test_split_model_output_preserves_thinking_tags_in_source_fences() {
+        let input = "before\n```html\n<think>literal</think>\n<!-- think -->literal<!-- /think -->\n```\nafter";
+        let (thinking, response) = split_model_output(input);
+        assert_eq!(thinking, None);
+        assert_eq!(response.as_deref(), Some(input));
+    }
+
+    #[test]
+    fn test_literal_fence_requires_matching_run_and_whitespace_suffix() {
+        let input = concat!(
+            "before\n",
+            "````\n",
+            "<think>literal</think>\n",
+            "```python\n",
+            "```text\n",
+            "````\n",
+            "after"
+        );
+        let (thinking, response) = split_model_output(input);
+        assert_eq!(thinking, None);
+        assert_eq!(response.as_deref(), Some(input));
+
+        let input = "before\n```\nliteral\n````\nafter";
+        let (thinking, response) = split_model_output(input);
+        assert_eq!(thinking, None);
+        assert_eq!(response.as_deref(), Some(input));
+    }
+
+    #[test]
+    fn test_fence_indentation_matches_streaming_contract() {
+        let input = "    ```think\nhidden\n    ```\nafter";
+        let (thinking, response) = split_model_output(input);
+        assert_eq!(thinking, None);
+        assert_eq!(response.as_deref(), Some(input));
     }
 
     #[test]

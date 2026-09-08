@@ -20,6 +20,28 @@ use std::time::{Duration, Instant};
 const OPENAI_CLIENT_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 const OPENAI_NON_STREAM_PREOUTPUT_GRACE: Duration = Duration::from_secs(5);
 const OPENAI_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+const SNED_REASONING_HISTORY_KEY: &str = "sned_reasoning_history";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReasoningHistoryPolicy {
+    #[default]
+    Omit,
+    ReasoningContent,
+    ReasoningContentPlusReasoning,
+}
+
+impl ReasoningHistoryPolicy {
+    fn parse(value: &serde_json::Value) -> anyhow::Result<Self> {
+        match value.as_str() {
+            Some("omit") => Ok(Self::Omit),
+            Some("reasoning_content") => Ok(Self::ReasoningContent),
+            Some("reasoning_content_plus_reasoning") => Ok(Self::ReasoningContentPlusReasoning),
+            _ => anyhow::bail!(
+                "{SNED_REASONING_HISTORY_KEY} must be one of: omit, reasoning_content, reasoning_content_plus_reasoning"
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAiEndpointKind {
@@ -74,13 +96,14 @@ impl std::fmt::Debug for OpenAiConfig {
 #[derive(Debug)]
 pub struct OpenAiProvider {
     config: OpenAiConfig,
+    reasoning_history_policy: ReasoningHistoryPolicy,
     client: reqwest::Client,
     provider_name: String,
     provider_sort: Option<String>,
 }
 
 impl OpenAiProvider {
-    pub fn new(config: OpenAiConfig) -> anyhow::Result<Self> {
+    pub fn new(mut config: OpenAiConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(OPENAI_CLIENT_TOTAL_TIMEOUT)
             .connect_timeout(Duration::from_secs(10))
@@ -93,8 +116,16 @@ impl OpenAiProvider {
             .provider_name
             .clone()
             .unwrap_or_else(|| "OpenAI".to_string());
+        let reasoning_history_policy = config
+            .extra_body
+            .as_mut()
+            .and_then(|extra_body| extra_body.remove(SNED_REASONING_HISTORY_KEY))
+            .map(|value| ReasoningHistoryPolicy::parse(&value))
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             config,
+            reasoning_history_policy,
             client,
             provider_name,
             provider_sort: None,
@@ -191,8 +222,11 @@ impl OpenAiProvider {
                     messages.extend(convert_user_blocks(role, blocks));
                 }
                 crate::providers::MessageContent::AssistantBlocks(blocks) => {
-                    let content = convert_assistant_blocks(blocks);
-                    messages.push(json!({"role": role, "content": content}));
+                    messages.push(convert_assistant_blocks(
+                        role,
+                        blocks,
+                        self.reasoning_history_policy,
+                    ));
                 }
             }
         }
@@ -251,7 +285,12 @@ impl OpenAiProvider {
                     };
                     msg_obj.insert("tool_calls".to_string(), json!(tool_calls));
                     if text_parts.is_empty() {
-                        msg_obj.insert("content".to_string(), json!(null));
+                        let content = if msg_obj.get("reasoning_content").is_some() {
+                            json!("")
+                        } else {
+                            json!(null)
+                        };
+                        msg_obj.insert("content".to_string(), content);
                     } else {
                         msg_obj.insert(
                             "content".to_string(),
@@ -567,8 +606,11 @@ fn convert_user_blocks(
 }
 
 fn convert_assistant_blocks(
+    role: &str,
     blocks: &[crate::providers::AssistantContentBlock],
+    reasoning_history_policy: ReasoningHistoryPolicy,
 ) -> serde_json::Value {
+    let mut reasoning = String::new();
     let parts: Vec<serde_json::Value> = blocks
         .iter()
         .filter_map(|block| match block {
@@ -592,8 +634,15 @@ fn convert_assistant_blocks(
                 "name": tu.name,
                 "input": tu.input
             })),
-            crate::providers::AssistantContentBlock::Thinking(_) => {
-                // OpenAI API does not support "thinking" content blocks; skip.
+            crate::providers::AssistantContentBlock::Thinking(thinking) => {
+                if reasoning_history_policy != ReasoningHistoryPolicy::Omit
+                    && !thinking.thinking.is_empty()
+                {
+                    if !reasoning.is_empty() {
+                        reasoning.push('\n');
+                    }
+                    reasoning.push_str(&thinking.thinking);
+                }
                 None
             }
             crate::providers::AssistantContentBlock::RedactedThinking(_) => None,
@@ -613,7 +662,14 @@ fn convert_assistant_blocks(
             },
         })
         .collect();
-    json!(parts)
+    let mut message = json!({"role": role, "content": parts});
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = json!(reasoning);
+        if reasoning_history_policy == ReasoningHistoryPolicy::ReasoningContentPlusReasoning {
+            message["reasoning"] = message["reasoning_content"].clone();
+        }
+    }
+    message
 }
 
 fn join_assistant_text_parts(parts: &[serde_json::Value]) -> String {
@@ -954,6 +1010,20 @@ fn normalize_qwen_thinking_tool_name(name: &str) -> Option<String> {
         .then(|| function_name.to_owned())
 }
 
+fn accumulate_streamed_tool_name(current: &mut String, incoming: &str) {
+    if current.is_empty() || incoming.starts_with(current.as_str()) {
+        current.clear();
+        current.push_str(incoming);
+    } else if current != incoming && !current.starts_with(incoming) && !current.ends_with(incoming)
+    {
+        current.push_str(incoming);
+    }
+}
+
+fn completed_streamed_tool_name(name: &str) -> String {
+    normalize_qwen_thinking_tool_name(name).unwrap_or_else(|| name.to_owned())
+}
+
 fn is_safe_tool_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -1066,11 +1136,10 @@ async fn process_openai_sse_line(
 
                     if let Some(function) = tc.function {
                         if let Some(name) = function.name.filter(|n| !n.is_empty()) {
-                            let name = normalize_qwen_thinking_tool_name(&name).unwrap_or(name);
-                            accumulated_tool_calls
+                            let entry = accumulated_tool_calls
                                 .entry(tool_index)
-                                .or_insert_with(|| (String::new(), String::new(), String::new()))
-                                .1 = name;
+                                .or_insert_with(|| (String::new(), String::new(), String::new()));
+                            accumulate_streamed_tool_name(&mut entry.1, &name);
                         }
                         if let Some(args) = function.arguments.filter(|a| !a.is_empty()) {
                             let entry = accumulated_tool_calls
@@ -1107,15 +1176,17 @@ async fn process_openai_sse_line(
                     }
 
                     if !delta_state.started_tool_call_indices.contains(&tool_index)
-                        && let Some((id, name, _)) = accumulated_tool_calls.get(&tool_index)
+                        && let Some((id, name, args)) = accumulated_tool_calls.get(&tool_index)
                         && !id.is_empty()
-                        && is_safe_tool_name(name)
+                        && !args.is_empty()
+                        && is_safe_tool_name(&completed_streamed_tool_name(name))
                         && {
+                            let name = completed_streamed_tool_name(name);
                             if !send_chunk(
                                 tx,
                                 ApiStreamChunk::ToolCallStarted {
                                     call_id: id.clone(),
-                                    name: name.clone(),
+                                    name,
                                 },
                                 "tool_call_started",
                             )
@@ -1138,21 +1209,47 @@ async fn process_openai_sse_line(
                 // Flush accumulated tool calls when model signals tool_calls completion
                 if finish == "tool_calls" {
                     // Sort by index to ensure deterministic emission order
-                    let mut sorted_indices: Vec<_> = accumulated_tool_calls.keys().collect();
+                    let mut sorted_indices: Vec<_> =
+                        accumulated_tool_calls.keys().copied().collect();
                     sorted_indices.sort();
 
-                    for idx in sorted_indices {
-                        let (id, name, args) = &accumulated_tool_calls[idx];
+                    for idx in &sorted_indices {
+                        let (id, name, _) = &accumulated_tool_calls[idx];
+                        let name = completed_streamed_tool_name(name);
                         if !completed_tool_call_indices.contains(idx)
+                            && !delta_state.started_tool_call_indices.contains(idx)
+                            && !id.is_empty()
+                            && is_safe_tool_name(&name)
+                        {
+                            if !send_chunk(
+                                tx,
+                                ApiStreamChunk::ToolCallStarted {
+                                    call_id: id.clone(),
+                                    name,
+                                },
+                                "tool_call_started",
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                            delta_state.started_tool_call_indices.insert(*idx);
+                        }
+                    }
+
+                    for idx in sorted_indices {
+                        let (id, name, args) = &accumulated_tool_calls[&idx];
+                        if !completed_tool_call_indices.contains(&idx)
                             && !id.is_empty()
                             && !name.is_empty()
                         {
+                            let name = completed_streamed_tool_name(name);
                             let validated_args = crate::providers::validate_tool_call_args(
                                 args,
                                 "OpenAI",
                                 "on finish_reason:tool_calls",
                             );
-                            completed_tool_call_indices.insert(*idx);
+                            completed_tool_call_indices.insert(idx);
                             send_chunk(
                                 tx,
                                 ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
@@ -1160,7 +1257,7 @@ async fn process_openai_sse_line(
                                         call_id: Some(id.clone()),
                                         function: ApiStreamToolCallFunction {
                                             id: Some(id.clone()),
-                                            name: Some(name.clone()),
+                                            name: Some(name),
                                             arguments: Some(validated_args),
                                         },
                                         signature: None,
@@ -1348,15 +1445,40 @@ pub async fn finish_openai_sse_to_chunks(
     // Flush any remaining accumulated tool calls on stream end
     // (some providers don't send finish_reason == "tool_calls" explicitly)
     if !matches!(last_stop_reason.as_deref(), Some("content_filter")) {
-        let mut sorted_indices: Vec<_> = accumulated_tool_calls.keys().collect();
+        let mut sorted_indices: Vec<_> = accumulated_tool_calls.keys().copied().collect();
         sorted_indices.sort();
 
+        for idx in &sorted_indices {
+            let (id, name, _) = &accumulated_tool_calls[idx];
+            let name = completed_streamed_tool_name(name);
+            if !completed_tool_call_indices.contains(idx)
+                && !delta_state.started_tool_call_indices.contains(idx)
+                && !id.is_empty()
+                && is_safe_tool_name(&name)
+            {
+                if !send_chunk(
+                    tx,
+                    ApiStreamChunk::ToolCallStarted {
+                        call_id: id.clone(),
+                        name,
+                    },
+                    "tool_call_started",
+                )
+                .await
+                {
+                    return (frame_count, empty_frame_count);
+                }
+                delta_state.started_tool_call_indices.insert(*idx);
+            }
+        }
+
         for idx in sorted_indices {
-            let (id, name, args) = &accumulated_tool_calls[idx];
-            if !completed_tool_call_indices.contains(idx) && !id.is_empty() && !name.is_empty() {
+            let (id, name, args) = &accumulated_tool_calls[&idx];
+            if !completed_tool_call_indices.contains(&idx) && !id.is_empty() && !name.is_empty() {
+                let name = completed_streamed_tool_name(name);
                 let validated_args =
                     crate::providers::validate_tool_call_args(args, "OpenAI", "at stream end");
-                completed_tool_call_indices.insert(*idx);
+                completed_tool_call_indices.insert(idx);
                 if !send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
@@ -1364,7 +1486,7 @@ pub async fn finish_openai_sse_to_chunks(
                             call_id: Some(id.clone()),
                             function: ApiStreamToolCallFunction {
                                 id: Some(id.clone()),
-                                name: Some(name.clone()),
+                                name: Some(name),
                                 arguments: Some(validated_args),
                             },
                             signature: None,
@@ -2003,7 +2125,9 @@ pub fn get_openai_model_info(model_id: &str) -> OpenAiCompatibleModelInfo {
 mod tests {
     use super::*;
     use crate::providers::{
-        FunctionDefinition, MessageRole, SseLineBuffer, StorageMessage, ToolDefinition,
+        AssistantContentBlock, FunctionDefinition, MessageContent, MessageRole,
+        SharedContentFields, SseLineBuffer, StorageMessage, ThinkingBlock, ToolDefinition,
+        ToolResultBlock, ToolResultContent, ToolUseBlock, UserContentBlock,
     };
     struct EnvVarGuard {
         key: &'static str,
@@ -2389,6 +2513,237 @@ mod tests {
         assert!(body["messages"].is_array());
     }
 
+    fn reasoning_history_request() -> ProviderRequest {
+        ProviderRequest {
+            system_prompt: "Use tools when needed.".to_string(),
+            messages: vec![
+                StorageMessage {
+                    id: Some("assistant-turn".to_string()),
+                    role: MessageRole::Assistant,
+                    content: MessageContent::AssistantBlocks(vec![
+                        AssistantContentBlock::Thinking(ThinkingBlock {
+                            thinking: "I need to inspect the file first.".to_string(),
+                            signature: None,
+                            shared: SharedContentFields::default(),
+                            summary: None,
+                        }),
+                        AssistantContentBlock::ToolUse(ToolUseBlock {
+                            id: "call-read".to_string(),
+                            name: "read_file".to_string(),
+                            input: json!({"path": "README.md"}),
+                            shared: SharedContentFields::default(),
+                            reasoning_details: None,
+                        }),
+                    ]),
+                    model_info: None,
+                    metrics: None,
+                    ts: Some(42),
+                },
+                StorageMessage {
+                    id: Some("tool-turn".to_string()),
+                    role: MessageRole::User,
+                    content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                        ToolResultBlock {
+                            tool_use_id: "call-read".to_string(),
+                            content: ToolResultContent::Text("file contents".to_string()),
+                            shared: SharedContentFields::default(),
+                        },
+                    )]),
+                    model_info: None,
+                    metrics: None,
+                    ts: Some(43),
+                },
+            ],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        }
+    }
+
+    fn compatible_provider_with_extra_body(
+        extra_body: serde_json::Map<String, serde_json::Value>,
+    ) -> anyhow::Result<OpenAiProvider> {
+        OpenAiProvider::new(OpenAiConfig {
+            api_key: "test-key".to_string(),
+            base_url: Some("https://compatible.example.com/v1".to_string()),
+            model_id: "qwen3-coder".to_string(),
+            model_info: None,
+            reasoning_effort: None,
+            extra_body: Some(extra_body),
+            custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
+            provider_name: None,
+        })
+    }
+
+    #[test]
+    fn test_reasoning_history_defaults_to_omit() {
+        let provider = compatible_provider_with_extra_body(serde_json::Map::new()).unwrap();
+        let body = provider
+            .build_request_body(&reasoning_history_request())
+            .unwrap();
+        let assistant = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+
+        assert!(assistant.get("reasoning_content").is_none());
+        assert!(assistant.get("reasoning").is_none());
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "read_file");
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_content_survives_history_reload_and_tool_continuation() {
+        let mut extra_body = serde_json::Map::new();
+        extra_body.insert(
+            SNED_REASONING_HISTORY_KEY.to_string(),
+            json!("reasoning_content"),
+        );
+        let provider = compatible_provider_with_extra_body(extra_body).unwrap();
+        let request = reasoning_history_request();
+        let reloaded_messages: Vec<StorageMessage> =
+            serde_json::from_value(serde_json::to_value(&request.messages).unwrap()).unwrap();
+        let body = provider
+            .build_request_body(&ProviderRequest {
+                messages: reloaded_messages,
+                ..request
+            })
+            .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+
+        assert_eq!(
+            assistant["reasoning_content"],
+            "I need to inspect the file first."
+        );
+        assert!(assistant.get("reasoning").is_none());
+        assert_eq!(assistant["content"], "");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call-read");
+        assert!(messages.iter().any(|message| message["role"] == "tool"
+            && message["tool_call_id"] == "call-read"
+            && message["content"] == "file contents"));
+        assert!(body.get(SNED_REASONING_HISTORY_KEY).is_none());
+    }
+
+    #[test]
+    fn test_reasoning_history_separates_multiple_thinking_blocks() {
+        let message = convert_assistant_blocks(
+            "assistant",
+            &[
+                AssistantContentBlock::Thinking(ThinkingBlock {
+                    thinking: "first thought".to_string(),
+                    signature: None,
+                    shared: SharedContentFields::default(),
+                    summary: None,
+                }),
+                AssistantContentBlock::Thinking(ThinkingBlock {
+                    thinking: String::new(),
+                    signature: None,
+                    shared: SharedContentFields::default(),
+                    summary: None,
+                }),
+                AssistantContentBlock::Thinking(ThinkingBlock {
+                    thinking: "second thought".to_string(),
+                    signature: None,
+                    shared: SharedContentFields::default(),
+                    summary: None,
+                }),
+            ],
+            ReasoningHistoryPolicy::ReasoningContent,
+        );
+
+        assert_eq!(
+            message["reasoning_content"],
+            "first thought\nsecond thought"
+        );
+    }
+
+    #[test]
+    fn test_reasoning_alias_policy_preserves_explicit_endpoint_settings() {
+        let mut extra_body = serde_json::Map::from_iter([
+            (
+                "chat_template_kwargs".to_string(),
+                json!({"enable_thinking": true, "custom_option": "keep"}),
+            ),
+            ("reasoning_effort".to_string(), json!("high")),
+            ("enable_thinking".to_string(), json!(false)),
+            ("temperature".to_string(), json!(0.7)),
+        ]);
+        extra_body.insert(
+            SNED_REASONING_HISTORY_KEY.to_string(),
+            json!("reasoning_content_plus_reasoning"),
+        );
+        let provider = compatible_provider_with_extra_body(extra_body).unwrap();
+        let body = provider
+            .build_request_body(&reasoning_history_request())
+            .unwrap();
+        let assistant = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+
+        assert_eq!(assistant["reasoning"], assistant["reasoning_content"]);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["chat_template_kwargs"]["custom_option"], "keep");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["enable_thinking"], false);
+        assert_eq!(body["temperature"], 0.7);
+        assert!(body.get(SNED_REASONING_HISTORY_KEY).is_none());
+    }
+
+    #[test]
+    fn test_reasoning_history_policy_never_fabricates_reasoning() {
+        let mut extra_body = serde_json::Map::new();
+        extra_body.insert(
+            SNED_REASONING_HISTORY_KEY.to_string(),
+            json!("reasoning_content_plus_reasoning"),
+        );
+        let provider = compatible_provider_with_extra_body(extra_body).unwrap();
+        let mut request = reasoning_history_request();
+        let MessageContent::AssistantBlocks(blocks) = &mut request.messages[0].content else {
+            panic!("fixture must contain assistant blocks");
+        };
+        blocks.retain(|block| !matches!(block, AssistantContentBlock::Thinking(_)));
+
+        let body = provider.build_request_body(&request).unwrap();
+        let assistant = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+
+        assert!(assistant.get("reasoning_content").is_none());
+        assert!(assistant.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_history_policy_rejects_unknown_value() {
+        let extra_body = serde_json::Map::from_iter([(
+            SNED_REASONING_HISTORY_KEY.to_string(),
+            json!("automatic"),
+        )]);
+        let error = compatible_provider_with_extra_body(extra_body).unwrap_err();
+
+        assert!(error.to_string().contains(SNED_REASONING_HISTORY_KEY));
+        assert!(
+            error
+                .to_string()
+                .contains("reasoning_content_plus_reasoning")
+        );
+    }
+
     #[test]
     fn test_build_request_body_with_tools() {
         let config = OpenAiConfig {
@@ -2666,7 +3021,7 @@ mod tests {
 
     #[test]
     fn test_compatible_endpoint_qwen_reasoning_uses_max_tokens() {
-        let model_id = "qwen/qwen3.5-27b";
+        let model_id = "qwen/qwen3.6-plus";
         let model_info = get_openai_model_info(model_id);
         assert_eq!(model_info.base.supports_reasoning, Some(true));
 
@@ -3063,16 +3418,23 @@ mod tests {
 
     #[test]
     fn test_get_openai_model_info_qwen_family() {
-        for model_id in ["qwen3.6-35b-a3b", "qwen/qwen3.5-27b"] {
+        for model_id in ["qwen3.6-plus", "qwen/qwen3.7-plus"] {
             let info = get_openai_model_info(model_id);
-            assert_eq!(info.base.context_window, Some(262_144));
+            assert_eq!(info.base.context_window, Some(1_000_000));
             assert_eq!(info.base.max_tokens, Some(65_536));
             assert_eq!(info.base.supports_tools, Some(true));
-            assert_eq!(info.base.supports_images, Some(false));
+            assert_eq!(info.base.supports_images, Some(true));
             assert!(!info.base.supports_prompt_cache);
             assert_eq!(info.base.supports_reasoning, Some(true));
             assert_eq!(info.supports_reasoning_effort, Some(false));
         }
+    }
+
+    #[test]
+    fn test_get_openai_model_info_unknown_qwen_uses_generic_limits() {
+        let info = get_openai_model_info("qwen3.6-35b-a3b");
+        assert_eq!(info.base.context_window, Some(128_000));
+        assert_eq!(info.base.max_tokens, None);
     }
 
     #[test]
@@ -3621,6 +3983,102 @@ mod tests {
                         .as_deref()
                         .and_then(|arguments| serde_json::from_str(arguments).ok())
                         == Some(serde_json::json!({"commands": ["pwd"]}))
+        )));
+    }
+
+    #[test]
+    fn test_streamed_tool_name_accumulation_handles_fragments_and_resends() {
+        let mut fragmented = String::new();
+        accumulate_streamed_tool_name(&mut fragmented, "edit_");
+        accumulate_streamed_tool_name(&mut fragmented, "file");
+        assert_eq!(fragmented, "edit_file");
+
+        let mut cumulative = String::new();
+        accumulate_streamed_tool_name(&mut cumulative, "read_");
+        accumulate_streamed_tool_name(&mut cumulative, "read_file");
+        accumulate_streamed_tool_name(&mut cumulative, "read_file");
+        assert_eq!(cumulative, "read_file");
+
+        let mut repeated_suffix = "edit_file".to_string();
+        accumulate_streamed_tool_name(&mut repeated_suffix, "file");
+        assert_eq!(repeated_suffix, "edit_file");
+
+        let mut repeated_prefix = "edit_file".to_string();
+        accumulate_streamed_tool_name(&mut repeated_prefix, "edit_");
+        assert_eq!(repeated_prefix, "edit_file");
+    }
+
+    #[tokio::test]
+    async fn test_fragmented_tool_name_dispatches_completed_name() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason = None;
+        let mut usage_sent = false;
+        let lines = [
+            serde_json::json!({
+                "id": "chatcmpl-fragmented-name",
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call-edit",
+                        "function": {"name": "edit_", "arguments": ""}
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-fragmented-name",
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "",
+                        "function": {"name": "file", "arguments": ""}
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-fragmented-name",
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "",
+                        "function": {"arguments": "{\"files\": []}"}
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-fragmented-name",
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+            }),
+        ];
+
+        for line in lines {
+            process_openai_sse_line(
+                &format!("data: {line}"),
+                &tx,
+                &mut delta_state,
+                &mut accumulated_tool_calls,
+                &mut completed_tool_call_indices,
+                &mut last_stop_reason,
+                None,
+                &mut usage_sent,
+            )
+            .await;
+        }
+
+        let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ApiStreamChunk::ToolCallStarted { name, .. } if name == "edit_file"
+        )));
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ApiStreamChunk::ToolCalls(tool_chunk)
+                if tool_chunk.tool_call.function.name.as_deref() == Some("edit_file")
         )));
     }
 

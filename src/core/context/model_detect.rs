@@ -6,23 +6,23 @@
 /// Returns true when `model_id` matches the Qwen family.
 ///
 /// Recognizes:
-/// - bare ids: `qwen3.6-35b-a3b`, `qwen-max`, `qwq-preview`, `qwen2.5-coder-7b`
-/// - routed ids: `qwen/qwen3.6-35b-a3b`, `openrouter/qwen/qwen-max`
+/// - bare ids: `qwen3.6-27b`, `qwen-max`, `qwq-preview`, `qwen2.5-coder-7b`
+/// - routed ids: `Qwen/Qwen3.6-27B`, `vendor/qwen3-coder`
+/// - hosted ids: `hosted-qwen3-coder-custom`
 ///
-/// Match rule (case-insensitive): the id starts with `qwen-`,
-/// `qwen<digit>`, `qwen<dot>`, or `qwq-`, OR a `/`-separated segment
-/// does. The character immediately after the family name must be a
-/// separator (`-`, digit, dot) or end-of-string. This avoids false
-/// positives on non-Qwen ids that happen to share the `qwen` prefix
-/// (e.g., hypothetical `qwentin`, `qwenxia`).
+/// Qwen hosts routinely add routing prefixes and suffixes, so the requested
+/// wire model is matched case-insensitively without assuming a provider path.
 #[must_use]
 pub fn is_qwen_model(model_id: &str) -> bool {
     if model_id.is_empty() {
         return false;
     }
     let lower = model_id.to_lowercase();
-    for segment in lower.split('/') {
-        if segment_is_qwen(segment) {
+    if lower.contains("qwen") {
+        return true;
+    }
+    for segment in lower.split(['/', '|']) {
+        if segment_is_qwq(segment) || segment.split('-').any(segment_is_qwq) {
             return true;
         }
     }
@@ -31,12 +31,9 @@ pub fn is_qwen_model(model_id: &str) -> bool {
 
 /// Returns true when a single `/`-separated path segment matches the
 /// Qwen family pattern.
-fn segment_is_qwen(segment: &str) -> bool {
+fn segment_is_qwq(segment: &str) -> bool {
     let bytes = segment.as_bytes();
-    // Determine family name length and check the prefix.
-    let name_len = if bytes.len() >= 4 && &bytes[0..4] == b"qwen" {
-        4
-    } else if bytes.len() >= 3 && &bytes[0..3] == b"qwq" {
+    let name_len = if bytes.len() >= 3 && &bytes[0..3] == b"qwq" {
         3
     } else {
         return false;
@@ -56,6 +53,7 @@ mod tests {
 
     #[test]
     fn test_is_qwen_model_bare_ids() {
+        assert!(is_qwen_model("qwen3.6-27b"));
         assert!(is_qwen_model("qwen3.6-35b-a3b"));
         assert!(is_qwen_model("qwen3.5-27b"));
         assert!(is_qwen_model("qwen-max"));
@@ -67,6 +65,9 @@ mod tests {
 
     #[test]
     fn test_is_qwen_model_routed_ids() {
+        assert!(is_qwen_model("Qwen/Qwen3.6-27B"));
+        assert!(is_qwen_model("vendor/qwen3-coder"));
+        assert!(is_qwen_model("hosted-qwen3-coder-custom"));
         assert!(is_qwen_model("qwen/qwen3.6-35b-a3b"));
         assert!(is_qwen_model("openrouter/qwen/qwen3.6-35b-a3b"));
         assert!(is_qwen_model("qwen/qwen3.5-27b"));
@@ -87,10 +88,6 @@ mod tests {
         assert!(!is_qwen_model("minimax-M2.7"));
         assert!(!is_qwen_model("google/gemini-2.5-pro"));
         assert!(!is_qwen_model(""));
-        // False-positive guards: names that share the "qwen" prefix
-        // but are not Qwen-family models.
-        assert!(!is_qwen_model("qwentin"));
-        assert!(!is_qwen_model("qwenxia"));
         assert!(!is_qwen_model("qwerty"));
     }
 }

@@ -491,16 +491,90 @@ pub struct ModelInfo {
     pub api_format: Option<String>,
 }
 
-pub(crate) fn apply_qwen_model_profile(model_id: &str, info: &mut ModelInfo) -> bool {
-    if !crate::core::context::is_qwen_model(model_id) {
-        return false;
+#[derive(Clone, Copy)]
+struct QwenModelProfile {
+    context_window: u64,
+    max_tokens: u32,
+    supports_images: bool,
+    supports_reasoning: bool,
+}
+
+fn qwen_profile_id(model_id: &str) -> &str {
+    let routed_id = model_id.rsplit('/').next().unwrap_or(model_id);
+    let routed_id = routed_id.rsplit('|').next().unwrap_or(routed_id);
+    let lower = routed_id.to_ascii_lowercase();
+
+    for suffix in [":free", ":online", ":nitro", ":thinking"] {
+        if lower.ends_with(suffix) {
+            return &routed_id[..routed_id.len() - suffix.len()];
+        }
     }
 
-    info.max_tokens = Some(65_536);
-    info.context_window = Some(262_144);
-    info.supports_images = Some(false);
+    routed_id
+}
+
+fn exact_qwen_model_profile(model_id: &str) -> Option<QwenModelProfile> {
+    if !crate::core::context::is_qwen_model(model_id) {
+        return None;
+    }
+
+    let profile = match qwen_profile_id(model_id).to_ascii_lowercase().as_str() {
+        // qwen-code's Alibaba provider presets are the source for these exact context
+        // and modality capabilities; its tokenLimits table supplies output ceilings.
+        "qwen3.5-plus" | "qwen3.6-plus" => QwenModelProfile {
+            context_window: 1_000_000,
+            max_tokens: 65_536,
+            supports_images: true,
+            supports_reasoning: true,
+        },
+        "qwen3.7-plus" => QwenModelProfile {
+            context_window: 1_000_000,
+            max_tokens: 65_536,
+            supports_images: true,
+            supports_reasoning: true,
+        },
+        "qwen3.7-max" | "qwen3.6-flash" => QwenModelProfile {
+            context_window: 1_000_000,
+            max_tokens: 32_768,
+            supports_images: false,
+            supports_reasoning: true,
+        },
+        "qwen3-coder-plus" => QwenModelProfile {
+            context_window: 1_000_000,
+            max_tokens: 32_768,
+            supports_images: false,
+            supports_reasoning: false,
+        },
+        "qwen3-coder-next" => QwenModelProfile {
+            context_window: 262_144,
+            max_tokens: 32_768,
+            supports_images: false,
+            supports_reasoning: false,
+        },
+        "qwen3-max-2026-01-23" => QwenModelProfile {
+            context_window: 262_144,
+            max_tokens: 32_768,
+            supports_images: false,
+            supports_reasoning: true,
+        },
+        _ => return None,
+    };
+
+    Some(profile)
+}
+
+pub(crate) fn apply_qwen_model_profile(model_id: &str, info: &mut ModelInfo) -> bool {
+    // The requested wire model is authoritative because one endpoint can expose
+    // models with different limits; provider URLs and profile labels are not evidence.
+    let Some(profile) = exact_qwen_model_profile(model_id) else {
+        return false;
+    };
+
+    info.max_tokens = Some(profile.max_tokens);
+    info.context_window = Some(profile.context_window);
+    info.supports_images = Some(profile.supports_images);
     info.supports_prompt_cache = false;
-    info.supports_reasoning = Some(true);
+    info.supports_reasoning = Some(profile.supports_reasoning);
     info.supports_tools = Some(true);
     true
 }
@@ -1412,6 +1486,106 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         let deserialized: ModelInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(info, deserialized);
+    }
+
+    #[test]
+    fn exact_qwen_profiles_use_sourced_capabilities() {
+        let cases = [
+            ("qwen3.5-plus", 1_000_000, 65_536, true, true),
+            ("qwen3.6-plus", 1_000_000, 65_536, true, true),
+            ("qwen3.7-plus", 1_000_000, 65_536, true, true),
+            ("qwen3.6-flash", 1_000_000, 32_768, false, true),
+            ("qwen3.7-max", 1_000_000, 32_768, false, true),
+            ("qwen3-coder-plus", 1_000_000, 32_768, false, false),
+            ("qwen3-coder-next", 262_144, 32_768, false, false),
+            ("qwen3-max-2026-01-23", 262_144, 32_768, false, true),
+        ];
+
+        for (model_id, context_window, max_tokens, images, reasoning) in cases {
+            let mut info = ModelInfo::default();
+            assert!(apply_qwen_model_profile(model_id, &mut info), "{model_id}");
+            assert_eq!(info.context_window, Some(context_window), "{model_id}");
+            assert_eq!(info.max_tokens, Some(max_tokens), "{model_id}");
+            assert_eq!(info.supports_images, Some(images), "{model_id}");
+            assert_eq!(info.supports_reasoning, Some(reasoning), "{model_id}");
+            assert_eq!(info.supports_tools, Some(true), "{model_id}");
+        }
+    }
+
+    #[test]
+    fn exact_qwen_profiles_accept_routed_ids() {
+        for model_id in [
+            "qwen/qwen3-coder-next",
+            "openrouter/qwen/qwen3-coder-next",
+            "openai|qwen3-coder-next",
+            "qwen/qwen3-coder-next:free",
+        ] {
+            let mut info = ModelInfo::default();
+            assert!(apply_qwen_model_profile(model_id, &mut info), "{model_id}");
+            assert_eq!(info.context_window, Some(262_144), "{model_id}");
+            assert_eq!(info.max_tokens, Some(32_768), "{model_id}");
+        }
+    }
+
+    #[test]
+    fn unknown_qwen_models_keep_generic_defaults() {
+        for model_id in [
+            "qwen3.6-27b",
+            "Qwen/Qwen3.6-27B",
+            "vendor/qwen3-coder",
+            "hosted-qwen3-coder-custom",
+            "qwen2.5-coder-7b",
+            "qwen-vl-max",
+            "qwq-preview",
+        ] {
+            let mut info = ModelInfo {
+                max_tokens: None,
+                context_window: Some(128_000),
+                supports_images: Some(true),
+                supports_reasoning: Some(true),
+                ..ModelInfo::default()
+            };
+            let original = info.clone();
+
+            assert!(!apply_qwen_model_profile(model_id, &mut info), "{model_id}");
+            assert_eq!(info, original, "{model_id}");
+        }
+    }
+
+    #[test]
+    fn explicit_qwen_endpoint_info_overrides_builtin_profile() {
+        use crate::providers::openai::{OpenAiConfig, OpenAiEndpointKind, OpenAiProvider};
+
+        let explicit = OpenAiCompatibleModelInfo {
+            base: ModelInfo {
+                name: Some("endpoint-qwen".to_string()),
+                max_tokens: Some(12_345),
+                context_window: Some(98_765),
+                supports_images: Some(true),
+                supports_reasoning: Some(false),
+                supports_tools: Some(false),
+                ..ModelInfo::default()
+            },
+            is_r1_format_required: None,
+            system_role: None,
+            supports_reasoning_effort: None,
+            supports_streaming: None,
+        };
+        let provider = OpenAiProvider::new(OpenAiConfig {
+            api_key: "test-key".to_string(),
+            base_url: Some("https://example.invalid/v1".to_string()),
+            model_id: "qwen3-coder-plus".to_string(),
+            model_info: Some(explicit.clone()),
+            reasoning_effort: None,
+            extra_body: None,
+            custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Compatible,
+            stream: true,
+            provider_name: Some("test".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(provider.get_model().info, explicit.base);
     }
 
     #[test]

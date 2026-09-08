@@ -215,7 +215,7 @@ pub fn search_files_schema() -> ToolSchema {
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
-        description: "Edit existing files; does not create files. Use exact anchors from reads or successful edits. Batch independent edits from one snapshot. Untouched tracked anchors remain valid. For oversized files, use the complete sha256 revision from a ranged read with start_line/end_line/expected_text; Sned streams a same-directory atomic replacement. Failures withhold that file; other anchored files may apply. Reread only when recovery metadata requires it. Use write_to_file to create/full-rewrite.",
+        description: "Edit existing files; does not create files. Each files[] item must contain path and edits. Put anchor, edit_type, text, start_line, end_line, and expected_text inside an edits[] item, never directly alongside path. Use exact anchors from reads or successful edits. Batch independent edits from one snapshot. Untouched tracked anchors remain valid. For oversized files, use the complete sha256 revision from a ranged read with start_line/end_line/expected_text; Sned streams a same-directory atomic replacement. Failures withhold that file; other anchored files may apply. Reread only when recovery metadata requires it. Use write_to_file to create/full-rewrite.",
         parameters: vec![ToolParameter {
             name: "files",
             required: true,
@@ -1100,6 +1100,54 @@ mod tests {
         );
         assert!(schema.description.contains("revision from a ranged read"));
         assert!(schema.description.contains("recovery metadata requires it"));
+    }
+
+    #[test]
+    fn edit_file_schema_keeps_edit_fields_inside_nested_edits_array() {
+        let schema = edit_file_schema();
+        assert!(
+            schema
+                .description
+                .contains("files[] item must contain path and edits")
+        );
+        assert!(schema.description.contains(
+            "anchor, edit_type, text, start_line, end_line, and expected_text inside an edits[] item"
+        ));
+        assert!(schema.description.contains("never directly alongside path"));
+
+        let file_items = schema.parameters[0]
+            .items
+            .as_ref()
+            .expect("files should define item schema");
+        assert_eq!(file_items["required"], serde_json::json!(["path", "edits"]));
+
+        let file_properties = file_items["properties"]
+            .as_object()
+            .expect("file items should define properties");
+        for misplaced in [
+            "anchor",
+            "edit_type",
+            "text",
+            "start_line",
+            "end_line",
+            "expected_text",
+        ] {
+            assert!(!file_properties.contains_key(misplaced));
+        }
+
+        let edit_properties = file_properties["edits"]["items"]["properties"]
+            .as_object()
+            .expect("edits should define item properties");
+        for nested in [
+            "anchor",
+            "edit_type",
+            "text",
+            "start_line",
+            "end_line",
+            "expected_text",
+        ] {
+            assert!(edit_properties.contains_key(nested));
+        }
     }
 
     #[test]

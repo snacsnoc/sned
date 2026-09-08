@@ -12,7 +12,7 @@ EXAMPLE TOOL CALLS
 - File workflow: inspect first with read_file, then make the smallest file change with the matching file tool, then re-read or run a focused check.
 - inspect/read: tool=read_file args={\"paths\": [\"src/main.rs\"]}
 - search/find: tool=search_files args={\"regex\": \"fn handle_error\", \"path\": \"src\"}
-- edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
+- edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (each files[] item contains path and edits; anchor/edit_type/text belong inside edits[], never alongside path; copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
 - run/test: tool=execute_command args={\"commands\": [\"cargo test --no-fail-fast\"]} (commands is a literal JSON array, not a string containing an array)
 - complex run-only logic: tool=execute_command args={\"script\": \"...\", \"language\": \"python\"}
@@ -33,7 +33,7 @@ EXAMPLE TOOL CALLS
 - File workflow: inspect first with read_file, then make the smallest file change with the matching file tool, then re-read or run a focused check.
 - inspect/read: tool=read_file args={\"paths\": [\"src/main.rs\"]}
 - search/find: tool=search_files args={\"regex\": \"fn handle_error\", \"path\": \"src\"}
-- edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
+- edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (each files[] item contains path and edits; anchor/edit_type/text belong inside edits[], never alongside path; copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
 - Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; Word§ snapshot anchors are inspection-only.
 - edit_file uses text for replacement text. Its optional content field is only an array of exact interior lines for a duplicate-anchor fingerprint; it is not the replacement string.
@@ -101,6 +101,7 @@ mod tests {
         ] {
             let examples = tool_examples_for_model(None, Some(profile)).unwrap();
             assert!(examples.contains("current tracked state"));
+            assert!(examples.contains("anchor/edit_type/text belong inside edits[]"));
             assert!(examples.contains("same snapshot in one edit_file call"));
             assert!(examples.contains("ranged read's complete sha256 revision"));
             assert!(examples.contains("Word§ snapshot anchors are inspection-only"));

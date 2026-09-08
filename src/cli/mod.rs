@@ -262,7 +262,9 @@ pub struct TaskOptions {
     #[arg(long, hide_short_help = true)]
     pub api_key: Option<String>,
 
-    /// Additional JSON object fields for OpenAI-compatible chat-completions requests
+    /// Additional JSON fields for OpenAI-compatible requests. The Sned-only
+    /// `sned_reasoning_history` key accepts `omit`, `reasoning_content`, or
+    /// `reasoning_content_plus_reasoning` and is not sent to the endpoint.
     #[arg(long, value_name = "JSON", hide_short_help = true)]
     pub extra_body: Option<String>,
 
@@ -3399,8 +3401,8 @@ mod tests {
             Ok(provider) => {
                 assert_eq!(provider.name(), "openai");
                 let info = provider.get_model().info;
-                assert_eq!(info.context_window, Some(262_144));
-                assert_eq!(info.max_tokens, Some(65_536));
+                assert_eq!(info.context_window, Some(128_000));
+                assert_eq!(info.max_tokens, None);
                 assert_eq!(info.supports_reasoning, Some(true));
             }
             Err(err) => panic!("custom base_url+api_key should work: {}", err),
