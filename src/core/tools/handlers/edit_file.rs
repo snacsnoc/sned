@@ -151,11 +151,11 @@ impl EditFileHandler {
     }
 
     fn file_entry_path(file: &serde_json::Value) -> Result<&str, String> {
-        if let Some(path) = file.get("path") {
+        let path = if let Some(path) = file.get("path") {
             path.as_str().ok_or_else(|| {
             "edit_file requires 'path' to be a string in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
                 .to_string()
-        })
+            })?
         } else {
             // Lenient fallback: models commonly put "path" inside the first
             // edit object instead of at the file-entry level. Extract it
@@ -164,48 +164,64 @@ impl EditFileHandler {
                 && let Some(first_edit) = edits.first()
                 && let Some(path) = first_edit.get("path").and_then(|p| p.as_str())
             {
-                return Ok(path);
+                path
+            } else {
+                return Err(
+                    "edit_file requires a 'path' key in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
+                        .to_string(),
+                );
             }
-            Err(
-                "edit_file requires a 'path' key in each file entry. Example: { \"path\": \"src/file.rs\", \"edits\": [ ... ] }"
-                    .to_string(),
-            )
+        };
+
+        if let Some(edits) = file.get("edits").and_then(|e| e.as_array()) {
+            for edit in edits {
+                if let Some(nested_path) = edit.get("path") {
+                    let nested_path = nested_path.as_str().ok_or_else(|| {
+                        "edit_file requires nested edit 'path' values to be strings.".to_string()
+                    })?;
+                    if nested_path != path {
+                        return Err(format!(
+                            "edit_file received conflicting paths: file entry uses '{path}', but an edit uses '{nested_path}'. Put one path on the file entry and keep edits scoped to it."
+                        ));
+                    }
+                }
+            }
         }
+
+        Ok(path)
     }
 
     fn normalized_anchor(field_name: &str, path: &str, raw: &str) -> Result<String, String> {
         // Whitespace after § belongs to the source line, not the envelope.
         let anchor = raw.trim_start();
+        // Models sometimes paste adjacent anchored lines into one selector.
+        // A complete first anchored line remains a usable single-line selector.
+        if raw.contains(['\n', '\r']) {
+            let first_line = anchor.lines().next().unwrap_or("");
+            let (_, first_content) = split_anchor(first_line);
+            let starts_with_line_break = raw
+                .trim_start_matches([' ', '\t'])
+                .starts_with(['\n', '\r']);
+            let concatenated_anchors = !starts_with_line_break
+                && anchor.lines().all(|line| {
+                    let (word, content) = split_anchor(line);
+                    !word.is_empty() && !content.is_empty() && line.contains(ANCHOR_DELIMITER)
+                });
+            if concatenated_anchors
+                && first_line.contains(ANCHOR_DELIMITER)
+                && !first_content.is_empty()
+            {
+                return Ok(first_line.to_string());
+            }
+            return Err(format!(
+                "File '{path}': '{field_name}' must contain exactly one source line, not a multi-line block. No changes were made to this file, and no reread is needed. Copy one complete Word§source line from your current read into anchor. For a range, put the first line in anchor and the last line in end_anchor; put only unprefixed replacement source in text (use \"\" to delete the selected range)."
+            ));
+        }
+
         if anchor.is_empty() {
             return Err(format!(
                 "File '{path}': '{field_name}' is empty. Copy the exact 'Word§line content' string from read_file output."
             ));
-        }
-
-        // Distinguish two kinds of multi-line input:
-        //
-        // 1. Concatenated anchors — the model pasted multiple complete
-        //    `Word§content` lines from the diff output separated by
-        //    newlines. The first line is a complete anchor. Take it.
-        //
-        // 2. Truly multi-line anchor — the model's anchor spans
-        //    multiple physical lines (e.g. `Word§\nNextWord§content`).
-        //    The first line is incomplete (ends with `§` with no
-        //    content after it). Reject with a clear error.
-        if anchor.contains('\n') {
-            let first_line = anchor.lines().next().unwrap_or("");
-            if first_line.ends_with(ANCHOR_DELIMITER) {
-                let preview = if first_line.chars().count() > 60 {
-                    format!("{}...", first_line.chars().take(60).collect::<String>())
-                } else {
-                    first_line.to_string()
-                };
-                return Err(format!(
-                    "File '{path}': '{field_name}' is a multi-line anchor that starts with an incomplete line ('{preview}' ends with the '{ANCHOR_DELIMITER}' delimiter but has no content after it). Anchors must be a single complete physical line from the read_file output (format: 'Word§line content'). If you want to replace a range of lines, use 'anchor' for the first line and 'end_anchor' for the last line."
-                ));
-            }
-            // First line is complete (has content after §). Use it.
-            return Ok(first_line.to_string());
         }
 
         Ok(anchor.to_string())
@@ -525,6 +541,7 @@ impl EditFileHandler {
         consecutive_failures: u32,
     ) -> Result<(), ToolError> {
         let mut invalid_anchors = Vec::new();
+        let mut malformed_selectors = Vec::new();
         let mut path_errors = Vec::new();
         let mut affected_paths = Vec::new();
 
@@ -553,7 +570,11 @@ impl EditFileHandler {
                 let anchor = match Self::normalized_anchor("anchor", path, anchor_raw) {
                     Ok(anchor) => anchor,
                     Err(message) => {
-                        invalid_anchors.push(format!("  - {message}"));
+                        if anchor_raw.trim_start().contains(['\n', '\r']) {
+                            malformed_selectors.push(message);
+                        } else {
+                            invalid_anchors.push(format!("  - {message}"));
+                        }
                         continue;
                     }
                 };
@@ -593,7 +614,11 @@ impl EditFileHandler {
                         match Self::normalized_anchor("end_anchor", path, end_anchor_raw) {
                             Ok(anchor) => anchor,
                             Err(message) => {
-                                invalid_anchors.push(format!("  - {message}"));
+                                if end_anchor_raw.trim_start().contains(['\n', '\r']) {
+                                    malformed_selectors.push(message);
+                                } else {
+                                    invalid_anchors.push(format!("  - {message}"));
+                                }
                                 continue;
                             }
                         };
@@ -635,6 +660,10 @@ impl EditFileHandler {
             );
             message.push_str("Problems detected:\n");
             message.push_str(&path_errors.join("\n"));
+            if !malformed_selectors.is_empty() {
+                message.push('\n');
+                message.push_str(&malformed_selectors.join("\n"));
+            }
             if !invalid_anchors.is_empty() {
                 message.push_str("\n\nAdditionally, anchor issues were found:\n");
                 message.push_str(&invalid_anchors.join("\n"));
@@ -653,6 +682,10 @@ impl EditFileHandler {
             message.push_str("Anchors must be copied EXACTLY from read_file output (format: Word§line content).\n\n");
             message.push_str("Invalid anchors detected:\n");
             message.push_str(&invalid_anchors.join("\n"));
+            if !malformed_selectors.is_empty() {
+                message.push('\n');
+                message.push_str(&malformed_selectors.join("\n"));
+            }
             message.push_str("\n\nExample of CORRECT anchor: \"Crawler§void draw_game_over() {\"");
             message.push_str("\nExample of WRONG anchor: \"void draw_game_over() {\"");
             message.push_str("\n\nRecovery: ");
@@ -670,6 +703,10 @@ impl EditFileHandler {
                     required_next_step: Some(ToolRequiredNextStep::ReadFile),
                 },
             ));
+        }
+
+        if !malformed_selectors.is_empty() {
+            return Err(ToolError::InvalidInput(malformed_selectors.join("\n")));
         }
 
         Ok(())
@@ -2802,6 +2839,19 @@ mod tests {
         assert!(format!("{:?}", handler).starts_with("EditFileHandler"));
     }
 
+    #[test]
+    fn file_entry_path_rejects_conflicting_nested_path() {
+        let file = serde_json::json!({
+            "path": "a.txt",
+            "edits": [{"path": "b.txt", "anchor": "Word§line", "text": "updated"}]
+        });
+
+        let error = EditFileHandler::file_entry_path(&file).unwrap_err();
+        assert!(error.contains("conflicting paths"));
+        assert!(error.contains("a.txt"));
+        assert!(error.contains("b.txt"));
+    }
+
     #[tokio::test]
     async fn test_edit_file_missing_files() {
         let handler = EditFileHandler::new();
@@ -3645,7 +3695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edit_file_accepts_first_line_of_multiline_anchor() {
+    async fn test_edit_file_rejects_first_line_of_multiline_anchor() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
@@ -3681,12 +3731,26 @@ mod tests {
         });
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
-            result.is_ok(),
-            "multi-line anchor should normalize to the first line: {:?}",
-            result.err()
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must contain exactly one source line")
         );
         let updated = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(updated, "replaced\nline 2\nline 3\n");
+        assert_eq!(updated, "line 1\nline 2\nline 3\n");
+    }
+
+    #[test]
+    fn normalized_anchor_rejects_leading_and_empty_line_breaks() {
+        for raw in ["\nWord§source", " \t\r\nWord§source", "\n", "\r\n"] {
+            let error = EditFileHandler::normalized_anchor("anchor", "test.txt", raw)
+                .expect_err("a leading or empty line break must not be trimmed into an anchor");
+            assert!(
+                error.contains("must contain exactly one source line"),
+                "{error}"
+            );
+            assert!(error.contains("no reread is needed"), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -6886,8 +6950,7 @@ edition = "2021"
     }
 
     /// Regression test: the model sends multiple `§`-delimited pairs concatenated
-    /// across newlines (see convo-2222-export-15.json). The parser must normalize
-    /// to the first line instead of rejecting the whole input.
+    /// across newlines. Reject rather than silently changing the selected range.
     #[tokio::test]
     async fn test_edit_file_accepts_concatenated_anchor_pairs() {
         use tempfile::tempdir;
@@ -6927,14 +6990,12 @@ edition = "2021"
                 }]
             }]
         });
-        let result = ToolHandler::execute(&handler, &ctx, params).await;
-        assert!(
-            result.is_ok(),
-            "concatenated anchor pairs should normalize to the first line: {:?}",
-            result.err()
-        );
+        ToolHandler::execute(&handler, &ctx, params).await.unwrap();
         let updated = std::fs::read_to_string(&file_path).unwrap();
-        assert!(updated.contains("static int replaced"));
+        assert_eq!(
+            updated,
+            "static int replaced\nload_ax_hiservices(void)\n{\n"
+        );
     }
 
     /// Error message quality: when parse_edits fails, the error must teach the
@@ -7017,12 +7078,12 @@ edition = "2021"
         let err = result.expect_err("incomplete multi-line anchor must error");
         let msg = err.to_string();
         assert!(
-            msg.contains("multi-line"),
+            msg.contains("must contain exactly one source line"),
             "error must call out the multi-line anchor problem, got: {msg}"
         );
         assert!(
-            msg.contains("Countertop§"),
-            "error must preview the incomplete first line, got: {msg}"
+            msg.contains("Word§source"),
+            "error must teach the selector format, got: {msg}"
         );
         assert!(
             msg.contains("end_anchor"),

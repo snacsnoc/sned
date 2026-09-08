@@ -4159,7 +4159,18 @@ impl AgentLoop {
                                 format!("  {status} {stats}"),
                                 Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG }),
                             ));
-                        if !is_error {
+                        if is_error {
+                            for detail in
+                                crate::core::tool_output::edit_failure_details(&result_output.text)
+                            {
+                                self.config
+                                    .output_writer
+                                    .emit(OutputEvent::tool_output_line(
+                                        format!("    {detail}"),
+                                        Style::default().fg(ERROR_FG),
+                                    ));
+                            }
+                        } else {
                             for preview in edit_result_diff_previews(&result_output.text) {
                                 for mut line in
                                     crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&preview)
@@ -9880,6 +9891,46 @@ Irrespective of whether additional information or instructions are given, you ar
             format_tool_summary("read_file", parsed_args),
             format_tool_summary("read_file", &expected_args)
         );
+    }
+
+    #[tokio::test]
+    async fn test_multiline_edit_error_emits_actionable_tool_output() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::edit_file::EditFileHandler;
+
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_tool_call(
+                "call_bad_edit",
+                "edit_file",
+                serde_json::json!({"files": [{"path": "src/core/tool_output.rs", "edits": [{
+                    "anchor": "First§\nLast§last", "text": ""
+                }]}]}),
+            ),
+        ));
+        let (tx, mut rx) = mpsc::channel(64);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer.take_priority_rx().unwrap();
+        let mut config = test_agent_config(provider, "test-multiline-edit-output");
+        config.output_writer = writer;
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::EditFile, Arc::new(EditFileHandler::new()));
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let rendered = drain_output_events(&mut priority_rx, &mut rx)
+            .iter()
+            .filter_map(|event| match event {
+                OutputEvent::ToolOutputLine(line) => Some(line.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("must contain exactly one source line"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("end_anchor"), "{rendered}");
+        assert!(rendered.contains("no reread is needed"), "{rendered}");
+        assert!(agent.state.lock().await.must_reread_before_edit.is_empty());
     }
 
     #[tokio::test]

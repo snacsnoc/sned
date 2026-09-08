@@ -6,6 +6,30 @@
 use crate::core::tools::{SnedTool, coerce_command_array};
 use std::collections::HashSet;
 
+/// Keep actionable edit failures visible without repeating submitted source blocks.
+#[must_use]
+pub fn edit_failure_details(result: &str) -> Vec<String> {
+    result
+        .lines()
+        .filter_map(|line| {
+            let line = line.strip_prefix("Error: ").unwrap_or(line);
+            let diagnostic_line = line.trim_start();
+            if let Some((_, diagnostic)) = line.split_once(" Diagnostics: ") {
+                Some(diagnostic.to_owned())
+            } else if diagnostic_line.starts_with("Invalid input:")
+                || diagnostic_line.starts_with("Recovery:")
+                || diagnostic_line.starts_with("File '")
+                || diagnostic_line.starts_with("- File '")
+            {
+                Some(diagnostic_line.to_owned())
+            } else {
+                None
+            }
+        })
+        .take(8)
+        .collect()
+}
+
 /// Format a dispatched tool call for the interactive transcript.
 ///
 /// The full argument object is intentionally shown so the user can verify
@@ -626,6 +650,28 @@ pub fn format_tool_result(result: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_failure_details_handles_agent_error_prefix_and_batch_diagnostics() {
+        assert_eq!(
+            edit_failure_details(
+                "Error: Invalid input: File 'a': 'anchor' contains multiple lines."
+            ),
+            ["Invalid input: File 'a': 'anchor' contains multiple lines."]
+        );
+        assert_eq!(
+            edit_failure_details(
+                "Execution failed: Edited 1 file(s): 0 edit(s) applied\nEdit (replace) failed. Diagnostics: Anchor is stale.\nRecovery: Read a again."
+            ),
+            ["Anchor is stale.", "Recovery: Read a again."]
+        );
+        assert_eq!(
+            edit_failure_details(
+                "Error: Edited 0 file(s): 0 edit(s) applied\n  - File 'src/main.rs': anchor must contain exactly one source line."
+            ),
+            ["- File 'src/main.rs': anchor must contain exactly one source line."]
+        );
+    }
 
     #[test]
     fn pruned_read_distinguishes_retained_text_from_live_identity() {

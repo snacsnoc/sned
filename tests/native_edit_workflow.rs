@@ -14,6 +14,41 @@ struct Workflow {
 }
 
 #[tokio::test]
+async fn native_workflow_multiline_anchor_recovery_deletes_range_without_reread() {
+    let before = b"head\n    sed - '\n    log fixups\n    # duplicate\n    sed - '\ntail\n";
+    let w = Workflow::new(before);
+    let copied = w.read(None).await;
+    for field in ["anchor", "end_anchor"] {
+        let mut edit = json!({"anchor": copied[2], "end_anchor": copied[4], "text": ""});
+        edit[field] = json!(format!("Broken§\n{}", copied[1..=4].join("\n")));
+        let error = w.edit(json!([edit])).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("must contain exactly one source line"),
+            "{message}"
+        );
+        assert!(message.contains("no reread is needed"));
+        assert!(error.metadata().is_none());
+        w.assert_bytes(before);
+        w.assert_reread(false).await;
+        let visible = sned::core::tool_output::edit_failure_details(&message).join("\n");
+        assert!(
+            visible.contains("must contain exactly one source line"),
+            "{visible}"
+        );
+        assert!(!visible.contains(&copied[1]));
+    }
+    w.edit(json!([{"anchor": copied[2], "end_anchor": copied[4], "text": ""}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\n    sed - '\ntail\n");
+    w.edit(json!([{"anchor": copied[1], "text": "    sed - ' # kept"}]))
+        .await
+        .unwrap();
+    w.assert_bytes(b"head\n    sed - ' # kept\ntail\n");
+}
+
+#[tokio::test]
 async fn native_workflow_known_edit_preserves_untouched_duplicate_identity() {
     let w = Workflow::new(b"head\n}\nmiddle\n}\ntail\n");
     let copied = w.read(None).await;

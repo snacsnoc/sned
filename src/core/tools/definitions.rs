@@ -245,7 +245,7 @@ pub fn edit_file_schema() -> ToolSchema {
                                 },
                                 "anchor": {
                                     "type": "string",
-                                    "description": "Start/insertion anchor: copy one complete Word§source line exactly from read_file, get_function, get_file_skeleton, or successful edit output. No newline."
+                                    "description": "Start/insertion anchor: copy one complete Word§source line exactly from read_file, get_function, get_file_skeleton, or successful edit output. No newline; never paste a block here. Select a range with anchor and end_anchor, each containing one line."
                                 },
                                 "end_anchor": {
                                     "type": "string",
@@ -272,7 +272,7 @@ pub fn edit_file_schema() -> ToolSchema {
                                 },
                                 "text": {
                                     "type": "string",
-                                    "description": "Replacement text; use \\n for new lines. In insertions, leading and trailing blank lines count in duplicate checks."
+                                    "description": "Replacement source without Word§ prefixes; use \\n for new lines. Use an empty string to delete the inclusive anchor/end_anchor range. In insertions, leading and trailing blank lines count in duplicate checks."
                                 }
                             },
                             "required": ["text"],
