@@ -1111,7 +1111,6 @@ impl AgentLoop {
         state.first_displayable_text_time = None;
         state.first_output_emit_time = None;
         state.provider_stream_completed_time = None;
-        state.turn_end_emitted_time = None;
     }
 
     async fn wait_for_stream_retry_delay(&self, delay: std::time::Duration) -> bool {
@@ -1167,8 +1166,7 @@ impl AgentLoop {
             return None;
         }
         let emitted_at = std::time::Instant::now();
-        let mut state = self.state.lock().await;
-        state.turn_end_emitted_time = Some(emitted_at);
+        let state = self.state.lock().await;
         Some(crate::cli::output::TurnEndTiming {
             provider_completed_at: state.provider_stream_completed_time,
             first_output_at: state.first_output_emit_time,

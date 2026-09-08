@@ -3852,18 +3852,15 @@ impl TurnRenderWorker {
         }
     }
 
-    fn apply_ready(&self, app: &mut App) -> (u64, u64, u64, u64, u64, u64, Vec<TurnRenderMetrics>) {
+    fn apply_ready(&self, app: &mut App) -> (u64, u64, u64, u64, u64, Vec<TurnRenderMetrics>) {
         let mut render_total_us: u64 = 0;
         let mut syntax_highlight_total_us: u64 = 0;
         let mut apply_total_us: u64 = 0;
         let mut apply_peak_us: u64 = 0;
-        let mut turn_end_to_render_start_total_us: u64 = 0;
         let mut count: u64 = 0;
         let mut metrics = Vec::new();
         while let Ok((request, rendered, render_timing, queue_wait_us)) = self.result_rx.try_recv()
         {
-            turn_end_to_render_start_total_us =
-                turn_end_to_render_start_total_us.saturating_add(queue_wait_us);
             render_total_us = render_total_us.saturating_add(render_timing.total_us);
             syntax_highlight_total_us =
                 syntax_highlight_total_us.saturating_add(render_timing.syntax_highlight_us);
@@ -3892,7 +3889,6 @@ impl TurnRenderWorker {
             apply_total_us,
             count,
             apply_peak_us,
-            turn_end_to_render_start_total_us,
             metrics,
         )
     }
@@ -3946,11 +3942,9 @@ async fn run_main_loop(
         draw_total_us: u64,
         draw_count: u64,
         draw_peak_us: u64,
-        draw_histogram: crate::cli::output::TimingHistogram,
         drain_total_us: u64,
         drain_count: u64,
         drain_peak_us: u64,
-        drain_histogram: crate::cli::output::TimingHistogram,
         drain_events_total: u64,
         drain_events_peak: usize,
         output_lines_peak: usize,
@@ -3974,10 +3968,6 @@ async fn run_main_loop(
 
     struct TuiTurnTiming {
         request_sent_time: Option<std::time::Instant>,
-        first_output_emit_time: Option<std::time::Instant>,
-        provider_stream_completed_time: Option<std::time::Instant>,
-        turn_end_emitted_time: Option<std::time::Instant>,
-        turn_end_dequeued_time: Option<std::time::Instant>,
         turn_end_dequeue_to_render_start_us: u64,
         events_drained_before_turn_end: u64,
         last_progress_sample_events: u64,
@@ -4003,10 +3993,6 @@ async fn run_main_loop(
         fn new(dropped_events_at_start: u64) -> Self {
             Self {
                 request_sent_time: None,
-                first_output_emit_time: None,
-                provider_stream_completed_time: None,
-                turn_end_emitted_time: None,
-                turn_end_dequeued_time: None,
                 turn_end_dequeue_to_render_start_us: 0,
                 events_drained_before_turn_end: 0,
                 last_progress_sample_events: 0,
@@ -4139,11 +4125,9 @@ async fn run_main_loop(
         draw_total_us: 0,
         draw_count: 0,
         draw_peak_us: 0,
-        draw_histogram: crate::cli::output::TimingHistogram::default(),
         drain_total_us: 0,
         drain_count: 0,
         drain_peak_us: 0,
-        drain_histogram: crate::cli::output::TimingHistogram::default(),
         drain_events_total: 0,
         drain_events_peak: 0,
         output_lines_peak: 0,
@@ -4171,15 +4155,8 @@ async fn run_main_loop(
     let mut discarded_render_generations = std::collections::HashSet::new();
 
     loop {
-        let (
-            render_us,
-            syntax_highlight_us,
-            apply_us,
-            render_count,
-            apply_peak_us,
-            _queue_wait_us,
-            render_metrics,
-        ) = turn_render_worker.apply_ready(app);
+        let (render_us, syntax_highlight_us, apply_us, render_count, apply_peak_us, render_metrics) =
+            turn_render_worker.apply_ready(app);
         timing.turn_render_total_us = timing.turn_render_total_us.saturating_add(render_us);
         timing.turn_render_syntax_highlight_us = timing
             .turn_render_syntax_highlight_us
@@ -4253,7 +4230,6 @@ async fn run_main_loop(
             timing.drain_total_us += us;
             timing.drain_count += 1;
             timing.drain_peak_us = timing.drain_peak_us.max(us);
-            timing.drain_histogram.record(us);
             tui_turn.drain_peak_us = tui_turn.drain_peak_us.max(us);
             tui_turn.drain_histogram.record(us);
             timing.drain_events_total = timing
@@ -4305,7 +4281,6 @@ async fn run_main_loop(
                 boundary.events_drained = events_drained_before_this_pass
                     .saturating_add(boundary.events_drained as u64)
                     .min(usize::MAX as u64) as usize;
-                tui_turn.turn_end_dequeued_time = Some(boundary.dequeued_at);
                 tui_turn.transcript_lines_at_turn_end = boundary.transcript_lines;
                 completed_tui_turns = completed_tui_turns.saturating_add(1);
                 if boundary
@@ -4399,16 +4374,6 @@ async fn run_main_loop(
                         tui_turn = TuiTurnTiming::new(output_writer.dropped_count());
                         tui_turn.request_sent_time = state.request_sent_time;
                     }
-                    if tui_turn.first_output_emit_time.is_none() {
-                        tui_turn.first_output_emit_time = state.first_output_emit_time;
-                    }
-                    if tui_turn.provider_stream_completed_time.is_none() {
-                        tui_turn.provider_stream_completed_time =
-                            state.provider_stream_completed_time;
-                    }
-                    if tui_turn.turn_end_emitted_time.is_none() {
-                        tui_turn.turn_end_emitted_time = state.turn_end_emitted_time;
-                    }
                 }
 
                 app.reasoning_active = state.reasoning_active;
@@ -4476,7 +4441,6 @@ async fn run_main_loop(
                     timing.draw_total_us += draw_us;
                     timing.draw_count += 1;
                     timing.draw_peak_us = timing.draw_peak_us.max(draw_us);
-                    timing.draw_histogram.record(draw_us);
                     tui_turn.draw_peak_us = tui_turn.draw_peak_us.max(draw_us);
                     tui_turn.draw_histogram.record(draw_us);
                     if timing_enabled
