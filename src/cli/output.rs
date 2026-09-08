@@ -865,6 +865,10 @@ impl OutputWriter for ChannelOutputWriter {
         }
 
         let is_lossy_update = matches!(event, OutputEvent::ModelUpdateLine(_));
+        // This path must remain non-blocking. A slow TUI is handled as an
+        // explicit delivery policy below (lossy updates are counted; critical
+        // events use the priority lane), rather than stalling the agent or a
+        // tool producer behind the UI.
         if let Err(err) = self.tx.try_send(event) {
             if is_lossy_update {
                 let dropped = err.into_inner();

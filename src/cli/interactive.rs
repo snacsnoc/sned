@@ -817,6 +817,80 @@ fn flush_pending_reasoning_lines(
     }
 }
 
+fn render_panel_or_queue(
+    app: &mut App,
+    worker: Option<&TurnRenderWorker>,
+    kind: PanelRenderKind,
+    prefix: &str,
+    text: &str,
+    clear_before: bool,
+    generation: u64,
+) {
+    let target = match kind {
+        PanelRenderKind::Completion => {
+            let (display_generation, placeholder_id) = app.reserve_completion_render();
+            PanelRenderTarget {
+                display_generation,
+                error_generation: 0,
+                completion_placeholder_id: Some(placeholder_id),
+            }
+        }
+        PanelRenderKind::Error => PanelRenderTarget {
+            display_generation: app.display_generation(),
+            error_generation: generation,
+            completion_placeholder_id: None,
+        },
+    };
+    let request = PanelRenderRequest {
+        kind,
+        prefix: prefix.to_string(),
+        text: text.to_string(),
+        clear_before,
+        target,
+    };
+    if worker.is_some_and(|worker| worker.submit_panel(request)) {
+        return;
+    }
+
+    let rendered = match kind {
+        PanelRenderKind::Completion => {
+            crate::cli::markdown::render_completion_markdown(prefix, text)
+        }
+        PanelRenderKind::Error => crate::cli::markdown::render_error_markdown(prefix, text),
+    };
+    match kind {
+        PanelRenderKind::Completion => {
+            let applied = app.apply_completion_render(
+                target.display_generation,
+                target
+                    .completion_placeholder_id
+                    .expect("completion render target must reserve a line"),
+                rendered,
+            );
+            if !applied {
+                let _ = app.discard_completion_render(
+                    target
+                        .completion_placeholder_id
+                        .expect("completion render target must reserve a line"),
+                );
+            }
+        }
+        PanelRenderKind::Error => {
+            if app.display_generation() != target.display_generation
+                || app.error_render_generation() != target.error_generation
+            {
+                return;
+            }
+            if clear_before {
+                app.clear_error_lines();
+            }
+            for line in rendered {
+                app.push_error_line(line);
+            }
+        }
+    }
+}
+
 fn apply_output_event(
     app: &mut App,
     event: OutputEvent,
@@ -936,22 +1010,39 @@ fn apply_output_event(
             app.set_completion_needs_transcript_copy(!result_matches_model);
             if app.suppress_terminal_panels() {
                 if !result_matches_model {
-                    app.archive_completion_result(&result);
+                    render_panel_or_queue(
+                        app,
+                        turn_render_worker,
+                        PanelRenderKind::Completion,
+                        "",
+                        &result,
+                        false,
+                        0,
+                    );
                 }
                 return;
             }
             if result_matches_model {
-                for line in crate::cli::markdown::render_completion_markdown("✓ ", "Task completed")
-                {
-                    app.push_completion_line(line);
-                }
+                render_panel_or_queue(
+                    app,
+                    turn_render_worker,
+                    PanelRenderKind::Completion,
+                    "✓ ",
+                    "Task completed",
+                    false,
+                    0,
+                );
                 return;
             }
-            for line in
-                crate::cli::markdown::render_completion_markdown("✓ Task completed: ", &result)
-            {
-                app.push_completion_line(line);
-            }
+            render_panel_or_queue(
+                app,
+                turn_render_worker,
+                PanelRenderKind::Completion,
+                "✓ Task completed: ",
+                &result,
+                false,
+                0,
+            );
         }
         OutputEvent::ErrorBox(msg) => {
             flush_pending_model_update(app, pending_model_update, storage);
@@ -960,10 +1051,16 @@ fn apply_output_event(
                 return;
             }
             if !msg.trim().is_empty() {
-                app.clear_error_lines();
-                for line in crate::cli::markdown::render_error_markdown("✗ Error", &msg) {
-                    app.push_error_line(line);
-                }
+                let generation = app.begin_error_render();
+                render_panel_or_queue(
+                    app,
+                    turn_render_worker,
+                    PanelRenderKind::Error,
+                    "✗ Error",
+                    &msg,
+                    true,
+                    generation,
+                );
             }
         }
         OutputEvent::TurnEnd {
@@ -971,8 +1068,14 @@ fn apply_output_event(
         } => {
             flush_pending_model_update(app, pending_model_update, storage);
             if let Some(worker) = turn_render_worker {
-                if let Some(request) = app.begin_async_turn_render(accumulated_text) {
-                    worker.submit(request);
+                if let Some(request) = app.begin_async_turn_render(accumulated_text)
+                    && let Some(request) = worker.submit(request)
+                {
+                    let (rendered, _) = crate::cli::markdown::render_streamed_markdown_timed(
+                        &request.markdown_text,
+                        true,
+                    );
+                    let _ = app.apply_async_turn_render(request, rendered);
                 }
             } else {
                 app.finalize_turn_stream(&accumulated_text);
@@ -1487,7 +1590,8 @@ fn drain_output_queues_with_summary(
     if let Some(lines) = pending_reasoning_lines.take() {
         app.set_pending_transcript_reasoning_lines(lines);
     }
-    if crate::core::approval::take_followup_prompt_scroll() {
+    if app.followup_prompt_scroll_pending {
+        app.followup_prompt_scroll_pending = false;
         app.pin_approval_bottom();
     } else if crate::core::approval::is_any_followup_question_active() {
         // Any interactive prompt that blocks progress must keep its input line
@@ -1509,8 +1613,10 @@ fn drain_output_queues_with_summary(
     if let Some(err) = app.take_task_transcript_writer_error() {
         tracing::warn!("Failed to persist task transcript batch: {err}");
     }
-    if saw_turn_end && let Err(err) = app.flush_task_transcript() {
-        tracing::warn!("Failed to flush completed task transcript: {err}");
+    // Enqueue the acknowledgement without waiting for the writer or storage;
+    // suspending here would delay the next input poll.
+    if saw_turn_end && let Err(err) = app.request_task_transcript_flush() {
+        tracing::warn!("Failed to request completed task transcript flush: {err}");
     }
     DrainOutputSummary {
         drained_events,
@@ -1911,7 +2017,6 @@ async fn spawn_agent_task(
     let session_clone = Arc::clone(session);
     let prompt = prompt.to_string();
     let output_writer = Arc::clone(&output_writer);
-    let agent_busy_clone = Arc::clone(agent_busy);
     let agent_done_clone = Arc::clone(agent_done);
 
     let handle = tokio::spawn(async move {
@@ -1927,7 +2032,6 @@ async fn spawn_agent_task(
             state_manager,
             vec![initial_message],
             output_writer,
-            agent_busy_clone,
             agent_done_clone,
         )
         .await;
@@ -1950,7 +2054,6 @@ async fn spawn_agent_task_from_message(
     *agent_start_time.lock().await = Some(Instant::now());
 
     let session_clone = Arc::clone(session);
-    let agent_busy_clone = Arc::clone(agent_busy);
     let agent_done_clone = Arc::clone(agent_done);
 
     let handle = tokio::spawn(async move {
@@ -1963,7 +2066,6 @@ async fn spawn_agent_task_from_message(
             state_manager,
             vec![initial_message],
             output_writer,
-            agent_busy_clone,
             agent_done_clone,
         )
         .await;
@@ -2019,7 +2121,6 @@ async fn run_agent_task(
     state_manager: Arc<crate::storage::state_manager::StateManager>,
     initial_messages: Vec<crate::providers::StorageMessage>,
     output_writer: OutputWriterArc,
-    agent_busy: Arc<AtomicBool>,
     agent_done: Arc<tokio::sync::Notify>,
 ) {
     let result = {
@@ -2043,41 +2144,30 @@ async fn run_agent_task(
         tracing::error!("Agent task failed: {}", e);
     }
 
-    agent_busy.store(false, Ordering::Relaxed);
     agent_done.notify_one();
 }
 
-/// Cancel running agent task.
-///
-/// Uses the same graceful shutdown sequence as CancellationHandler::abort_task:
-/// SIGTERM → 100ms wait → SIGKILL. This gives running commands a chance to
-/// clean up (flush output, close files, etc.) before being force-killed.
-///
-/// `task.abort()` cancels the entire spawned future — including the
-/// epilogue that would normally reset `agent_busy` and notify `agent_done`
-/// — so without an explicit reset the atomic would stay `true` after
-/// Ctrl+C. The next `/plan`/message submission would then be enqueued
-/// forever, since the queue is consumed by the agent's `run()` loop,
-/// which is no longer running.
-async fn cancel_agent(
-    app: &mut App,
-    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
-    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    _agent_done: &Arc<tokio::sync::Notify>,
-    agent_busy: &Arc<AtomicBool>,
-) -> anyhow::Result<()> {
+async fn cancel_agent_resources(
+    state_handle: Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    agent_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    agent_busy: Arc<AtomicBool>,
+) {
     // Abort first so cancellation never waits for the agent to release a
     // state lock while it is blocked in tool preparation or filesystem I/O.
-    let task_opt = agent_task.lock().await.take();
-    if let Some(task) = task_opt {
+    let task = match task {
+        Some(task) => Some(task),
+        None => agent_task.lock().await.take(),
+    };
+    if let Some(task) = task {
         task.abort();
     }
 
     // Once the task is aborted, any Tokio mutex guards it held are released
     // as the future unwinds. Await them here: skipping a busy state would
     // leave its registered command process groups running after cancellation.
-    let state_arc = state_handle.lock().await.as_ref().cloned();
-    if let Some(sh) = state_arc {
+    let state = state_handle.lock().await.as_ref().cloned();
+    if let Some(sh) = state {
         let pids = {
             let mut state = sh.lock().await;
             state.is_cancelled = true;
@@ -2107,17 +2197,78 @@ async fn cancel_agent(
         }
     }
 
+    // Publish cancellation before allowing another task to start. Otherwise
+    // a retry can reset these flags and then be cancelled by this cleanup.
+    agent_busy.store(false, Ordering::Release);
+}
+
+/// Request cancellation without making the input loop wait for cleanup.
+fn request_agent_cancel(
+    app: &mut App,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    agent_busy: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    // Keep admission closed for the whole asynchronous cleanup window.
+    agent_busy.store(true, Ordering::Release);
+    app.cancellation_pending = true;
+    let state_handle = Arc::clone(state_handle);
+    let agent_task = Arc::clone(agent_task);
+    let task = agent_task.try_lock().ok().and_then(|mut slot| slot.take());
+    if let Some(task) = task.as_ref() {
+        task.abort();
+    }
+    let agent_busy_for_cleanup = Arc::clone(agent_busy);
+    let cleanup = tokio::spawn(async move {
+        cancel_agent_resources(state_handle, agent_task, task, agent_busy_for_cleanup).await;
+    });
+    app.cancellation_cleanup = Some(cleanup);
+
+    app.push_plain("Cancelled. Type /retry to resend.");
+    // Cancellation must return to input handling immediately; the writer
+    // reports any storage error through its asynchronous error channel.
+    if let Err(error) = app.request_task_transcript_flush() {
+        tracing::warn!("Failed to flush cancelled task transcript: {error}");
+    }
+
+    Ok(())
+}
+
+async fn await_cancellation_cleanup(app: &mut App) {
+    let cleanup = app.cancellation_cleanup.take();
+    if let Some(cleanup) = cleanup
+        && let Err(error) = cleanup.await
+        && !error.is_cancelled()
+    {
+        tracing::warn!("Cancellation cleanup task failed: {error}");
+    }
+}
+
+/// Cancel running agent task while waiting for resource cleanup.
+///
+/// This variant is retained for callers that need a completed cleanup before
+/// continuing; the interactive input path uses `request_agent_cancel`.
+#[cfg(test)]
+async fn cancel_agent(
+    app: &mut App,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    _agent_done: &Arc<tokio::sync::Notify>,
+    agent_busy: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    cancel_agent_resources(
+        Arc::clone(state_handle),
+        Arc::clone(agent_task),
+        None,
+        Arc::clone(agent_busy),
+    )
+    .await;
+
     app.push_plain("Cancelled. Type /retry to resend.");
     if let Err(error) = app.flush_task_transcript() {
         tracing::warn!("Failed to flush cancelled task transcript: {error}");
     }
-
-    // Reset unconditionally: covers both abort (epilogue never runs) and
-    // natural completion (epilogue may have run before abort, setting the
-    // same value). Without this, a Ctrl+C during a busy agent leaves the
-    // atomic stuck at `true` and any subsequent prompt is enqueued.
     agent_busy.store(false, Ordering::Relaxed);
-
     Ok(())
 }
 
@@ -2660,8 +2811,8 @@ async fn handle_cli_only_command(
 
     match cli_cmd {
         CliOnlyCommand::Exit | CliOnlyCommand::Quit => {
-            if agent_busy.load(Ordering::Relaxed) {
-                cancel_agent(app, state_handle, agent_task, agent_done, agent_busy).await?;
+            if agent_busy.load(Ordering::Relaxed) && !app.cancellation_pending {
+                request_agent_cancel(app, state_handle, agent_task, agent_busy)?;
                 app.agent_busy = false;
             }
             return Ok(true);
@@ -2870,6 +3021,13 @@ async fn handle_cli_only_command(
             };
 
             if agent_busy.load(Ordering::Relaxed) {
+                if app.cancellation_pending {
+                    app.show_notification(
+                        "Cancellation is still finishing; retry when the previous task is fully stopped.",
+                        NotificationKind::Info,
+                    );
+                    return Ok(false);
+                }
                 let sess = session.lock().await;
                 if !sess.prepend_retryable_failed_request(retry_message).await {
                     app.show_notification(
@@ -2952,6 +3110,7 @@ async fn handle_cli_only_command(
 
                 let (sender, receiver) = std::sync::mpsc::channel();
                 crate::core::approval::set_followup_question_active(task_id, true);
+                app.followup_prompt_scroll_pending = true;
                 crate::core::approval::set_followup_sender(task_id, sender);
 
                 let response_result = tokio::task::spawn_blocking(move || {
@@ -3096,6 +3255,7 @@ async fn handle_cli_only_command(
                                     crate::core::approval::set_followup_question_active(
                                         task_id, true,
                                     );
+                                    app.followup_prompt_scroll_pending = true;
                                     crate::core::approval::set_followup_sender(task_id, sender);
 
                                     let response_result = tokio::task::spawn_blocking(move || {
@@ -3216,6 +3376,7 @@ async fn handle_cli_only_command(
 
                 let (sender, receiver) = std::sync::mpsc::channel();
                 crate::core::approval::set_followup_question_active(task_id, true);
+                app.followup_prompt_scroll_pending = true;
                 crate::core::approval::set_followup_sender(task_id, sender);
 
                 let response_result = tokio::task::spawn_blocking(move || {
@@ -3259,6 +3420,7 @@ async fn handle_cli_only_command(
 
                             let (sender, receiver) = std::sync::mpsc::channel();
                             crate::core::approval::set_followup_question_active(task_id, true);
+                            app.followup_prompt_scroll_pending = true;
                             crate::core::approval::set_followup_sender(task_id, sender);
 
                             let response_result = tokio::task::spawn_blocking(move || {
@@ -3792,14 +3954,46 @@ async fn export_agent_conversation(
 }
 
 struct TurnRenderWorker {
-    request_tx: Option<std_mpsc::Sender<TurnRenderRequest>>,
-    result_rx: std_mpsc::Receiver<(
+    request_tx: Option<std_mpsc::SyncSender<RenderJob>>,
+    result_rx: Option<std_mpsc::Receiver<RenderResult>>,
+    deferred_jobs: Arc<std::sync::Mutex<VecDeque<RenderJob>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PanelRenderKind {
+    Completion,
+    Error,
+}
+
+struct PanelRenderRequest {
+    kind: PanelRenderKind,
+    prefix: String,
+    text: String,
+    clear_before: bool,
+    target: PanelRenderTarget,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PanelRenderTarget {
+    display_generation: u64,
+    error_generation: u64,
+    completion_placeholder_id: Option<crate::cli::tui::app::OutputLineId>,
+}
+
+enum RenderJob {
+    Turn(TurnRenderRequest),
+    Panel(PanelRenderRequest),
+}
+
+enum RenderResult {
+    Turn(
         TurnRenderRequest,
         Vec<Line<'static>>,
         crate::cli::markdown::MarkdownRenderTiming,
         u64,
-    )>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    ),
+    Panel(PanelRenderKind, bool, PanelRenderTarget, Vec<Line<'static>>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3813,42 +4007,168 @@ struct TurnRenderMetrics {
 }
 
 impl TurnRenderWorker {
+    const CHANNEL_CAPACITY: usize = 64;
+    const MAX_DEFERRED_JOBS: usize = 64;
+    const MAX_RESULTS_PER_FRAME: usize = 16;
+
     fn start() -> std::io::Result<Self> {
-        let (request_tx, request_rx) = std_mpsc::channel::<TurnRenderRequest>();
-        let (result_tx, result_rx) = std_mpsc::channel();
+        let (request_tx, request_rx) = std_mpsc::sync_channel::<RenderJob>(Self::CHANNEL_CAPACITY);
+        let (result_tx, result_rx) = std_mpsc::sync_channel::<RenderResult>(Self::CHANNEL_CAPACITY);
+        let deferred_jobs = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let worker_deferred_jobs = Arc::clone(&deferred_jobs);
         let handle = std::thread::Builder::new()
             .name("sned-turn-renderer".to_string())
             .spawn(move || {
-                while let Ok(request) = request_rx.recv() {
-                    let worker_started = Instant::now();
-                    let (rendered, timing) = crate::cli::markdown::render_streamed_markdown_timed(
-                        &request.markdown_text,
-                        true,
-                    );
-                    let turn_end_to_render_start_us = request
-                        .turn_end_dequeued_at
-                        .map(|dequeued| worker_started.duration_since(dequeued).as_micros() as u64)
-                        .unwrap_or_default();
-                    if result_tx
-                        .send((request, rendered, timing, turn_end_to_render_start_us))
-                        .is_err()
-                    {
+                loop {
+                    let deferred_job = worker_deferred_jobs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .pop_front();
+                    let job = deferred_job.or_else(|| request_rx.recv().ok());
+                    let Some(job) = job else {
+                        break;
+                    };
+                    let result = match job {
+                        RenderJob::Turn(request) => {
+                            let worker_started = Instant::now();
+                            let (rendered, timing) =
+                                crate::cli::markdown::render_streamed_markdown_timed(
+                                    &request.markdown_text,
+                                    true,
+                                );
+                            let turn_end_to_render_start_us = request
+                                .turn_end_dequeued_at
+                                .map(|dequeued| {
+                                    worker_started.duration_since(dequeued).as_micros() as u64
+                                })
+                                .unwrap_or_default();
+                            RenderResult::Turn(
+                                request,
+                                rendered,
+                                timing,
+                                turn_end_to_render_start_us,
+                            )
+                        }
+                        RenderJob::Panel(request) => {
+                            let rendered = match request.kind {
+                                PanelRenderKind::Completion => {
+                                    crate::cli::markdown::render_completion_markdown(
+                                        &request.prefix,
+                                        &request.text,
+                                    )
+                                }
+                                PanelRenderKind::Error => {
+                                    crate::cli::markdown::render_error_markdown(
+                                        &request.prefix,
+                                        &request.text,
+                                    )
+                                }
+                            };
+                            RenderResult::Panel(
+                                request.kind,
+                                request.clear_before,
+                                request.target,
+                                rendered,
+                            )
+                        }
+                    };
+                    if result_tx.send(result).is_err() {
                         break;
                     }
                 }
             })?;
         Ok(Self {
             request_tx: Some(request_tx),
-            result_rx,
+            result_rx: Some(result_rx),
+            deferred_jobs,
             handle: Some(handle),
         })
     }
 
-    fn submit(&self, request: TurnRenderRequest) {
-        if let Some(sender) = self.request_tx.as_ref()
-            && sender.send(request).is_err()
+    fn submit(&self, request: TurnRenderRequest) -> Option<TurnRenderRequest> {
+        let Some(sender) = self.request_tx.as_ref() else {
+            return Some(request);
+        };
+        let mut deferred_jobs = self
+            .deferred_jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
         {
-            tracing::debug!("turn render worker stopped before accepting a request");
+            tracing::debug!("turn render worker has stopped");
+            return Some(request);
+        }
+        if !deferred_jobs.is_empty() {
+            if deferred_jobs.len() >= Self::MAX_DEFERRED_JOBS {
+                tracing::debug!("turn render deferred queue is full; rendering synchronously");
+                return Some(request);
+            }
+            deferred_jobs.push_back(RenderJob::Turn(request));
+            return None;
+        }
+        match sender.try_send(RenderJob::Turn(request)) {
+            Ok(()) => None,
+            Err(std_mpsc::TrySendError::Full(RenderJob::Turn(request))) => {
+                if deferred_jobs.len() >= Self::MAX_DEFERRED_JOBS {
+                    tracing::debug!("turn render deferred queue is full; rendering synchronously");
+                    Some(request)
+                } else {
+                    deferred_jobs.push_back(RenderJob::Turn(request));
+                    None
+                }
+            }
+            Err(std_mpsc::TrySendError::Disconnected(RenderJob::Turn(request))) => {
+                tracing::debug!("turn render worker queue is stopped");
+                Some(request)
+            }
+            Err(_) => unreachable!("turn render queue only contains turn jobs"),
+        }
+    }
+
+    fn submit_panel(&self, request: PanelRenderRequest) -> bool {
+        let Some(sender) = self.request_tx.as_ref() else {
+            return false;
+        };
+        let mut deferred_jobs = self
+            .deferred_jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            tracing::debug!("turn render worker has stopped");
+            return false;
+        }
+        if !deferred_jobs.is_empty() {
+            if deferred_jobs.len() >= Self::MAX_DEFERRED_JOBS {
+                tracing::debug!("panel render deferred queue is full; rendering synchronously");
+                return false;
+            }
+            deferred_jobs.push_back(RenderJob::Panel(request));
+            return true;
+        }
+        match sender.try_send(RenderJob::Panel(request)) {
+            Ok(()) => true,
+            Err(std_mpsc::TrySendError::Full(job)) => match job {
+                RenderJob::Panel(request) => {
+                    if deferred_jobs.len() >= Self::MAX_DEFERRED_JOBS {
+                        tracing::debug!(
+                            "panel render deferred queue is full; rendering synchronously"
+                        );
+                        false
+                    } else {
+                        deferred_jobs.push_back(RenderJob::Panel(request));
+                        true
+                    }
+                }
+                RenderJob::Turn(_) => unreachable!("turn render queue received a panel job"),
+            },
+            Err(std_mpsc::TrySendError::Disconnected(_)) => false,
         }
     }
 
@@ -3858,29 +4178,86 @@ impl TurnRenderWorker {
         let mut apply_total_us: u64 = 0;
         let mut apply_peak_us: u64 = 0;
         let mut count: u64 = 0;
+        let mut processed_results = 0usize;
         let mut metrics = Vec::new();
-        while let Ok((request, rendered, render_timing, queue_wait_us)) = self.result_rx.try_recv()
+        let Some(result_rx) = self.result_rx.as_ref() else {
+            return (
+                render_total_us,
+                syntax_highlight_total_us,
+                apply_total_us,
+                count,
+                apply_peak_us,
+                metrics,
+            );
+        };
+        while processed_results < Self::MAX_RESULTS_PER_FRAME
+            && let Ok(result) = result_rx.try_recv()
         {
-            render_total_us = render_total_us.saturating_add(render_timing.total_us);
-            syntax_highlight_total_us =
-                syntax_highlight_total_us.saturating_add(render_timing.syntax_highlight_us);
-            let apply_started = Instant::now();
-            let generation = request.generation;
-            let applied = app.apply_async_turn_render(request, rendered);
-            let apply_us = apply_started.elapsed().as_micros() as u64;
-            apply_total_us = apply_total_us.saturating_add(apply_us);
-            apply_peak_us = apply_peak_us.max(apply_us);
-            count += 1;
-            metrics.push(TurnRenderMetrics {
-                generation,
-                applied,
-                worker_us: render_timing.total_us,
-                syntax_highlight_us: render_timing.syntax_highlight_us,
-                apply_us,
-                turn_end_to_render_start_us: queue_wait_us,
-            });
-            if !applied {
-                tracing::debug!(generation, "discarded a stale asynchronous turn render");
+            processed_results = processed_results.saturating_add(1);
+            match result {
+                RenderResult::Turn(request, rendered, render_timing, queue_wait_us) => {
+                    render_total_us = render_total_us.saturating_add(render_timing.total_us);
+                    syntax_highlight_total_us =
+                        syntax_highlight_total_us.saturating_add(render_timing.syntax_highlight_us);
+                    let apply_started = Instant::now();
+                    let generation = request.generation;
+                    let applied = app.apply_async_turn_render(request, rendered);
+                    let apply_us = apply_started.elapsed().as_micros() as u64;
+                    apply_total_us = apply_total_us.saturating_add(apply_us);
+                    apply_peak_us = apply_peak_us.max(apply_us);
+                    count += 1;
+                    metrics.push(TurnRenderMetrics {
+                        generation,
+                        applied,
+                        worker_us: render_timing.total_us,
+                        syntax_highlight_us: render_timing.syntax_highlight_us,
+                        apply_us,
+                        turn_end_to_render_start_us: queue_wait_us,
+                    });
+                    if !applied {
+                        tracing::debug!(generation, "discarded a stale asynchronous turn render");
+                    }
+                }
+                RenderResult::Panel(kind, clear_before, target, rendered) => {
+                    if app.display_generation() != target.display_generation {
+                        if matches!(kind, PanelRenderKind::Completion)
+                            && let Some(placeholder_id) = target.completion_placeholder_id
+                        {
+                            let _ = app.discard_completion_render(placeholder_id);
+                        }
+                        continue;
+                    }
+                    match kind {
+                        PanelRenderKind::Completion => {
+                            let Some(placeholder_id) = target.completion_placeholder_id else {
+                                continue;
+                            };
+                            let applied = app.apply_completion_render(
+                                target.display_generation,
+                                placeholder_id,
+                                rendered,
+                            );
+                            if !applied {
+                                let _ = app.discard_completion_render(placeholder_id);
+                            }
+                        }
+                        PanelRenderKind::Error => {
+                            if app.error_render_generation() != target.error_generation {
+                                continue;
+                            }
+                            if app.suppress_terminal_panels() {
+                                app.clear_error_lines();
+                                continue;
+                            }
+                            if clear_before {
+                                app.clear_error_lines();
+                            }
+                            for line in rendered {
+                                app.push_error_line(line);
+                            }
+                        }
+                    }
+                }
             }
         }
         (
@@ -3895,6 +4272,7 @@ impl TurnRenderWorker {
 
     fn shutdown(&mut self) {
         self.request_tx.take();
+        self.result_rx.take();
         if let Some(handle) = self.handle.take()
             && handle.join().is_err()
         {
@@ -4155,6 +4533,10 @@ async fn run_main_loop(
     let mut discarded_render_generations = std::collections::HashSet::new();
 
     loop {
+        if app.cancellation_pending && !agent_busy.load(Ordering::Acquire) {
+            app.cancellation_pending = false;
+            app.needs_redraw = true;
+        }
         let (render_us, syntax_highlight_us, apply_us, render_count, apply_peak_us, render_metrics) =
             turn_render_worker.apply_ready(app);
         timing.turn_render_total_us = timing.turn_render_total_us.saturating_add(render_us);
@@ -4405,6 +4787,7 @@ async fn run_main_loop(
             }
         }
 
+        app.poll_layout_reflow();
         if app.has_resized {
             sync_scroll_viewport(terminal, app, task_opts.debug)?;
         }
@@ -4609,14 +4992,7 @@ async fn run_main_loop(
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
                                 app.force_bottom();
-                                cancel_agent(
-                                    app,
-                                    &state_handle,
-                                    &agent_task,
-                                    &agent_done,
-                                    &agent_busy,
-                                )
-                                .await?;
+                                request_agent_cancel(app, &state_handle, &agent_task, &agent_busy)?;
                                 app.push_plain("^C");
                                 app.agent_busy = false;
                             }
@@ -4658,6 +5034,7 @@ async fn run_main_loop(
                                 );
                             }
                             let _ = app.flush_scrollback_pending();
+                            await_cancellation_cleanup(app).await;
                             return Ok(());
                         }
 
@@ -4677,8 +5054,7 @@ async fn run_main_loop(
 
                         // If agent is busy, cancel it
                         if agent_busy.load(Ordering::Relaxed) {
-                            cancel_agent(app, &state_handle, &agent_task, &agent_done, &agent_busy)
-                                .await?;
+                            request_agent_cancel(app, &state_handle, &agent_task, &agent_busy)?;
                             app.agent_busy = false;
                             app.push_styled(
                                 "Press Ctrl+C again to quit.",
@@ -4889,6 +5265,7 @@ async fn run_main_loop(
                                                 );
                                             }
                                             let _ = app.flush_scrollback_pending();
+                                            await_cancellation_cleanup(app).await;
                                             return Ok(());
                                         }
                                         continue;
@@ -4906,6 +5283,13 @@ async fn run_main_loop(
                                     if agent_busy.load(Ordering::Relaxed)
                                         && cli_cmd.requires_agent_idle()
                                     {
+                                        if app.cancellation_pending {
+                                            app.show_notification(
+                                                "Cancellation is still finishing; wait before submitting another task.",
+                                                NotificationKind::Info,
+                                            );
+                                            continue;
+                                        }
                                         // Queue the command
                                         if let Some(qh) = queue_handle.lock().await.as_ref() {
                                             qh.enqueue_text_message(text.clone()).await;
@@ -4939,8 +5323,16 @@ async fn run_main_loop(
                                     }
                                 };
 
-                                // If agent is busy, queue the message; otherwise spawn
-                                if agent_busy.load(Ordering::Relaxed)
+                                // If agent is busy, queue the message; otherwise spawn. A
+                                // cancelled task keeps the admission guard set until cleanup
+                                // publishes cancellation, but has no live queue consumer.
+                                let cancellation_pending = app.cancellation_pending;
+                                if cancellation_pending {
+                                    app.show_notification(
+                                        "Cancellation is still finishing; wait before submitting another task.",
+                                        NotificationKind::Info,
+                                    );
+                                } else if agent_busy.load(Ordering::Relaxed)
                                     && let Some(qh) = queue_handle.lock().await.as_ref()
                                     && !processed.is_empty()
                                 {
@@ -5068,8 +5460,10 @@ async fn run_main_loop(
         // 4. Check agent completion (non-blocking)
         // Always check notification to avoid race condition where agent_busy is already false
         // but app.agent_busy hasn't been updated yet
-        let agent_completed = agent_done.notified().now_or_never().is_some();
-        if agent_completed {
+        let cancellation_pending = app.cancellation_pending;
+        let agent_completed =
+            !cancellation_pending && agent_done.notified().now_or_never().is_some();
+        if agent_completed && !cancellation_pending {
             agent_busy.store(false, Ordering::Relaxed);
             app.agent_busy = false;
             app.needs_redraw = true;
@@ -5271,9 +5665,8 @@ pub async fn run_interactive_shell_inner(
     if is_resuming {
         replay_transcript(&mut app, &task_storage);
     }
-    if let Err(error) = app.start_task_transcript_writer(&task_storage) {
-        tracing::warn!(error = %error, "Failed to start task transcript writer");
-    }
+    app.start_task_transcript_writer(&task_storage)
+        .map_err(|error| anyhow::anyhow!("Failed to start task transcript writer: {error}"))?;
 
     // 5. Shared state (same as current)
     let agent_busy = Arc::new(AtomicBool::new(false));
@@ -5342,6 +5735,10 @@ pub async fn run_interactive_shell_inner(
         auto_approve,
     )
     .await;
+    // A cancellation may still be terminating command process groups when
+    // the input loop exits (for example after /exit or a second Ctrl+C).
+    // Keep the cleanup task owned until it has completed.
+    await_cancellation_cleanup(&mut app).await;
     turn_render_worker.shutdown();
     if let Err(err) = app.shutdown_scrollback_writer() {
         tracing::warn!("Failed to shut down scrollback writer: {err}");
@@ -5421,6 +5818,214 @@ mod tests {
 
         assert_eq!(summary.drained_events, 2);
         assert_eq!(summary.turn_end_boundaries.len(), 2);
+    }
+
+    #[test]
+    fn large_completion_and_error_markdown_is_rendered_by_worker() {
+        let mut worker = TurnRenderWorker::start().expect("renderer should start");
+        let mut app = App::new();
+        let mut pending_model_update = None;
+        let mut pending_reasoning_lines = None;
+        let completion = (0..10_000)
+            .map(|index| format!("**completion line {index}**"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        apply_output_event(
+            &mut app,
+            OutputEvent::Completion(completion),
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            None,
+            Some(&worker),
+        );
+        assert!(
+            app.output_lines.is_empty(),
+            "queued completion rendering must not reserve a blank transcript row"
+        );
+
+        let error = (0..10_000)
+            .map(|index| format!("error line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        apply_output_event(
+            &mut app,
+            OutputEvent::ErrorBox(error),
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            None,
+            Some(&worker),
+        );
+        assert!(app.error_lines.is_empty());
+
+        for _ in 0..10_000 {
+            worker.apply_ready(&mut app);
+            if !app.output_lines.is_empty() && !app.error_lines.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!app.output_lines.is_empty());
+        assert!(!app.error_lines.is_empty());
+        worker.shutdown();
+    }
+
+    #[test]
+    fn discarded_completion_render_removes_its_placeholder() {
+        let mut app = App::new();
+        let (generation, placeholder_id) = app.reserve_completion_render();
+        assert!(app.output_lines.is_empty());
+
+        let applied = app.apply_completion_render(
+            generation.wrapping_add(1),
+            placeholder_id,
+            vec![Line::from("stale completion")],
+        );
+        assert!(!applied);
+        assert!(app.output_lines.is_empty());
+    }
+
+    #[test]
+    fn completed_render_results_are_applied_with_a_frame_budget() {
+        fn rendered_results(app: &App) -> usize {
+            app.output_lines
+                .iter()
+                .filter(|line| App::line_to_string(line).contains("result "))
+                .count()
+        }
+
+        let mut worker = TurnRenderWorker::start().expect("renderer should start");
+        let mut app = App::new();
+        for index in 0..TurnRenderWorker::MAX_RESULTS_PER_FRAME * 2 {
+            render_panel_or_queue(
+                &mut app,
+                Some(&worker),
+                PanelRenderKind::Completion,
+                "✓ ",
+                &format!("result {index}"),
+                false,
+                0,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+
+        worker.apply_ready(&mut app);
+        assert!(rendered_results(&app) <= TurnRenderWorker::MAX_RESULTS_PER_FRAME);
+
+        for _ in 0..2_000 {
+            worker.apply_ready(&mut app);
+            if rendered_results(&app) >= TurnRenderWorker::MAX_RESULTS_PER_FRAME * 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            rendered_results(&app),
+            TurnRenderWorker::MAX_RESULTS_PER_FRAME * 2
+        );
+        worker.shutdown();
+    }
+
+    #[test]
+    fn deferred_render_jobs_are_bounded() {
+        let mut worker = TurnRenderWorker::start().expect("renderer should start");
+        let mut app = App::new();
+        for index in 0..(TurnRenderWorker::MAX_DEFERRED_JOBS * 4) {
+            render_panel_or_queue(
+                &mut app,
+                Some(&worker),
+                PanelRenderKind::Completion,
+                "✓ ",
+                &format!("queued result {index} {}", "x".repeat(4096)),
+                false,
+                0,
+            );
+        }
+        let deferred_len = worker
+            .deferred_jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert!(deferred_len <= TurnRenderWorker::MAX_DEFERRED_JOBS);
+        worker.shutdown();
+    }
+
+    #[test]
+    fn asynchronous_completion_keeps_its_transcript_position() {
+        let mut worker = TurnRenderWorker::start().expect("renderer should start");
+        let mut app = App::new();
+        render_panel_or_queue(
+            &mut app,
+            Some(&worker),
+            PanelRenderKind::Completion,
+            "✓ ",
+            "earlier completion",
+            false,
+            0,
+        );
+        app.push_plain("later output");
+
+        for _ in 0..2_000 {
+            worker.apply_ready(&mut app);
+            if app
+                .output_lines
+                .iter()
+                .any(|line| App::line_to_string(line).contains("earlier completion"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let lines = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>();
+        let completion = lines
+            .iter()
+            .position(|line| line.contains("earlier completion"))
+            .expect("completion should render");
+        let later = lines
+            .iter()
+            .position(|line| line.contains("later output"))
+            .expect("later output should remain");
+        assert!(completion < later);
+        worker.shutdown();
+    }
+
+    #[test]
+    fn clearing_output_discards_pending_panel_renders() {
+        let mut worker = TurnRenderWorker::start().expect("renderer should start");
+        let mut app = App::new();
+        render_panel_or_queue(
+            &mut app,
+            Some(&worker),
+            PanelRenderKind::Completion,
+            "✓ ",
+            "completion that must stay cleared",
+            false,
+            0,
+        );
+        let error_generation = app.begin_error_render();
+        render_panel_or_queue(
+            &mut app,
+            Some(&worker),
+            PanelRenderKind::Error,
+            "✗ Error",
+            "error that must stay cleared",
+            true,
+            error_generation,
+        );
+        app.clear_output().unwrap();
+
+        for _ in 0..100 {
+            worker.apply_ready(&mut app);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.output_lines.is_empty());
+        assert!(app.error_lines.is_empty());
+        worker.shutdown();
     }
 
     struct FlushFailsOnceBackend {
@@ -5511,7 +6116,6 @@ mod tests {
     }
 
     fn reset_prompt_state() {
-        crate::core::approval::clear_followup_prompt_scroll();
         crate::core::approval::set_followup_question_active("test-task", false);
     }
 
@@ -5763,15 +6367,22 @@ mod tests {
             })
             .unwrap();
             drain_output(&mut rx, &mut app);
-            terminal.draw(|frame| app.render(frame)).unwrap();
-            let screen = terminal
-                .backend()
-                .buffer()
-                .content
-                .chunks(100)
-                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let screen = loop {
+                terminal.draw(|frame| app.render(frame)).unwrap();
+                let screen = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .chunks(100)
+                    .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !screen.contains("Reflowing transcript") || Instant::now() >= deadline {
+                    break screen;
+                }
+                std::thread::yield_now();
+            };
             assert_eq!(
                 screen.matches("Same-line duplicates").count(),
                 1,
@@ -6404,30 +7015,6 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_output_forces_scroll_for_followup_prompt() {
-        use crate::cli::tui::app::ScrollMode;
-
-        let _lock = crate::core::approval::approval_test_guard();
-        reset_prompt_state();
-
-        let (_tx, mut rx) = mpsc::channel(1);
-
-        crate::core::approval::clear_followup_prompt_scroll();
-        crate::core::approval::set_followup_prompt_scroll();
-
-        let mut app = App::new();
-        app.scroll_mode = ScrollMode::Manual;
-        app.scroll_offset = 7;
-
-        drain_output(&mut rx, &mut app);
-
-        assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
-        assert_eq!(app.scroll_offset, 0);
-
-        reset_prompt_state();
-    }
-
-    #[test]
     fn test_drain_output_forces_scroll_while_followup_prompt_is_active() {
         use crate::cli::tui::app::ScrollMode;
 
@@ -6436,7 +7023,6 @@ mod tests {
 
         let (_tx, mut rx) = mpsc::channel(1);
 
-        crate::core::approval::clear_followup_prompt_scroll();
         crate::core::approval::set_followup_question_active("test-task", true);
 
         let mut app = App::new();
@@ -6446,12 +7032,30 @@ mod tests {
         drain_output(&mut rx, &mut app);
 
         crate::core::approval::set_followup_question_active("test-task", false);
-        crate::core::approval::clear_followup_prompt_scroll();
 
         assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
         assert_eq!(app.scroll_offset, 0);
 
         reset_prompt_state();
+    }
+
+    #[test]
+    fn test_drain_output_forces_scroll_for_completed_sync_followup_prompt() {
+        use crate::cli::tui::app::ScrollMode;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        let (_tx, mut rx) = mpsc::channel(1);
+        let mut app = App::new();
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 7;
+        app.followup_prompt_scroll_pending = true;
+
+        drain_output(&mut rx, &mut app);
+
+        assert_eq!(app.scroll_mode, ScrollMode::ApprovalPinned);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(!app.followup_prompt_scroll_pending);
     }
 
     #[test]
@@ -11313,6 +11917,104 @@ mod tests {
         .unwrap();
 
         assert!(!agent_busy.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_request_agent_cancel_returns_while_state_cleanup_is_busy() {
+        let task_state = Arc::new(Mutex::new(crate::core::agent_types::TaskState::default()));
+        let state_handle = Arc::new(Mutex::new(Some(Arc::clone(&task_state))));
+        let held_state = task_state.lock().await;
+        let task_slot: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let mut app = App::new();
+
+        let started = std::time::Instant::now();
+        request_agent_cancel(&mut app, &state_handle, &task_slot, &agent_busy).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "cancellation request should not wait for the state lock"
+        );
+        assert!(agent_busy.load(Ordering::Acquire));
+        assert!(app.cancellation_pending);
+
+        drop(held_state);
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if !agent_busy.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background cancellation cleanup should finish");
+        await_cancellation_cleanup(&mut app).await;
+        assert!(app.cancellation_cleanup.is_none());
+        {
+            let state = task_state.lock().await;
+            assert!(state.is_cancelled);
+            assert!(state.is_cancelled_atomic.load(Ordering::Acquire));
+            assert!(state.checkpoint_cancellation.load(Ordering::Acquire));
+        }
+
+        // A newly admitted turn resets cancellation only after cleanup has
+        // published it and reopened admission. No delayed cleanup remains to
+        // overwrite this reset.
+        {
+            let mut state = task_state.lock().await;
+            state.is_cancelled = false;
+            state.is_cancelled_atomic.store(false, Ordering::Release);
+            state
+                .checkpoint_cancellation
+                .store(false, Ordering::Release);
+        }
+        tokio::task::yield_now().await;
+        let state = task_state.lock().await;
+        assert!(!state.is_cancelled);
+        assert!(!state.is_cancelled_atomic.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn exit_waits_for_pending_cancellation_cleanup() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_in_task = Arc::clone(&completed);
+        let mut app = App::new();
+        app.cancellation_cleanup = Some(tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            completed_in_task.store(true, Ordering::Release);
+        }));
+
+        await_cancellation_cleanup(&mut app).await;
+
+        assert!(completed.load(Ordering::Acquire));
+        assert!(app.cancellation_cleanup.is_none());
+    }
+
+    #[tokio::test]
+    async fn background_cancellation_does_not_abort_retried_task() {
+        let task_state = Arc::new(Mutex::new(crate::core::agent_types::TaskState::default()));
+        let state_handle = Arc::new(Mutex::new(Some(Arc::clone(&task_state))));
+        let held_state = task_state.lock().await;
+        let original_task = tokio::spawn(std::future::pending::<()>());
+        let task_slot = Arc::new(Mutex::new(Some(original_task)));
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let mut app = App::new();
+
+        request_agent_cancel(&mut app, &state_handle, &task_slot, &agent_busy).unwrap();
+
+        let replacement_task = tokio::spawn(std::future::pending::<()>());
+        *task_slot.lock().await = Some(replacement_task);
+        drop(held_state);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        await_cancellation_cleanup(&mut app).await;
+
+        let replacement_task = task_slot
+            .lock()
+            .await
+            .take()
+            .expect("replacement task should remain registered");
+        assert!(!replacement_task.is_finished());
+        replacement_task.abort();
     }
 
     #[tokio::test]

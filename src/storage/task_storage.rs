@@ -83,6 +83,7 @@ pub struct TranscriptEntry {
 enum TranscriptWriterCommand {
     Append(Vec<TranscriptEntry>),
     Flush(std_mpsc::Sender<io::Result<()>>),
+    FlushAsync,
     Shutdown(std_mpsc::Sender<io::Result<()>>),
 }
 
@@ -152,6 +153,15 @@ impl TaskTranscriptWriter {
                             );
                             let _ = response.send(result);
                         }
+                        TranscriptWriterCommand::FlushAsync => {
+                            if let Err(error) = flush_transcript_batch(
+                                &storage,
+                                &mut pending,
+                                &mut appends_since_compaction,
+                            ) {
+                                let _ = error_sender.send(error.to_string());
+                            }
+                        }
                         TranscriptWriterCommand::Shutdown(response) => {
                             let result = flush_transcript_batch(
                                 &storage,
@@ -188,6 +198,17 @@ impl TaskTranscriptWriter {
         receiver
             .recv_timeout(TRANSCRIPT_WRITER_RESPONSE_TIMEOUT)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "transcript writer stopped"))?
+    }
+
+    /// Request a flush without waiting for storage to finish.
+    ///
+    /// The interactive loop must not wait on filesystem latency when a turn
+    /// completes. The writer processes this command in order after preceding
+    /// appends and reports failures through its existing error channel.
+    pub fn request_flush(&self) -> io::Result<()> {
+        self.sender
+            .send(TranscriptWriterCommand::FlushAsync)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "transcript writer stopped"))
     }
 
     pub fn take_error(&self) -> Option<String> {
@@ -1886,6 +1907,36 @@ mod tests {
         assert_eq!(retained.len(), DEFAULT_TRANSCRIPT_CAP);
         assert_eq!(retained.first().unwrap().ts, 1);
         assert_eq!(retained.last().unwrap().ts, DEFAULT_TRANSCRIPT_CAP as u64);
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_background_transcript_writer_flush_request_does_not_wait_for_storage() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-writer-async-flush");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage { task_dir };
+        let mut writer = TaskTranscriptWriter::start(storage).unwrap();
+
+        writer
+            .append(
+                (0..10_000)
+                    .map(|index| TranscriptEntry {
+                        kind: BlockKind::Model,
+                        ts: index as u64,
+                        markdown: format!("line {index}"),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        writer.request_flush().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "flush request unexpectedly waited for transcript storage"
+        );
+
         writer.shutdown().unwrap();
     }
 

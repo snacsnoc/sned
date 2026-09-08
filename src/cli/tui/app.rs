@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
@@ -32,6 +32,7 @@ const MAX_SCROLLBACK_LOAD_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SCROLLBACK_LOAD_LINES: usize = 10_000;
 const MAX_PASTED_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FOLDED_PASTE_CHUNKS: usize = 256;
+const ASYNC_LAYOUT_REFLOW_THRESHOLD: usize = 512;
 const STATUS_NOTIFICATION_DURATION: Duration = Duration::from_secs(4);
 const PICKER_MAX_VISIBLE_ROWS: usize = 8;
 const OSC8_PREFIX: &str = "\x1b]8;;";
@@ -164,6 +165,16 @@ pub(crate) struct TurnRenderRequest {
     pub(crate) viewport_revision: u64,
     pub(crate) turn_end_dequeued_at: Option<Instant>,
     anchor: Option<ManualViewportAnchor>,
+}
+
+struct LayoutReflowResult {
+    wrap_width: usize,
+    output_lines: Vec<Line<'static>>,
+    output_ids: Vec<OutputLineId>,
+    output_kinds: Vec<BlockKind>,
+    error_lines: Vec<Line<'static>>,
+    index: VisualLayoutIndex,
+    elapsed_us: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -881,6 +892,12 @@ pub struct App {
     approval_detail_area: Option<Rect>,
     /// Whether the agent is currently busy
     pub agent_busy: bool,
+    /// Whether cancellation cleanup is still publishing state for the prior turn.
+    pub cancellation_pending: bool,
+    /// A synchronous follow-up prompt was emitted and needs one forced scroll.
+    pub(crate) followup_prompt_scroll_pending: bool,
+    /// Cleanup task that must finish before the interactive shell exits.
+    pub(crate) cancellation_cleanup: Option<tokio::task::JoinHandle<()>>,
     /// Whether the model is currently in a reasoning/thinking phase (no displayable output yet).
     /// Drives the prompt border while the model is busy.
     pub reasoning_active: bool,
@@ -997,6 +1014,10 @@ pub struct App {
     /// Fingerprint for the visible window cache (output_len, scroll_y, wrap_width, content_height, cached_visual_rows, scroll_mode).
     pub cached_window_fingerprint: (usize, usize, usize, usize, usize, ScrollMode),
     visual_layout_index: VisualLayoutIndex,
+    /// Receiver for a background reflow after a large transcript resize.
+    layout_reflow_rx: Option<std_mpsc::Receiver<LayoutReflowResult>>,
+    /// Width whose geometry is being prepared by the background reflow.
+    layout_reflow_wrap_width: Option<usize>,
     layout_rebuild_total_us: u64,
     layout_rebuild_count: u64,
     layout_rebuild_peak_us: u64,
@@ -1061,6 +1082,11 @@ pub struct App {
     last_completion_text: Option<String>,
     completion_lines: Vec<Line<'static>>,
     needs_transcript_copy: bool,
+    pending_completion_renders: HashMap<OutputLineId, (Option<OutputLineId>, u64)>,
+    completed_completion_renders: HashMap<Option<OutputLineId>, Vec<u64>>,
+    next_completion_render_sequence: u64,
+    display_generation: u64,
+    error_render_generation: u64,
     transcript_selection_area: Option<Rect>,
     transcript_selection_row_sources: Vec<Option<SelectionRowSource>>,
     text_selection: Option<TextSelection>,
@@ -1370,6 +1396,9 @@ impl App {
             pending_approval: None,
             approval_detail_area: None,
             agent_busy: false,
+            cancellation_pending: false,
+            followup_prompt_scroll_pending: false,
+            cancellation_cleanup: None,
             reasoning_active: false,
             reasoning_partial_line: String::new(),
             scroll_offset: 0,
@@ -1436,6 +1465,11 @@ impl App {
             last_completion_text: None,
             completion_lines: Vec::new(),
             needs_transcript_copy: false,
+            pending_completion_renders: HashMap::new(),
+            completed_completion_renders: HashMap::new(),
+            next_completion_render_sequence: 0,
+            display_generation: 0,
+            error_render_generation: 0,
             transcript_selection_area: None,
             transcript_selection_row_sources: Vec::new(),
             text_selection: None,
@@ -1445,6 +1479,8 @@ impl App {
             cached_visible_window: None,
             cached_window_fingerprint: (0, 0, 0, 0, 0, ScrollMode::Auto),
             visual_layout_index: VisualLayoutIndex::default(),
+            layout_reflow_rx: None,
+            layout_reflow_wrap_width: None,
             layout_rebuild_total_us: 0,
             layout_rebuild_count: 0,
             layout_rebuild_peak_us: 0,
@@ -2422,6 +2458,133 @@ impl App {
         self.push_output_with_kind(line, BlockKind::Completion);
     }
 
+    pub(crate) fn reserve_completion_render(&mut self) -> (u64, OutputLineId) {
+        let id = self.allocate_output_line_id();
+        let sequence = self.next_completion_render_sequence;
+        self.next_completion_render_sequence = self.next_completion_render_sequence.wrapping_add(1);
+        self.pending_completion_renders
+            .insert(id, (self.output_line_ids.back().copied(), sequence));
+        (self.display_generation, id)
+    }
+
+    pub(crate) fn apply_completion_render(
+        &mut self,
+        display_generation: u64,
+        placeholder_id: OutputLineId,
+        rendered: Vec<Line<'static>>,
+    ) -> bool {
+        if self.display_generation != display_generation {
+            self.pending_completion_renders.remove(&placeholder_id);
+            return false;
+        }
+        let Some((predecessor, sequence)) = self.pending_completion_renders.remove(&placeholder_id)
+        else {
+            return false;
+        };
+        let prior_completed = self
+            .completed_completion_renders
+            .get(&predecessor)
+            .map_or(0, |sequences| {
+                sequences.iter().filter(|prior| **prior < sequence).count()
+            });
+        let Some(insert_at) = predecessor.map_or(Some(prior_completed), |id| {
+            self.output_index_for_id(id)
+                .map(|index| index.saturating_add(1 + prior_completed))
+        }) else {
+            return false;
+        };
+        let manual_anchor = self.manual_viewport_anchor(self.last_wrap_width());
+
+        let saved_entries = self
+            .turn_stream_entries
+            .iter()
+            .filter_map(|(index, kind)| {
+                self.output_line_ids
+                    .get(*index)
+                    .copied()
+                    .map(|id| (id, *kind))
+            })
+            .collect::<Vec<_>>();
+        let saved_last_group = self.last_stream_group.map(|(start, count, kind)| {
+            (
+                (start..start.saturating_add(count))
+                    .filter_map(|index| self.output_line_ids.get(index).copied())
+                    .collect::<Vec<_>>(),
+                kind,
+            )
+        });
+
+        for line in rendered.into_iter().rev() {
+            let id = self.allocate_output_line_id();
+            self.output_lines.insert(insert_at, line);
+            self.output_line_ids.insert(insert_at, id);
+            self.output_line_kinds
+                .insert(insert_at, BlockKind::Completion);
+        }
+        self.completed_completion_renders
+            .entry(predecessor)
+            .or_default()
+            .push(sequence);
+        if !self
+            .pending_completion_renders
+            .values()
+            .any(|(pending_predecessor, _)| *pending_predecessor == predecessor)
+        {
+            self.completed_completion_renders.remove(&predecessor);
+        }
+        while self.output_lines.len() > 10_000 {
+            if let Some(line) = self.output_lines.pop_front() {
+                self.scrollback_pending
+                    .push_str(&Self::line_to_string(&line));
+                self.scrollback_pending.push('\n');
+                self.scrollback_pending_lines = self.scrollback_pending_lines.saturating_add(1);
+                self.scrollback_count = self
+                    .scrollback_count
+                    .saturating_add(1)
+                    .min(MAX_SCROLLBACK_LOAD_LINES as u64);
+            }
+            self.output_line_ids.pop_front();
+            self.output_line_kinds.pop_front();
+        }
+
+        self.turn_stream_entries = saved_entries
+            .into_iter()
+            .filter_map(|(id, kind)| self.output_index_for_id(id).map(|index| (index, kind)))
+            .collect();
+        self.last_stream_group = saved_last_group.and_then(|(ids, kind)| {
+            let indices = ids
+                .iter()
+                .filter_map(|id| self.output_index_for_id(*id))
+                .collect::<Vec<_>>();
+            let start = *indices.first()?;
+            (indices
+                .iter()
+                .enumerate()
+                .all(|(offset, index)| *index == start.saturating_add(offset)))
+            .then_some((start, indices.len(), kind))
+        });
+        self.clear_text_selection();
+        self.needs_redraw = true;
+        self.cached_wrap_width = None;
+        self.cached_visible_window = None;
+        self.rebuild_visual_row_cache(self.last_wrap_width());
+        if let Some(anchor) = manual_anchor.as_ref() {
+            self.restore_manual_viewport_anchor(anchor, self.last_wrap_width());
+        } else {
+            self.clamp_to_content();
+        }
+        true
+    }
+
+    /// Remove a completion reservation when its asynchronous render is no
+    /// longer applicable. Reservations are metadata only, so discarding one
+    /// cannot leave an empty transcript row behind.
+    pub(crate) fn discard_completion_render(&mut self, placeholder_id: OutputLineId) -> bool {
+        self.pending_completion_renders
+            .remove(&placeholder_id)
+            .is_some()
+    }
+
     pub fn set_last_completion_text(&mut self, text: String) {
         self.last_completion_text = Some(text);
     }
@@ -2869,6 +3032,7 @@ impl App {
     /// Clear the transient error tail and invalidate cached layout for the next render.
     pub fn clear_error_lines(&mut self) {
         self.clear_text_selection();
+        self.error_render_generation = self.error_render_generation.wrapping_add(1);
         self.needs_redraw = true;
         self.error_lines.clear();
         self.visual_layout_index.invalidate();
@@ -3011,6 +3175,14 @@ impl App {
     pub fn flush_task_transcript(&self) -> io::Result<()> {
         if let Some(writer) = self.task_transcript_writer.as_ref() {
             writer.flush()
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn request_task_transcript_flush(&self) -> io::Result<()> {
+        if let Some(writer) = self.task_transcript_writer.as_ref() {
+            writer.request_flush()
         } else {
             Ok(())
         }
@@ -3213,12 +3385,17 @@ impl App {
     pub fn clear_output(&mut self) -> io::Result<()> {
         let result = self.clear_scrollback_storage();
         self.clear_text_selection();
+        self.display_generation = self.display_generation.wrapping_add(1);
+        self.error_render_generation = self.error_render_generation.wrapping_add(1);
         self.needs_redraw = true;
+        self.followup_prompt_scroll_pending = false;
         self.output_lines.clear();
         self.output_line_ids.clear();
         self.output_line_kinds.clear();
         self.last_completion_text = None;
         self.error_lines.clear();
+        self.pending_completion_renders.clear();
+        self.completed_completion_renders.clear();
         self.visual_layout_index = VisualLayoutIndex::default();
         self.turn_stream_entries.clear();
         self.last_stream_group = None;
@@ -3310,7 +3487,12 @@ impl App {
     }
 
     pub fn clamp_to_content(&mut self) {
-        let total_rows = self.output_visual_rows(self.active_wrap_width());
+        let wrap_width = self.last_wrap_width();
+        let total_rows = if self.layout_reflow_wrap_width == Some(wrap_width) {
+            self.total_visual_rows_for_width(wrap_width)
+        } else {
+            self.output_visual_rows(self.active_wrap_width())
+        };
         let max_offset = Self::max_scroll_offset_for(total_rows, self.last_content_height);
 
         match self.scroll_mode {
@@ -3331,7 +3513,16 @@ impl App {
         self.clear_text_selection();
         self.needs_redraw = true;
         self.viewport_revision = self.viewport_revision.saturating_add(1);
-        let total_rows = self.output_visual_rows(self.last_wrap_width());
+        let wrap_width = self.last_wrap_width();
+        // A large resize keeps the old index installed until the worker
+        // finishes. Scroll input still needs bounds for the new width, or a
+        // manual scroll taken during that window will be clamped against the
+        // old geometry and jump when the reflow is applied.
+        let total_rows = if self.layout_reflow_wrap_width == Some(wrap_width) {
+            self.total_visual_rows_for_width(wrap_width)
+        } else {
+            self.output_visual_rows(wrap_width)
+        };
         if !self.enter_manual_mode(total_rows) {
             return;
         }
@@ -3345,6 +3536,47 @@ impl App {
                 .min(max_offset)
         };
         self.clamp_to_content();
+    }
+
+    fn total_visual_rows_for_width(&self, wrap_width: usize) -> usize {
+        let mut total = 0usize;
+        let mut previous_kind = None;
+        for (line, kind) in self.output_lines.iter().zip(&self.output_line_kinds) {
+            if previous_kind.is_some_and(|previous| Self::should_insert_separator(previous, *kind))
+            {
+                total = total.saturating_add(1);
+            }
+            total =
+                total.saturating_add(Self::output_row_visual_rows(Some(line), *kind, wrap_width));
+            previous_kind = Some(*kind);
+        }
+        for line in &self.error_lines {
+            if previous_kind
+                .is_some_and(|previous| Self::should_insert_separator(previous, BlockKind::Error))
+            {
+                total = total.saturating_add(1);
+            }
+            total = total.saturating_add(Self::output_row_visual_rows(
+                Some(line),
+                BlockKind::Error,
+                wrap_width,
+            ));
+            previous_kind = Some(BlockKind::Error);
+        }
+        total
+    }
+
+    pub(crate) fn begin_error_render(&mut self) -> u64 {
+        self.error_render_generation = self.error_render_generation.wrapping_add(1);
+        self.error_render_generation
+    }
+
+    pub(crate) fn error_render_generation(&self) -> u64 {
+        self.error_render_generation
+    }
+
+    pub(crate) fn display_generation(&self) -> u64 {
+        self.display_generation
     }
 
     pub fn scroll_pages(&mut self, delta_pages: isize) {
@@ -3481,24 +3713,21 @@ impl App {
             .max(1)
     }
 
-    fn rebuild_visual_layout_index(&mut self, wrap_width: usize) {
-        let started = Instant::now();
-        let mut entries = Vec::with_capacity(
-            self.output_lines
-                .len()
-                .saturating_add(self.error_lines.len()),
-        );
-        let mut output_entry_positions = VecDeque::with_capacity(self.output_lines.len());
+    fn build_visual_layout_index(
+        output_lines: impl IntoIterator<Item = Line<'static>>,
+        output_line_kinds: impl IntoIterator<Item = BlockKind>,
+        error_lines: impl IntoIterator<Item = Line<'static>>,
+        wrap_width: usize,
+    ) -> VisualLayoutIndex {
+        let output_lines = output_lines.into_iter().collect::<Vec<_>>();
+        let output_line_kinds = output_line_kinds.into_iter().collect::<Vec<_>>();
+        let error_lines = error_lines.into_iter().collect::<Vec<_>>();
+        let mut entries = Vec::with_capacity(output_lines.len().saturating_add(error_lines.len()));
+        let mut output_entry_positions = VecDeque::new();
         let mut previous_kind = None;
 
-        for (index, (line, kind)) in self
-            .output_lines
-            .iter()
-            .zip(self.output_line_kinds.iter())
-            .enumerate()
-        {
-            if previous_kind.is_some_and(|previous| Self::should_insert_separator(previous, *kind))
-            {
+        for (index, (line, kind)) in output_lines.into_iter().zip(output_line_kinds).enumerate() {
+            if previous_kind.is_some_and(|previous| Self::should_insert_separator(previous, kind)) {
                 entries.push(LayoutEntry {
                     source: LayoutSource::Separator,
                     kind: BlockKind::Separator,
@@ -3508,13 +3737,13 @@ impl App {
             output_entry_positions.push_back(entries.len());
             entries.push(LayoutEntry {
                 source: LayoutSource::Output(index),
-                kind: *kind,
-                rows: Self::output_row_visual_rows(Some(line), *kind, wrap_width),
+                kind,
+                rows: Self::output_row_visual_rows(Some(&line), kind, wrap_width),
             });
-            previous_kind = Some(*kind);
+            previous_kind = Some(kind);
         }
 
-        for (index, line) in self.error_lines.iter().enumerate() {
+        for (index, line) in error_lines.iter().enumerate() {
             if previous_kind
                 .is_some_and(|previous| Self::should_insert_separator(previous, BlockKind::Error))
             {
@@ -3533,8 +3762,7 @@ impl App {
         }
 
         let row_index = RowPrefixIndex::from_rows(entries.iter().map(|entry| entry.rows));
-        let total = row_index.total();
-        self.visual_layout_index = VisualLayoutIndex {
+        VisualLayoutIndex {
             wrap_width: Some(wrap_width),
             entries,
             row_index,
@@ -3543,7 +3771,19 @@ impl App {
             base_rows: 0,
             base_output_index: 0,
             dirty: false,
-        };
+        }
+    }
+
+    fn rebuild_visual_layout_index(&mut self, wrap_width: usize) {
+        let started = Instant::now();
+        let index = Self::build_visual_layout_index(
+            self.output_lines.iter().cloned(),
+            self.output_line_kinds.iter().copied(),
+            self.error_lines.iter().cloned(),
+            wrap_width,
+        );
+        let total = index.total_rows();
+        self.visual_layout_index = index;
         self.cached_visual_rows = total;
         self.cached_wrap_width = Some(wrap_width);
         let elapsed_us = started.elapsed().as_micros() as u64;
@@ -3564,8 +3804,117 @@ impl App {
         timing
     }
 
+    /// Poll a pending large-transcript reflow without waiting for the worker.
+    /// A result is accepted only when the transcript snapshot still matches;
+    /// otherwise the next frame schedules a fresh snapshot.
+    pub(crate) fn poll_layout_reflow(&mut self) {
+        let Some(receiver) = self.layout_reflow_rx.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(std_mpsc::TryRecvError::Empty) => return,
+            Err(std_mpsc::TryRecvError::Disconnected) => {
+                self.layout_reflow_rx = None;
+                self.layout_reflow_wrap_width = None;
+                self.needs_redraw = true;
+                return;
+            }
+        };
+        self.layout_reflow_rx = None;
+        self.layout_reflow_wrap_width = None;
+
+        let snapshot_matches = result.wrap_width == self.last_wrap_width()
+            && result.output_lines.len() == self.output_lines.len()
+            && result.output_lines.iter().eq(self.output_lines.iter())
+            && result.output_ids.len() == self.output_line_ids.len()
+            && result
+                .output_ids
+                .iter()
+                .copied()
+                .eq(self.output_line_ids.iter().copied())
+            && result.output_kinds.len() == self.output_line_kinds.len()
+            && result
+                .output_kinds
+                .iter()
+                .copied()
+                .eq(self.output_line_kinds.iter().copied())
+            && result.error_lines.len() == self.error_lines.len()
+            && result.error_lines.iter().eq(self.error_lines.iter());
+
+        if !snapshot_matches {
+            self.needs_redraw = true;
+            return;
+        }
+
+        let total = result.index.total_rows();
+        self.visual_layout_index = result.index;
+        self.cached_visual_rows = total;
+        self.cached_wrap_width = Some(result.wrap_width);
+        self.layout_rebuild_total_us = self
+            .layout_rebuild_total_us
+            .saturating_add(result.elapsed_us);
+        self.layout_rebuild_count = self.layout_rebuild_count.saturating_add(1);
+        self.layout_rebuild_peak_us = self.layout_rebuild_peak_us.max(result.elapsed_us);
+        self.cached_visible_window = None;
+        self.needs_redraw = true;
+    }
+
+    fn start_layout_reflow(&mut self, wrap_width: usize) -> bool {
+        if self.layout_reflow_rx.is_some() {
+            return true;
+        }
+
+        let output_lines = self.output_lines.iter().cloned().collect::<Vec<_>>();
+        let output_ids = self.output_line_ids.iter().copied().collect::<Vec<_>>();
+        let output_kinds = self.output_line_kinds.iter().copied().collect::<Vec<_>>();
+        let error_lines = self.error_lines.iter().cloned().collect::<Vec<_>>();
+        let result_output_ids = output_ids.clone();
+        let result_output_lines = output_lines.clone();
+        let result_output_kinds = output_kinds.clone();
+        let result_error_lines = error_lines.clone();
+        let (sender, receiver) = std_mpsc::sync_channel(1);
+        self.layout_reflow_rx = Some(receiver);
+
+        let worker = std::thread::Builder::new()
+            .name("sned-layout-reflow".to_string())
+            .spawn(move || {
+                let started = Instant::now();
+                let index = Self::build_visual_layout_index(
+                    output_lines,
+                    output_kinds,
+                    error_lines,
+                    wrap_width,
+                );
+                let result = LayoutReflowResult {
+                    wrap_width,
+                    output_lines: result_output_lines,
+                    output_ids: result_output_ids,
+                    output_kinds: result_output_kinds,
+                    error_lines: result_error_lines,
+                    index,
+                    elapsed_us: started.elapsed().as_micros() as u64,
+                };
+                let _ = sender.send(result);
+            });
+
+        if worker.is_err() {
+            self.layout_reflow_rx = None;
+            self.layout_reflow_wrap_width = None;
+            self.rebuild_visual_layout_index(wrap_width);
+            return false;
+        }
+        self.layout_reflow_wrap_width = Some(wrap_width);
+        true
+    }
+
     fn ensure_visual_layout_index(&mut self, wrap_width: usize) {
         if !self.visual_layout_index.is_valid_for(wrap_width) {
+            if self.layout_reflow_rx.is_some()
+                && self.output_lines.len() >= ASYNC_LAYOUT_REFLOW_THRESHOLD
+            {
+                return;
+            }
             self.rebuild_visual_layout_index(wrap_width);
         }
     }
@@ -4368,6 +4717,33 @@ impl App {
         let content_height = (output_area.height as usize).saturating_sub(2);
         self.last_content_width = output_area.width as usize;
         self.last_content_height = content_height;
+
+        self.poll_layout_reflow();
+        let width_changed = self.visual_layout_index.wrap_width != Some(wrap_width);
+        if width_changed
+            && !self.visual_layout_index.is_valid_for(wrap_width)
+            && self.output_lines.len() >= ASYNC_LAYOUT_REFLOW_THRESHOLD
+        {
+            let reflow_pending = self.start_layout_reflow(wrap_width);
+            if !reflow_pending {
+                // Thread creation failed, but the synchronous fallback has
+                // already rebuilt the index. Render the transcript now.
+                self.needs_redraw = true;
+            } else {
+                self.transcript_selection_area = None;
+                self.transcript_selection_row_sources.clear();
+                self.rendered_hyperlink_targets.clear();
+                frame.render_widget(Clear, output_area);
+                frame.render_widget(
+                    Paragraph::new(Line::from("Reflowing transcript…"))
+                        .style(Style::default().fg(theme::STATUS_FG))
+                        .block(theme::border_block(" sned ")),
+                    output_area,
+                );
+                return;
+            }
+        }
+
         self.restore_pending_manual_viewport_after_reflow(wrap_width);
         let output_rows = self.total_visual_rows(wrap_width);
         self.transcript_selection_area =
@@ -5462,6 +5838,128 @@ mod tests {
             .expect("manual viewport should retain an anchor after reflow");
         assert_eq!(anchor.output_index, 8);
         assert!(anchor.text.starts_with("row 8:"));
+    }
+
+    #[test]
+    fn queued_completion_renders_keep_reservation_order() {
+        let mut app = App::new();
+        app.push_plain("before");
+        let (generation, first) = app.reserve_completion_render();
+        let (_, second) = app.reserve_completion_render();
+
+        assert!(app.apply_completion_render(generation, second, vec![Line::from("second")]));
+        assert!(app.apply_completion_render(generation, first, vec![Line::from("first")]));
+
+        let text = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(text, ["before", "first", "second"]);
+    }
+
+    #[test]
+    fn large_resize_reflow_is_deferred_to_background_worker() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new();
+        app.set_content_width(120);
+        for index in 0..10_000 {
+            app.push_output_with_kind(
+                Line::from(format!("row {index}: {}", "x".repeat(180))),
+                BlockKind::Model,
+            );
+        }
+        app.rebuild_visual_layout_index(app.last_wrap_width());
+        app.set_content_width(24);
+
+        let backend = TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("initial resized frame should render");
+
+        assert!(
+            app.layout_reflow_rx.is_some(),
+            "large resize should schedule reflow instead of rebuilding in render"
+        );
+        assert_eq!(
+            app.visual_layout_index.wrap_width,
+            Some(App::content_wrap_width(120)),
+            "the old index remains available while the new width is prepared"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.layout_reflow_rx.is_some() && Instant::now() < deadline {
+            app.poll_layout_reflow();
+            std::thread::yield_now();
+        }
+        assert!(
+            app.layout_reflow_rx.is_none(),
+            "background reflow should complete without blocking the render loop"
+        );
+        assert!(
+            app.visual_layout_index
+                .is_valid_for(App::content_wrap_width(24))
+        );
+    }
+
+    #[test]
+    fn scrolling_during_resize_reflow_uses_target_width_geometry() {
+        let mut app = App::new();
+        app.set_content_width(120);
+        app.set_content_height(5);
+        for index in 0..ASYNC_LAYOUT_REFLOW_THRESHOLD {
+            app.push_output_with_kind(
+                Line::from(format!("row {index}: {}", "x".repeat(80))),
+                BlockKind::Model,
+            );
+        }
+        app.rebuild_visual_layout_index(app.last_wrap_width());
+        let old_rows = app.visual_layout_index.total_rows();
+
+        app.set_content_width(24);
+        let target_width = App::content_wrap_width(24);
+        assert!(app.start_layout_reflow(target_width));
+        app.scroll_lines(-1);
+
+        let target_rows = app.total_visual_rows_for_width(target_width);
+        assert!(target_rows > old_rows);
+        assert_eq!(
+            app.scroll_offset,
+            App::max_scroll_offset_for(target_rows, app.last_content_height).saturating_sub(1)
+        );
+    }
+
+    #[test]
+    fn background_reflow_rejects_changed_output_with_same_line_id() {
+        let mut app = App::new();
+        app.set_content_width(120);
+        for index in 0..ASYNC_LAYOUT_REFLOW_THRESHOLD.saturating_sub(2) {
+            app.push_output_with_kind(Line::from(format!("row {index}")), BlockKind::Model);
+        }
+        app.push_stream_line(Line::from("partial model"), StreamKind::Model);
+        app.push_stream_line(Line::from("interleaved reasoning"), StreamKind::Reasoning);
+        app.rebuild_visual_layout_index(app.last_wrap_width());
+        app.set_content_width(24);
+        assert!(app.start_layout_reflow(App::content_wrap_width(24)));
+
+        let retained_ids = app.output_line_ids.clone();
+        app.replace_last_stream_line(Line::from("changed after snapshot"), StreamKind::Model);
+        assert_eq!(app.output_line_ids, retained_ids);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.layout_reflow_rx.is_some() && Instant::now() < deadline {
+            app.poll_layout_reflow();
+            std::thread::yield_now();
+        }
+        assert!(app.layout_reflow_rx.is_none());
+        assert!(
+            !app.visual_layout_index
+                .is_valid_for(App::content_wrap_width(24))
+        );
+        assert!(app.needs_redraw);
     }
 
     #[test]
