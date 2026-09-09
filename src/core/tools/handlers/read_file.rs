@@ -1177,11 +1177,11 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn drain_rendered_output(
-        rx: &mut tokio::sync::mpsc::Receiver<crate::cli::output::OutputEvent>,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::cli::output::SequencedOutputEvent>,
     ) -> Vec<String> {
         let mut rendered = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            match event {
+            match event.event {
                 crate::cli::output::OutputEvent::Line(line) => rendered.push(line.to_string()),
                 crate::cli::output::OutputEvent::ModelUpdateLine(line) => {
                     rendered.push(line.to_string())

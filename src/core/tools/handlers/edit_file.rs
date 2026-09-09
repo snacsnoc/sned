@@ -3009,7 +3009,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let OutputEvent::ApprovalRequested(request) = event else {
+        let OutputEvent::ApprovalRequested(request) = event.event else {
             panic!("expected approval request");
         };
         assert!(revision_stage_files(dir.path()).is_empty());
@@ -3063,7 +3063,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let OutputEvent::ApprovalRequested(request) = event else {
+        let OutputEvent::ApprovalRequested(request) = event.event else {
             panic!("expected approval request");
         };
         assert!(revision_stage_files(dir.path()).is_empty());
@@ -7172,7 +7172,7 @@ edition = "2021"
         // Create a real channel-based writer. The edit_file emit calls
         // must reach the channel even when no drain is running (the
         // channel is bounded at 8192 and try_send will drop on full).
-        let (tx, _rx) = mpsc::channel::<crate::cli::output::OutputEvent>(16);
+        let (tx, _rx) = mpsc::channel(16);
         let writer: Arc<dyn crate::cli::output::OutputWriter> =
             Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
 

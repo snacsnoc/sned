@@ -6788,7 +6788,7 @@ mod tests {
                 .await
                 .expect("first approval prompt should arrive")
                 .expect("priority output should stay open");
-            if let OutputEvent::ApprovalRequested(request) = event {
+            if let OutputEvent::ApprovalRequested(request) = event.event {
                 break request;
             }
         };
@@ -6798,7 +6798,7 @@ mod tests {
                 .await
                 .expect("second approval prompt should arrive after timeout")
                 .expect("priority output should stay open");
-            if let OutputEvent::ApprovalRequested(request) = event {
+            if let OutputEvent::ApprovalRequested(request) = event.event {
                 break request;
             }
         };
@@ -6835,11 +6835,11 @@ mod tests {
     }
 
     fn drain_rendered_output(
-        rx: &mut tokio::sync::mpsc::Receiver<crate::cli::output::OutputEvent>,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::cli::output::SequencedOutputEvent>,
     ) -> Vec<String> {
         let mut rendered = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            match event {
+            match event.event {
                 crate::cli::output::OutputEvent::Line(line) => rendered.push(line.to_string()),
                 crate::cli::output::OutputEvent::ModelUpdateLine(line) => {
                     rendered.push(line.to_string())
@@ -6880,15 +6880,17 @@ mod tests {
     }
 
     fn drain_output_events(
-        priority_rx: &mut tokio::sync::mpsc::UnboundedReceiver<OutputEvent>,
-        rx: &mut tokio::sync::mpsc::Receiver<OutputEvent>,
+        priority_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
+            crate::cli::output::SequencedOutputEvent,
+        >,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::cli::output::SequencedOutputEvent>,
     ) -> Vec<OutputEvent> {
         let mut events = Vec::new();
         while let Ok(event) = priority_rx.try_recv() {
-            events.push(event);
+            events.push(event.event);
         }
         while let Ok(event) = rx.try_recv() {
-            events.push(event);
+            events.push(event.event);
         }
         events
     }
@@ -7088,7 +7090,7 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let mut emitted = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            match event {
+            match event.event {
                 OutputEvent::Line(line) => emitted.push(line.to_string()),
                 OutputEvent::ModelUpdateLine(line) => emitted.push(line.to_string()),
                 other => panic!("unexpected output event: {:?}", other),
@@ -7111,7 +7113,12 @@ Irrespective of whether additional information or instructions are given, you ar
         print_model_line("ok\r\x1b[31mthere\tfriend", &writer, false);
 
         let rendered = match rx.try_recv() {
-            Ok(OutputEvent::Line(line)) => line.to_string(),
+            Ok(event) if matches!(event.event, OutputEvent::Line(_)) => {
+                let OutputEvent::Line(line) = event.event else {
+                    unreachable!()
+                };
+                line.to_string()
+            }
             Ok(other) => panic!("unexpected output event: {:?}", other),
             Err(err) => panic!("expected output event, got {}", err),
         };
@@ -7173,13 +7180,23 @@ Irrespective of whether additional information or instructions are given, you ar
         update_model_line("**bold**", &writer, true);
 
         let partial = match rx.try_recv() {
-            Ok(OutputEvent::ModelUpdateLine(line)) => line,
+            Ok(event) if matches!(event.event, OutputEvent::ModelUpdateLine(_)) => {
+                let OutputEvent::ModelUpdateLine(line) = event.event else {
+                    unreachable!()
+                };
+                line
+            }
             other => panic!("expected raw partial update, got {other:?}"),
         };
         assert_eq!(partial.to_string(), "**bol");
 
         let completed = match rx.try_recv() {
-            Ok(OutputEvent::ModelUpdateLine(line)) => line,
+            Ok(event) if matches!(event.event, OutputEvent::ModelUpdateLine(_)) => {
+                let OutputEvent::ModelUpdateLine(line) = event.event else {
+                    unreachable!()
+                };
+                line
+            }
             other => panic!("expected styled completed update, got {other:?}"),
         };
         assert_eq!(completed.to_string(), "bold");
@@ -7695,17 +7712,17 @@ Irrespective of whether additional information or instructions are given, you ar
         }
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(events.iter().any(
-            |event| matches!(event, OutputEvent::Line(line) if line.to_string().contains("partial output"))
+            |event| matches!(event.event, OutputEvent::Line(ref line) if line.to_string().contains("partial output"))
         ));
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, OutputEvent::Line(line) if line.to_string().contains("[sned] ERROR: Provider stream error: OpenAI SSE stream error: error decoding response body (retryable)")))
+                .any(|event| matches!(event.event, OutputEvent::Line(ref line) if line.to_string().contains("[sned] ERROR: Provider stream error: OpenAI SSE stream error: error decoding response body (retryable)")))
         );
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, OutputEvent::Line(line) if line.to_string().contains("should not be used")))
+                .any(|event| matches!(event.event, OutputEvent::Line(ref line) if line.to_string().contains("should not be used")))
         );
         assert!(
             !agent
@@ -7887,7 +7904,7 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(agent.state.lock().await.is_cancelled);
         assert!(matches!(
             rx.try_recv(),
-            Ok(OutputEvent::Line(line)) if line.to_string() == "[sned] Cancelled. Type /retry to resend."
+            Ok(event) if matches!(event.event, OutputEvent::Line(ref line) if line.to_string() == "[sned] Cancelled. Type /retry to resend.")
         ));
 
         // SAFETY: restore the process environment for later tests.
@@ -7991,13 +8008,13 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(events.iter().any(|event| {
-            matches!(event, OutputEvent::Line(line) if line.to_string().contains("[snipped from streamed display; use /full]"))
+            matches!(event.event, OutputEvent::Line(ref line) if line.to_string().contains("[snipped from streamed display; use /full]"))
         }));
         assert!(events.iter().any(|event| {
             matches!(
-                event,
+                event.event,
                 OutputEvent::TurnEnd {
-                    accumulated_text,
+                    ref accumulated_text,
                     ..
                 }
                     if accumulated_text.contains("```rust")
@@ -10650,7 +10667,7 @@ Irrespective of whether additional information or instructions are given, you ar
         let accumulated_text = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| {
             if let crate::cli::output::OutputEvent::TurnEnd {
                 accumulated_text, ..
-            } = event
+            } = event.event
             {
                 Some(accumulated_text)
             } else {

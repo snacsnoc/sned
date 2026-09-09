@@ -1070,7 +1070,7 @@ pub struct App {
     /// Reasoning blocks awaiting a non-reasoning event or TurnEnd. Keeping
     /// the rendered blocks together preserves chunk coalescing on replay.
     pending_transcript_reasoning_lines: Option<Vec<Line<'static>>>,
-    pub(crate) deferred_priority_events: VecDeque<OutputEvent>,
+    pub(crate) deferred_priority_events: VecDeque<crate::cli::output::SequencedOutputEvent>,
     /// Whether the model picker is active.
     pub model_picker_active: bool,
     /// Model picker entries.
@@ -5859,6 +5859,28 @@ mod tests {
     }
 
     #[test]
+    fn clear_output_rejects_pending_completion_render() {
+        let mut app = App::new();
+        app.push_plain("before");
+        let (generation, reserved) = app.reserve_completion_render();
+        app.set_last_completion_text("stale completion".to_string());
+
+        app.clear_output().expect("output should clear");
+        assert!(app.last_completion_text().is_none());
+
+        // The reservation died with the cleared display generation, and
+        // reservations are metadata only, so applying the stale result must
+        // neither return success nor leave an empty transcript row behind.
+        assert!(!app.apply_completion_render(
+            generation,
+            reserved,
+            vec![Line::from("stale completion")]
+        ));
+        assert!(!app.discard_completion_render(reserved));
+        assert!(app.output_lines.is_empty());
+    }
+
+    #[test]
     fn large_resize_reflow_is_deferred_to_background_worker() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -8161,7 +8183,7 @@ mod tests {
 
         let _approval_guard = crate::core::approval::approval_test_guard();
 
-        let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(8);
+        let (tx, mut rx) = mpsc::channel(8);
         let writer: Arc<dyn crate::cli::output::OutputWriter> =
             Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
 
@@ -8216,7 +8238,7 @@ mod tests {
         use std::sync::Arc;
         use tokio::sync::mpsc;
 
-        let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(2);
+        let (tx, mut rx) = mpsc::channel(2);
         let writer: Arc<dyn crate::cli::output::OutputWriter> =
             Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
         let backend = TestBackend::new(80, 24);
@@ -8261,7 +8283,7 @@ mod tests {
 
         let _approval_guard = crate::core::approval::approval_test_guard();
 
-        let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(8);
+        let (tx, mut rx) = mpsc::channel(8);
         let writer: Arc<dyn crate::cli::output::OutputWriter> =
             Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
 
@@ -8343,7 +8365,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use tokio::sync::mpsc;
 
-        let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(16);
+        let (tx, mut rx) = mpsc::channel(16);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -8365,7 +8387,7 @@ mod tests {
             "    line 5 of output",
         ];
         for line in tool_result_lines {
-            tx.try_send(crate::cli::output::OutputEvent::dim(line.to_string()))
+            tx.try_send(crate::cli::output::OutputEvent::dim(line.to_string()).into())
                 .expect("tool output should fit");
         }
 
@@ -8378,7 +8400,7 @@ mod tests {
             "Approval required · edit_file",
             prompt,
         );
-        tx.try_send(crate::cli::output::OutputEvent::ApprovalRequested(request))
+        tx.try_send(crate::cli::output::OutputEvent::ApprovalRequested(request).into())
             .expect("approval request should fit");
 
         crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);
@@ -8433,7 +8455,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use tokio::sync::mpsc;
 
-        let (tx, mut rx) = mpsc::channel::<crate::cli::output::OutputEvent>(16);
+        let (tx, mut rx) = mpsc::channel(16);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
@@ -8454,7 +8476,7 @@ mod tests {
             "Approval required · edit_file",
             prompt,
         );
-        tx.try_send(crate::cli::output::OutputEvent::ApprovalRequested(request))
+        tx.try_send(crate::cli::output::OutputEvent::ApprovalRequested(request).into())
             .expect("approval request should fit");
 
         crate::cli::interactive::drain_output_for_test(&mut rx, &mut app);

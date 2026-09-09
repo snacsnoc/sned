@@ -7,6 +7,7 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -243,14 +244,14 @@ pub(crate) struct TuiDrainProgressRecord {
 
 #[derive(Clone, Default)]
 pub(crate) struct ReasoningMailbox {
-    pending: Arc<std::sync::Mutex<Option<String>>>,
+    pending: Arc<std::sync::Mutex<Option<(String, u64)>>>,
     received_chunks: Arc<std::sync::atomic::AtomicU64>,
 }
 
 const MAX_REASONING_SNAPSHOT_BYTES: usize = 64 * 1024;
 
 impl ReasoningMailbox {
-    fn lock_pending(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, Option<(String, u64)>> {
         match self.pending.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -262,7 +263,12 @@ impl ReasoningMailbox {
         }
     }
 
-    fn append(&self, chunk: String) {
+    #[cfg(test)]
+    pub(crate) fn append(&self, chunk: String) {
+        self.append_with_sequence(chunk, 0);
+    }
+
+    fn append_with_sequence(&self, chunk: String, sequence: u64) {
         self.received_chunks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if chunk.is_empty() {
@@ -273,11 +279,14 @@ impl ReasoningMailbox {
         Self::retain_tail(&mut chunk);
         let mut pending = self.lock_pending();
         match pending.as_mut() {
-            Some(existing) => {
+            Some((existing, seq)) => {
                 existing.push_str(&chunk);
                 Self::retain_tail(existing);
+                if sequence != 0 {
+                    *seq = sequence;
+                }
             }
-            None => *pending = Some(chunk),
+            None => *pending = Some((chunk, sequence)),
         }
     }
 
@@ -293,7 +302,12 @@ impl ReasoningMailbox {
         value.drain(..start);
     }
 
+    #[cfg(test)]
     pub(crate) fn take(&self) -> Option<String> {
+        self.take_with_sequence().map(|(text, _)| text)
+    }
+
+    pub(crate) fn take_with_sequence(&self) -> Option<(String, u64)> {
         self.lock_pending().take()
     }
 
@@ -302,12 +316,47 @@ impl ReasoningMailbox {
     }
 
     pub(crate) fn pending_len(&self) -> usize {
-        self.lock_pending().as_ref().map_or(0, String::len)
+        self.lock_pending()
+            .as_ref()
+            .map_or(0, |(text, _)| text.len())
     }
 
     pub(crate) fn received_chunks(&self) -> u64 {
         self.received_chunks
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// An output event paired with a monotonic sequence number for cross-lane ordering.
+#[derive(Clone, Debug)]
+pub struct SequencedOutputEvent {
+    pub sequence: u64,
+    pub event: OutputEvent,
+}
+
+impl SequencedOutputEvent {
+    #[must_use]
+    pub fn new(sequence: u64, event: OutputEvent) -> Self {
+        Self { sequence, event }
+    }
+}
+
+impl From<OutputEvent> for SequencedOutputEvent {
+    fn from(event: OutputEvent) -> Self {
+        Self { sequence: 0, event }
+    }
+}
+
+impl std::ops::Deref for SequencedOutputEvent {
+    type Target = OutputEvent;
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
+impl std::ops::DerefMut for SequencedOutputEvent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.event
     }
 }
 
@@ -523,6 +572,14 @@ impl OutputEvent {
         Self::CommandOutputLine(Line::from(text.into()))
     }
 
+    /// Returns true when this event represents a transient state snapshot
+    /// (`ModelUpdateLine`) whose latest value supersedes prior ones. Lossy
+    /// events may be dropped without losing user-visible content; every
+    /// other event is finalized and must keep its content + order.
+    pub fn is_lossy(&self) -> bool {
+        matches!(self, Self::ModelUpdateLine(_))
+    }
+
     pub fn reasoning_chunk(text: impl Into<String>) -> Self {
         Self::ReasoningChunk(text.into())
     }
@@ -568,6 +625,29 @@ pub trait OutputWriter: Send + Sync {
     /// Default: "none" (no drops).
     fn drop_summary(&self) -> String {
         "none".to_string()
+    }
+
+    /// Flush any deferred finalized events that were preserved on overflow.
+    /// Returns `(moved, remaining)`: how many events were re-inserted into
+    /// the main channel and how many are still waiting. The drain loop uses
+    /// this to pull waiting finalized output back before post-priority
+    /// control events render, preserving emission order across lanes.
+    /// Default: nothing to flush.
+    fn flush_deferred_finalized_events(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    /// Returns whether any finalized events are waiting in the deferred
+    /// queue. Used by the drain loop to decide whether post-priority
+    /// control events must wait for the next frame. Default: none.
+    fn has_deferred_finalized_events(&self) -> bool {
+        false
+    }
+
+    /// Returns the sequence number of the oldest event waiting in the
+    /// deferred finalized queue, if any.
+    fn oldest_deferred_sequence(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -706,23 +786,126 @@ impl DropCounters {
 /// `SNED_OUTPUT_CHANNEL_CAPACITY` in `run_interactive_shell_inner`). Approval
 /// requests and critical overflow events use separate control lanes so the
 /// drain loop can service approvals first and bound critical work separately.
+///
+/// Finalized transcript output keeps one ordering domain: the bounded main
+/// channel plus a bounded deferred FIFO. Events that arrive while the main
+/// channel is full wait in the deferred queue (in emission order) and are
+/// re-inserted at the main-channel tail by `flush_deferred_finalized_events`,
+/// which runs before every drain pass, before every non-lossy `emit`, and
+/// inside the drain pass before post-priority control events apply.
+/// Flushing before appending guarantees a freed slot always goes to the
+/// oldest waiting event first, so finalized output cannot be reordered by
+/// lane overtaking. Control events stay on the priority lane so the UI
+/// remains responsive. The **delivery contract** is explicit and bounded:
+///
+/// - `ModelUpdateLine` snapshots are droppable in any quantity; they are
+///   coalesced by the TUI's streaming layout and the user-visible
+///   transcript only ever shows the last snapshot.
+/// - Finalized events (`Line`, `ToolHeaderLine`, `ToolOutputLine`,
+///   `CommandHeaderLine`, `CommandOutputLine`, `RawAnsi`,
+///   `LocalCommandEcho`, `TurnIndicator`) are retained without loss while the
+///   deferred queue stays within `MAX_DEFERRED_FINALIZED_EVENTS` and
+///   `MAX_DEFERRED_FINALIZED_BYTES` (defaults: 65 536 entries / 64 MiB).
+///   Those bounds are sized to absorb every realistic model stream, tool
+///   flood, and command flood in a single turn. The byte bound is an
+///   estimate based on rendered text length, not an exact heap-memory bound.
+/// - When the deferred queue is saturated and a new finalized event
+///   arrives, the **oldest waiter is evicted** to make room. This is the
+///   documented bounded-loss overflow policy: the eviction is counted per
+///   category by `record_dropped_event`, which sets the overflow signal so
+///   the TUI shows a visible `⚠ N dropped` banner with a per-category
+///   summary. Loss is therefore never silent. This is bounded finalized-
+///   output retention with visible loss on saturation, not a lossless
+///   guarantee.
+/// - A single finalized event larger than `MAX_DEFERRED_FINALIZED_BYTES`
+///   is rejected outright as a counted, signaled bounded failure, so the
+///   deferred queue can never exceed its advertised bound by one event.
+///   The rejection is checked before any eviction, so a single oversized
+///   arrival cannot discard valid older output.
+///
+/// This is the single contract. Tests, comments, and acceptance claims all
+/// refer to it: see `test_deferred_finalized_events_are_bounded_and_drop_earliest`,
+/// `test_deferred_finalized_events_are_bounded_by_bytes`, and
+/// `test_deferred_finalized_rejects_single_oversized_event`.
 pub struct ChannelOutputWriter {
-    tx: mpsc::Sender<OutputEvent>,
+    tx: mpsc::Sender<SequencedOutputEvent>,
     reasoning_mailbox: ReasoningMailbox,
-    approval_tx: mpsc::UnboundedSender<OutputEvent>,
-    approval_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<OutputEvent>>>,
-    priority_tx: mpsc::UnboundedSender<OutputEvent>,
-    priority_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<OutputEvent>>>,
+    approval_tx: mpsc::UnboundedSender<SequencedOutputEvent>,
+    approval_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<SequencedOutputEvent>>>,
+    priority_tx: mpsc::UnboundedSender<SequencedOutputEvent>,
+    priority_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<SequencedOutputEvent>>>,
     approval_attached: std::sync::atomic::AtomicBool,
     priority_attached: std::sync::atomic::AtomicBool,
+    inner: std::sync::Mutex<ChannelOutputWriterInner>,
+    /// Maximum finalized events retained while waiting for main queue drain.
+    /// Kept bounded to avoid unbounded memory growth.
+    max_deferred_finalized_events: usize,
+    /// Maximum estimated payload bytes retained in the deferred queue.
+    /// Bounds memory even when individual events are large.
+    max_deferred_finalized_bytes: usize,
     drop_counters: DropCounters,
     overflow_signaled: std::sync::atomic::AtomicBool,
 }
 
+#[derive(Default)]
+struct ChannelOutputWriterInner {
+    next_sequence: u64,
+    deferred_finalized_events: DeferredFinalizedQueue,
+}
+
+/// Bounded FIFO for finalized events that overflowed the main channel.
+///
+/// Overflow policy (explicit, bounded-loss): when either bound is reached,
+/// the oldest waiting event is evicted to make room for the newest arrival.
+/// Every eviction is counted by category via `record_dropped_event`, which
+/// also sets the overflow signal so the TUI shows a visible `⚠ N dropped`
+/// indicator with a per-category summary. Loss is therefore never silent:
+/// this implements the "fail visibly and preserve the diagnostic" option.
+/// Evicting the oldest (rather than rejecting the newest) keeps the most
+/// recent transcript context adjacent to the live stream. A single event
+/// larger than the byte bound is rejected before any eviction, so it cannot
+/// discard valid older output.
+#[derive(Default)]
+struct DeferredFinalizedQueue {
+    events: VecDeque<SizedOutputEvent>,
+    bytes: usize,
+}
+
+struct SizedOutputEvent {
+    event: SequencedOutputEvent,
+    bytes: usize,
+}
+
 impl ChannelOutputWriter {
     /// Create a new ChannelOutputWriter with a bounded channel.
+    /// Bounded number of finalized events retained while the main output
+    /// queue is full. Sized to absorb a long sustained backpressure burst
+    /// (provider stream + tool flood + command flood in one turn) without
+    /// evicting any finalized events. Finalized events beyond this bound
+    /// fall back to the explicit overflow policy (counted + visible banner).
+    pub(crate) const MAX_DEFERRED_FINALIZED_EVENTS: usize = 65_536;
+    /// Bounded payload bytes retained in the deferred finalized queue.
+    /// Caps memory when individual finalized events are large.
+    pub(crate) const MAX_DEFERRED_FINALIZED_BYTES: usize = 64 * 1024 * 1024;
+
     #[must_use]
-    pub fn new(tx: mpsc::Sender<OutputEvent>) -> Self {
+    pub(crate) fn with_deferred_capacity(
+        tx: mpsc::Sender<SequencedOutputEvent>,
+        max_deferred_finalized_events: usize,
+    ) -> Self {
+        Self::with_deferred_capacity_and_bytes(
+            tx,
+            max_deferred_finalized_events,
+            Self::MAX_DEFERRED_FINALIZED_BYTES,
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn with_deferred_capacity_and_bytes(
+        tx: mpsc::Sender<SequencedOutputEvent>,
+        max_deferred_finalized_events: usize,
+        max_deferred_finalized_bytes: usize,
+    ) -> Self {
         let (approval_tx, approval_rx) = mpsc::unbounded_channel();
         let (priority_tx, priority_rx) = mpsc::unbounded_channel();
         Self {
@@ -734,9 +917,20 @@ impl ChannelOutputWriter {
             priority_rx: std::sync::Mutex::new(Some(priority_rx)),
             approval_attached: std::sync::atomic::AtomicBool::new(false),
             priority_attached: std::sync::atomic::AtomicBool::new(false),
+            inner: std::sync::Mutex::new(ChannelOutputWriterInner {
+                next_sequence: 1,
+                deferred_finalized_events: DeferredFinalizedQueue::default(),
+            }),
+            max_deferred_finalized_events: max_deferred_finalized_events.max(1),
+            max_deferred_finalized_bytes: max_deferred_finalized_bytes.max(1),
             drop_counters: DropCounters::default(),
             overflow_signaled: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[must_use]
+    pub fn new(tx: mpsc::Sender<SequencedOutputEvent>) -> Self {
+        Self::with_deferred_capacity(tx, Self::MAX_DEFERRED_FINALIZED_EVENTS)
     }
 
     #[must_use]
@@ -745,7 +939,7 @@ impl ChannelOutputWriter {
     }
 
     #[must_use]
-    pub fn take_approval_rx(&self) -> Option<mpsc::UnboundedReceiver<OutputEvent>> {
+    pub fn take_approval_rx(&self) -> Option<mpsc::UnboundedReceiver<SequencedOutputEvent>> {
         let receiver = self
             .approval_rx
             .lock()
@@ -759,7 +953,7 @@ impl ChannelOutputWriter {
     }
 
     #[must_use]
-    pub fn take_priority_rx(&self) -> Option<mpsc::UnboundedReceiver<OutputEvent>> {
+    pub fn take_priority_rx(&self) -> Option<mpsc::UnboundedReceiver<SequencedOutputEvent>> {
         let receiver = self
             .priority_rx
             .lock()
@@ -826,27 +1020,151 @@ impl ChannelOutputWriter {
         }
     }
 
-    fn flush_reasoning_snapshot(&self) {
-        let Some(snapshot) = self.reasoning_mailbox.take() else {
+    fn flush_reasoning_snapshot_locked(&self, inner: &mut ChannelOutputWriterInner) {
+        let Some((snapshot, _)) = self.reasoning_mailbox.take_with_sequence() else {
             return;
         };
-        if let Err(error) = self.tx.try_send(OutputEvent::ReasoningChunk(snapshot)) {
-            self.record_dropped_event(&error.into_inner());
+        let sequence = inner.next_sequence;
+        inner.next_sequence = inner.next_sequence.saturating_add(1);
+        let sequenced = SequencedOutputEvent::new(sequence, OutputEvent::ReasoningChunk(snapshot));
+        if let Err(error) = self.tx.try_send(sequenced) {
+            self.record_dropped_event(&error.into_inner().event);
         }
+    }
+
+    /// Estimated heap payload of an event, used only to bound the deferred
+    /// finalized queue. Exact accounting is unnecessary; the goal is to cap
+    /// memory when deferred events are individually large.
+    fn estimated_event_bytes(event: &OutputEvent) -> usize {
+        match event {
+            OutputEvent::Line(line)
+            | OutputEvent::ModelUpdateLine(line)
+            | OutputEvent::ToolOutputLine(line)
+            | OutputEvent::ToolHeaderLine(line)
+            | OutputEvent::CommandHeaderLine(line)
+            | OutputEvent::CommandOutputLine(line)
+            | OutputEvent::UserPromptLine(line)
+            | OutputEvent::LocalCommandEcho(line)
+            | OutputEvent::TurnIndicator(line) => line.to_string().len(),
+            OutputEvent::ReasoningChunk(chunk)
+            | OutputEvent::RawAnsi(chunk)
+            | OutputEvent::Completion(chunk)
+            | OutputEvent::ErrorBox(chunk) => chunk.len(),
+            OutputEvent::TurnEnd {
+                accumulated_text, ..
+            } => accumulated_text.len(),
+            OutputEvent::QueuedMessageStarted { .. } | OutputEvent::ApprovalFinished { .. } => {
+                std::mem::size_of::<usize>()
+            }
+            OutputEvent::ApprovalRequested(_) => 1024,
+        }
+    }
+
+    fn push_deferred_finalized_event_inner(
+        &self,
+        inner: &mut ChannelOutputWriterInner,
+        event: SequencedOutputEvent,
+    ) {
+        let bytes = Self::estimated_event_bytes(&event.event);
+        // A single event larger than the whole byte bound can never fit no
+        // matter how much is evicted. Reject it before evicting any valid
+        // older output, so a single oversized arrival cannot discard
+        // already-queued finalized events.
+        if bytes > self.max_deferred_finalized_bytes {
+            self.record_dropped_event(&event.event);
+            return;
+        }
+        let queue = &mut inner.deferred_finalized_events;
+        while !queue.events.is_empty()
+            && (queue.events.len() >= self.max_deferred_finalized_events
+                || queue.bytes.saturating_add(bytes) > self.max_deferred_finalized_bytes)
+        {
+            if let Some(dropped) = queue.events.pop_front() {
+                queue.bytes = queue.bytes.saturating_sub(dropped.bytes);
+                self.record_dropped_event(&dropped.event.event);
+            }
+        }
+        queue.bytes = queue.bytes.saturating_add(bytes);
+        queue.events.push_back(SizedOutputEvent { event, bytes });
+    }
+
+    /// Flush any deferred finalized events back into the main channel.
+    /// Returns `(moved, remaining)`: how many events were re-inserted and
+    /// how many are still waiting. The drain loop uses `remaining` to keep
+    /// pulling before post-priority control events render, preserving
+    /// emission order across lanes.
+    fn flush_deferred_finalized_events_inner(
+        &self,
+        inner: &mut ChannelOutputWriterInner,
+    ) -> (usize, usize) {
+        let mut moved = 0usize;
+        let queue = &mut inner.deferred_finalized_events;
+        while let Some(pending) = queue.events.pop_front() {
+            queue.bytes = queue.bytes.saturating_sub(pending.bytes);
+            match self.tx.try_send(pending.event) {
+                Ok(()) => {
+                    moved = moved.saturating_add(1);
+                }
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    let bytes = Self::estimated_event_bytes(&event.event);
+                    queue.bytes = queue.bytes.saturating_add(bytes);
+                    queue.events.push_front(SizedOutputEvent { event, bytes });
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(event)) => {
+                    // The TUI is gone; count the rest as lost so the
+                    // diagnostic reflects what never rendered.
+                    self.record_dropped_event(&event.event);
+                    while let Some(pending) = queue.events.pop_front() {
+                        queue.bytes = queue.bytes.saturating_sub(pending.bytes);
+                        self.record_dropped_event(&pending.event.event);
+                    }
+                    break;
+                }
+            }
+        }
+        (moved, queue.events.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_queue_for_test(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .deferred_finalized_events
+            .events
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_bytes_for_test(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .deferred_finalized_events
+            .bytes
     }
 }
 
 impl OutputWriter for ChannelOutputWriter {
     fn emit(&self, event: OutputEvent) {
+        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+
         if let OutputEvent::ReasoningChunk(chunk) = event {
-            self.reasoning_mailbox.append(chunk);
+            let sequence = inner.next_sequence;
+            inner.next_sequence = inner.next_sequence.saturating_add(1);
+            self.reasoning_mailbox.append_with_sequence(chunk, sequence);
             return;
         }
 
-        self.flush_reasoning_snapshot();
+        self.flush_reasoning_snapshot_locked(&mut inner);
+
+        let sequence = inner.next_sequence;
+        inner.next_sequence = inner.next_sequence.saturating_add(1);
+        let sequenced = SequencedOutputEvent::new(sequence, event);
 
         if matches!(
-            &event,
+            &sequenced.event,
             OutputEvent::ApprovalRequested(_) | OutputEvent::ApprovalFinished { .. }
         ) {
             // Approval bypasses transcript backlog so the panel is rendered
@@ -855,24 +1173,36 @@ impl OutputWriter for ChannelOutputWriter {
                 .approval_attached
                 .load(std::sync::atomic::Ordering::Acquire)
             {
-                self.fail_control_delivery(event, "interactive approval receiver is not attached");
+                self.fail_control_delivery(
+                    sequenced.event,
+                    "interactive approval receiver is not attached",
+                );
                 return;
             }
-            if let Err(err) = self.approval_tx.send(event) {
-                self.fail_control_delivery(err.0, "interactive approval receiver is closed");
+            if let Err(err) = self.approval_tx.send(sequenced) {
+                self.fail_control_delivery(err.0.event, "interactive approval receiver is closed");
             }
             return;
         }
 
-        let is_lossy_update = matches!(event, OutputEvent::ModelUpdateLine(_));
+        let is_lossy_update = sequenced.event.is_lossy();
+        if !is_lossy_update {
+            // Re-insert any waiting finalized events before appending: a
+            // slot freed by the drain loop must go to the oldest waiter
+            // first. Without this, a newer event could take the freed slot
+            // while an older event still waits in the deferred queue,
+            // reordering the transcript. Lossy snapshots skip this; they
+            // are droppable.
+            self.flush_deferred_finalized_events_inner(&mut inner);
+        }
         // This path must remain non-blocking. A slow TUI is handled as an
         // explicit delivery policy below (lossy updates are counted; critical
         // events use the priority lane), rather than stalling the agent or a
         // tool producer behind the UI.
-        if let Err(err) = self.tx.try_send(event) {
+        if let Err(err) = self.tx.try_send(sequenced) {
             if is_lossy_update {
                 let dropped = err.into_inner();
-                self.record_dropped_event(&dropped);
+                self.record_dropped_event(&dropped.event);
                 return;
             }
 
@@ -881,7 +1211,7 @@ impl OutputWriter for ChannelOutputWriter {
             // dropped (non-critical).
             let dropped = err.into_inner();
             let is_critical = matches!(
-                &dropped,
+                &dropped.event,
                 OutputEvent::TurnEnd { .. }
                     | OutputEvent::Completion(_)
                     | OutputEvent::ErrorBox(_)
@@ -894,12 +1224,17 @@ impl OutputWriter for ChannelOutputWriter {
                 // into the unbounded critical lane so the TUI always sees
                 // them even when the main queue is backed up.
                 if let Err(err) = self.priority_tx.send(dropped) {
-                    self.record_dropped_event(&err.0);
+                    self.record_dropped_event(&err.0.event);
                 }
                 return;
             }
 
-            self.record_dropped_event(&dropped);
+            // Finalized, non-lossy, non-critical event: queue it in the
+            // bounded deferred FIFO. The drain loop re-inserts these in
+            // emission order before applying post-priority control events.
+            // Beyond the bound the oldest waiter is evicted as a counted,
+            // signaled bounded failure (see `DeferredFinalizedQueue`).
+            self.push_deferred_finalized_event_inner(&mut inner, dropped);
         }
     }
 
@@ -919,6 +1254,31 @@ impl OutputWriter for ChannelOutputWriter {
 
     fn drop_summary(&self) -> String {
         self.drop_counters.format_summary()
+    }
+
+    fn flush_deferred_finalized_events(&self) -> (usize, usize) {
+        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        self.flush_deferred_finalized_events_inner(&mut inner)
+    }
+
+    fn has_deferred_finalized_events(&self) -> bool {
+        !self
+            .inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .deferred_finalized_events
+            .events
+            .is_empty()
+    }
+
+    fn oldest_deferred_sequence(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .deferred_finalized_events
+            .events
+            .front()
+            .map(|e| e.event.sequence)
     }
 }
 
@@ -1237,7 +1597,7 @@ mod tests {
     fn test_channel_overflow_preserves_approval_prompt_via_approval_lane() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
         let mut approval_rx = writer
             .take_approval_rx()
@@ -1257,7 +1617,7 @@ mod tests {
         let event = approval_rx
             .try_recv()
             .expect("approval should bypass the saturated transcript queue");
-        let OutputEvent::ApprovalRequested(request) = event else {
+        let OutputEvent::ApprovalRequested(request) = event.event else {
             panic!("expected approval request in control lane");
         };
         assert!(request.details().contains("Execute this tool?"));
@@ -1277,7 +1637,7 @@ mod tests {
     fn test_channel_overflow_coalesces_reasoning_chunks_in_bounded_mailbox() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
 
         writer.emit(OutputEvent::plain("line 1"));
@@ -1296,19 +1656,19 @@ mod tests {
     fn test_reasoning_snapshot_is_queued_before_following_output() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<OutputEvent>(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let writer = ChannelOutputWriter::new(tx);
 
         writer.emit(OutputEvent::reasoning_chunk("thinking"));
         writer.emit(OutputEvent::plain("answer"));
 
         assert!(matches!(
-            rx.try_recv(),
-            Ok(OutputEvent::ReasoningChunk(chunk)) if chunk == "thinking"
+            rx.try_recv().unwrap().event,
+            OutputEvent::ReasoningChunk(chunk) if chunk == "thinking"
         ));
         assert!(matches!(
-            rx.try_recv(),
-            Ok(OutputEvent::Line(line)) if line.to_string() == "answer"
+            rx.try_recv().unwrap().event,
+            OutputEvent::Line(line) if line.to_string() == "answer"
         ));
         assert!(!writer.reasoning_mailbox().is_pending());
     }
@@ -1347,7 +1707,7 @@ mod tests {
         let mailbox = ReasoningMailbox::default();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut guard = mailbox.pending.lock().unwrap();
-            *guard = Some("partial".to_string());
+            *guard = Some(("partial".to_string(), 0));
             panic!("simulate a panic while holding the mailbox lock");
         }));
 
@@ -1359,23 +1719,125 @@ mod tests {
     fn test_dropped_reasoning_snapshot_is_counted_when_main_queue_is_full() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
 
         writer.emit(OutputEvent::plain("line 1"));
         writer.emit(OutputEvent::reasoning_chunk("thinking"));
         writer.emit(OutputEvent::plain("line 2"));
 
-        assert_eq!(writer.dropped_count(), 2);
-        assert_eq!(writer.drop_summary(), "1 model, 1 reasoning");
+        // "line 2" is now a finalized Line that goes to the bounded
+        // deferred queue instead of being counted as a drop. Only the
+        // transient reasoning snapshot is dropped and counted.
+        assert_eq!(writer.dropped_count(), 1);
+        assert_eq!(writer.drop_summary(), "1 reasoning");
         assert!(writer.take_overflow_signal());
+    }
+
+    #[test]
+    fn test_deferred_finalized_rejects_single_oversized_event() {
+        // P2 regression: a single finalized event larger than the byte
+        // bound can never fit no matter how much is evicted. It must be
+        // rejected as a counted, signaled bounded failure rather than
+        // being inserted and exceeding the advertised byte bound.
+        use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        // 8-byte payload budget with room for smaller events.
+        let writer = ChannelOutputWriter::with_deferred_capacity_and_bytes(tx, 1_024, 8);
+
+        writer.emit(OutputEvent::plain("main"));
+        let oversized = "X".repeat(100);
+        writer.emit(OutputEvent::plain(oversized));
+        assert_eq!(
+            writer.deferred_queue_for_test(),
+            0,
+            "oversized event must not be inserted into the deferred queue"
+        );
+        assert_eq!(
+            writer.deferred_bytes_for_test(),
+            0,
+            "oversized event must not exceed the byte bound by sitting in the deferred queue"
+        );
+        assert_eq!(writer.dropped_count(), 1);
+        assert_eq!(writer.drop_summary(), "1 model");
+        assert!(writer.take_overflow_signal());
+
+        // The main channel is untouched: the original line still drains.
+        assert!(matches!(
+            rx.try_recv().expect("main queue should still hold the first line").event,
+            OutputEvent::Line(line) if line.to_string() == "main"
+        ));
+        let (moved, remaining) = writer.flush_deferred_finalized_events();
+        assert_eq!(moved, 0);
+        assert_eq!(remaining, 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_oversized_arrival_preserves_existing_deferred_event() {
+        // P1 regression: when the deferred queue already holds a valid
+        // finalized event and a new oversized event arrives, the existing
+        // event must survive. The oversized event is rejected before any
+        // eviction, so it cannot evict valid older output.
+        use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        // 8-byte payload budget: "existing" (8 bytes) fits, "oversized" (100) does not.
+        let writer = ChannelOutputWriter::with_deferred_capacity_and_bytes(tx, 1_024, 8);
+
+        // Fill the main channel so the first event goes to the deferred queue.
+        writer.emit(OutputEvent::plain("main"));
+        // This event overflows into the deferred queue (8 bytes, fits the bound).
+        writer.emit(OutputEvent::plain("existing"));
+        assert_eq!(
+            writer.deferred_queue_for_test(),
+            1,
+            "existing event must be in the deferred queue"
+        );
+        assert_eq!(
+            writer.deferred_bytes_for_test(),
+            8,
+            "existing event must account for its 8 bytes"
+        );
+
+        // Now an oversized event arrives. It must be rejected without
+        // evicting the existing event.
+        let oversized = "X".repeat(100);
+        writer.emit(OutputEvent::plain(oversized));
+
+        assert_eq!(
+            writer.deferred_queue_for_test(),
+            1,
+            "existing event must survive the oversized arrival"
+        );
+        assert_eq!(
+            writer.deferred_bytes_for_test(),
+            8,
+            "byte count must be unchanged after oversized rejection"
+        );
+        // Only the oversized event is counted as dropped.
+        assert_eq!(writer.dropped_count(), 1);
+        assert_eq!(writer.drop_summary(), "1 model");
+        assert!(writer.take_overflow_signal());
+
+        // The existing event is still intact and flushable.
+        // Drain the main channel first to free a slot.
+        let _ = rx.try_recv();
+        let (moved, remaining) = writer.flush_deferred_finalized_events();
+        assert_eq!(moved, 1);
+        assert_eq!(remaining, 0);
+        assert!(matches!(
+            rx.try_recv().expect("existing event should flush to main").event,
+            OutputEvent::Line(line) if line.to_string() == "existing"
+        ));
     }
 
     #[test]
     fn test_approval_request_fails_closed_without_attached_ui() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
         let (request, response_rx) = crate::core::approval::approval_request_for_test(
             51,
@@ -1398,7 +1860,7 @@ mod tests {
     fn test_approval_request_fails_closed_after_ui_disconnects() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
         let approval_rx = writer
             .take_approval_rx()
@@ -1425,7 +1887,7 @@ mod tests {
     fn test_channel_overflow_counts_critical_events_after_priority_disconnect() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
         let priority_rx = writer
             .take_priority_rx()
@@ -1455,7 +1917,7 @@ mod tests {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
         use ratatui::text::Line;
 
-        let (tx, _rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
 
         writer.emit(OutputEvent::plain("line 1"));
@@ -1470,7 +1932,7 @@ mod tests {
     fn test_channel_overflow_still_signals_when_all_receivers_are_gone() {
         use super::{ChannelOutputWriter, OutputEvent, OutputWriter};
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<OutputEvent>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
         let writer = ChannelOutputWriter::new(tx);
         let priority_rx = writer
             .take_priority_rx()
@@ -1480,6 +1942,10 @@ mod tests {
         drop(priority_rx);
 
         writer.emit(OutputEvent::plain("dropped"));
+        // Closed receivers are only discovered once the deferred flush
+        // attempts the send; the deferred queue holds finalized output
+        // until then.
+        let _ = writer.flush_deferred_finalized_events();
 
         assert!(
             writer.take_overflow_signal(),

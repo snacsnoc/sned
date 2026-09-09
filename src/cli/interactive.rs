@@ -3,7 +3,9 @@
 //! Extracted from `cli/mod.rs` — handles raw mode, terminal rendering,
 //! file picker, input queuing, and agent lifecycle.
 
-use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriterArc};
+use crate::cli::output::{
+    ChannelOutputWriter, OutputEvent, OutputWriter, OutputWriterArc, SequencedOutputEvent,
+};
 use crate::cli::tui::app::{NotificationKind, PasteOutcome, PendingModelSwitch, TurnRenderRequest};
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
@@ -1289,13 +1291,14 @@ fn handle_copy_command(app: &mut App, copy: impl FnOnce(&str) -> std::io::Result
 /// Service control lanes before normal output so approvals stay actionable and
 /// critical terminal events cannot be starved by a saturated main queue.
 fn drain_output_queues(
-    approval_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
-    priority_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
-    rx: &mut mpsc::Receiver<OutputEvent>,
+    approval_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    priority_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    rx: &mut mpsc::Receiver<SequencedOutputEvent>,
     app: &mut App,
     storage: Option<&TaskStorage>,
     reasoning_mailbox: Option<&crate::cli::output::ReasoningMailbox>,
     turn_render_worker: Option<&TurnRenderWorker>,
+    finalized_output: Option<&dyn OutputWriter>,
 ) -> usize {
     drain_output_queues_with_summary(
         approval_rx,
@@ -1305,6 +1308,7 @@ fn drain_output_queues(
         storage,
         reasoning_mailbox,
         turn_render_worker,
+        finalized_output,
     )
     .drained_events
 }
@@ -1353,13 +1357,14 @@ struct DrainOutputSummary {
 }
 
 fn drain_output_queues_with_summary(
-    approval_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
-    priority_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
-    rx: &mut mpsc::Receiver<OutputEvent>,
+    approval_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    priority_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    rx: &mut mpsc::Receiver<SequencedOutputEvent>,
     app: &mut App,
     storage: Option<&TaskStorage>,
     reasoning_mailbox: Option<&crate::cli::output::ReasoningMailbox>,
     turn_render_worker: Option<&TurnRenderWorker>,
+    finalized_output: Option<&dyn OutputWriter>,
 ) -> DrainOutputSummary {
     const MAX_CRITICAL_EVENTS_PER_DRAIN: usize = 512;
     const MAX_DEFERRED_PRIORITY_EVENTS: usize = 1_024;
@@ -1374,7 +1379,8 @@ fn drain_output_queues_with_summary(
     let mut turn_end_boundaries = Vec::new();
     let mut pending_model_update = app.take_pending_transcript_model_line();
     let mut pending_reasoning_lines = app.take_pending_transcript_reasoning_lines();
-    let pending_reasoning_snapshot = reasoning_mailbox.and_then(|mailbox| mailbox.take());
+    let pending_reasoning_snapshot =
+        reasoning_mailbox.and_then(|mailbox| mailbox.take_with_sequence());
 
     let mut deferred_priority = std::mem::take(&mut app.deferred_priority_events);
     // Approvals have no per-frame budget: a prompt must become visible even
@@ -1382,10 +1388,10 @@ fn drain_output_queues_with_summary(
     while let Ok(event) = approval_rx.try_recv() {
         drained_events = drained_events.saturating_add(1);
         saw_output = true;
-        let (is_turn_end, turn_end_timing) = turn_end_event_data(&event);
+        let (is_turn_end, turn_end_timing) = turn_end_event_data(&event.event);
         apply_output_event(
             app,
-            event,
+            event.event,
             &mut pending_model_update,
             &mut pending_reasoning_lines,
             storage,
@@ -1420,10 +1426,10 @@ fn drain_output_queues_with_summary(
                 "critical output backlog exceeded deferred priority limit"
             );
             saw_output = true;
-            let (is_turn_end, turn_end_timing) = turn_end_event_data(&event);
+            let (is_turn_end, turn_end_timing) = turn_end_event_data(&event.event);
             apply_output_event(
                 app,
-                event,
+                event.event,
                 &mut pending_model_update,
                 &mut pending_reasoning_lines,
                 storage,
@@ -1447,7 +1453,7 @@ fn drain_output_queues_with_summary(
     let mut post_main_priority = VecDeque::new();
     for event in deferred_priority {
         if matches!(
-            &event,
+            &event.event,
             OutputEvent::ReasoningChunk(_)
                 | OutputEvent::Completion(_)
                 | OutputEvent::TurnEnd { .. }
@@ -1458,8 +1464,11 @@ fn drain_output_queues_with_summary(
             pre_main_priority.push_back(event);
         }
     }
-    if let Some(snapshot) = pending_reasoning_snapshot {
-        post_main_priority.push_front(OutputEvent::ReasoningChunk(snapshot));
+    if let Some((snapshot, seq)) = pending_reasoning_snapshot {
+        post_main_priority.push_front(SequencedOutputEvent::new(
+            seq,
+            OutputEvent::ReasoningChunk(snapshot),
+        ));
     }
 
     let mut critical_budget = MAX_CRITICAL_EVENTS_PER_DRAIN;
@@ -1469,10 +1478,10 @@ fn drain_output_queues_with_summary(
         };
         critical_budget = critical_budget.saturating_sub(1);
         saw_output = true;
-        let (is_turn_end, turn_end_timing) = turn_end_event_data(&event);
+        let (is_turn_end, turn_end_timing) = turn_end_event_data(&event.event);
         apply_output_event(
             app,
-            event,
+            event.event,
             &mut pending_model_update,
             &mut pending_reasoning_lines,
             storage,
@@ -1492,28 +1501,35 @@ fn drain_output_queues_with_summary(
     }
 
     let mut main_budget = adaptive_main_event_budget(rx.len());
-    while main_budget > 0
-        && drain_started.elapsed() < MAX_DRAIN_DURATION
-        && let Ok(event) = rx.try_recv()
-    {
-        main_budget = main_budget.saturating_sub(1);
-        drained_events = drained_events.saturating_add(1);
-        if matches!(
-            &event,
-            OutputEvent::TurnEnd { .. } | OutputEvent::UserPromptLine(_)
-        ) {
-            // A completion/error that spilled into the critical lane must be
-            // applied after streamed prose but before turn finalization or a
-            // new prompt clears the previous terminal state.
+    'main_drain: loop {
+        while main_budget > 0
+            && drain_started.elapsed() < MAX_DRAIN_DURATION
+            && let Ok(sequenced) = rx.try_recv()
+        {
+            main_budget = main_budget.saturating_sub(1);
+            drained_events = drained_events.saturating_add(1);
+
+            // Sequence barrier: apply any post-priority controls that were
+            // emitted BEFORE this main event (priority.sequence < sequenced.sequence).
+            // Unsequenced events (sequence == 0) wait until a turn boundary or queue drain.
+            // This ensures controls never overtake prior output, while preventing
+            // starvation when sustained output follows the control.
             while critical_budget > 0 {
-                let Some(priority_event) = post_main_priority.pop_front() else {
+                let Some(priority_event) = post_main_priority.front() else {
                     break;
                 };
+                if priority_event.sequence == 0
+                    || sequenced.sequence == 0
+                    || priority_event.sequence >= sequenced.sequence
+                {
+                    break;
+                }
+                let priority_event = post_main_priority.pop_front().unwrap();
                 critical_budget = critical_budget.saturating_sub(1);
-                let (is_turn_end, turn_end_timing) = turn_end_event_data(&priority_event);
+                let (is_turn_end, turn_end_timing) = turn_end_event_data(&priority_event.event);
                 apply_output_event(
                     app,
-                    priority_event,
+                    priority_event.event,
                     &mut pending_model_update,
                     &mut pending_reasoning_lines,
                     storage,
@@ -1531,55 +1547,139 @@ fn drain_output_queues_with_summary(
                     &mut turn_end_boundaries,
                 );
             }
+
+            if matches!(
+                &sequenced.event,
+                OutputEvent::TurnEnd { .. } | OutputEvent::UserPromptLine(_)
+            ) {
+                // A completion/error that spilled into the critical lane before or at
+                // this turn boundary must be applied after streamed prose but before
+                // turn finalization or a new prompt clears the previous terminal state.
+                // Priority events that belong to later sequences (emitted AFTER this
+                // TurnEnd or UserPromptLine) must remain deferred.
+                while critical_budget > 0 {
+                    let Some(priority_event) = post_main_priority.front() else {
+                        break;
+                    };
+                    if priority_event.sequence != 0
+                        && sequenced.sequence != 0
+                        && priority_event.sequence > sequenced.sequence
+                    {
+                        break;
+                    }
+                    let priority_event = post_main_priority.pop_front().unwrap();
+                    critical_budget = critical_budget.saturating_sub(1);
+                    let (is_turn_end, turn_end_timing) = turn_end_event_data(&priority_event.event);
+                    apply_output_event(
+                        app,
+                        priority_event.event,
+                        &mut pending_model_update,
+                        &mut pending_reasoning_lines,
+                        storage,
+                        turn_render_worker,
+                    );
+                    record_turn_end_boundary(
+                        is_turn_end,
+                        turn_end_timing,
+                        is_turn_end
+                            .then(|| app.take_last_turn_render_generation())
+                            .flatten(),
+                        app,
+                        drained_events,
+                        &mut saw_turn_end,
+                        &mut turn_end_boundaries,
+                    );
+                }
+            }
+            saw_output = true;
+            let (is_turn_end, turn_end_timing) = turn_end_event_data(&sequenced.event);
+            apply_output_event(
+                app,
+                sequenced.event,
+                &mut pending_model_update,
+                &mut pending_reasoning_lines,
+                storage,
+                turn_render_worker,
+            );
+            record_turn_end_boundary(
+                is_turn_end,
+                turn_end_timing,
+                is_turn_end
+                    .then(|| app.take_last_turn_render_generation())
+                    .flatten(),
+                app,
+                drained_events,
+                &mut saw_turn_end,
+                &mut turn_end_boundaries,
+            );
         }
-        saw_output = true;
-        let (is_turn_end, turn_end_timing) = turn_end_event_data(&event);
-        apply_output_event(
-            app,
-            event,
-            &mut pending_model_update,
-            &mut pending_reasoning_lines,
-            storage,
-            turn_render_worker,
-        );
-        record_turn_end_boundary(
-            is_turn_end,
-            turn_end_timing,
-            is_turn_end
-                .then(|| app.take_last_turn_render_generation())
-                .flatten(),
-            app,
-            drained_events,
-            &mut saw_turn_end,
-            &mut turn_end_boundaries,
-        );
-    }
-    while critical_budget > 0 && drain_started.elapsed() < MAX_DRAIN_DURATION {
-        let Some(event) = post_main_priority.pop_front() else {
-            break;
+        // Re-insert any waiting finalized output before the post-priority
+        // control events apply. The priority lane drains before the main
+        // queue; without this, a single pass would render A, Completion
+        // while a deferred B waits for the next frame. The per-frame budget
+        // and frame time still win: under sustained flood the remainder
+        // (and any trailing control) waits for the next frame, keeping the
+        // TUI responsive while bounded loss (via the deferred-queue
+        // eviction policy) remains the visible signal of backpressure.
+        let Some(writer) = finalized_output else {
+            break 'main_drain;
         };
-        critical_budget = critical_budget.saturating_sub(1);
-        saw_output = true;
-        let (is_turn_end, turn_end_timing) = turn_end_event_data(&event);
-        apply_output_event(
-            app,
-            event,
-            &mut pending_model_update,
-            &mut pending_reasoning_lines,
-            storage,
-            turn_render_worker,
-        );
-        record_turn_end_boundary(
-            is_turn_end,
-            turn_end_timing,
-            is_turn_end
-                .then(|| app.take_last_turn_render_generation())
-                .flatten(),
-            app,
-            drained_events,
-            &mut saw_turn_end,
-            &mut turn_end_boundaries,
-        );
+        if main_budget == 0 || drain_started.elapsed() >= MAX_DRAIN_DURATION {
+            break 'main_drain;
+        }
+        let (moved, _) = writer.flush_deferred_finalized_events();
+        if moved == 0 {
+            break 'main_drain;
+        }
+    }
+    // Post-priority controls must not overtake deferred finalized output or
+    // unconsumed finalized events remaining in the main queue that were emitted
+    // before the control.
+    // If preceding events are still waiting in the deferred queue or in the
+    // main channel when the frame budget or time budget expired, skip the
+    // post-priority application in this pass. The controls will be applied on
+    // the next frame, after preceding main and deferred events have been
+    // processed, preserving emission order.
+    let preceding_main_remaining = if let Some(priority) = post_main_priority.front() {
+        if priority.sequence == 0 {
+            !rx.is_empty() || finalized_output.is_some_and(|w| w.has_deferred_finalized_events())
+        } else {
+            !rx.is_empty()
+                || finalized_output
+                    .and_then(|w| w.oldest_deferred_sequence())
+                    .is_some_and(|seq| seq < priority.sequence)
+        }
+    } else {
+        false
+    };
+    if !preceding_main_remaining {
+        while critical_budget > 0 && drain_started.elapsed() < MAX_DRAIN_DURATION {
+            let Some(event) = post_main_priority.pop_front() else {
+                break;
+            };
+            critical_budget = critical_budget.saturating_sub(1);
+            saw_output = true;
+            let (is_turn_end, turn_end_timing) = turn_end_event_data(&event.event);
+            apply_output_event(
+                app,
+                event.event,
+                &mut pending_model_update,
+                &mut pending_reasoning_lines,
+                storage,
+                turn_render_worker,
+            );
+            record_turn_end_boundary(
+                is_turn_end,
+                turn_end_timing,
+                is_turn_end
+                    .then(|| app.take_last_turn_render_generation())
+                    .flatten(),
+                app,
+                drained_events,
+                &mut saw_turn_end,
+                &mut turn_end_boundaries,
+            );
+        }
     }
     pre_main_priority.append(&mut post_main_priority);
     app.deferred_priority_events = pre_main_priority;
@@ -1625,7 +1725,7 @@ fn drain_output_queues_with_summary(
 }
 
 #[cfg(test)]
-fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
+fn drain_output(rx: &mut mpsc::Receiver<SequencedOutputEvent>, app: &mut App) {
     let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
     drain_output_queues(
@@ -1633,6 +1733,7 @@ fn drain_output(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
         &mut priority_rx,
         rx,
         app,
+        None,
         None,
         None,
         None,
@@ -1735,9 +1836,9 @@ fn next_draw_retry_delay(current: Duration, maximum: Duration) -> Duration {
 fn drain_and_render_user_submit(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    approval_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
-    priority_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
-    output_rx: &mut mpsc::Receiver<OutputEvent>,
+    approval_output_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    priority_output_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    output_rx: &mut mpsc::Receiver<SequencedOutputEvent>,
     storage: &TaskStorage,
     debug: bool,
     terminal_desynced: &mut bool,
@@ -1748,6 +1849,7 @@ fn drain_and_render_user_submit(
         output_rx,
         app,
         Some(storage),
+        None,
         None,
         None,
     );
@@ -1784,7 +1886,7 @@ fn echo_agent_prompt(app: &mut App, text: &str, output_writer: &OutputWriterArc)
 /// `cli::tui::app` can verify the emit → drain pipeline against a real
 /// `ChannelOutputWriter` without standing up a full `ratatui::DefaultTerminal`.
 #[cfg(test)]
-pub(crate) fn drain_output_for_test(rx: &mut mpsc::Receiver<OutputEvent>, app: &mut App) {
+pub(crate) fn drain_output_for_test(rx: &mut mpsc::Receiver<SequencedOutputEvent>, app: &mut App) {
     let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
     let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
     drain_output_queues(
@@ -1795,32 +1897,42 @@ pub(crate) fn drain_output_for_test(rx: &mut mpsc::Receiver<OutputEvent>, app: &
         None,
         None,
         None,
+        None,
     );
 }
 
 #[cfg(test)]
 pub(crate) fn drain_output_for_test_with_priority(
-    priority_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
-    rx: &mut mpsc::Receiver<OutputEvent>,
+    priority_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    rx: &mut mpsc::Receiver<SequencedOutputEvent>,
     app: &mut App,
 ) {
     let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
-    drain_output_queues(&mut approval_rx, priority_rx, rx, app, None, None, None);
+    drain_output_queues(
+        &mut approval_rx,
+        priority_rx,
+        rx,
+        app,
+        None,
+        None,
+        None,
+        None,
+    );
 }
 
 #[cfg(test)]
 pub(crate) fn drain_output_for_test_with_lanes(
-    approval_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
-    priority_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
-    rx: &mut mpsc::Receiver<OutputEvent>,
+    approval_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    priority_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    rx: &mut mpsc::Receiver<SequencedOutputEvent>,
     app: &mut App,
 ) {
-    drain_output_queues(approval_rx, priority_rx, rx, app, None, None, None);
+    drain_output_queues(approval_rx, priority_rx, rx, app, None, None, None, None);
 }
 
 #[cfg(test)]
 pub(crate) fn drain_output_for_test_with_storage(
-    rx: &mut mpsc::Receiver<OutputEvent>,
+    rx: &mut mpsc::Receiver<SequencedOutputEvent>,
     app: &mut App,
     storage: &TaskStorage,
 ) {
@@ -1832,6 +1944,7 @@ pub(crate) fn drain_output_for_test_with_storage(
         rx,
         app,
         Some(storage),
+        None,
         None,
         None,
     );
@@ -4284,10 +4397,10 @@ impl TurnRenderWorker {
 async fn run_main_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    approval_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
-    priority_output_rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    approval_output_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    priority_output_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
     mention_search_rx: &mut mpsc::UnboundedReceiver<crate::cli::tui::app::MentionSearchUpdate>,
-    output_rx: &mut mpsc::Receiver<OutputEvent>,
+    output_rx: &mut mpsc::Receiver<SequencedOutputEvent>,
     reasoning_mailbox: crate::cli::output::ReasoningMailbox,
     turn_render_worker: &TurnRenderWorker,
     output_writer: OutputWriterArc,
@@ -4591,6 +4704,7 @@ async fn run_main_loop(
                 Some(&task_storage),
                 Some(&reasoning_mailbox),
                 Some(turn_render_worker),
+                Some(&*output_writer),
             );
             let drained_events = drain_summary.drained_events;
             // Lost transcript context remains visible because it may affect
@@ -5794,15 +5908,21 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
         let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: "done".to_string(),
-            timing: None,
-        })
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: "done".to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: "done again".to_string(),
-            timing: None,
-        })
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: "done again".to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
         let mut app = App::new();
 
@@ -5814,10 +5934,1202 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert_eq!(summary.drained_events, 2);
         assert_eq!(summary.turn_end_boundaries.len(), 2);
+    }
+
+    #[test]
+    fn test_single_drain_pass_applies_deferred_finalized_before_priority_completion() {
+        // P1 regression: reachable production hazard where A holds the
+        // only main slot, B waits in the deferred finalized queue, and a
+        // Completion lands on the priority lane. The priority lane drains
+        // before the main queue; without an in-drain merge, one pass
+        // would apply A, Completion while B waits for the next frame.
+        // The pass must apply A, B, Completion.
+        use crate::cli::output::{ChannelOutputWriter, OutputWriter};
+
+        let (tx, mut main_rx) = mpsc::channel(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+        let mut app = App::new();
+
+        writer.emit(OutputEvent::Line(Line::from("A")));
+        writer.emit(OutputEvent::Line(Line::from("B")));
+        writer.emit(OutputEvent::Completion("done".to_string()));
+        assert_eq!(
+            writer.deferred_queue_for_test(),
+            1,
+            "B must wait deferred while A holds the only main slot"
+        );
+
+        // Mirror the production schedule: one pre-drain flush, then
+        // exactly one drain pass with the writer attached for the
+        // in-drain merge.
+        writer.flush_deferred_finalized_events();
+        let summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            Some(&writer),
+        );
+        assert_eq!(
+            summary.drained_events, 3,
+            "A, B, and Completion must all apply in one pass"
+        );
+
+        let rendered = app
+            .output_lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let position = |needle: &str| {
+            rendered
+                .iter()
+                .position(|line| line == needle)
+                .unwrap_or_else(|| panic!("expected transcript row {needle:?}, got {rendered:?}"))
+        };
+        let completion_idx = rendered
+            .iter()
+            .position(|line| line.contains("done"))
+            .expect("completion should be in the transcript");
+        assert!(position("A") < position("B"), "A must precede B");
+        assert!(
+            position("B") < completion_idx,
+            "deferred B must precede priority Completion, got: {rendered:?}"
+        );
+        assert_eq!(writer.dropped_count(), 0);
+    }
+
+    #[test]
+    fn test_budget_expiry_defers_priority_completion_behind_finalized() {
+        // P1 regression: when the frame budget expires while a finalized
+        // event is still deferred, post-priority controls must not apply
+        // in the same pass. The Completion waits for the next frame, after
+        // the deferred event has been flushed back into the main channel.
+        use crate::cli::output::{ChannelOutputWriter, OutputWriter};
+
+        // Use a channel with capacity 128 so that the 129th event
+        // overflows to the deferred queue.
+        let (tx, mut main_rx) = mpsc::channel(128);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+        let mut app = App::new();
+
+        // Fill the main channel to capacity (128 events).
+        for i in 0..128 {
+            writer.emit(OutputEvent::Line(Line::from(format!("line-{i}"))));
+        }
+        // The 129th event overflows to the deferred queue.
+        writer.emit(OutputEvent::Line(Line::from("deferred-B")));
+        assert_eq!(
+            writer.deferred_queue_for_test(),
+            1,
+            "deferred-B must wait in the deferred queue"
+        );
+        // Completion goes to the priority lane.
+        writer.emit(OutputEvent::Completion("done".to_string()));
+
+        // One drain pass: the inner loop drains 128 events (budget),
+        // leaving 0 in main + 1 deferred. The post-priority Completion
+        // must NOT apply because deferred-B is still waiting.
+        let summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            Some(&writer),
+        );
+        // 129 events drained: 128 from main + 1 Completion from priority_rx
+        // into deferred_priority.
+        assert_eq!(summary.drained_events, 129);
+        // The Completion must NOT have been applied in this pass.
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert!(
+            !rendered.iter().any(|line| line.contains("done")),
+            "Completion must not overtake deferred finalized output, got: {rendered:?}"
+        );
+        // deferred-B is still in the deferred queue.
+        assert_eq!(
+            writer.deferred_queue_for_test(),
+            1,
+            "deferred-B must still be waiting"
+        );
+
+        // Second pass: the in-drain flush re-inserts deferred-B into main,
+        // then the drain loop applies it. The Completion can now apply
+        // after deferred-B.
+        let _summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            Some(&writer),
+        );
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        let deferred_idx = rendered
+            .iter()
+            .position(|line| line == "deferred-B")
+            .expect("deferred-B should be in the transcript");
+        let completion_idx = rendered
+            .iter()
+            .position(|line| line.contains("done"))
+            .expect("Completion should be in the transcript after second pass");
+        assert!(
+            deferred_idx < completion_idx,
+            "deferred-B must precede Completion, got: {rendered:?}"
+        );
+        assert_eq!(writer.dropped_count(), 0);
+    }
+
+    #[test]
+    fn test_budget_expiry_defers_priority_completion_behind_main_queue() {
+        // P1 regression: when the main queue has more events than the per-frame
+        // drain budget (e.g. 129 events in a channel of capacity 129), the
+        // unconsumed main events must NOT be overtaken by a priority Completion.
+        // The Completion must wait for the next frame so that the final main
+        // line precedes the Completion in the transcript.
+        use crate::cli::output::{ChannelOutputWriter, OutputWriter};
+
+        // Main channel capacity 129 allows all 129 lines to fit in `rx`.
+        let (tx, mut main_rx) = mpsc::channel(129);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+        let mut app = App::new();
+
+        // Emit 129 finalized lines directly into main channel.
+        for i in 0..129 {
+            writer.emit(OutputEvent::Line(Line::from(format!("line-{i}"))));
+        }
+        assert_eq!(
+            writer.deferred_queue_for_test(),
+            0,
+            "all 129 lines fit in main channel"
+        );
+
+        // Emit Completion: since main channel is at capacity (129),
+        // Completion spills to priority lane.
+        writer.emit(OutputEvent::Completion("done".to_string()));
+
+        // Pass 1: drain budget is 128 (adaptive_main_event_budget(129) = 128).
+        // 128 main events drain; 1 remains in rx.
+        // 1 Completion drains from priority_rx into post_main_priority.
+        // Because rx is not empty, Completion must NOT apply this pass.
+        let summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            Some(&writer),
+        );
+        assert_eq!(summary.drained_events, 129);
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert!(
+            !rendered.iter().any(|line| line.contains("done")),
+            "Completion must not overtake remaining main queue events, got: {rendered:?}"
+        );
+        assert_eq!(
+            rendered.len(),
+            128,
+            "exactly 128 lines rendered in first pass"
+        );
+
+        // Pass 2: remaining 129th line ('line-128') drains, rx becomes empty,
+        // and Completion applies after it.
+        let summary2 = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            Some(&writer),
+        );
+        assert_eq!(summary2.drained_events, 1);
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        let last_line_idx = rendered
+            .iter()
+            .position(|line| line == "line-128")
+            .expect("line-128 should be in the transcript");
+        let completion_idx = rendered
+            .iter()
+            .position(|line| line.contains("done"))
+            .expect("Completion should be in the transcript after second pass");
+        assert!(
+            last_line_idx < completion_idx,
+            "line-128 must precede Completion, got: {rendered:?}"
+        );
+        assert_eq!(rendered.len(), 130);
+        assert_eq!(writer.dropped_count(), 0);
+    }
+
+    #[test]
+    fn test_concurrent_finalized_event_after_control_preserves_sequence_order() {
+        // P1 regression: when a producer emits a finalized line A, then a priority
+        // Completion, and then emits line B, the sequence barrier must apply
+        // Completion before line B even though line B arrived before or during
+        // drain processing.
+        use crate::cli::output::{ChannelOutputWriter, OutputWriter};
+
+        let (tx, mut main_rx) = mpsc::channel(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+        let mut app = App::new();
+
+        // 1. Line A takes the 1 slot in main channel (seq 1).
+        writer.emit(OutputEvent::Line(Line::from("A")));
+        // 2. Completion spills to priority channel (seq 2).
+        writer.emit(OutputEvent::Completion("done".to_string()));
+        // 3. Producer emits Line B (seq 3) which waits in deferred queue.
+        writer.emit(OutputEvent::Line(Line::from("B")));
+
+        // Drain in one pass:
+        let summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            Some(&writer),
+        );
+        assert_eq!(summary.drained_events, 3);
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        let pos_a = rendered
+            .iter()
+            .position(|l| l == "A")
+            .expect("A must be rendered");
+        let pos_comp = rendered
+            .iter()
+            .position(|l| l.contains("done"))
+            .expect("Completion must be rendered");
+        let pos_b = rendered
+            .iter()
+            .position(|l| l == "B")
+            .expect("B must be rendered");
+
+        assert!(
+            pos_a < pos_comp,
+            "A (seq 1) must precede Completion (seq 2), got: {rendered:?}"
+        );
+        assert!(
+            pos_comp < pos_b,
+            "Completion (seq 2) must precede B (seq 3), got: {rendered:?}"
+        );
+        assert_eq!(writer.dropped_count(), 0);
+    }
+
+    #[test]
+    fn test_priority_control_does_not_starve_under_sustained_flood() {
+        // P1/P2 regression: when a producer emits a priority Completion followed
+        // by a massive sustained flood of finalized output, the Completion must
+        // NOT starve or wait for the main queue to empty. It must be applied
+        // immediately as soon as preceding events are processed, in the very
+        // first frame.
+        use crate::cli::output::{ChannelOutputWriter, OutputWriter};
+
+        let (tx, mut main_rx) = mpsc::channel(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+        let mut app = App::new();
+
+        // 1. Initial event (seq 1) fills main channel.
+        writer.emit(OutputEvent::Line(Line::from("start")));
+        // 2. Completion spills to priority lane (seq 2).
+        writer.emit(OutputEvent::Completion("done".to_string()));
+        // 3. Sustained flood of 500 events emitted after Completion (seq 3..502).
+        for i in 0..500 {
+            writer.emit(OutputEvent::Line(Line::from(format!("flood-{i}"))));
+        }
+
+        // Pass 1: drain frame processes up to budget (128 events).
+        // Because rx is NOT empty (500 events waiting), the old backlog gate would
+        // have starved Completion and refused to render it!
+        // The sequence barrier must apply Completion on the first pass right after 'start'.
+        let _summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            Some(&writer),
+        );
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        let comp_pos = rendered
+            .iter()
+            .position(|l| l.contains("done"))
+            .expect("Completion must NOT starve under sustained flood in pass 1");
+        let start_pos = rendered
+            .iter()
+            .position(|l| l == "start")
+            .expect("'start' must be in transcript");
+        assert!(
+            start_pos < comp_pos,
+            "'start' (seq 1) must precede Completion (seq 2)"
+        );
+
+        // Completion was rendered before any flood lines.
+        let flood_0_pos = rendered
+            .iter()
+            .position(|l| l == "flood-0")
+            .expect("flood-0 must be rendered");
+        assert!(
+            comp_pos < flood_0_pos,
+            "Completion (seq 2) must precede flood-0 (seq 3)"
+        );
+        assert_eq!(writer.dropped_count(), 0);
+    }
+
+    #[test]
+    fn test_concurrent_multi_threaded_emission_preserves_monotonic_order() {
+        // P1 regression: when multiple concurrent tasks (e.g. subagents) emit
+        // finalized events simultaneously into a shared ChannelOutputWriter,
+        // sequence assignment and channel/deferred queue insertion are serialized.
+        // As a result, all events drained by the consumer appear in strictly
+        // monotonic sequence order, with no reordering.
+        use crate::cli::output::{ChannelOutputWriter, OutputWriter};
+
+        let (tx, mut main_rx) = mpsc::channel(16);
+        let writer = Arc::new(ChannelOutputWriter::new(tx));
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+
+        const THREADS: usize = 10;
+        const EVENTS_PER_THREAD: usize = 50;
+
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for thread_idx in 0..THREADS {
+            let writer_clone = Arc::clone(&writer);
+            let barrier_clone = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier_clone.wait();
+                for event_idx in 0..EVENTS_PER_THREAD {
+                    writer_clone.emit(OutputEvent::Line(Line::from(format!(
+                        "thread-{thread_idx}-event-{event_idx}"
+                    ))));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut drained_events: Vec<SequencedOutputEvent> = Vec::new();
+        while drained_events.len() < THREADS * EVENTS_PER_THREAD {
+            while let Ok(event) = main_rx.try_recv() {
+                drained_events.push(event);
+            }
+            let (moved, _) = writer.flush_deferred_finalized_events();
+            if moved == 0 && drained_events.len() < THREADS * EVENTS_PER_THREAD {
+                std::thread::yield_now();
+            }
+        }
+
+        assert_eq!(drained_events.len(), THREADS * EVENTS_PER_THREAD);
+        assert_eq!(writer.dropped_count(), 0);
+        assert!(approval_rx.try_recv().is_err());
+        assert!(priority_rx.try_recv().is_err());
+
+        // Assert drained SequencedOutputEvent.sequence values directly:
+        // Every single drained event must be strictly monotonically increasing (1..=500).
+        // Global monotonic ordering proves that sequence allocation and lane routing
+        // are serialized under a single critical section across concurrent threads.
+        for (idx, event) in drained_events.iter().enumerate() {
+            let expected_seq = (idx + 1) as u64;
+            assert_eq!(
+                event.sequence, expected_seq,
+                "global sequence reordered at index {idx}: expected {expected_seq}, got {}",
+                event.sequence
+            );
+        }
+
+        // Verify per-thread FIFO ordering is strictly preserved.
+        for thread_idx in 0..THREADS {
+            let mut last_event_idx = None;
+            for event in &drained_events {
+                if let OutputEvent::Line(line) = &event.event {
+                    let s = line.to_string();
+                    let prefix = format!("thread-{thread_idx}-event-");
+                    if let Some(suffix) = s.strip_prefix(&prefix) {
+                        let event_idx: usize = suffix.parse().unwrap();
+                        if let Some(last) = last_event_idx {
+                            assert_eq!(
+                                event_idx,
+                                last + 1,
+                                "thread {thread_idx} events out of order: last={last}, curr={event_idx}"
+                            );
+                        }
+                        last_event_idx = Some(event_idx);
+                    }
+                }
+            }
+            assert_eq!(
+                last_event_idx,
+                Some(EVENTS_PER_THREAD - 1),
+                "all events for thread {thread_idx} must be received"
+            );
+        }
+    }
+
+    #[test]
+    fn test_turn_end_sequence_barrier_defers_later_priority_controls() {
+        // P2 regression: when a TurnEnd or UserPromptLine is encountered in the main queue,
+        // it must only apply priority controls emitted BEFORE or AT that turn boundary.
+        // Controls emitted after that turn boundary (e.g. belonging to a later turn)
+        // must remain deferred and NOT be pulled across the turn boundary.
+        use crate::cli::output::{ChannelOutputWriter, OutputWriter};
+
+        // Capacity 2 allows both Turn 1 Line and Turn 1 TurnEnd to be queued in main_rx.
+        let (tx, mut main_rx) = mpsc::channel(2);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+        let mut app = App::new();
+
+        // Turn 1:
+        // 1. Line 1 fills slot 1 in main channel (seq 1)
+        writer.emit(OutputEvent::Line(Line::from("turn-1-body")));
+        // 2. Turn 1 TurnEnd fills slot 2 in main channel (seq 2).
+        // It resides in main_rx, so the main drain loop processes it as a main-lane TurnEnd.
+        writer.emit(OutputEvent::TurnEnd {
+            accumulated_text: "turn-1-body".to_string(),
+            timing: None,
+        });
+
+        // Turn 2:
+        // 3. Turn 2 Line attempts main channel, which is now full (capacity 2).
+        // Non-critical event: queued in deferred finalized queue (seq 3).
+        writer.emit(OutputEvent::Line(Line::from("turn-2-body")));
+        // 4. Turn 2 Completion attempts main channel, which is still full.
+        // Critical event: routed to priority channel (seq 4).
+        writer.emit(OutputEvent::Completion("turn-2-done".to_string()));
+        // 5. Turn 2 TurnEnd attempts main channel, which is still full.
+        // Critical event: routed to priority channel (seq 5).
+        writer.emit(OutputEvent::TurnEnd {
+            accumulated_text: "turn-2-body".to_string(),
+            timing: None,
+        });
+
+        // Drain queues completely:
+        let summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            Some(&writer),
+        );
+        assert_eq!(summary.drained_events, 5);
+        assert_eq!(summary.turn_end_boundaries.len(), 2);
+        // Turn 1 boundary occurred after turn-1-body (1 line before Turn 2).
+        assert_eq!(summary.turn_end_boundaries[0].transcript_lines, 1);
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        let pos_t1_body = rendered
+            .iter()
+            .position(|l| l.contains("turn-1-body"))
+            .expect("turn-1-body");
+        let pos_t2_body = rendered
+            .iter()
+            .position(|l| l.contains("turn-2-body"))
+            .expect("turn-2-body");
+        let pos_t2_comp = rendered
+            .iter()
+            .position(|l| l.contains("turn-2-done"))
+            .expect("turn-2-done");
+
+        assert!(
+            pos_t1_body < pos_t2_body,
+            "turn 1 body must precede turn 2 body, got: {rendered:?}"
+        );
+        assert!(
+            pos_t2_body <= pos_t2_comp,
+            "turn 2 body must precede turn 2 completion, got: {rendered:?}"
+        );
+        assert_eq!(writer.dropped_count(), 0);
+    }
+
+    #[test]
+    fn test_turn_end_in_main_rx_applies_prior_controls_and_defers_later_controls() {
+        // Specifically exercises both sides of the patched branch at src/cli/interactive.rs:1551:
+        // When TurnEnd is in rx (main lane), post_main_priority contains:
+        // - control 1: sequence <= TurnEnd.sequence (must be applied at TurnEnd)
+        // - control 2: sequence > TurnEnd.sequence (must be DEFERRED past TurnEnd)
+        let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        let (priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        let (tx, mut main_rx) = mpsc::channel(10);
+        let mut app = App::new();
+
+        // rx events:
+        // seq 1: Line("turn-1-body")
+        tx.try_send(SequencedOutputEvent::new(
+            1,
+            OutputEvent::Line(Line::from("turn-1-body")),
+        ))
+        .unwrap();
+        // seq 3: TurnEnd for Turn 1
+        tx.try_send(SequencedOutputEvent::new(
+            3,
+            OutputEvent::TurnEnd {
+                accumulated_text: "turn-1-body".to_string(),
+                timing: None,
+            },
+        ))
+        .unwrap();
+        // seq 4: Line("turn-2-body")
+        tx.try_send(SequencedOutputEvent::new(
+            4,
+            OutputEvent::Line(Line::from("turn-2-body")),
+        ))
+        .unwrap();
+
+        // priority_rx events:
+        // seq 3: Completion for Turn 1 (emitted at TurnEnd seq 3; held at line 1517 by sequence
+        // barrier because 3 >= 3, then applied at line 1551 because 3 > 3 is false)
+        priority_tx
+            .send(SequencedOutputEvent::new(
+                3,
+                OutputEvent::Completion("turn-1-done".to_string()),
+            ))
+            .unwrap();
+        // seq 5: Completion for Turn 2 (emitted AFTER TurnEnd seq 3; line 1566 must break
+        // because 5 > 3, keeping it deferred in post_main_priority across the Turn 1 boundary)
+        priority_tx
+            .send(SequencedOutputEvent::new(
+                5,
+                OutputEvent::Completion("turn-2-done".to_string()),
+            ))
+            .unwrap();
+
+        let summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(summary.turn_end_boundaries.len(), 1);
+        // Turn 1 boundary encompasses turn-1-body and turn-1-done (2 transcript lines),
+        // but does NOT encompass turn-2-body or turn-2-done.
+        assert_eq!(summary.turn_end_boundaries[0].transcript_lines, 2);
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        let pos_t1_body = rendered
+            .iter()
+            .position(|l| l.contains("turn-1-body"))
+            .expect("turn-1-body");
+        let pos_t1_comp = rendered
+            .iter()
+            .position(|l| l.contains("turn-1-done"))
+            .expect("turn-1-done");
+        let pos_t2_body = rendered
+            .iter()
+            .position(|l| l.contains("turn-2-body"))
+            .expect("turn-2-body");
+        let pos_t2_comp = rendered
+            .iter()
+            .position(|l| l.contains("turn-2-done"))
+            .expect("turn-2-done");
+
+        assert!(
+            pos_t1_body < pos_t1_comp,
+            "turn 1 body must precede turn 1 completion: {rendered:?}"
+        );
+        assert!(
+            pos_t1_comp < pos_t2_body,
+            "turn 1 completion must precede turn 2 body: {rendered:?}"
+        );
+        assert!(
+            pos_t2_body < pos_t2_comp,
+            "turn 2 body must precede turn 2 completion: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_single_drain_pass_without_writer_keeps_deferred_after_main() {
+        // Counter-regression: when the writer is not attached to the
+        // drain, the in-drain merge is skipped and the deferred queue is
+        // preserved verbatim — it never silently drops a finalized
+        // waiter just because the caller forgot the writer reference.
+        use crate::cli::output::{ChannelOutputWriter, OutputWriter};
+
+        let (tx, mut main_rx) = mpsc::channel(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+        let mut app = App::new();
+
+        writer.emit(OutputEvent::Line(Line::from("A")));
+        writer.emit(OutputEvent::Line(Line::from("B")));
+        writer.emit(OutputEvent::Completion("done".to_string()));
+
+        writer.flush_deferred_finalized_events();
+        let summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(summary.drained_events, 2);
+        assert_eq!(
+            writer.deferred_queue_for_test(),
+            1,
+            "B must remain deferred when the drain path does not flush it"
+        );
+        assert_eq!(
+            writer.dropped_count(),
+            0,
+            "the missing flush must not silently drop the deferred waiter"
+        );
+
+        // Second pass picks up B in order once the caller does flush.
+        writer.flush_deferred_finalized_events();
+        let summary = drain_output_queues_with_summary(
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut main_rx,
+            &mut app,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(summary.drained_events, 1);
+        assert_eq!(
+            writer.dropped_count(),
+            0,
+            "B must reach the drain loop losslessly across passes"
+        );
+    }
+
+    #[test]
+    fn test_backpressure_finalized_order_completion_and_prompt_through_tui_drain() {
+        use crate::cli::output::{ChannelOutputWriter, OutputWriter};
+
+        // Smallest possible main channel: every finalized event after the
+        // first must wait in the writer's bounded deferred queue.
+        let (tx, mut main_rx) = mpsc::channel(1);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+        let mut app = App::new();
+
+        let mut drain_pass = |app: &mut App| {
+            writer.flush_deferred_finalized_events();
+            drain_output_queues_with_summary(
+                &mut approval_rx,
+                &mut priority_rx,
+                &mut main_rx,
+                app,
+                None,
+                None,
+                None,
+                Some(&writer),
+            );
+        };
+
+        writer.emit(OutputEvent::Line(Line::from("A")));
+        writer.emit(OutputEvent::ModelUpdateLine(Line::from(
+            "transient snapshot",
+        )));
+        writer.emit(OutputEvent::Line(Line::from("B")));
+        writer.emit(OutputEvent::ToolOutputLine(Line::from("tool")));
+        writer.emit(OutputEvent::CommandOutputLine(Line::from("cmd")));
+        for _ in 0..8 {
+            drain_pass(&mut app);
+        }
+
+        // A live snapshot arriving once space is available replaces the last
+        // streamed model line in place instead of reordering the transcript.
+        writer.emit(OutputEvent::ModelUpdateLine(Line::from("live tail")));
+        writer.emit(OutputEvent::Line(Line::from("E")));
+        for _ in 0..4 {
+            drain_pass(&mut app);
+        }
+
+        // Control events are emitted after the backlog cleared so they take
+        // the main lane in emission order: completion first, then the prompt.
+        writer.emit(OutputEvent::Completion("done".to_string()));
+        for _ in 0..4 {
+            drain_pass(&mut app);
+        }
+        writer.emit(OutputEvent::UserPromptLine(Line::from("next")));
+        for _ in 0..4 {
+            drain_pass(&mut app);
+        }
+
+        let rendered = app
+            .output_lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let position = |needle: &str| {
+            rendered
+                .iter()
+                .position(|line| line == needle)
+                .unwrap_or_else(|| panic!("expected transcript row {needle:?}, got {rendered:?}"))
+        };
+
+        // Finalized lines remain in emission order. The live snapshot
+        // replaced `B` in place, so `B` is gone but nothing moved.
+        assert!(position("A") < position("live tail"));
+        assert!(position("live tail") < position("tool"));
+        assert!(position("tool") < position("cmd"));
+        assert!(position("cmd") < position("E"));
+        assert!(!rendered.iter().any(|line| line == "B"));
+        // The transient snapshot never becomes a transcript row.
+        assert!(!rendered.iter().any(|line| line.contains("transient")));
+        // Completion appears after the finalized content.
+        let completion_idx = rendered
+            .iter()
+            .position(|line| line.contains("done"))
+            .expect("completion should be in the transcript");
+        assert!(completion_idx > position("E"));
+        // Prompt placement is unchanged: it stays the last transcript row.
+        assert_eq!(rendered.last().map(String::as_str), Some("next"));
+        // No blank or duplicate transcript rows appeared.
+        assert!(rendered.iter().all(|line| !line.trim().is_empty()));
+        for needle in ["A", "live tail", "tool", "cmd", "E", "next"] {
+            assert_eq!(
+                rendered
+                    .iter()
+                    .filter(|line| line.as_str() == needle)
+                    .count(),
+                1,
+                "transcript row {needle:?} must appear exactly once"
+            );
+        }
+        // Only the transient snapshot was dropped.
+        assert_eq!(writer.dropped_count(), 1);
+        assert_eq!(writer.drop_summary(), "1 model");
+    }
+
+    #[test]
+    fn test_async_worker_applies_queued_completions_in_order() {
+        let worker = TurnRenderWorker::start().expect("renderer should start");
+        let mut app = App::new();
+        render_panel_or_queue(
+            &mut app,
+            Some(&worker),
+            PanelRenderKind::Completion,
+            "",
+            "first",
+            false,
+            0,
+        );
+        render_panel_or_queue(
+            &mut app,
+            Some(&worker),
+            PanelRenderKind::Completion,
+            "",
+            "second",
+            false,
+            0,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            worker.apply_ready(&mut app);
+            let rendered = transcript_text(&app);
+            if rendered.contains("first") && rendered.contains("second") {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        let rendered = transcript_text(&app);
+        let first_idx = rendered
+            .find("first")
+            .expect("first completion should render");
+        let second_idx = rendered
+            .find("second")
+            .expect("second completion should render");
+        assert!(
+            first_idx < second_idx,
+            "transcript order must remain first, then second, got: {rendered}"
+        );
+        assert!(transcript_has_kind(&app, BlockKind::Completion));
+    }
+
+    #[test]
+    fn test_stale_worker_completion_render_is_discarded_after_clear() {
+        let worker = TurnRenderWorker::start().expect("renderer should start");
+        let mut app = App::new();
+        // Queue a completion through the background renderer, then clear the
+        // display before its result is applied.
+        render_panel_or_queue(
+            &mut app,
+            Some(&worker),
+            PanelRenderKind::Completion,
+            "✓ Task completed: ",
+            "stale completion",
+            false,
+            0,
+        );
+        app.clear_output().expect("output should clear");
+        assert!(app.last_completion_text().is_none());
+        // A sentinel queued after the clear proves the worker drained the
+        // stale result instead of this test racing it.
+        render_panel_or_queue(
+            &mut app,
+            Some(&worker),
+            PanelRenderKind::Completion,
+            "✓ Task completed: ",
+            "sentinel",
+            false,
+            0,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            worker.apply_ready(&mut app);
+            if transcript_text(&app).contains("sentinel") {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        let rendered = transcript_text(&app);
+        assert!(
+            rendered.contains("sentinel"),
+            "post-clear completion should render, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("stale completion"),
+            "pre-clear completion must not leak into the transcript, got: {rendered}"
+        );
+        assert!(app.last_completion_text().is_none());
+    }
+
+    /// Deterministic acceptance check for Task 7 — the same workload classes
+    /// the perf fixture exercises, driven through the real drain path so per
+    /// category drop accounting is exact. Channel capacity is forced to 1 in
+    /// every scenario; the deferred finalized queue holds the overflow.
+    #[test]
+    fn test_perf_fixture_acceptance_at_capacity_one() {
+        use crate::cli::output::{ChannelOutputWriter, OutputEvent, OutputWriter};
+        use ratatui::text::Line;
+
+        struct Scenario {
+            name: &'static str,
+            emit: Box<dyn Fn(&ChannelOutputWriter)>,
+            /// How many *finalized* events the test expects to be applied by
+            /// the drain loop. The deferred queue is bounded (65 536 events /
+            /// 64 MiB) so a flood larger than the bound will evict the oldest
+            /// finalized waiter to the drop counters; that is the explicit
+            /// overflow policy, not a silent failure. Callers compute this
+            /// from the writer's bound.
+            expect_finalized_applied_min: usize,
+            assert: Box<dyn Fn(&App, &ChannelOutputWriter, usize)>,
+        }
+
+        let many_lines = Scenario {
+            name: "many-lines",
+            emit: Box::new(|w| {
+                for i in 0..2_000u32 {
+                    w.emit(OutputEvent::Line(Line::from(format!("many-{i:05}"))));
+                    w.emit(OutputEvent::ModelUpdateLine(Line::from(format!(
+                        "snap-{i:05}"
+                    ))));
+                }
+            }),
+            // Capacity-1 + 4000 emissions: all 2000 finalized Lines fit the
+            // deferred bound, so every one must reach the drain loop. The
+            // transient snapshots are the dominant drop category.
+            expect_finalized_applied_min: 2_000,
+            assert: Box::new(|app, writer, applied| {
+                let deferred_events = writer.deferred_queue_for_test();
+                let deferred_bytes = writer.deferred_bytes_for_test();
+                assert!(
+                    deferred_events
+                        <= crate::cli::output::ChannelOutputWriter::MAX_DEFERRED_FINALIZED_EVENTS,
+                    "deferred queue must stay bounded by event count: {deferred_events}"
+                );
+                assert!(
+                    deferred_bytes
+                        <= crate::cli::output::ChannelOutputWriter::MAX_DEFERRED_FINALIZED_BYTES,
+                    "deferred queue must stay bounded by bytes: {deferred_bytes}"
+                );
+                assert_eq!(
+                    applied, 2_000,
+                    "every finalized Line must reach the drain loop: applied={applied}"
+                );
+                let summary = writer.drop_summary();
+                assert!(
+                    summary.ends_with(" model"),
+                    "every drop should be classified as a model snapshot, got: {summary}"
+                );
+                assert!(
+                    app.output_lines
+                        .iter()
+                        .all(|line| !line.to_string().starts_with("snap-")),
+                    "transient ModelUpdateLine must not appear as transcript rows"
+                );
+                assert!(
+                    app.output_lines
+                        .iter()
+                        .any(|line| line.to_string().starts_with("many-")),
+                    "at least one finalized model Line must reach the transcript"
+                );
+            }),
+        };
+
+        let tool_flood = Scenario {
+            name: "tool-output-flood",
+            emit: Box::new(|w| {
+                w.emit(OutputEvent::ToolHeaderLine(Line::from("▶ stream_tool")));
+                for i in 0..1_500u32 {
+                    w.emit(OutputEvent::ToolOutputLine(Line::from(format!("t-{i:04}"))));
+                }
+                w.emit(OutputEvent::Completion("tool flood done".to_string()));
+            }),
+            // 1501 finalized content events + 1 Completion, all within
+            // the deferred bound: every one must reach the drain loop.
+            expect_finalized_applied_min: 1502,
+            assert: Box::new(|app, writer, applied| {
+                assert_eq!(
+                    applied, 1502,
+                    "every finalized tool event and the Completion must reach the drain loop"
+                );
+                let rendered = app
+                    .output_lines
+                    .iter()
+                    .map(App::line_to_string)
+                    .collect::<Vec<_>>();
+                assert!(rendered.iter().any(|line| line == "▶ stream_tool"));
+                assert_eq!(
+                    app.last_completion_text(),
+                    Some("tool flood done"),
+                    "critical Completion must remain responsive under backpressure"
+                );
+                // The deferred queue's overflow policy is to evict the
+                // oldest waiter; only finalized events may be evicted,
+                // and they are recorded as drops in the model-text bucket.
+                // Under the perf fixture's bounded deferred queue, no
+                // finalized event should be evicted at all.
+                assert_eq!(
+                    writer.dropped_count(),
+                    0,
+                    "this flood fits the deferred bound, so no finalized output may drop (drops={}, summary={})",
+                    writer.dropped_count(),
+                    writer.drop_summary(),
+                );
+            }),
+        };
+
+        let mixed = Scenario {
+            name: "mixed-model-tool-command",
+            emit: Box::new(|w| {
+                w.emit(OutputEvent::Line(Line::from("model intro")));
+                w.emit(OutputEvent::ToolHeaderLine(Line::from("▶ first_tool")));
+                for i in 0..600u32 {
+                    w.emit(OutputEvent::ToolOutputLine(Line::from(format!(
+                        "tool-{i:03}"
+                    ))));
+                }
+                w.emit(OutputEvent::CommandHeaderLine(Line::from("$ run")));
+                for i in 0..600u32 {
+                    w.emit(OutputEvent::CommandOutputLine(Line::from(format!(
+                        "cmd-{i:03}"
+                    ))));
+                }
+                w.emit(OutputEvent::Line(Line::from("model tail")));
+                w.emit(OutputEvent::Completion("mixed done".to_string()));
+                w.emit(OutputEvent::UserPromptLine(Line::from("❯ ")));
+            }),
+            // 1204 content events + Completion + prompt, all within the
+            // deferred bound: every one must reach the drain loop.
+            expect_finalized_applied_min: 1206,
+            assert: Box::new(|app, writer, applied| {
+                assert_eq!(
+                    applied, 1206,
+                    "every finalized mixed-class event plus control must reach the drain loop"
+                );
+                let rendered = app
+                    .output_lines
+                    .iter()
+                    .map(App::line_to_string)
+                    .collect::<Vec<_>>();
+                assert!(
+                    rendered.iter().any(|line| line == "▶ first_tool"),
+                    "tool header must reach the transcript"
+                );
+                assert!(
+                    rendered.iter().any(|line| line == "$ run"),
+                    "command header must reach the transcript"
+                );
+                assert!(
+                    rendered.iter().any(|line| line == "❯ "),
+                    "UserPromptLine must reach the transcript"
+                );
+                assert_eq!(
+                    app.last_completion_text(),
+                    Some("mixed done"),
+                    "Completion must remain responsive across the mixed flood"
+                );
+                // Control events (Completion, UserPromptLine) take the
+                // priority lane and never land in the deferred queue, so
+                // they must not appear in the drop summary.
+                let summary = writer.drop_summary();
+                assert!(
+                    !summary.contains("other"),
+                    "control events must not drop, got summary: {summary}"
+                );
+            }),
+        };
+
+        let memory = Scenario {
+            name: "memory-under-stalled-drain",
+            emit: Box::new(|w| {
+                for i in 0..5_000u32 {
+                    w.emit(OutputEvent::Line(Line::from(format!("stall-{i:04}"))));
+                }
+                w.emit(OutputEvent::Completion("stalled done".to_string()));
+            }),
+            expect_finalized_applied_min: 5_001,
+            assert: Box::new(|app, writer, applied| {
+                assert_eq!(
+                    applied, 5_001,
+                    "every applied event under the bound must reach the drain loop: applied={applied}"
+                );
+                assert_eq!(
+                    app.last_completion_text(),
+                    Some("stalled done"),
+                    "completion must remain responsive while the deferred queue drains"
+                );
+                let deferred_events = writer.deferred_queue_for_test();
+                let deferred_bytes = writer.deferred_bytes_for_test();
+                assert!(
+                    deferred_events
+                        <= crate::cli::output::ChannelOutputWriter::MAX_DEFERRED_FINALIZED_EVENTS,
+                    "deferred queue must stay bounded by event count: {deferred_events}"
+                );
+                assert!(
+                    deferred_bytes
+                        <= crate::cli::output::ChannelOutputWriter::MAX_DEFERRED_FINALIZED_BYTES,
+                    "deferred queue must stay bounded by bytes: {deferred_bytes}"
+                );
+            }),
+        };
+
+        for scenario in [many_lines, tool_flood, mixed, memory] {
+            let (tx, mut main_rx) = mpsc::channel(1);
+            let writer = ChannelOutputWriter::new(tx);
+            let mut approval_rx = writer
+                .take_approval_rx()
+                .expect("approval receiver should be available");
+            let mut priority_rx = writer
+                .take_priority_rx()
+                .expect("priority receiver should be available");
+            let mut app = App::new();
+            let mut total_applied: usize = 0;
+
+            (scenario.emit)(&writer);
+
+            for _ in 0..100_000 {
+                writer.flush_deferred_finalized_events();
+                let summary = drain_output_queues_with_summary(
+                    &mut approval_rx,
+                    &mut priority_rx,
+                    &mut main_rx,
+                    &mut app,
+                    None,
+                    None,
+                    None,
+                    Some(&writer),
+                );
+                total_applied = total_applied.saturating_add(summary.drained_events);
+                let deferred_empty = writer.deferred_queue_for_test() == 0;
+                let main_empty = main_rx.is_empty();
+                if deferred_empty && main_empty {
+                    break;
+                }
+            }
+
+            (scenario.assert)(&app, &writer, total_applied);
+            assert!(
+                total_applied >= scenario.expect_finalized_applied_min,
+                "{}: expected at least {} applied events, got {} (drops={}, summary={})",
+                scenario.name,
+                scenario.expect_finalized_applied_min,
+                total_applied,
+                writer.dropped_count(),
+                writer.drop_summary(),
+            );
+        }
     }
 
     #[test]
@@ -6269,7 +7581,7 @@ mod tests {
         reset_prompt_state();
 
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(OutputEvent::plain("new line")).unwrap();
+        tx.try_send(OutputEvent::plain("new line").into()).unwrap();
 
         let mut app = App::new();
         app.set_content_height(5);
@@ -6298,7 +7610,7 @@ mod tests {
         reset_prompt_state();
 
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(OutputEvent::plain("new streamed line"))
+        tx.try_send(OutputEvent::plain("new streamed line").into())
             .unwrap();
 
         let mut app = App::new();
@@ -6355,15 +7667,15 @@ mod tests {
         .enumerate()
         {
             if reasoning && index > 0 {
-                tx.try_send(OutputEvent::ReasoningChunk("inspect context\n".into()))
+                tx.try_send(OutputEvent::ReasoningChunk("inspect context\n".into()).into())
                     .unwrap();
                 drain_output(&mut rx, &mut app);
             }
             let line = Line::from(text);
             tx.try_send(if index == 0 {
-                OutputEvent::Line(line)
+                OutputEvent::Line(line).into()
             } else {
-                OutputEvent::ModelUpdateLine(line)
+                OutputEvent::ModelUpdateLine(line).into()
             })
             .unwrap();
             drain_output(&mut rx, &mut app);
@@ -6396,11 +7708,14 @@ mod tests {
                 .collect();
             assert_eq!(model_lines, [text]);
         }
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text:
-                "1. **Same-line duplicates.** STATUS.md had the line at lines 3 and 6.".into(),
-            timing: None,
-        })
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text:
+                    "1. **Same-line duplicates.** STATUS.md had the line at lines 3 and 6.".into(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
         drain_output(&mut rx, &mut app);
         let model_lines: Vec<_> = app
@@ -6426,13 +7741,13 @@ mod tests {
         reset_prompt_state();
 
         let (tx, mut rx) = mpsc::channel(8);
-        tx.try_send(OutputEvent::Line(Line::from("initial")))
+        tx.try_send(OutputEvent::Line(Line::from("initial")).into())
             .unwrap();
-        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 1")))
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 1")).into())
             .unwrap();
-        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 2")))
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 2")).into())
             .unwrap();
-        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("final partial")))
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("final partial")).into())
             .unwrap();
 
         let mut app = App::new();
@@ -6457,11 +7772,11 @@ mod tests {
         std::fs::create_dir_all(&task_dir).unwrap();
         let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
         let (tx, mut rx) = mpsc::channel(8);
-        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 1")))
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 1")).into())
             .unwrap();
-        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 2")))
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial 2")).into())
             .unwrap();
-        tx.try_send(OutputEvent::ToolHeaderLine(Line::from("▶ read_file")))
+        tx.try_send(OutputEvent::ToolHeaderLine(Line::from("▶ read_file")).into())
             .unwrap();
 
         let mut app = App::new();
@@ -6488,7 +7803,7 @@ mod tests {
         std::fs::create_dir_all(&task_dir).unwrap();
         let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial")))
+        tx.try_send(OutputEvent::ModelUpdateLine(Line::from("partial")).into())
             .unwrap();
 
         let mut app = App::new();
@@ -6500,10 +7815,13 @@ mod tests {
                 .is_empty()
         );
 
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: "partial".to_string(),
-            timing: None,
-        })
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: "partial".to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
         drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
 
@@ -6529,7 +7847,7 @@ mod tests {
         std::fs::create_dir_all(&task_dir).unwrap();
         let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(OutputEvent::RawAnsi("pty output\nsecond line".to_string()))
+        tx.try_send(OutputEvent::RawAnsi("pty output\nsecond line".to_string()).into())
             .unwrap();
 
         let mut app = App::new();
@@ -6556,10 +7874,12 @@ mod tests {
         std::fs::create_dir_all(&task_dir).unwrap();
         let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
         let (tx, mut rx) = mpsc::channel(8);
-        tx.try_send(OutputEvent::reasoning_chunk("first")).unwrap();
-        tx.try_send(OutputEvent::reasoning_chunk(" thought\n\nnext"))
+        tx.try_send(OutputEvent::reasoning_chunk("first").into())
             .unwrap();
-        tx.try_send(OutputEvent::reasoning_chunk(" step")).unwrap();
+        tx.try_send(OutputEvent::reasoning_chunk(" thought\n\nnext").into())
+            .unwrap();
+        tx.try_send(OutputEvent::reasoning_chunk(" step").into())
+            .unwrap();
 
         let mut app = App::new();
         app.set_content_width(80);
@@ -6571,7 +7891,7 @@ mod tests {
                 .is_empty()
         );
 
-        tx.try_send(OutputEvent::Line(Line::from("answer")))
+        tx.try_send(OutputEvent::Line(Line::from("answer")).into())
             .unwrap();
         drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
 
@@ -6601,7 +7921,7 @@ mod tests {
         std::fs::create_dir_all(&task_dir).unwrap();
         let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
         let (tx, mut rx) = mpsc::channel(2);
-        tx.try_send(OutputEvent::TurnIndicator(Line::from("♦")))
+        tx.try_send(OutputEvent::TurnIndicator(Line::from("♦")).into())
             .unwrap();
 
         let mut app = App::new();
@@ -6624,7 +7944,7 @@ mod tests {
         std::fs::create_dir_all(&task_dir).unwrap();
         let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(OutputEvent::Completion("done".to_string()))
+        tx.try_send(OutputEvent::Completion("done".to_string()).into())
             .unwrap();
 
         let mut app = App::new();
@@ -6690,11 +8010,13 @@ mod tests {
         reset_prompt_state();
 
         let (tx, mut rx) = mpsc::channel(8);
-        tx.try_send(OutputEvent::reasoning_chunk("first")).unwrap();
-        tx.try_send(OutputEvent::reasoning_chunk(" thought\n\nnext"))
+        tx.try_send(OutputEvent::reasoning_chunk("first").into())
             .unwrap();
-        tx.try_send(OutputEvent::reasoning_chunk(" step")).unwrap();
-        tx.try_send(OutputEvent::Line(Line::from("answer")))
+        tx.try_send(OutputEvent::reasoning_chunk(" thought\n\nnext").into())
+            .unwrap();
+        tx.try_send(OutputEvent::reasoning_chunk(" step").into())
+            .unwrap();
+        tx.try_send(OutputEvent::Line(Line::from("answer")).into())
             .unwrap();
 
         let mut app = App::new();
@@ -6800,6 +8122,7 @@ mod tests {
             None,
             Some(&mailbox),
             None,
+            None,
         );
 
         let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
@@ -6818,20 +8141,24 @@ mod tests {
         let result = "STREAMED_RESULT_MARKER";
         let (tx, mut rx) = mpsc::channel(2);
         let (priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-        tx.try_send(OutputEvent::Line(Line::from(result))).unwrap();
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: result.to_string(),
-            timing: None,
-        })
+        tx.try_send(OutputEvent::Line(Line::from(result)).into())
+            .unwrap();
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: result.to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
         priority_tx
-            .send(OutputEvent::Completion(result.to_string()))
+            .send(OutputEvent::Completion(result.to_string()).into())
             .unwrap();
 
         let mut app = App::new();
         drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
 
-        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request").into())
             .unwrap();
         drain_output_for_test_with_priority(&mut priority_rx, &mut rx, &mut app);
 
@@ -6923,8 +8250,11 @@ mod tests {
         drain_output_for_test_with_lanes(&mut approval_rx, &mut priority_rx, &mut rx, &mut app);
 
         assert!(app.has_pending_approval());
-        assert!(writer.dropped_count() > 0);
-        assert!(writer.take_overflow_signal());
+        // The approval lane must preempt the main backlog. With the
+        // current bounded deferred-queue policy the 10 000-line backlog
+        // is preserved losslessly, so what proves preemption is the
+        // approval becoming pending while the main queue is saturated
+        // (i.e. the lane is not gated on the main backlog clearing).
     }
 
     #[test]
@@ -7086,7 +8416,7 @@ mod tests {
         reset_prompt_state();
 
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(OutputEvent::Completion("first completion".to_string()))
+        tx.try_send(OutputEvent::Completion("first completion".to_string()).into())
             .unwrap();
 
         let mut app = App::new();
@@ -7098,7 +8428,7 @@ mod tests {
             "expected first completion in transcript, got: {first_rendered}"
         );
 
-        tx.try_send(OutputEvent::Completion("second completion".to_string()))
+        tx.try_send(OutputEvent::Completion("second completion".to_string()).into())
             .unwrap();
         drain_output(&mut rx, &mut app);
 
@@ -7118,9 +8448,9 @@ mod tests {
         use crate::cli::output::OutputEvent;
 
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(OutputEvent::Completion("first completion".to_string()))
+        tx.try_send(OutputEvent::Completion("first completion".to_string()).into())
             .unwrap();
-        tx.try_send(OutputEvent::user_prompt_line("❯ queued message"))
+        tx.try_send(OutputEvent::user_prompt_line("❯ queued message").into())
             .unwrap();
 
         let mut app = App::new();
@@ -7150,9 +8480,9 @@ mod tests {
 
         let result = "FORMAL_RESULT_MARKER";
         let (tx, mut rx) = mpsc::channel(2);
-        tx.try_send(OutputEvent::Completion(result.to_string()))
+        tx.try_send(OutputEvent::Completion(result.to_string()).into())
             .unwrap();
-        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request").into())
             .unwrap();
 
         let mut app = App::new();
@@ -7188,9 +8518,9 @@ mod tests {
         use crate::cli::output::OutputEvent;
 
         let (tx, mut rx) = mpsc::channel(3);
-        tx.try_send(OutputEvent::ErrorBox("network error".to_string()))
+        tx.try_send(OutputEvent::ErrorBox("network error".to_string()).into())
             .unwrap();
-        tx.try_send(OutputEvent::user_prompt_line("❯ try again"))
+        tx.try_send(OutputEvent::user_prompt_line("❯ try again").into())
             .unwrap();
 
         let mut app = App::new();
@@ -7206,11 +8536,11 @@ mod tests {
 
         let result = "QUEUED_FOLLOWUP_RESULT";
         let (tx, mut rx) = mpsc::channel(3);
-        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request").into())
             .unwrap();
-        tx.try_send(OutputEvent::Completion(result.to_string()))
+        tx.try_send(OutputEvent::Completion(result.to_string()).into())
             .unwrap();
-        tx.try_send(OutputEvent::ErrorBox("network error".to_string()))
+        tx.try_send(OutputEvent::ErrorBox("network error".to_string()).into())
             .unwrap();
 
         let mut app = App::new();
@@ -7254,9 +8584,9 @@ mod tests {
         assert!(!transcript_text(&app).contains("queued message"));
 
         app.set_queued_message_state(1, vec!["queued message".to_string()]);
-        tx.try_send(OutputEvent::QueuedMessageStarted { remaining: 0 })
+        tx.try_send(OutputEvent::QueuedMessageStarted { remaining: 0 }.into())
             .unwrap();
-        tx.try_send(OutputEvent::user_prompt_line("❯ queued message"))
+        tx.try_send(OutputEvent::user_prompt_line("❯ queued message").into())
             .unwrap();
         drain_output(&mut rx, &mut app);
 
@@ -7308,16 +8638,16 @@ mod tests {
         let mut app = App::new();
         app.set_pending_queued_prompts(2);
 
-        tx.try_send(OutputEvent::QueuedMessageStarted { remaining: 1 })
+        tx.try_send(OutputEvent::QueuedMessageStarted { remaining: 1 }.into())
             .unwrap();
-        tx.try_send(OutputEvent::Completion("first queued result".to_string()))
+        tx.try_send(OutputEvent::Completion("first queued result".to_string()).into())
             .unwrap();
         drain_output(&mut rx, &mut app);
         assert!(transcript_text(&app).contains("first queued result"));
 
-        tx.try_send(OutputEvent::QueuedMessageStarted { remaining: 0 })
+        tx.try_send(OutputEvent::QueuedMessageStarted { remaining: 0 }.into())
             .unwrap();
-        tx.try_send(OutputEvent::Completion("final queued result".to_string()))
+        tx.try_send(OutputEvent::Completion("final queued result".to_string()).into())
             .unwrap();
         drain_output(&mut rx, &mut app);
 
@@ -7333,14 +8663,14 @@ mod tests {
         use crate::cli::output::OutputEvent;
 
         let (tx, mut rx) = mpsc::channel(2);
-        let (priority_tx, mut priority_rx) = mpsc::unbounded_channel();
-        priority_tx
-            .send(OutputEvent::Completion("PRIORITY_RESULT".to_string()))
+        let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        _priority_tx
+            .send(OutputEvent::Completion("PRIORITY_RESULT".to_string()).into())
             .unwrap();
-        priority_tx
-            .send(OutputEvent::ErrorBox("priority network error".to_string()))
+        _priority_tx
+            .send(OutputEvent::ErrorBox("priority network error".to_string()).into())
             .unwrap();
-        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request").into())
             .unwrap();
 
         let mut app = App::new();
@@ -7363,16 +8693,19 @@ mod tests {
         let streamed = "I have the evidence. I will compile the review.";
         let result = "FORMAL_REVIEW_RESULT_MARKER";
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(OutputEvent::Line(Line::from(streamed)))
+        tx.try_send(OutputEvent::Line(Line::from(streamed)).into())
             .unwrap();
-        tx.try_send(OutputEvent::Completion(result.to_string()))
+        tx.try_send(OutputEvent::Completion(result.to_string()).into())
             .unwrap();
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: streamed.to_string(),
-            timing: None,
-        })
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: streamed.to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
-        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request").into())
             .unwrap();
 
         let mut app = App::new();
@@ -7394,15 +8727,19 @@ mod tests {
 
         let result = "STREAMED_RESULT_MARKER";
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(OutputEvent::Line(Line::from(result))).unwrap();
-        tx.try_send(OutputEvent::Completion(result.to_string()))
+        tx.try_send(OutputEvent::Line(Line::from(result)).into())
             .unwrap();
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: result.to_string(),
-            timing: None,
-        })
+        tx.try_send(OutputEvent::Completion(result.to_string()).into())
+            .unwrap();
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: result.to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
-        tx.try_send(OutputEvent::user_prompt_line("❯ next request"))
+        tx.try_send(OutputEvent::user_prompt_line("❯ next request").into())
             .unwrap();
 
         let mut app = App::new();
@@ -7423,7 +8760,7 @@ mod tests {
 
         let result = "CTRL_C_RESULT_MARKER";
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(OutputEvent::Completion(result.to_string()))
+        tx.try_send(OutputEvent::Completion(result.to_string()).into())
             .unwrap();
 
         let mut app = App::new();
@@ -7579,9 +8916,9 @@ mod tests {
         use crate::cli::output::OutputEvent;
 
         let (tx, mut rx) = mpsc::channel(2);
-        tx.try_send(OutputEvent::Completion("completed work".to_string()))
+        tx.try_send(OutputEvent::Completion("completed work".to_string()).into())
             .unwrap();
-        tx.try_send(OutputEvent::ErrorBox("Task failed".to_string()))
+        tx.try_send(OutputEvent::ErrorBox("Task failed".to_string()).into())
             .unwrap();
 
         let mut app = App::new();
@@ -7900,16 +9237,16 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(8);
         // Stream model text — ends up as BlockKind::Model in output_lines.
-        tx.try_send(OutputEvent::Line(Line::from(model_text)))
+        tx.try_send(OutputEvent::Line(Line::from(model_text)).into())
             .unwrap();
         // Emit a tool header — BlockKind::ToolHeader.
-        tx.try_send(OutputEvent::tool_call("▶ attempt_completion"))
+        tx.try_send(OutputEvent::tool_call("▶ attempt_completion").into())
             .unwrap();
         // Emit a tool result — BlockKind::ToolOutput.
-        tx.try_send(OutputEvent::ToolOutputLine(Line::from(tool_output_text)))
+        tx.try_send(OutputEvent::ToolOutputLine(Line::from(tool_output_text)).into())
             .unwrap();
         // Emit the completion with text identical to the streamed model line.
-        tx.try_send(OutputEvent::Completion(model_text.to_string()))
+        tx.try_send(OutputEvent::Completion(model_text.to_string()).into())
             .unwrap();
 
         let mut app = App::new();
@@ -7970,13 +9307,13 @@ mod tests {
         app.finalize_turn_stream(repeated_text);
 
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send(OutputEvent::Line(Line::from(
-            "The current turn has different model text.",
-        )))
+        tx.try_send(
+            OutputEvent::Line(Line::from("The current turn has different model text.")).into(),
+        )
         .unwrap();
-        tx.try_send(OutputEvent::tool_call("▶ attempt_completion"))
+        tx.try_send(OutputEvent::tool_call("▶ attempt_completion").into())
             .unwrap();
-        tx.try_send(OutputEvent::Completion(repeated_text.to_string()))
+        tx.try_send(OutputEvent::Completion(repeated_text.to_string()).into())
             .unwrap();
 
         drain_output(&mut rx, &mut app);
@@ -8005,15 +9342,21 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         // Simulate the agent loop streaming three lines that are
         // fragments of the original markdown "**bold** text\n\nmore".
-        tx.try_send(OutputEvent::model_output("  **bold")).unwrap();
-        tx.try_send(OutputEvent::model_output("  text")).unwrap();
-        tx.try_send(OutputEvent::model_output("  more")).unwrap();
+        tx.try_send(OutputEvent::model_output("  **bold").into())
+            .unwrap();
+        tx.try_send(OutputEvent::model_output("  text").into())
+            .unwrap();
+        tx.try_send(OutputEvent::model_output("  more").into())
+            .unwrap();
         // The agent loop emits TurnEnd with the raw markdown text
         // when the turn finishes.
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: "**bold** text\n\nmore".to_string(),
-            timing: None,
-        })
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: "**bold** text\n\nmore".to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
 
         let mut app = App::new();
@@ -8079,21 +9422,22 @@ mod tests {
         reset_prompt_state();
 
         let (tx, mut rx) = mpsc::channel(8);
-        tx.try_send(OutputEvent::model_output(
-            "Right — the plan is ready for your review.",
-        ))
-        .unwrap();
-        tx.try_send(OutputEvent::tool_call("▶ plan_mode_respond"))
+        tx.try_send(OutputEvent::model_output("Right — the plan is ready for your review.").into())
             .unwrap();
-        tx.try_send(OutputEvent::tool_output_line(
-            "📋 Plan Generated\n1. Run the tests",
-            Style::default(),
-        ))
+        tx.try_send(OutputEvent::tool_call("▶ plan_mode_respond").into())
+            .unwrap();
+        tx.try_send(
+            OutputEvent::tool_output_line("📋 Plan Generated\n1. Run the tests", Style::default())
+                .into(),
+        )
         .unwrap();
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: "Right — the plan is ready for your review.".to_string(),
-            timing: None,
-        })
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: "Right — the plan is ready for your review.".to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
 
         let mut app = App::new();
@@ -8127,16 +9471,21 @@ mod tests {
         reset_prompt_state();
 
         let (tx, mut rx) = mpsc::channel(8);
-        tx.try_send(OutputEvent::model_output(
-            "I need more exploration before I can create the plan.",
-        ))
+        tx.try_send(
+            OutputEvent::model_output("I need more exploration before I can create the plan.")
+                .into(),
+        )
         .unwrap();
-        tx.try_send(OutputEvent::tool_call("▶ plan_mode_respond"))
+        tx.try_send(OutputEvent::tool_call("▶ plan_mode_respond").into())
             .unwrap();
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: "I need more exploration before I can create the plan.".to_string(),
-            timing: None,
-        })
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: "I need more exploration before I can create the plan."
+                    .to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
 
         let mut app = App::new();
@@ -8165,27 +9514,35 @@ mod tests {
 
         let code_turn = "before code\n\n```rust\nlet value = 1;\n```\n\nafter code";
         let (tx, mut rx) = mpsc::channel(10);
-        tx.try_send(OutputEvent::TurnIndicator(Line::from("♦")))
+        tx.try_send(OutputEvent::TurnIndicator(Line::from("♦")).into())
             .unwrap();
-        tx.try_send(OutputEvent::model_output("before code"))
+        tx.try_send(OutputEvent::model_output("before code").into())
             .unwrap();
-        tx.try_send(OutputEvent::model_output("```rust")).unwrap();
-        tx.try_send(OutputEvent::model_output("  let value = 1;"))
+        tx.try_send(OutputEvent::model_output("```rust").into())
             .unwrap();
-        tx.try_send(OutputEvent::model_output("```")).unwrap();
-        tx.try_send(OutputEvent::model_output("after code"))
+        tx.try_send(OutputEvent::model_output("  let value = 1;").into())
             .unwrap();
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: code_turn.to_string(),
-            timing: None,
-        })
+        tx.try_send(OutputEvent::model_output("```").into())
+            .unwrap();
+        tx.try_send(OutputEvent::model_output("after code").into())
+            .unwrap();
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: code_turn.to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
-        tx.try_send(OutputEvent::model_output("**next turn**"))
+        tx.try_send(OutputEvent::model_output("**next turn**").into())
             .unwrap();
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: "**next turn**".to_string(),
-            timing: None,
-        })
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: "**next turn**".to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
 
         let mut app = App::new();
@@ -8224,12 +9581,15 @@ mod tests {
         let markdown = "| Feature | Why |\n|---|---|\n| GPS | Uses `CLLocation.distance(from:)` with a check |\n\n* first\n* final\n\nAfterward.";
         let (tx, mut rx) = mpsc::channel(16);
         for line in markdown.lines() {
-            tx.try_send(OutputEvent::model_output(line)).unwrap();
+            tx.try_send(OutputEvent::model_output(line).into()).unwrap();
         }
-        tx.try_send(OutputEvent::TurnEnd {
-            accumulated_text: markdown.to_string(),
-            timing: None,
-        })
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: markdown.to_string(),
+                timing: None,
+            }
+            .into(),
+        )
         .unwrap();
 
         let mut app = App::new();
