@@ -1555,6 +1555,16 @@ impl App {
     /// with the same indices.
     fn _push_output_line(&mut self, line: Line<'static>, kind: BlockKind, wrap_width: usize) {
         let previous_kind = self.output_line_kinds.back().copied();
+        let separator_before_line = self.output_lines.back().zip(previous_kind).is_some_and(
+            |(previous_line, previous_kind)| {
+                Self::should_insert_separator_for_lines(
+                    previous_kind,
+                    Some(previous_line),
+                    kind,
+                    &line,
+                )
+            },
+        );
         let can_extend_layout = self.visual_layout_index.is_valid_for(wrap_width)
             && self.error_lines.is_empty()
             && self.output_lines.len() <= 10_000;
@@ -1573,7 +1583,15 @@ impl App {
                 .output_line_kinds
                 .get(1)
                 .copied()
-                .is_some_and(|next_kind| Self::should_insert_separator(evicted_kind, next_kind));
+                .zip(self.output_lines.get(1))
+                .is_some_and(|(next_kind, next_line)| {
+                    Self::should_insert_separator_for_lines(
+                        evicted_kind,
+                        Some(self.output_lines.front().expect("output line must exist")),
+                        next_kind,
+                        next_line,
+                    )
+                });
             let fallback_evicted_rows = || {
                 Self::output_row_visual_rows(self.output_lines.front(), evicted_kind, wrap_width)
                     .saturating_add(usize::from(has_separator_after_front))
@@ -1658,14 +1676,11 @@ impl App {
                 kind,
                 wrap_width,
             )
-            .saturating_add(
-                previous_kind.is_some_and(|prev| Self::should_insert_separator(prev, kind))
-                    as usize,
-            );
+            .saturating_add(usize::from(separator_before_line));
             self.cached_visual_rows = self.cached_visual_rows.saturating_add(added_rows);
         }
         if can_extend_layout && self.visual_layout_index.is_valid_for(wrap_width) {
-            if previous_kind.is_some_and(|previous| Self::should_insert_separator(previous, kind)) {
+            if separator_before_line {
                 self.visual_layout_index.append_entry(LayoutEntry {
                     source: LayoutSource::Separator,
                     kind: BlockKind::Separator,
@@ -3541,14 +3556,17 @@ impl App {
     fn total_visual_rows_for_width(&self, wrap_width: usize) -> usize {
         let mut total = 0usize;
         let mut previous_kind = None;
+        let mut previous_line = None;
         for (line, kind) in self.output_lines.iter().zip(&self.output_line_kinds) {
-            if previous_kind.is_some_and(|previous| Self::should_insert_separator(previous, *kind))
-            {
+            if previous_kind.is_some_and(|previous| {
+                Self::should_insert_separator_for_lines(previous, previous_line, *kind, line)
+            }) {
                 total = total.saturating_add(1);
             }
             total =
                 total.saturating_add(Self::output_row_visual_rows(Some(line), *kind, wrap_width));
             previous_kind = Some(*kind);
+            previous_line = Some(line);
         }
         for line in &self.error_lines {
             if previous_kind
@@ -3725,9 +3743,12 @@ impl App {
         let mut entries = Vec::with_capacity(output_lines.len().saturating_add(error_lines.len()));
         let mut output_entry_positions = VecDeque::new();
         let mut previous_kind = None;
+        let mut previous_line = None;
 
-        for (index, (line, kind)) in output_lines.into_iter().zip(output_line_kinds).enumerate() {
-            if previous_kind.is_some_and(|previous| Self::should_insert_separator(previous, kind)) {
+        for (index, (line, kind)) in output_lines.iter().zip(output_line_kinds).enumerate() {
+            if previous_kind.is_some_and(|previous| {
+                Self::should_insert_separator_for_lines(previous, previous_line, kind, line)
+            }) {
                 entries.push(LayoutEntry {
                     source: LayoutSource::Separator,
                     kind: BlockKind::Separator,
@@ -3738,9 +3759,10 @@ impl App {
             entries.push(LayoutEntry {
                 source: LayoutSource::Output(index),
                 kind,
-                rows: Self::output_row_visual_rows(Some(&line), kind, wrap_width),
+                rows: Self::output_row_visual_rows(Some(line), kind, wrap_width),
             });
             previous_kind = Some(kind);
+            previous_line = Some(line);
         }
 
         for (index, line) in error_lines.iter().enumerate() {
@@ -4231,12 +4253,10 @@ impl App {
     ///
     /// Same-kind headers (`ToolHeader → ToolHeader` and
     /// `CommandHeader → CommandHeader`) return `true` so two distinct
-    /// tool calls always get breathing room, even when their kinds
-    /// match.  This relies on the invariant that each header is one
-    /// logical entry (one `push_output_with_kind` call) — see the
-    /// deferred-wrap change in `push_output_with_kind`.  All other
-    /// same-kind pairs are part of one logical block and stay
-    /// un-separated.
+    /// calls get breathing room when only block kinds are available.
+    /// Callers that have concrete lines use
+    /// `should_insert_separator_for_lines` to group multiline tool-call
+    /// arguments correctly.
     fn should_insert_separator(prev: BlockKind, next: BlockKind) -> bool {
         if prev == BlockKind::Separator || next == BlockKind::Separator {
             return false;
@@ -4282,6 +4302,34 @@ impl App {
                 | (BlockKind::ToolOutput, BlockKind::ToolHeader)
                 | (BlockKind::CommandOutput, BlockKind::CommandHeader)
         )
+    }
+
+    /// Tool-call arguments are emitted as separate `ToolHeaderLine` events,
+    /// but only lines beginning with `▶` represent a new call. Keep the
+    /// argument rows together while preserving a separator between calls.
+    fn should_insert_separator_for_lines(
+        prev_kind: BlockKind,
+        prev_line: Option<&Line<'static>>,
+        next_kind: BlockKind,
+        next_line: &Line<'static>,
+    ) -> bool {
+        if prev_kind == next_kind
+            && matches!(prev_kind, BlockKind::ToolHeader | BlockKind::CommandHeader)
+        {
+            let next_is_call_start = match next_kind {
+                BlockKind::ToolHeader => Self::line_to_string(next_line)
+                    .trim_start()
+                    .starts_with("▶ "),
+                BlockKind::CommandHeader => {
+                    let text = Self::line_to_string(next_line);
+                    text.trim_start().starts_with("Running: ")
+                        || text.trim_start().starts_with("$ ")
+                }
+                _ => false,
+            };
+            return next_is_call_start && prev_line.is_some();
+        }
+        Self::should_insert_separator(prev_kind, next_kind)
     }
 
     fn total_visual_rows(&mut self, wrap_width: usize) -> usize {
@@ -10001,5 +10049,25 @@ mod tests {
         // Separator rows suppress surrounding blanks.
         assert!(!App::should_insert_separator(Model, Separator));
         assert!(!App::should_insert_separator(Separator, Model));
+    }
+
+    #[test]
+    fn test_tool_call_argument_lines_stay_in_one_visual_block() {
+        use BlockKind::ToolHeader;
+
+        let mut app = App::new();
+        app.push_output_with_kind(Line::from("  ▶ list_files"), ToolHeader);
+        app.push_output_with_kind(Line::from("    args: {"), ToolHeader);
+        app.push_output_with_kind(Line::from("      \"path\": \".\""), ToolHeader);
+        app.push_output_with_kind(Line::from("    }"), ToolHeader);
+
+        assert_eq!(app.output_visual_rows(app.last_wrap_width()), 4);
+
+        app.push_output_with_kind(Line::from("  ▶ read_file"), ToolHeader);
+        assert_eq!(app.output_visual_rows(app.last_wrap_width()), 6);
+
+        app.push_output_with_kind(Line::from("Running: cargo test"), BlockKind::CommandHeader);
+        app.push_output_with_kind(Line::from("Running: cargo check"), BlockKind::CommandHeader);
+        assert_eq!(app.output_visual_rows(app.last_wrap_width()), 9);
     }
 }
