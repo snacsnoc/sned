@@ -6,7 +6,7 @@ use crate::core::file_editor::{
     AppliedEdit, ApplyOutcome, Edit, EditExecutor, FailedEdit, FileEditorError, ResolvedEdit,
     SpliceProvenance, UnchangedSite, split_content_lines,
 };
-use crate::core::hash_utils::format_line_with_hash;
+use crate::core::hash_utils::{format_line_with_hash, strip_hashes};
 use crate::core::tools::handlers::error_guidance;
 use std::path::Path;
 
@@ -381,6 +381,40 @@ impl BatchProcessor {
     /// Generates diff for a batch.
     #[must_use]
     pub fn generate_diff(&self, display_path: &str, prepared: &PreparedEdits) -> String {
+        let entries: Vec<(usize, usize, &Edit)> = prepared
+            .applied_edits
+            .iter()
+            .map(|applied| {
+                (
+                    applied.original_start_idx,
+                    applied.original_end_idx,
+                    &applied.edit,
+                )
+            })
+            .collect();
+        self.generate_diff_for_entries(display_path, &prepared.lines, &entries)
+    }
+
+    /// Generates the preview shown before approval from edits that have been
+    /// resolved but not applied yet. Approval must show the actual source and
+    /// replacement, rather than the empty `applied_edits` state used during
+    /// preparation.
+    #[must_use]
+    pub fn generate_diff_preview(&self, display_path: &str, prepared: &PreparedEdits) -> String {
+        let entries: Vec<(usize, usize, &Edit)> = prepared
+            .resolved_edits
+            .iter()
+            .map(|resolved| (resolved.line_idx, resolved.end_idx, &resolved.edit))
+            .collect();
+        self.generate_diff_for_entries(display_path, &prepared.lines, &entries)
+    }
+
+    fn generate_diff_for_entries(
+        &self,
+        display_path: &str,
+        lines: &[String],
+        entries: &[(usize, usize, &Edit)],
+    ) -> String {
         let mut diff = String::new();
         let colored = !crate::cli::colors::stdout_colors_disabled();
         let language = syntax_language_for_path(display_path);
@@ -396,30 +430,44 @@ impl BatchProcessor {
             diff.push_str(&format!("Update File: {display_path}\n\n"));
         }
 
-        for applied in &prepared.applied_edits {
-            let edit_type = &applied.edit.edit_type;
+        for &(start_idx, end_idx, edit) in entries {
+            // Resolved edits are normally range-checked by the executor, but
+            // keep preview generation defensive so a malformed prepared
+            // value cannot panic while an approval prompt is being built.
+            if start_idx >= lines.len() || end_idx < start_idx || end_idx >= lines.len() {
+                continue;
+            }
+            let edit_type = &edit.edit_type;
             let search_lines: Vec<String>;
             let replace_lines: Vec<String>;
 
             if edit_type == "insert_after" {
-                search_lines = vec![prepared.lines[applied.original_start_idx].clone()];
-                replace_lines = vec![
-                    prepared.lines[applied.original_start_idx].clone(),
-                    applied.edit.text.clone(),
-                ];
+                search_lines = vec![lines[start_idx].clone()];
+                let clean_text = strip_hashes(&edit.text);
+                replace_lines = std::iter::once(lines[start_idx].clone())
+                    .chain(
+                        (!clean_text.is_empty())
+                            .then(|| split_content_lines(&clean_text))
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .collect();
             } else if edit_type == "insert_before" {
-                search_lines = vec![prepared.lines[applied.original_start_idx].clone()];
-                replace_lines = vec![
-                    applied.edit.text.clone(),
-                    prepared.lines[applied.original_start_idx].clone(),
-                ];
+                search_lines = vec![lines[start_idx].clone()];
+                let clean_text = strip_hashes(&edit.text);
+                replace_lines = (!clean_text.is_empty())
+                    .then(|| split_content_lines(&clean_text))
+                    .into_iter()
+                    .flatten()
+                    .chain(std::iter::once(lines[start_idx].clone()))
+                    .collect();
             } else {
-                search_lines =
-                    prepared.lines[applied.original_start_idx..=applied.original_end_idx].to_vec();
-                replace_lines = if applied.edit.text.is_empty() {
+                search_lines = lines[start_idx..=end_idx].to_vec();
+                let clean_text = strip_hashes(&edit.text);
+                replace_lines = if clean_text.is_empty() {
                     Vec::new()
                 } else {
-                    split_content_lines(&applied.edit.text)
+                    split_content_lines(&clean_text)
                 };
             }
 
@@ -1499,6 +1547,44 @@ mod tests {
 
         // Note: ANSI color codes won't be present in non-TTY test environment
         // This is correct behavior - colors respect NO_COLOR and TTY detection
+    }
+
+    #[test]
+    fn test_generate_diff_preview_renders_resolved_edits_before_apply() {
+        let task_id = "diff_preview_test";
+        let anchor_mgr = AnchorStateManager::new();
+        anchor_mgr.reset(Some(task_id));
+
+        let processor = BatchProcessor::new(DiffMode::Full);
+        let content = "before\ntarget\nafter";
+        let lines = split_content_lines(content);
+        let hashes = anchor_mgr.reconcile("/tmp/diff_preview_test.rs", &lines, Some(task_id));
+        let edits = vec![Edit {
+            anchor: format!("{}§target", hashes[1]),
+            end_anchor: Some(format!("{}§target", hashes[1])),
+            edit_type: "replace".to_string(),
+            text: format!("{}§new one\n{}§new two", hashes[0], hashes[1]),
+            content: None,
+        }];
+
+        let prepared = processor
+            .prepare_edits(
+                "/tmp/diff_preview_test.rs",
+                "diff_preview_test.rs",
+                content,
+                &edits,
+                &hashes,
+            )
+            .unwrap();
+
+        let diff = processor.generate_diff_preview("diff_preview_test.rs", &prepared);
+
+        assert!(diff.contains("<<<<<<< SEARCH"));
+        assert!(diff.contains("- target"));
+        assert!(diff.contains("+ new one"));
+        assert!(diff.contains("+ new two"));
+        assert!(!diff.contains(&format!("+ {}§", hashes[0])));
+        assert!(!diff.contains(&format!("+ {}§", hashes[1])));
     }
 
     #[cfg(feature = "lang-rust")]

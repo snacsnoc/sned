@@ -1838,7 +1838,7 @@ impl EditFileHandler {
             total_edits += batch.edits.len();
             // Generate diff preview without modifying prepared (skip in silent mode)
             if !silent {
-                let diff_preview = processor.generate_diff(&batch.display_path, &prepared);
+                let diff_preview = processor.generate_diff_preview(&batch.display_path, &prepared);
                 diff_previews.push(diff_preview);
             }
 
