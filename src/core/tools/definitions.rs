@@ -294,13 +294,13 @@ pub fn edit_file_schema() -> ToolSchema {
 pub fn execute_command_schema() -> ToolSchema {
     ToolSchema {
         name: "execute_command",
-        description: "Executes CLI commands or scripts. Use commands as a literal JSON array of strings for simple sequences, not a string containing an array. Use script for complex run-only logic. Use file tools for workspace changes rather than shell redirection, heredocs, or ad-hoc Python/sed rewrites. Provide exactly one of {commands, script}.",
+        description: "Executes CLI commands or scripts. Use commands as a literal JSON array of strings for simple sequences, not a string containing an array. Each commands[] entry runs in a fresh shell, so variables, cd, and other shell state do not persist between entries or tool calls; keep dependent statements in one multiline entry or use script. Use script for complex run-only logic. Use file tools for workspace changes rather than shell redirection, heredocs, or ad-hoc Python/sed rewrites. Provide exactly one of {commands, script}.",
         parameters: vec![
             ToolParameter {
                 name: "commands",
                 required: false,
                 param_type: "array",
-                description: "A literal JSON array of CLI command strings to execute in sequence. Do not encode the array as a string.",
+                description: "A literal JSON array of CLI command strings to execute in sequence. Each entry runs in a fresh shell; variables, cd, and other shell state do not persist between entries or tool calls. Keep dependent statements in one multiline entry or use script. Do not encode the array as a string.",
                 items: Some(serde_json::json!({"type": "string"})),
                 extra: None,
             },

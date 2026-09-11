@@ -16,6 +16,8 @@ EXAMPLE TOOL CALLS
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
 - run/test: tool=execute_command args={\"commands\": [\"cargo test --no-fail-fast\"]} (commands is a literal JSON array, not a string containing an array)
 - complex run-only logic: tool=execute_command args={\"script\": \"...\", \"language\": \"python\"}
+- dependent shell statements: tool=execute_command args={\"commands\": [\"value='ready'\\nprintf '%s\\\\n' \\\"$value\\\"\"]} (each commands[] entry starts a fresh shell; keep assignment and use in one entry)
+- quoted multiline shell text: tool=execute_command args={\"commands\": [\"cat <<'EOF'\\nquoted \\\"value\\\"\\nEOF\"]} (preserve the `\\n` escapes and quoted heredoc delimiter)
 - Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; Word§ snapshot anchors are inspection-only.
 - Delete a range: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"anchor\": \"First§// obsolete\", \"end_anchor\": \"Last§old_call();\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read; each selector is one line, never a pasted block).
 - edit_file uses text for replacement source without Word§ prefixes. Its optional content field is only an array of plain interior source lines for a duplicate-anchor fingerprint; ordinary range deletion does not need it.

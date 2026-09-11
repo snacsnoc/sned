@@ -118,14 +118,17 @@ pub fn load_images_to_content_blocks(
 /// Parse a prompt string and extract image file paths.
 ///
 /// Supports `@/path/to/image.png` syntax as well as standalone absolute paths
-/// that look like images. Returns the cleaned prompt and extracted paths.
+/// that look like images. Preserves prompt whitespace outside image references
+/// and their adjacent separator spaces.
 #[must_use]
 pub fn parse_images_from_input(input: &str) -> (String, Vec<String>) {
     let mut image_paths = Vec::new();
+    let mut references = Vec::new();
 
     // Match @/path/to/image.ext patterns
     for cap in AT_IMAGE_PATH_REGEX.captures_iter(input) {
         if let Some(m) = cap.get(1) {
+            references.push((m.start() - 1, m.end())); // Include the @ prefix.
             let path = m.as_str().to_string();
             if !image_paths.contains(&path) {
                 image_paths.push(path);
@@ -136,6 +139,7 @@ pub fn parse_images_from_input(input: &str) -> (String, Vec<String>) {
     // Match standalone absolute paths that look like images
     for cap in STANDALONE_IMAGE_PATH_REGEX.captures_iter(input) {
         if let Some(m) = cap.get(1) {
+            references.push((m.start(), m.end()));
             let path = m.as_str().to_string();
             if !image_paths.contains(&path) {
                 image_paths.push(path);
@@ -143,12 +147,23 @@ pub fn parse_images_from_input(input: &str) -> (String, Vec<String>) {
         }
     }
 
-    // Remove image references from prompt
-    let mut prompt = AT_IMAGE_PATH_REGEX.replace_all(input, " ").to_string();
-    prompt = STANDALONE_IMAGE_PATH_REGEX
-        .replace_all(&prompt, " ")
-        .to_string();
-    prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The regex matches include whitespace delimiters. Remove only the image
+    // spans so newlines, indentation, and spaces inside quoted text survive.
+    // Work backwards to keep the remaining byte offsets valid.
+    let mut prompt = input.to_string();
+    references.sort_unstable();
+    for (mut start, mut end) in references.into_iter().rev() {
+        let line_start = prompt[..start].rfind('\n').map_or(0, |pos| pos + 1);
+        let follows_indentation = prompt[line_start..start].chars().all(char::is_whitespace);
+        if follows_indentation {
+            if prompt.as_bytes().get(end) == Some(&b' ') {
+                end += 1;
+            }
+        } else if start > 0 && prompt.as_bytes()[start - 1] == b' ' {
+            start -= 1;
+        }
+        prompt.replace_range(start..end, "");
+    }
 
     (prompt, image_paths)
 }
@@ -253,6 +268,33 @@ mod tests {
         let (prompt, paths) = parse_images_from_input(input);
         assert_eq!(prompt, "just some text without images");
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_parse_images_from_input_preserves_multiline_prompt_verbatim() {
+        let input = "\n# Coverage check\n\n```bash\nTASK_DATE=2026-09-11\nprintf '%s\\n' \"$TASK_DATE\"\ncat <<SQL\nSELECT 'two  spaces', (1);\nSQL\n```\n\n\tIndented text.  \n";
+        let (prompt, paths) = parse_images_from_input(input);
+        assert_eq!(prompt, input);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_parse_images_from_input_preserves_multiline_text_around_images() {
+        let input = "Inspect @/tmp/image.png\n\n```python\ndef example():\n\treturn \"two  spaces\"\n```\n/tmp/another.jpg\nNext paragraph.\n";
+        let (prompt, paths) = parse_images_from_input(input);
+        assert_eq!(
+            prompt,
+            "Inspect\n\n```python\ndef example():\n\treturn \"two  spaces\"\n```\n\nNext paragraph.\n"
+        );
+        assert_eq!(paths, vec!["/tmp/image.png", "/tmp/another.jpg"]);
+    }
+
+    #[test]
+    fn test_parse_images_from_input_preserves_crlf_and_indentation() {
+        let input = "Review\r\n  @/tmp/image.png\r\n\tquoted = \"a  b\"\r\n";
+        let (prompt, paths) = parse_images_from_input(input);
+        assert_eq!(prompt, "Review\r\n  \r\n\tquoted = \"a  b\"\r\n");
+        assert_eq!(paths, vec!["/tmp/image.png"]);
     }
 
     #[test]

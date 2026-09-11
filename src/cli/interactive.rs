@@ -9635,6 +9635,53 @@ mod tests {
         fn flush(&self) {}
     }
 
+    #[tokio::test]
+    async fn test_pasted_multiline_prompt_survives_message_construction() {
+        use crate::core::agent_loop::{AgentConfig, AgentLoop};
+        use crate::providers::{MessageContent, MessageRole, Providers};
+
+        let writer: OutputWriterArc = Arc::new(NullOutputWriter);
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![],
+        )));
+        let agent = Arc::new(Mutex::new(AgentLoop::new(AgentConfig {
+            provider: Arc::new(std::sync::Mutex::new(provider)),
+            output_writer: Arc::clone(&writer),
+            ..Default::default()
+        })));
+        // The reported Qwen run lost the newlines in this heredoc after the
+        // textarea had already expanded the paste correctly.
+        let prompt = "# Intraday Trade Analysis TASK (Qwen3-4B)\n\n```bash\nTASK_DATE=2026-09-11\n./venv/bin/python clawbot/bin/postgres_read.py <<SQL\nSELECT ticker, qty, pnl_cad\nFROM clawbot_analytics.trade_outcomes\nWHERE (exit_time::timestamptz AT TIME ZONE 'America/Vancouver')::date = DATE '$TASK_DATE';\nSQL\n```\n\nKeep \"two  spaces\" and \\n literal.\n";
+
+        for fold_large in [false, true] {
+            for with_image in [false, true] {
+                let input = if with_image {
+                    format!("Inspect @/tmp/prompt-image.png\n{prompt}")
+                } else {
+                    prompt.to_string()
+                };
+                let expected = if with_image {
+                    format!("Inspect\n{prompt}")
+                } else {
+                    prompt.to_string()
+                };
+                let mut app = App::new();
+                app.handle_paste(&input, fold_large);
+                let submitted = app.get_input_with_expanded_pastes();
+                let message = build_initial_message_from_prompt(&submitted, &agent, &writer).await;
+                assert_eq!(message.role, MessageRole::User);
+                let MessageContent::Text(text) = &message.content else {
+                    panic!("expected text for the mock model");
+                };
+                assert_eq!(text, &expected, "fold={fold_large}, image={with_image}");
+
+                let exported = serialize_conversation_export(&vec![message]).unwrap();
+                let history: serde_json::Value = serde_json::from_str(&exported).unwrap();
+                assert_eq!(history[0]["content"], expected);
+            }
+        }
+    }
+
     #[test]
     fn test_build_user_message_content_includes_images() {
         use std::sync::Arc;

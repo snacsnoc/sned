@@ -215,7 +215,8 @@ impl PromptBuilder {
         if self.has_tool(SnedTool::ExecuteCommand) {
             prompt.push_str(
                 "- Use `execute_command` for inspection, builds, tests, and other execution; do not use shell redirection, heredocs, or ad-hoc Python/sed scripts as a substitute for workspace file tools.\n\
-                 - For `execute_command`, send `commands` as a JSON array of strings, not a string containing an array; use `script` for complex run-only logic.\n",
+                 - For `execute_command`, send `commands` as a JSON array of strings, not a string containing an array; use `script` for complex run-only logic.\n\
+                 - Each `commands[]` entry runs in a fresh shell, so variables, `cd`, and other shell state do not persist between entries or tool calls. Keep dependent statements in one multiline entry or use `script`. Preserve `\\n` escapes and quoted delimiters when a JSON command string contains multiline shell text such as a heredoc.\n",
             );
         }
         if self.has_tool(SnedTool::WriteToFile) && self.has_tool(SnedTool::EditFile) {

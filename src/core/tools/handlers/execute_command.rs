@@ -1726,6 +1726,80 @@ mod tests {
         assert!(result.contains("hello"));
     }
 
+    #[tokio::test]
+    async fn test_tool_handler_keeps_dependent_commands_in_one_shell_entry() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let workspace_root = tempfile::tempdir().unwrap();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace_root.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "dependent-command-test".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::from_str(
+                r#"{"commands":["task_date='2026-09-11'\nprintf '%s\\n' \"$task_date\""]}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let output = result
+            .as_str()
+            .unwrap()
+            .split("\n\n--- Note (informational, not a tool error) ---\n")
+            .next()
+            .unwrap();
+        assert_eq!(output, "2026-09-11\n");
+    }
+
+    #[tokio::test]
+    async fn test_tool_handler_preserves_quoted_multiline_heredoc() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let workspace_root = tempfile::tempdir().unwrap();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace_root.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "heredoc-command-test".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+        );
+
+        let result = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::from_str(
+                r#"{"commands":["cat <<'EOF'\nquoted \"value\"\n$dollar stays literal\nEOF"]}"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let output = result
+            .as_str()
+            .unwrap()
+            .split("\n\n--- Note (informational, not a tool error) ---\n")
+            .next()
+            .unwrap();
+        assert_eq!(output, "quoted \"value\"\n$dollar stays literal\n");
+    }
+
     #[test]
     fn test_serialized_command_containers_are_recognized() {
         for value in [
