@@ -39,14 +39,18 @@ fn test_help_shows_task_options() {
 fn test_version_shows_version() {
     let mut cmd = Command::cargo_bin("sned").unwrap();
     cmd.arg("--version");
-    cmd.assert().success().stdout(contains("0.1.4"));
+    cmd.assert()
+        .success()
+        .stdout(contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
 fn test_version_subcommand_shows_version() {
     let mut cmd = Command::cargo_bin("sned").unwrap();
     cmd.arg("version");
-    cmd.assert().success().stdout(contains("0.1.4"));
+    cmd.assert()
+        .success()
+        .stdout(contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
