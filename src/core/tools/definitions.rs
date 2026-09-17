@@ -234,7 +234,7 @@ pub fn edit_file_schema() -> ToolSchema {
                     },
                     "edits": {
                         "type": "array",
-                        "description": "Edits for this file.",
+                        "description": "Edits for this file. Each edit requires either anchor (anchored edit) or start_line plus expected_text (revision-checked edit with expected_file_hash).",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -245,7 +245,7 @@ pub fn edit_file_schema() -> ToolSchema {
                                 },
                                 "anchor": {
                                     "type": "string",
-                                    "description": "Start/insertion anchor: copy one complete Word§source line exactly from read_file, get_function, get_file_skeleton, or successful edit output. No newline; never paste a block here. Select a range with anchor and end_anchor, each containing one line."
+                                    "description": "Start/insertion anchor: copy one complete Word§source line exactly from read_file, get_function, get_file_skeleton, or successful edit output. No newline; never paste a block here. Select a range with anchor and end_anchor, each containing one line. Either anchor or start_line plus expected_text is required."
                                 },
                                 "end_anchor": {
                                     "type": "string",
@@ -275,11 +275,7 @@ pub fn edit_file_schema() -> ToolSchema {
                                     "description": "Replacement source without Word§ prefixes; use \\n for new lines. Use an empty string to delete the inclusive anchor/end_anchor range. In insertions, leading and trailing blank lines count in duplicate checks."
                                 }
                             },
-                            "required": ["text"],
-                            "anyOf": [
-                                {"required": ["anchor"]},
-                                {"required": ["start_line", "expected_text"]}
-                            ]
+                            "required": ["text"]
                         }
                     }
                 },
@@ -1086,8 +1082,24 @@ mod tests {
         assert!(required.iter().any(|field| field == "text"));
         assert_eq!(properties["start_line"]["minimum"], 1);
         assert_eq!(properties["expected_text"]["type"], "string");
-        assert_eq!(edit["anyOf"][0]["required"][0], "anchor");
-        assert_eq!(edit["anyOf"][1]["required"][0], "start_line");
+        // Gemini rejects `required` on subschemas without type: object plus
+        // locally-defined properties, so the schema must stay flat: no
+        // anyOf/oneOf branches, with the anchor-vs-range either/or carried
+        // by descriptions and enforced handler-side instead.
+        assert!(
+            edit.get("anyOf").is_none(),
+            "edit items must not use anyOf branches (Gemini 400)"
+        );
+        assert!(
+            edit.get("oneOf").is_none(),
+            "edit items must not use oneOf branches (Gemini 400)"
+        );
+        assert!(
+            properties["anchor"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("start_line")),
+            "anchor description must state the start_line alternative"
+        );
         assert!(
             schema
                 .description
@@ -1100,6 +1112,91 @@ mod tests {
         );
         assert!(schema.description.contains("revision from a ranged read"));
         assert!(schema.description.contains("recovery metadata requires it"));
+    }
+
+    /// Regression guard for the Gemini 400 `INVALID_ARGUMENT` rejection:
+    /// Gemini requires every schema carrying `required` to declare
+    /// `type: object` with locally-defined `properties`, and rejects bare
+    /// `anyOf`/`oneOf`/`allOf` required-branches. Walk every tool's
+    /// parameters and fail on any such shape before it reaches the API.
+    #[test]
+    fn all_tool_schemas_stay_gemini_flat() {
+        fn check(value: &serde_json::Value, trail: &str) {
+            let Some(obj) = value.as_object() else {
+                return;
+            };
+            for branch in ["anyOf", "oneOf", "allOf"] {
+                assert!(
+                    obj.get(branch).is_none(),
+                    "Gemini-invalid {branch} at {trail}"
+                );
+            }
+            if let Some(required) = obj.get("required") {
+                assert_eq!(
+                    obj.get("type").and_then(serde_json::Value::as_str),
+                    Some("object"),
+                    "Gemini-invalid required without type: object at {trail}"
+                );
+                let properties = obj
+                    .get("properties")
+                    .and_then(|properties| properties.as_object());
+                for name in required
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                {
+                    assert!(
+                        properties.is_some_and(|props| props.contains_key(name)),
+                        "Gemini-invalid required property {name} not defined at {trail}"
+                    );
+                }
+            }
+            for (key, child) in obj {
+                if key == "description" || key == "enum" {
+                    continue;
+                }
+                if child.is_object() {
+                    check(child, &format!("{trail}.{key}"));
+                } else if child.is_array() {
+                    for (index, item) in
+                        child.as_array().into_iter().flatten().enumerate()
+                    {
+                        check(item, &format!("{trail}.{key}[{index}]"));
+                    }
+                }
+            }
+        }
+
+        let tools = [
+            super::SnedTool::ReadFile,
+            super::SnedTool::WriteToFile,
+            super::SnedTool::ListFiles,
+            super::SnedTool::SearchFiles,
+            super::SnedTool::EditFile,
+            super::SnedTool::ExecuteCommand,
+            super::SnedTool::AskFollowupQuestion,
+            super::SnedTool::AttemptCompletion,
+            super::SnedTool::PlanModeRespond,
+            super::SnedTool::GetFunction,
+            super::SnedTool::GetFileSkeleton,
+            super::SnedTool::FindSymbolReferences,
+            super::SnedTool::ReplaceSymbol,
+            super::SnedTool::RenameSymbol,
+            super::SnedTool::UseSubagents,
+            super::SnedTool::UseSkill,
+            super::SnedTool::ListSkills,
+            super::SnedTool::DiagnosticsScan,
+            super::SnedTool::Condense,
+            super::SnedTool::WebFetch,
+        ];
+        for tool in tools {
+            let definition = get_tool_schema(tool).to_tool_definition();
+            check(
+                &definition.function.parameters,
+                definition.function.name.as_str(),
+            );
+        }
     }
 
     #[test]

@@ -248,28 +248,10 @@ impl GeminiProvider {
             let function_declarations: Vec<serde_json::Value> = tool_defs
                 .iter()
                 .map(|t| {
-                    // Gemini doesn't support additionalProperties in schemas
-                    // Strip it from the parameters object
-                    let mut params = t.function.parameters.clone();
-                    if let Some(obj) = params.as_object_mut() {
-                        obj.remove("additionalProperties");
-                        obj.remove("$schema");
-                        // Also strip from nested property schemas
-                        if let Some(props) =
-                            obj.get_mut("properties").and_then(|v| v.as_object_mut())
-                        {
-                            for (_, prop) in props.iter_mut() {
-                                if let Some(prop_obj) = prop.as_object_mut() {
-                                    prop_obj.remove("additionalProperties");
-                                    prop_obj.remove("$schema");
-                                }
-                            }
-                        }
-                    }
                     json!({
                         "name": t.function.name,
                         "description": t.function.description,
-                        "parameters": params,
+                        "parameters": sanitize_function_parameters(&t.function.parameters),
                     })
                 })
                 .collect();
@@ -331,6 +313,30 @@ impl GeminiProvider {
             self.base_url(),
             self.config.model_id
         )
+    }
+}
+
+/// Strip schema keys the Gemini API rejects, at any depth.
+///
+/// Gemini supports only a subset of JSON Schema: `additionalProperties`
+/// and `$schema` are rejected wherever they appear, so they are removed
+/// recursively instead of only at the top two levels.
+fn sanitize_function_parameters(params: &serde_json::Value) -> serde_json::Value {
+    match params {
+        serde_json::Value::Object(obj) => {
+            let mut clean = serde_json::Map::with_capacity(obj.len());
+            for (key, value) in obj {
+                if key == "additionalProperties" || key == "$schema" {
+                    continue;
+                }
+                clean.insert(key.clone(), sanitize_function_parameters(value));
+            }
+            serde_json::Value::Object(clean)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items.iter().map(sanitize_function_parameters).collect(),
+        ),
+        scalar => scalar.clone(),
     }
 }
 
@@ -2157,5 +2163,93 @@ mod tests {
             None => "{}".to_string(),
         };
         assert_eq!(args_str, "{}");
+    }
+
+    /// Wire-shape guard: every real tool definition must survive the Gemini
+    /// converter in a form the API accepts — no anyOf/oneOf/allOf branches,
+    /// no additionalProperties/$schema at any depth, and `required` only on
+    /// object schemas with locally-defined properties. This is the
+    /// provider-layer backstop for the definitions-level
+    /// `all_tool_schemas_stay_gemini_flat` test; the bare-required
+    /// edit_file anyOf (Gemini 400) proved the converter output itself
+    /// must be asserted, not just the source schemas.
+    #[test]
+    fn test_full_inventory_stays_gemini_wire_safe() {
+        fn check(value: &serde_json::Value, trail: &str) {
+            let Some(obj) = value.as_object() else {
+                return;
+            };
+            for branch in ["anyOf", "oneOf", "allOf"] {
+                assert!(
+                    obj.get(branch).is_none(),
+                    "Gemini-invalid {branch} at {trail}"
+                );
+            }
+            for rejected in ["additionalProperties", "$schema"] {
+                assert!(
+                    obj.get(rejected).is_none(),
+                    "Gemini-invalid {rejected} at {trail}"
+                );
+            }
+            if let Some(required) = obj.get("required") {
+                assert_eq!(
+                    obj.get("type").and_then(serde_json::Value::as_str),
+                    Some("object"),
+                    "Gemini-invalid required without type: object at {trail}"
+                );
+                let properties = obj
+                    .get("properties")
+                    .and_then(|properties| properties.as_object());
+                for name in required
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                {
+                    assert!(
+                        properties.is_some_and(|props| props.contains_key(name)),
+                        "Gemini-invalid required property {name} not defined at {trail}"
+                    );
+                }
+            }
+            for (key, child) in obj {
+                if key == "description" || key == "enum" {
+                    continue;
+                }
+                if child.is_object() {
+                    check(child, &format!("{trail}.{key}"));
+                } else if child.is_array() {
+                    for (index, item) in
+                        child.as_array().into_iter().flatten().enumerate()
+                    {
+                        check(item, &format!("{trail}.{key}[{index}]"));
+                    }
+                }
+            }
+        }
+
+        let defs = crate::core::tools::definitions::get_active_tool_definitions();
+        assert!(!defs.is_empty(), "expected active tool definitions");
+        let mut total_bytes = 0;
+        for def in &defs {
+            let declaration = json!({
+                "name": def.function.name,
+                "description": def.function.description,
+                "parameters": sanitize_function_parameters(&def.function.parameters),
+            });
+            check(&declaration["parameters"], &def.function.name);
+            total_bytes += serde_json::to_string(&declaration).unwrap().len();
+        }
+        eprintln!(
+            "\nGemini Full-profile functionDeclarations: {total_bytes} bytes ({} tools)",
+            defs.len()
+        );
+        // Docs budget totalDeclarationsTokens; JSON schema text runs ~3-4
+        // bytes per token, so 100_000 bytes stays ~3-4x under budget while
+        // tripping loudly on unbounded schema growth.
+        assert!(
+            total_bytes < 100_000,
+            "Gemini declarations grew past 100_000 bytes: got {total_bytes}"
+        );
     }
 }
