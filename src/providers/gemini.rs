@@ -11,7 +11,7 @@
 
 use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
-    ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, ModelInfo, ModelTier,
+    ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, ModelInfo,
     Provider, ProviderError, ProviderHttpError, ProviderModel, ProviderRequest, SseLineBuffer,
     ThinkingConfig, gemini_format, is_retryable_stream_transport_error,
 };
@@ -924,6 +924,10 @@ impl Provider for GeminiProvider {
 }
 
 /// Get model info for Gemini models.
+///
+/// Pricing is intentionally not tracked here: provider rates change too
+/// often to maintain, so all price fields stay `None` and usage cost
+/// reports as unknown.
 pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
     // Default model info for unknown Gemini models
     let mut info = ModelInfo {
@@ -933,8 +937,8 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
         supports_images: Some(true),
         supports_prompt_cache: true,
         supports_reasoning: Some(true),
-        input_price: Some(4.0),
-        output_price: Some(18.0),
+        input_price: None,
+        output_price: None,
         image_output_price: None,
         thinking_config: Some(ThinkingConfig {
             max_budget: None,
@@ -944,8 +948,8 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
             supports_thinking_level: Some(true),
         }),
         supports_global_endpoint: Some(true),
-        cache_writes_price: Some(4.0),
-        cache_reads_price: Some(0.4),
+        cache_writes_price: None,
+        cache_reads_price: None,
         description: None,
         tiers: None,
         temperature: None,
@@ -956,11 +960,16 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
     };
 
     // Model-specific overrides - most-specific-first ordering
-    if model_id.contains("gemini-3.6-flash") {
-        info.input_price = Some(1.5);
-        info.output_price = Some(7.5);
-        info.cache_writes_price = Some(1.5);
-        info.cache_reads_price = Some(0.15);
+    if model_id.contains("gemini-3.7-flash") {
+        // Default thinking level is medium.
+        info.thinking_config = Some(ThinkingConfig {
+            max_budget: None,
+            output_price: None,
+            output_price_tiers: None,
+            gemini_thinking_level: Some("medium".to_string()),
+            supports_thinking_level: Some(true),
+        });
+    } else if model_id.contains("gemini-3.6-flash") {
         info.thinking_config = Some(ThinkingConfig {
             max_budget: None,
             output_price: None,
@@ -969,10 +978,6 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
             supports_thinking_level: Some(true),
         });
     } else if model_id.contains("gemini-3.5-flash-lite") {
-        info.input_price = Some(0.3);
-        info.output_price = Some(2.5);
-        info.cache_writes_price = Some(0.3);
-        info.cache_reads_price = Some(0.03);
         info.thinking_config = Some(ThinkingConfig {
             max_budget: None,
             output_price: None,
@@ -981,10 +986,6 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
             supports_thinking_level: Some(true),
         });
     } else if model_id.contains("gemini-3.5-flash") {
-        info.input_price = Some(1.5);
-        info.output_price = Some(9.0);
-        info.cache_writes_price = Some(1.5);
-        info.cache_reads_price = Some(0.15);
         info.thinking_config = Some(ThinkingConfig {
             max_budget: None,
             output_price: None,
@@ -993,21 +994,14 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
             supports_thinking_level: Some(true),
         });
     } else if model_id.contains("gemini-3.1-flash-image") {
-        // 128k context, $0.25 input, $0.067/image output
+        // 128k context
         info.context_window = Some(128_000);
-        info.input_price = Some(0.25);
-        info.output_price = Some(0.067);
     } else if model_id.contains("gemini-3-pro-image") {
-        // 65k context, $2 input, $0.134/image output
+        // 65k context
         info.context_window = Some(65_000);
-        info.input_price = Some(2.0);
-        info.output_price = Some(0.134);
     } else if model_id.contains("gemini-3.1-flash-lite") {
-        // 1M context, $0.25 input, $1.50 output, cache_reads_price: 0.05
+        // 1M context
         info.context_window = Some(1_048_576);
-        info.input_price = Some(0.25);
-        info.output_price = Some(1.50);
-        info.cache_reads_price = Some(0.05);
         info.thinking_config = Some(ThinkingConfig {
             max_budget: None,
             output_price: None,
@@ -1016,51 +1010,16 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
             supports_thinking_level: Some(true),
         });
     } else if model_id.contains("gemini-3.1-pro") {
-        // 1M context, tiered pricing: <$200k = $2/$12, >$200k = $4/$18
+        // 1M context
         info.context_window = Some(1_048_576);
-        info.tiers = Some(vec![
-            ModelTier {
-                context_window: 200_000,
-                input_price: Some(2.0),
-                output_price: Some(12.0),
-                cache_writes_price: Some(2.0),
-                cache_reads_price: Some(0.2),
-            },
-            ModelTier {
-                context_window: u64::MAX,
-                input_price: Some(4.0),
-                output_price: Some(18.0),
-                cache_writes_price: Some(4.0),
-                cache_reads_price: Some(0.4),
-            },
-        ]);
         info.temperature = Some(1.0);
     } else if model_id.contains("gemini-3-pro") {
-        // 1M context, tiered pricing: <$200k = $2/$12, >$200k = $4/$18
+        // 1M context
         info.context_window = Some(1_048_576);
-        info.tiers = Some(vec![
-            ModelTier {
-                context_window: 200_000,
-                input_price: Some(2.0),
-                output_price: Some(12.0),
-                cache_writes_price: Some(2.0),
-                cache_reads_price: Some(0.2),
-            },
-            ModelTier {
-                context_window: u64::MAX,
-                input_price: Some(4.0),
-                output_price: Some(18.0),
-                cache_writes_price: Some(4.0),
-                cache_reads_price: Some(0.4),
-            },
-        ]);
         info.temperature = Some(1.0);
     } else if model_id.contains("gemini-3-flash") {
-        // 1M context, $0.50 input, $3.00 output, cache_reads_price: 0.05
+        // 1M context
         info.context_window = Some(1_048_576);
-        info.input_price = Some(0.50);
-        info.output_price = Some(3.00);
-        info.cache_reads_price = Some(0.05);
         info.temperature = Some(1.0);
         // Gemini 3 Flash defaults to minimal thinking level per docs
         info.thinking_config = Some(ThinkingConfig {
@@ -1072,19 +1031,15 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
         });
     } else if model_id.contains("gemini-2.5-pro") {
         info.context_window = Some(1_048_576);
-        info.input_price = Some(2.5);
-        info.output_price = Some(15.0);
         info.thinking_config = Some(ThinkingConfig {
             max_budget: Some(32767),
-            output_price: Some(15.0),
+            output_price: None,
             output_price_tiers: None,
             gemini_thinking_level: None,
             supports_thinking_level: Some(false),
         });
     } else if model_id.contains("gemini-2.5-flash-lite") {
         info.context_window = Some(1_048_576);
-        info.input_price = Some(0.1);
-        info.output_price = Some(0.4);
         info.thinking_config = Some(ThinkingConfig {
             max_budget: Some(24576),
             output_price: None,
@@ -1094,11 +1049,9 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
         });
     } else if model_id.contains("gemini-2.5-flash") {
         info.context_window = Some(1_048_576);
-        info.input_price = Some(0.3);
-        info.output_price = Some(2.5);
         info.thinking_config = Some(ThinkingConfig {
             max_budget: Some(24576),
-            output_price: Some(3.5),
+            output_price: None,
             output_price_tiers: None,
             gemini_thinking_level: None,
             supports_thinking_level: Some(false),
@@ -1700,35 +1653,61 @@ mod tests {
         );
     }
 
-    // ============== Model Ordering Regression Tests ==============
-    // These tests verify that all Gemini models resolve to correct pricing.
+    // ============== Model Config Regression Tests ==============
+    // These tests verify that all Gemini models resolve to the correct
+    // functional config (context, thinking mode, temperature). Pricing is
+    // intentionally unmapped, so every model must report no prices.
     // The order of contains() checks in get_gemini_model_info() matters:
     // more-specific patterns (e.g., "flash-lite") must come before less-specific
     // ones (e.g., "flash") to avoid incorrect matches.
 
     #[test]
-    fn test_gemini_model_pricing_gemini_3_1_flash_image() {
-        let info = get_gemini_model_info("gemini-3.1-flash-image");
-        assert_eq!(info.context_window, Some(128_000));
-        assert_eq!(info.input_price, Some(0.25));
-        assert_eq!(info.output_price, Some(0.067));
+    fn test_gemini_model_info_carries_no_prices() {
+        let models = [
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-image",
+            "gemini-3-pro-image",
+            "gemini-3.1-flash-lite",
+            "gemini-3.1-pro",
+            "gemini-3-pro",
+            "gemini-3-flash",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-unknown-future-model",
+        ];
+        for model_id in models {
+            let info = get_gemini_model_info(model_id);
+            assert_eq!(info.input_price, None, "{model_id}");
+            assert_eq!(info.output_price, None, "{model_id}");
+            assert_eq!(info.cache_writes_price, None, "{model_id}");
+            assert_eq!(info.cache_reads_price, None, "{model_id}");
+            assert_eq!(info.tiers, None, "{model_id}");
+        }
     }
 
     #[test]
-    fn test_gemini_model_pricing_latest_flash_models() {
+    fn test_gemini_model_info_gemini_3_1_flash_image() {
+        let info = get_gemini_model_info("gemini-3.1-flash-image");
+        assert_eq!(info.context_window, Some(128_000));
+    }
+
+    #[test]
+    fn test_gemini_model_info_latest_flash_models() {
         let cases = [
-            ("gemini-3.6-flash", 1.5, 7.5, 0.15, "medium"),
-            ("gemini-3.5-flash", 1.5, 9.0, 0.15, "medium"),
-            ("gemini-3.5-flash-lite", 0.3, 2.5, 0.03, "minimal"),
+            ("gemini-3.7-flash", "medium"),
+            ("gemini-3.6-flash", "medium"),
+            ("gemini-3.5-flash", "medium"),
+            ("gemini-3.5-flash-lite", "minimal"),
         ];
 
-        for (model_id, input_price, output_price, cache_read_price, thinking_level) in cases {
+        for (model_id, thinking_level) in cases {
             let info = get_gemini_model_info(model_id);
             assert_eq!(info.context_window, Some(1_048_576));
             assert_eq!(info.max_tokens, Some(65_536));
-            assert_eq!(info.input_price, Some(input_price));
-            assert_eq!(info.output_price, Some(output_price));
-            assert_eq!(info.cache_reads_price, Some(cache_read_price));
             assert_eq!(
                 info.thinking_config
                     .as_ref()
@@ -1739,20 +1718,15 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_model_pricing_gemini_3_pro_image() {
+    fn test_gemini_model_info_gemini_3_pro_image() {
         let info = get_gemini_model_info("gemini-3-pro-image");
         assert_eq!(info.context_window, Some(65_000));
-        assert_eq!(info.input_price, Some(2.0));
-        assert_eq!(info.output_price, Some(0.134));
     }
 
     #[test]
-    fn test_gemini_model_pricing_gemini_3_1_flash_lite() {
+    fn test_gemini_model_info_gemini_3_1_flash_lite() {
         let info = get_gemini_model_info("gemini-3.1-flash-lite");
         assert_eq!(info.context_window, Some(1_048_576));
-        assert_eq!(info.input_price, Some(0.25));
-        assert_eq!(info.output_price, Some(1.50));
-        assert_eq!(info.cache_reads_price, Some(0.05));
         assert_eq!(
             info.thinking_config.as_ref().unwrap().gemini_thinking_level,
             Some("minimal".to_string())
@@ -1760,36 +1734,23 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_model_pricing_gemini_3_1_pro() {
+    fn test_gemini_model_info_gemini_3_1_pro() {
         let info = get_gemini_model_info("gemini-3.1-pro");
         assert_eq!(info.context_window, Some(1_048_576));
         assert_eq!(info.temperature, Some(1.0));
-        assert!(info.tiers.is_some());
-        let tiers = info.tiers.unwrap();
-        assert_eq!(tiers.len(), 2);
-        assert_eq!(tiers[0].input_price, Some(2.0));
-        assert_eq!(tiers[0].output_price, Some(12.0));
     }
 
     #[test]
-    fn test_gemini_model_pricing_gemini_3_pro() {
+    fn test_gemini_model_info_gemini_3_pro() {
         let info = get_gemini_model_info("gemini-3-pro");
         assert_eq!(info.context_window, Some(1_048_576));
         assert_eq!(info.temperature, Some(1.0));
-        assert!(info.tiers.is_some());
-        let tiers = info.tiers.unwrap();
-        assert_eq!(tiers.len(), 2);
-        assert_eq!(tiers[0].input_price, Some(2.0));
-        assert_eq!(tiers[0].output_price, Some(12.0));
     }
 
     #[test]
-    fn test_gemini_model_pricing_gemini_3_flash() {
+    fn test_gemini_model_info_gemini_3_flash() {
         let info = get_gemini_model_info("gemini-3-flash");
         assert_eq!(info.context_window, Some(1_048_576));
-        assert_eq!(info.input_price, Some(0.50));
-        assert_eq!(info.output_price, Some(3.00));
-        assert_eq!(info.cache_reads_price, Some(0.05));
         assert_eq!(
             info.thinking_config.as_ref().unwrap().gemini_thinking_level,
             Some("minimal".to_string())
@@ -1797,11 +1758,9 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_model_pricing_gemini_2_5_pro() {
+    fn test_gemini_model_info_gemini_2_5_pro() {
         let info = get_gemini_model_info("gemini-2.5-pro");
         assert_eq!(info.context_window, Some(1_048_576));
-        assert_eq!(info.input_price, Some(2.5));
-        assert_eq!(info.output_price, Some(15.0));
         assert_eq!(
             info.thinking_config.as_ref().unwrap().max_budget,
             Some(32767)
@@ -1809,11 +1768,9 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_model_pricing_gemini_2_5_flash() {
+    fn test_gemini_model_info_gemini_2_5_flash() {
         let info = get_gemini_model_info("gemini-2.5-flash");
         assert_eq!(info.context_window, Some(1_048_576));
-        assert_eq!(info.input_price, Some(0.3));
-        assert_eq!(info.output_price, Some(2.5));
         assert_eq!(
             info.thinking_config.as_ref().unwrap().max_budget,
             Some(24576)
@@ -1821,32 +1778,13 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_model_pricing_gemini_2_5_flash_lite() {
+    fn test_gemini_model_info_gemini_2_5_flash_lite() {
         let info = get_gemini_model_info("gemini-2.5-flash-lite");
         assert_eq!(info.context_window, Some(1_048_576));
-        assert_eq!(info.input_price, Some(0.1));
-        assert_eq!(info.output_price, Some(0.4));
         assert_eq!(
             info.thinking_config.as_ref().unwrap().max_budget,
             Some(24576)
         );
-    }
-
-    #[test]
-    fn test_gemini_model_ordering_flash_vs_flash_lite() {
-        // Regression test: verify "flash-lite" models don't match "flash" pricing
-        let flash_lite = get_gemini_model_info("gemini-2.5-flash-lite");
-        let flash = get_gemini_model_info("gemini-2.5-flash");
-
-        // flash-lite should have different (lower) pricing than flash
-        assert_eq!(flash_lite.input_price, Some(0.1));
-        assert_eq!(flash_lite.output_price, Some(0.4));
-        assert_eq!(flash.input_price, Some(0.3));
-        assert_eq!(flash.output_price, Some(2.5));
-
-        // Verify they are not the same (would indicate ordering bug)
-        assert_ne!(flash_lite.input_price, flash.input_price);
-        assert_ne!(flash_lite.output_price, flash.output_price);
     }
 
     #[test]
@@ -1855,27 +1793,9 @@ mod tests {
         let lite = get_gemini_model_info("gemini-3.1-flash-lite");
         let flash = get_gemini_model_info("gemini-3-flash");
 
-        assert_eq!(lite.input_price, Some(0.25));
-        assert_eq!(lite.output_price, Some(1.50));
-        assert_eq!(flash.input_price, Some(0.50));
-        assert_eq!(flash.output_price, Some(3.00));
-
-        assert_ne!(lite.input_price, flash.input_price);
-        assert_ne!(lite.output_price, flash.output_price);
-    }
-
-    #[test]
-    fn test_gemini_model_ordering_3_1_pro_vs_3_pro() {
-        // Regression test: verify "gemini-3.1-pro" doesn't match "gemini-3-pro"
-        let pro_3_1 = get_gemini_model_info("gemini-3.1-pro");
-        let pro_3 = get_gemini_model_info("gemini-3-pro");
-
-        // Both should have tiers, but verify they're matched correctly
-        assert!(pro_3_1.tiers.is_some());
-        assert!(pro_3.tiers.is_some());
-        // Both should have temperature 1.0
-        assert_eq!(pro_3_1.temperature, Some(1.0));
-        assert_eq!(pro_3.temperature, Some(1.0));
+        // lite has no explicit temperature while 3-flash pins 1.0
+        assert_eq!(lite.temperature, None);
+        assert_eq!(flash.temperature, Some(1.0));
     }
 
     #[test]
