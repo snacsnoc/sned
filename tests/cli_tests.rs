@@ -31,7 +31,7 @@ fn test_help_shows_task_options() {
         .stdout(contains("--provider"))
         .stdout(contains("--json"))
         .stdout(contains("--continue"))
-        .stdout(contains("--task-id"))
+        .stdout(contains("--session-id"))
         .stdout(contains("--hooks-dir"));
 }
 
@@ -146,7 +146,7 @@ fn test_history_subcommand_empty() {
     cmd.arg("history");
     cmd.assert()
         .success()
-        .stdout(contains("No task history found matching"));
+        .stdout(contains("No session history found matching"));
 }
 
 #[test]

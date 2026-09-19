@@ -402,7 +402,7 @@ impl InteractiveSession {
 
         let mut initial_messages = Vec::new();
 
-        let is_resuming = self.root_opts.continue_task || self.root_opts.task_id.is_some();
+        let is_resuming = self.root_opts.continue_session || self.root_opts.session_id.is_some();
         if is_resuming {
             let loaded = agent.lock().await.load_conversation_history().await;
             agent.lock().await.load_file_context_tracker().await;
@@ -5704,7 +5704,7 @@ pub async fn run_interactive_shell_inner(
         let sess = session.lock().await;
         sess.agent_loop().await.task_id().to_string()
     };
-    let is_resuming = root_opts.continue_task || root_opts.task_id.is_some();
+    let is_resuming = root_opts.continue_session || root_opts.session_id.is_some();
     {
         let sess = session.lock().await;
         if is_resuming {
@@ -11512,8 +11512,8 @@ mod tests {
         let session = InteractiveSession::build_with_writer(
             task_opts,
             RootOnlyOptions {
-                task_id: None,
-                continue_task: false,
+                session_id: None,
+                continue_session: false,
             },
             None,
         )
@@ -11549,8 +11549,8 @@ mod tests {
             InteractiveSession::build_with_writer(
                 task_opts.clone(),
                 RootOnlyOptions {
-                    task_id: None,
-                    continue_task: false,
+                    session_id: None,
+                    continue_session: false,
                 },
                 None,
             )
@@ -11611,8 +11611,8 @@ mod tests {
             InteractiveSession::build_with_writer(
                 retry_test_task_opts(),
                 RootOnlyOptions {
-                    task_id: None,
-                    continue_task: false,
+                    session_id: None,
+                    continue_session: false,
                 },
                 None,
             )
@@ -11665,8 +11665,8 @@ mod tests {
             InteractiveSession::build_with_writer(
                 retry_test_task_opts(),
                 RootOnlyOptions {
-                    task_id: None,
-                    continue_task: false,
+                    session_id: None,
+                    continue_session: false,
                 },
                 None,
             )
@@ -11736,8 +11736,8 @@ mod tests {
             InteractiveSession::build_with_writer(
                 retry_test_task_opts(),
                 RootOnlyOptions {
-                    task_id: None,
-                    continue_task: false,
+                    session_id: None,
+                    continue_session: false,
                 },
                 None,
             )
@@ -11854,8 +11854,8 @@ mod tests {
             debug: false,
         };
         let root_opts = RootOnlyOptions {
-            task_id: None,
-            continue_task: false,
+            session_id: None,
+            continue_session: false,
         };
 
         let session = Arc::new(Mutex::new(
@@ -11943,8 +11943,8 @@ mod tests {
             InteractiveSession::build_with_writer(
                 task_opts.clone(),
                 RootOnlyOptions {
-                    task_id: None,
-                    continue_task: false,
+                    session_id: None,
+                    continue_session: false,
                 },
                 None,
             )
@@ -12024,8 +12024,8 @@ mod tests {
             InteractiveSession::build_with_writer(
                 task_opts.clone(),
                 RootOnlyOptions {
-                    task_id: None,
-                    continue_task: false,
+                    session_id: None,
+                    continue_session: false,
                 },
                 None,
             )
@@ -12090,8 +12090,8 @@ mod tests {
             InteractiveSession::build_with_writer(
                 task_opts.clone(),
                 RootOnlyOptions {
-                    task_id: None,
-                    continue_task: false,
+                    session_id: None,
+                    continue_session: false,
                 },
                 None,
             )
@@ -12230,8 +12230,8 @@ mod tests {
             InteractiveSession::build_with_writer(
                 task_opts.clone(),
                 RootOnlyOptions {
-                    task_id: None,
-                    continue_task: false,
+                    session_id: None,
+                    continue_session: false,
                 },
                 None,
             )
@@ -12316,8 +12316,8 @@ mod tests {
             InteractiveSession::build_with_writer(
                 task_opts.clone(),
                 RootOnlyOptions {
-                    task_id: None,
-                    continue_task: false,
+                    session_id: None,
+                    continue_session: false,
                 },
                 None,
             )
@@ -12417,8 +12417,8 @@ mod tests {
             InteractiveSession::build_with_writer(
                 task_opts.clone(),
                 RootOnlyOptions {
-                    task_id: None,
-                    continue_task: false,
+                    session_id: None,
+                    continue_session: false,
                 },
                 None,
             )
@@ -12513,8 +12513,8 @@ mod tests {
             debug: false,
         };
         let root_opts = RootOnlyOptions {
-            task_id: None,
-            continue_task: false,
+            session_id: None,
+            continue_session: false,
         };
 
         let session = Arc::new(Mutex::new(
@@ -12648,8 +12648,8 @@ mod tests {
             debug: false,
         };
         let root_opts = RootOnlyOptions {
-            task_id: None,
-            continue_task: false,
+            session_id: None,
+            continue_session: false,
         };
 
         let session = Arc::new(Mutex::new(
@@ -12775,8 +12775,8 @@ mod tests {
             debug: false,
         };
         let root_opts = RootOnlyOptions {
-            task_id: None,
-            continue_task: false,
+            session_id: None,
+            continue_session: false,
         };
 
         let session = Arc::new(Mutex::new(
@@ -12912,8 +12912,8 @@ mod tests {
             debug: false,
         };
         let root_opts = RootOnlyOptions {
-            task_id: None,
-            continue_task: false,
+            session_id: None,
+            continue_session: false,
         };
 
         let session = Arc::new(Mutex::new(
@@ -13034,8 +13034,8 @@ mod tests {
             debug: false,
         };
         let root_opts = RootOnlyOptions {
-            task_id: None,
-            continue_task: false,
+            session_id: None,
+            continue_session: false,
         };
 
         let session = Arc::new(Mutex::new(
@@ -13159,8 +13159,8 @@ mod tests {
             debug: false,
         };
         let root_opts = RootOnlyOptions {
-            task_id: None,
-            continue_task: false,
+            session_id: None,
+            continue_session: false,
         };
 
         let session = Arc::new(Mutex::new(

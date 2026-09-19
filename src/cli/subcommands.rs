@@ -223,7 +223,7 @@ pub fn run_history(opts: &HistoryOptions) -> anyhow::Result<()> {
     }
 
     if history.is_empty() {
-        println!("No task history found matching the specified filters.");
+        println!("No session history found matching the specified filters.");
         return Ok(());
     }
 

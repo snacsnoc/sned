@@ -212,7 +212,7 @@ impl ReasoningEffort {
 /// Source: `dirac/cli/src/index.ts` `TaskOptions` interface and the
 /// `.option()` calls on both the root command and the `task` subcommand.
 #[derive(Debug, Clone, Parser)]
-#[command(next_help_heading = "Task Options")]
+#[command(next_help_heading = "Session Options")]
 pub struct TaskOptions {
     /// Run in act mode
     #[arg(short = 'a', long)]
@@ -234,7 +234,7 @@ pub struct TaskOptions {
     #[arg(short = 't', long)]
     pub timeout: Option<String>,
 
-    /// Model to use for the task
+    /// Model to use for the session
     #[arg(short = 'm', long)]
     pub model: Option<String>,
 
@@ -275,7 +275,7 @@ pub struct TaskOptions {
     #[arg(short = 'v', long)]
     pub verbose: bool,
 
-    /// Working directory for the task
+    /// Working directory for the session
     #[arg(short = 'c', long)]
     pub cwd: Option<String>,
 
@@ -323,7 +323,7 @@ pub struct TaskOptions {
     #[arg(long, hide_short_help = true)]
     pub no_token_display: bool,
 
-    /// Enable subagents for the task. Default disabled
+    /// Enable subagents for the session. Default disabled
     #[arg(long, hide_short_help = true)]
     pub subagents: bool,
 
@@ -343,7 +343,7 @@ pub struct TaskOptions {
     #[arg(long, value_name = "path", hide_short_help = true)]
     pub export: Option<String>,
 
-    /// Image files to include with the task prompt
+    /// Image files to include with the session prompt
     #[arg(short = 'i', long, value_name = "path")]
     pub image: Vec<String>,
 
@@ -359,7 +359,7 @@ pub struct TaskOptions {
     #[arg(long, value_name = "turns", hide_short_help = true)]
     pub max_context_turns: Option<String>,
 
-    /// Maximum provider output tokens for this task
+    /// Maximum provider output tokens for this session
     #[arg(long, value_name = "tokens", hide_short_help = true)]
     pub max_tokens: Option<u32>,
 
@@ -372,13 +372,13 @@ pub struct TaskOptions {
 #[derive(Debug, Clone, Parser)]
 #[command(next_help_heading = "Root Command Options")]
 pub struct RootOnlyOptions {
-    /// Resume an existing task by ID
-    #[arg(short = 'T', long, hide_short_help = true)]
-    pub task_id: Option<String>,
+    /// Resume an existing session by ID
+    #[arg(short = 's', long, hide_short_help = true)]
+    pub session_id: Option<String>,
 
-    /// Resume the most recent task from the current working directory
+    /// Resume the most recent session from the current working directory
     #[arg(long = "continue")]
-    pub continue_task: bool,
+    pub continue_session: bool,
 }
 
 /// Options for the `history` subcommand.
@@ -477,7 +477,7 @@ pub struct AuthOptions {
     #[arg(short = 'v', long)]
     pub verbose: bool,
 
-    /// Working directory for the task
+    /// Working directory for the session
     #[arg(short = 'c', long)]
     pub cwd: Option<String>,
 
@@ -491,17 +491,17 @@ pub struct AuthOptions {
 /// Source: `dirac/cli/src/index.ts` Commander `.command()` definitions.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run a new task
+    /// Run a new session
     #[command(alias = "t")]
     Task {
-        /// The task prompt
+        /// The session prompt
         prompt: String,
 
         #[command(flatten)]
         opts: Box<TaskOptions>,
     },
 
-    /// List task history
+    /// List session history
     #[command(alias = "h")]
     History {
         #[command(flatten)]
@@ -561,7 +561,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Task prompt (starts task immediately)
+    /// Session prompt (starts session immediately)
     #[arg(value_name = "prompt")]
     pub prompt: Option<String>,
 
@@ -1634,10 +1634,10 @@ async fn build_task_components(
     } else {
         AgentMode::Act
     };
-    let has_task_id = root_opts.task_id.is_some();
-    let task_id = if let Some(id) = root_opts.task_id.clone() {
+    let has_task_id = root_opts.session_id.is_some();
+    let task_id = if let Some(id) = root_opts.session_id.clone() {
         id
-    } else if root_opts.continue_task {
+    } else if root_opts.continue_session {
         state_manager
             .get_most_recent_task_for_workspace(&workspace_root_str)
             .map(|h| h.id)
@@ -1744,7 +1744,7 @@ async fn build_task_components(
     };
 
     let task_storage = crate::storage::task_storage::TaskStorage::new(&task_id)?;
-    let is_new_task = !root_opts.continue_task && !has_task_id;
+    let is_new_task = !root_opts.continue_session && !has_task_id;
     if is_new_task {
         let _ = task_storage.create_initial_metadata(&workspace_root_str, None);
     }
@@ -1859,7 +1859,7 @@ pub fn run() -> anyhow::Result<()> {
     // mode (stderr writes inside the alternate screen corrupt the
     // display).
     let tui_mode = cli.command.is_none()
-        && cli.root_opts.task_id.is_none()
+        && cli.root_opts.session_id.is_none()
         && interactive::should_start_interactive_shell(
             cli.prompt.is_some(),
             io::stdin().is_terminal(),
@@ -1907,11 +1907,11 @@ pub fn run() -> anyhow::Result<()> {
             let stdin_input = read_piped_stdin()?;
             let stdin_was_piped = stdin_input.is_some();
 
-            if cli.root_opts.task_id.is_some() && cli.root_opts.continue_task {
+            if cli.root_opts.session_id.is_some() && cli.root_opts.continue_session {
                 anyhow::bail!("Use either --taskId or --continue, not both.")
             }
 
-            if cli.root_opts.continue_task {
+            if cli.root_opts.continue_session {
                 if cli.prompt.is_some() {
                     anyhow::bail!("Use --continue without a prompt.")
                 }
@@ -1929,7 +1929,7 @@ pub fn run() -> anyhow::Result<()> {
                 .map(|prompt| prompt.trim().to_string())
                 .filter(|prompt| !prompt.is_empty());
 
-            if cli.root_opts.task_id.is_some() {
+            if cli.root_opts.session_id.is_some() {
                 if effective_prompt.is_some() {
                     anyhow::bail!(
                         "Use --taskId without a prompt. To resume and add a message, use sned task <id> <prompt>."
@@ -2163,13 +2163,13 @@ mod tests {
     #[test]
     fn parse_root_continue_flag() {
         let cli = Cli::try_parse_from(["sned", "--continue"]).unwrap();
-        assert!(cli.root_opts.continue_task);
+        assert!(cli.root_opts.continue_session);
     }
 
     #[test]
-    fn parse_root_task_id_flag() {
-        let cli = Cli::try_parse_from(["sned", "-T", "abc-123"]).unwrap();
-        assert_eq!(cli.root_opts.task_id.as_deref(), Some("abc-123"));
+    fn parse_root_session_id_flag() {
+        let cli = Cli::try_parse_from(["sned", "-s", "abc-123"]).unwrap();
+        assert_eq!(cli.root_opts.session_id.as_deref(), Some("abc-123"));
     }
 
     #[test]
