@@ -347,11 +347,11 @@ pub struct TaskOptions {
     #[arg(short = 'i', long, value_name = "path")]
     pub image: Vec<String>,
 
-    /// Enable automatic change tracking (shadow git for undo/versioning)
+    /// Enable shadow git versioning for undo/history across runs
     #[arg(long)]
     pub track_changes: bool,
 
-    /// Disable workspace checkpoints for this run.
+    /// Disable pre-edit snapshots for batch edits
     #[arg(long)]
     pub no_checkpoints: bool,
 
