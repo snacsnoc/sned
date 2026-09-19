@@ -323,7 +323,7 @@ pub struct TaskOptions {
     #[arg(long, hide_short_help = true)]
     pub no_token_display: bool,
 
-    /// Enable subagents for the task
+    /// Enable subagents for the task. Default disabled
     #[arg(long, hide_short_help = true)]
     pub subagents: bool,
 
@@ -347,7 +347,7 @@ pub struct TaskOptions {
     #[arg(short = 'i', long, value_name = "path")]
     pub image: Vec<String>,
 
-    /// Enable shadow git versioning for undo/history across runs
+    /// Enable shadow git versioning for undo/history across runs. Default disabled
     #[arg(long)]
     pub track_changes: bool,
 
@@ -363,7 +363,7 @@ pub struct TaskOptions {
     #[arg(long, value_name = "tokens", hide_short_help = true)]
     pub max_tokens: Option<u32>,
 
-    /// Enable debug logging to /tmp/sned-debug.log
+    /// Enable debug logging to /tmp/sned-debug.log. Default disabled
     #[arg(long, hide_short_help = true)]
     pub debug: bool,
 }
