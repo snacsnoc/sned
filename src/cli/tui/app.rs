@@ -2179,9 +2179,7 @@ impl App {
         for &idx in model_entry_indices.iter().rev() {
             self.output_lines.remove(idx);
             self.output_line_ids.remove(idx);
-            if idx < self.output_line_kinds.len() {
-                self.output_line_kinds.remove(idx);
-            }
+            self.output_line_kinds.remove(idx);
         }
 
         // The Model entry indices were contiguous in append order
@@ -2560,6 +2558,7 @@ impl App {
             }
             self.output_line_ids.pop_front();
             self.output_line_kinds.pop_front();
+            let _ = self.visual_layout_index.evict_front_output(self.last_wrap_width(), 10_000, false);
         }
 
         self.turn_stream_entries = saved_entries
