@@ -468,7 +468,7 @@ impl EditFileHandler {
                                 MAX_FINGERPRINT_CONTENT_BYTES
                             )));
                         }
-                        content_lines.push(line.to_string());
+                        content_lines.push(strip_hashes(line));
                     }
                     (!content_lines.is_empty()).then_some(content_lines)
                 } else {
@@ -1103,7 +1103,9 @@ impl EditFileHandler {
                         if matches!(edit.edit_type.as_str(), "insert_before" | "insert_after")
                             && !replacement_lines.is_empty()
                         {
-                            if replacement_lines.iter().any(|line| line == &captured[0]) {
+                            if captured[0].chars().any(char::is_alphanumeric)
+                                && replacement_lines.iter().any(|line| line == &captured[0])
+                            {
                                 return Err(ToolError::InvalidInput(format!(
                                     "{} for {display_path} would duplicate the anchored source line; use a range replacement instead.",
                                     edit.edit_type

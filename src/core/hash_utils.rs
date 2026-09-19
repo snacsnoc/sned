@@ -221,24 +221,6 @@ pub fn extract_id(reference: &str) -> String {
     }
 }
 
-/// Interpret common escape sequences in the `text` field of `edit_file`.
-///
-/// Models (especially smaller or non-frontier ones) often submit the
-/// `text` replacement with JSON-style escape sequences that were meant
-/// to represent file content: `\n` for a newline, `\t` for a tab, `\\`
-/// for a literal backslash, `\"` for a quote. Without interpretation,
-/// these land verbatim in the file as two characters (backslash + letter)
-/// and corrupt the source.
-///
-/// This mirrors how shell / C string literals are commonly read, and
-/// matches the model's expectation from the post-hoc warning emitted
-/// at `edit_batch.rs:387-410` (now removed in favor of this fix).
-///
-/// To write a literal `\n` (backslash + n) to the file, the model must
-/// send `\\n` in the JSON, which decodes to `\n` in Rust and is then
-/// interpreted here as a single newline. To write a literal `\n` as
-/// two characters, the model must send `\\\\n` in JSON.
-
 #[cfg(test)]
 mod tests {
     use super::*;

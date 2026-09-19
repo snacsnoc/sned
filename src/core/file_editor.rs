@@ -98,13 +98,15 @@ pub(crate) fn restore_file_content(content: &str, format: FileTextFormat) -> Str
         let mut previous_was_cr = false;
         let mut newline_index = 0;
         for character in content.chars() {
-            if character == '\n' && !previous_was_cr {
-                if format
-                    .line_endings
-                    .get(newline_index)
-                    .copied()
-                    .unwrap_or(format.line_ending)
-                    == FileLineEnding::CrLf
+            if character == '\n' {
+                let is_model_crlf = previous_was_cr;
+                if !is_model_crlf
+                    && format
+                        .line_endings
+                        .get(newline_index)
+                        .copied()
+                        .unwrap_or(format.line_ending)
+                        == FileLineEnding::CrLf
                 {
                     restored.push('\r');
                 }
@@ -3286,6 +3288,29 @@ mod tests {
             restore_file_content("first\r\nsecond\nliteral\rvalue", format),
             "first\r\nsecond\r\nliteral\rvalue"
         );
+    }
+
+    #[test]
+    fn test_crlf_restoration_bare_cr_does_not_desync_index() {
+        // Mixed-ending file: line0→line1 is CRLF, line1→line2 is LF,
+        // line2→line3 is LF, line3→line4 is CRLF.
+        // Model replaces line1 with "X\r" (bare CR at end).
+        // Without the fix, the join-boundary \n after X\r is skipped
+        // by the previous_was_cr guard, leaving newline_index
+        // desynced: the line3→line4 boundary (CRLF) gets mapped to
+        // the wrong index and is restored as LF.
+        let raw = "line0\r\nline1\nline2\nline3\r\nline4";
+        let (normalized, format) = normalize_file_content(raw);
+        // Simulate: line1 replaced by "X\r".
+        // After split_content_lines + join("\n"):
+        // "line0\nX\r\nline2\nline3\r\nline4"
+        let joined = "line0\nX\r\nline2\nline3\r\nline4";
+        let restored = restore_file_content(joined, format);
+        // line0→X: index 0 → CRLF (original)
+        // X→line2: index 1 → LF (original), model-supplied \r preserved
+        // line2→line3: index 2 → LF (original)
+        // line3→line4: index 3 → CRLF (original) — must NOT be desynced to LF
+        assert_eq!(restored, "line0\r\nX\r\nline2\nline3\r\nline4");
     }
 
     #[test]
