@@ -788,15 +788,16 @@ impl EditFileHandler {
                 Ok(current) if current == expected.as_bytes() => {}
                 Ok(_) => {
                     errors.push(format!(
-                        "Skipped rollback for {path}: file changed after Sned wrote it"
+                        "Cannot rollback {path}: file changed after Sned wrote it; aborting batch to avoid partial state"
                     ));
                     stale_paths.push(path.clone());
-                    continue;
+                    // Fail-closed: do not attempt further rollbacks; caller will abort
+                    return (errors, stale_paths);
                 }
                 Err(error) => {
                     errors.push(format!("Failed to verify rollback for {path}: {error}"));
                     stale_paths.push(path.clone());
-                    continue;
+                    return (errors, stale_paths);
                 }
             }
             match crate::storage::disk::atomic_write_file_async(path, original).await {
@@ -810,6 +811,7 @@ impl EditFileHandler {
                 Err(error) => {
                     errors.push(format!("Failed to rollback {path}: {error}"));
                     stale_paths.push(path.clone());
+                    return (errors, stale_paths);
                 }
             }
         }
