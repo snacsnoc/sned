@@ -21,6 +21,7 @@ struct RatatuiPerformer {
     lines: Vec<Line<'static>>,
     current_spans: Vec<Span<'static>>,
     current_text: String,
+    current_column: usize,
 }
 
 impl RatatuiPerformer {
@@ -30,6 +31,7 @@ impl RatatuiPerformer {
             lines: Vec::new(),
             current_spans: Vec::new(),
             current_text: String::with_capacity(capacity),
+            current_column: 0,
         }
     }
 
@@ -55,14 +57,27 @@ impl RatatuiPerformer {
 impl Perform for RatatuiPerformer {
     fn print(&mut self, c: char) {
         self.current_text.push(c);
+        self.current_column += if c == '\t' { 0 } else { 1 };
     }
 
     fn execute(&mut self, byte: u8) {
-        if byte == 0x0A {
-            // newline
-            self.flush_current_text();
-            self.lines
-                .push(Line::from(std::mem::take(&mut self.current_spans)));
+        match byte {
+            0x0A => {
+                // newline
+                self.flush_current_text();
+                self.lines
+                    .push(Line::from(std::mem::take(&mut self.current_spans)));
+                self.current_column = 0;
+            }
+            0x09 => {
+                // tab — expand to next tab stop (every 4 columns)
+                let remaining = 4 - (self.current_column % 4);
+                for _ in 0..remaining {
+                    self.current_text.push(' ');
+                }
+                self.current_column += remaining;
+            }
+            _ => {}
         }
     }
 
@@ -131,6 +146,15 @@ impl Perform for RatatuiPerformer {
                         self.current_style =
                             self.current_style.remove_modifier(Modifier::UNDERLINED);
                     }
+                    [25] => {
+                        self.current_style = self.current_style.remove_modifier(Modifier::SLOW_BLINK);
+                    }
+                    [27] => {
+                        self.current_style = self.current_style.remove_modifier(Modifier::REVERSED);
+                    }
+                    // Default color resets
+                    [39] => self.current_style.fg = None,
+                    [49] => self.current_style.bg = None,
                     // 256-color: [38, 5, N] → Color::Indexed(N)
                     [38, 5, n] => {
                         self.current_style = self.current_style.fg(Color::Indexed(*n as u8));
@@ -182,5 +206,72 @@ mod tests {
         let lines = ansi_to_ratatui_lines("\x1b[31mred\x1b[0m");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn test_tab_expands_to_spaces() {
+        let lines = ansi_to_ratatui_lines("col1\tvalue");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "col1    value");
+    }
+
+    #[test]
+    fn test_tab_expands_to_next_tab_stop() {
+        let lines = ansi_to_ratatui_lines("abcdefgh\tvalue");
+        assert_eq!(lines.len(), 1);
+        // "abcdefgh" is 8 chars, next tab stop at 12 → 4 spaces
+        assert_eq!(lines[0].to_string(), "abcdefgh    value");
+    }
+
+    #[test]
+    fn test_sgr_default_fg_reset() {
+        let lines = ansi_to_ratatui_lines("\x1b[31mred\x1b[39mreset");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(lines[0].spans[1].style.fg, None);
+    }
+
+    #[test]
+    fn test_sgr_default_bg_reset() {
+        let lines = ansi_to_ratatui_lines("\x1b[41mred_bg\x1b[49mreset");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].style.bg, Some(Color::Red));
+        assert_eq!(lines[0].spans[1].style.bg, None);
+    }
+
+    #[test]
+    fn test_sgr_blink_off_reset() {
+        let lines = ansi_to_ratatui_lines("\x1b[5mblink\x1b[25mreset");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .intersects(Modifier::SLOW_BLINK)
+        );
+        assert!(
+            !lines[0].spans[1]
+                .style
+                .add_modifier
+                .intersects(Modifier::SLOW_BLINK)
+        );
+    }
+
+    #[test]
+    fn test_sgr_reverse_off_reset() {
+        let lines = ansi_to_ratatui_lines("\x1b[7mreverse\x1b[27mreset");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .intersects(Modifier::REVERSED)
+        );
+        assert!(
+            !lines[0].spans[1]
+                .style
+                .add_modifier
+                .intersects(Modifier::REVERSED)
+        );
     }
 }
