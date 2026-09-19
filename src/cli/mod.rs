@@ -222,11 +222,11 @@ pub struct TaskOptions {
     #[arg(short = 'p', long)]
     pub plan: bool,
 
-    /// Enable yes/yolo mode (auto-approve actions)
+    /// Auto-approve all actions, including writes outside workspace and commands
     #[arg(short = 'y', long)]
     pub yolo: bool,
 
-    /// Enable auto-approve all actions while keeping interactive mode
+    /// Auto-approve actions inside workspace. Writes outside workspace and commands still require approval
     #[arg(long, hide_short_help = true)]
     pub auto_approve_all: bool,
 
@@ -262,15 +262,12 @@ pub struct TaskOptions {
     #[arg(long, hide_short_help = true)]
     pub api_key: Option<String>,
 
-    /// Additional JSON fields for OpenAI-compatible requests. The Sned-only
-    /// `sned_reasoning_history` key accepts `omit`, `reasoning_content`, or
-    /// `reasoning_content_plus_reasoning` and is not sent to the endpoint.
+    /// Additional JSON fields for OpenAI-compatible requests.
+    /// Sned-only `sned_reasoning_history` controls reasoning history handling
     #[arg(long, value_name = "JSON", hide_short_help = true)]
     pub extra_body: Option<String>,
 
-    /// Disable incremental SSE output for custom OpenAI-compatible endpoints.
-    /// Responses are buffered until completion (up to approximately 600 seconds)
-    /// and a full-length timeout leaves no practical automatic retry budget.
+    /// Buffer responses until completion for OpenAI-compatible endpoints (no streaming)
     #[arg(long)]
     pub no_stream: bool,
 
@@ -282,7 +279,7 @@ pub struct TaskOptions {
     #[arg(short = 'c', long)]
     pub cwd: Option<String>,
 
-    /// Allow file tools to access an external directory for this session (repeatable)
+    /// Allow file tools to access a directory outside workspace for this session (repeatable)
     #[arg(long, value_name = "DIR")]
     pub allow_dir: Vec<String>,
 
@@ -290,9 +287,8 @@ pub struct TaskOptions {
     #[arg(long, hide_short_help = true)]
     pub config: Option<String>,
 
-    /// Set a provider-supported thinking token budget (Anthropic, Gemini 2.5).
-    /// Use `--thinking` (defaults to 1024) or `--thinking=4096` for an explicit budget.
-    /// Omit the flag to use the provider default.
+    /// Set thinking token budget. Supported by Anthropic Claude 4, Gemini 2.5, and MiniMax.
+    /// Defaults to 1024 if flag is present without value.
     #[arg(
         long,
         conflicts_with = "reasoning_effort",
