@@ -2226,7 +2226,7 @@ mod tests {
 
     #[test]
     fn test_non_stream_requests_use_buffered_header_timeout() {
-        let _lock = OPENAI_ENV_LOCK.lock().unwrap();
+        let _lock = OPENAI_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _stream_guard = EnvVarGuard::set("SNED_RESPONSE_HEADERS_TIMEOUT_SECS", "7");
         let _buffered_guard = EnvVarGuard::set("SNED_NON_STREAM_RESPONSE_TIMEOUT_SECS", "123");
 
@@ -2242,7 +2242,7 @@ mod tests {
 
     #[test]
     fn test_sse_read_timeouts_are_opt_in() {
-        let _lock = OPENAI_ENV_LOCK.lock().unwrap();
+        let _lock = OPENAI_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         {
             let _first_byte_guard = EnvVarGuard::unset("SNED_SSE_FIRST_BYTE_TIMEOUT_SECS");
             let _inactivity_guard = EnvVarGuard::unset("SNED_SSE_INACTIVITY_TIMEOUT_SECS");
@@ -3761,21 +3761,21 @@ mod tests {
 
     #[test]
     fn test_cumulative_openai_text_stream_setting_defaults_to_incremental() {
-        let _lock = OPENAI_ENV_LOCK.lock().unwrap();
+        let _lock = OPENAI_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvVarGuard::unset("SNED_OPENAI_CUMULATIVE_TEXT_STREAM");
         assert!(!cumulative_openai_text_stream_from_env().unwrap());
     }
 
     #[test]
     fn test_cumulative_openai_text_stream_setting_accepts_true_values() {
-        let _lock = OPENAI_ENV_LOCK.lock().unwrap();
+        let _lock = OPENAI_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvVarGuard::set("SNED_OPENAI_CUMULATIVE_TEXT_STREAM", "true");
         assert!(cumulative_openai_text_stream_from_env().unwrap());
     }
 
     #[test]
     fn test_cumulative_openai_text_stream_setting_rejects_invalid_values() {
-        let _lock = OPENAI_ENV_LOCK.lock().unwrap();
+        let _lock = OPENAI_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvVarGuard::set("SNED_OPENAI_CUMULATIVE_TEXT_STREAM", "maybe");
         let error = cumulative_openai_text_stream_from_env().unwrap_err();
         assert!(error.contains("SNED_OPENAI_CUMULATIVE_TEXT_STREAM"));

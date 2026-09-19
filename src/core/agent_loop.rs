@@ -10574,7 +10574,7 @@ Irrespective of whether additional information or instructions are given, you ar
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
-        let _openai_env_lock = crate::providers::openai::OPENAI_ENV_LOCK.lock().unwrap();
+        let _openai_env_lock = crate::providers::openai::OPENAI_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_cumulative_text_stream = std::env::var_os("SNED_OPENAI_CUMULATIVE_TEXT_STREAM");
         // SAFETY: this test holds the shared OpenAI environment lock.
         unsafe {
