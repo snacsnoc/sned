@@ -3300,7 +3300,7 @@ mod tests {
         // desynced: the line3→line4 boundary (CRLF) gets mapped to
         // the wrong index and is restored as LF.
         let raw = "line0\r\nline1\nline2\nline3\r\nline4";
-        let (normalized, format) = normalize_file_content(raw);
+        let (_normalized, format) = normalize_file_content(raw);
         // Simulate: line1 replaced by "X\r".
         // After split_content_lines + join("\n"):
         // "line0\nX\r\nline2\nline3\r\nline4"

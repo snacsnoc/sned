@@ -611,19 +611,17 @@ pub enum CheckpointError {
 
 /// Hash a working directory path to a unique identifier.
 fn hash_working_dir(cwd: &Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
 
     // Namespace the hash so checkpoint locations are intentionally scoped to
     // sned's workspace hashing policy, not an implied cross-version ABI.
     const WORKING_DIR_HASH_NAMESPACE: &str = "sned::checkpoint-workspace-hash::v1";
 
-    let mut hasher = DefaultHasher::new();
-    WORKING_DIR_HASH_NAMESPACE.hash(&mut hasher);
-    cwd.canonicalize()
-        .unwrap_or_else(|_| cwd.to_path_buf())
-        .hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(WORKING_DIR_HASH_NAMESPACE.as_bytes());
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hex::encode(hasher.finalize())[..16].to_string()
 }
 
 /// Get the shadow git repository path for a given workspace hash.
