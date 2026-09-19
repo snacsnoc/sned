@@ -492,8 +492,8 @@ pub struct AuthOptions {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run a new session
-    #[command(alias = "t")]
-    Task {
+    #[command(alias = "s")]
+    Session {
         /// The session prompt
         prompt: String,
 
@@ -584,7 +584,7 @@ pub fn apply_config_override(cli: &Cli) {
 
     if let Some(cmd) = &cli.command {
         match cmd {
-            Command::Task { opts, .. } if opts.config.is_some() => {
+            Command::Session { opts, .. } if opts.config.is_some() => {
                 config_path = opts.config.clone();
             }
             Command::History { opts } if opts.config.is_some() => {
@@ -1875,7 +1875,7 @@ pub fn run() -> anyhow::Result<()> {
     let _tui_trace_session = TuiTraceSessionGuard::new(tui_mode);
 
     match cli.command {
-        Some(Command::Task { prompt, opts }) => run_task(Some(prompt), *opts, cli.root_opts),
+        Some(Command::Session { prompt, opts }) => run_task(Some(prompt), *opts, cli.root_opts),
         Some(Command::History { opts }) => run_history(&opts),
         Some(Command::Config { opts }) => run_config(opts),
         Some(Command::Auth { opts }) => run_auth(opts),
@@ -1977,25 +1977,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_task_subcommand() {
-        let cli = Cli::try_parse_from(["sned", "task", "fix the bug", "--act"]).unwrap();
+    fn parse_session_subcommand() {
+        let cli = Cli::try_parse_from(["sned", "session", "fix the bug", "--act"]).unwrap();
         match cli.command {
-            Some(Command::Task { prompt, opts }) => {
+            Some(Command::Session { prompt, opts }) => {
                 assert_eq!(prompt, "fix the bug");
                 assert!(opts.act);
             }
-            _ => panic!("expected Task command"),
+            _ => panic!("expected Session command"),
         }
     }
 
     #[test]
-    fn parse_task_alias() {
-        let cli = Cli::try_parse_from(["sned", "t", "hello world"]).unwrap();
+    fn parse_session_alias() {
+        let cli = Cli::try_parse_from(["sned", "s", "hello world"]).unwrap();
         match cli.command {
-            Some(Command::Task { prompt, .. }) => {
+            Some(Command::Session { prompt, .. }) => {
                 assert_eq!(prompt, "hello world");
             }
-            _ => panic!("expected Task command via alias"),
+            _ => panic!("expected Session command via alias"),
         }
     }
 

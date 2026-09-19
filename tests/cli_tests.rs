@@ -10,7 +10,7 @@ fn test_help_shows_all_subcommands() {
     cmd.arg("--help");
     cmd.assert()
         .success()
-        .stdout(contains("task"))
+        .stdout(contains("session"))
         .stdout(contains("history"))
         .stdout(contains("config"))
         .stdout(contains("auth"))
