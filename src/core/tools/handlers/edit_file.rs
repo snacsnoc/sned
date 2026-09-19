@@ -1082,16 +1082,23 @@ impl EditFileHandler {
                     captured_raw.extend_from_slice(&raw);
                     if line_number == active.unwrap().end_line {
                         let edit = active.unwrap();
-                        if captured.join("\n") != edit.expected_text {
+                        let expected_normalized = edit.expected_text.replace("\r\n", "\n");
+                        if captured.join("\n") != expected_normalized {
                             return Err(ToolError::InvalidInput(format!("expected_text did not match {display_path} lines {}-{}. The file was not changed; correct the range/text using the current read output.", edit.start_line, edit.end_line)));
                         }
                         let had_terminator = captured_raw.ends_with(b"\n");
                         let replacement_text = strip_hashes(&edit.text).replace("\r\n", "\n");
-                        let replacement_lines = if replacement_text.is_empty() {
+                        let mut replacement_lines = if replacement_text.is_empty() {
                             Vec::new()
                         } else {
                             crate::core::file_editor::split_content_lines(&replacement_text)
                         };
+                        // Remove the trailing empty element added by split('\n') when the text ends with a newline.
+                        // Otherwise join(newline) produces a trailing newline and the explicit newline writes
+                        // afterwards create a double blank line.
+                        if replacement_text.ends_with('\n') && !replacement_lines.is_empty() && replacement_lines.last().unwrap().is_empty() {
+                            replacement_lines.pop();
+                        }
                         let replacement = replacement_lines
                             .join(std::str::from_utf8(&newline).unwrap())
                             .into_bytes();
@@ -3117,7 +3124,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            b"head\nreplacement\n\nnext\n"
+            b"head\nreplacement\nnext\n"
         );
     }
 
