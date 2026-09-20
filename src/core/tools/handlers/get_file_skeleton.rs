@@ -237,7 +237,8 @@ mod tests {
         assert!(!output.contains('\u{feff}'));
         let anchor_line = output
             .lines()
-            .find_map(|line| line.strip_prefix('│'))
+            .filter_map(|line| line.strip_prefix('│'))
+            .find(|line| line.contains('§'))
             .expect("skeleton should expose an anchored definition line");
         let (_, anchored_content) = crate::core::hash_utils::split_anchor(anchor_line);
         assert_eq!(anchored_content, "struct Widget;");

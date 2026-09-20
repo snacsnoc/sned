@@ -109,7 +109,7 @@ pub fn read_file_schema() -> ToolSchema {
                 name: "start_line",
                 required: false,
                 param_type: "integer",
-                description: "First line (default 1).",
+                description: "First line (default 1). Prefer reading full files or generous windows (100-200+ lines); narrow slices (<30 lines) frequently lack the enclosing scope and anchors needed for subsequent edits. For syntactic orientation, prefer get_file_skeleton.",
                 items: None,
                 extra: None,
             },
@@ -117,7 +117,7 @@ pub fn read_file_schema() -> ToolSchema {
                 name: "end_line",
                 required: false,
                 param_type: "integer",
-                description: "Last line (default EOF).",
+                description: "Last line (default EOF). Pair with start_line; the read window is [start_line, end_line] inclusive. For multi-megabyte files, a 100-200 line window is a reasonable default; for brace / scope hunting, start with 50 lines and widen if anchors fail to resolve.",
                 items: None,
                 extra: None,
             },
@@ -230,7 +230,7 @@ pub fn edit_file_schema() -> ToolSchema {
                     },
                     "expected_file_hash": {
                         "type": "string",
-                        "description": "Optional complete sha256:<digest> from a large ranged read. When present, submit exactly one file and use line-range selectors instead of anchors."
+                        "description": "Optional complete sha256:<digest> from a large ranged read. Only consumed when no edit in this file uses 'anchor'; ignored otherwise. When consumed, submit exactly one file and use line-range selectors (start_line + expected_text) instead of anchors."
                     },
                     "edits": {
                         "type": "array",
@@ -777,6 +777,8 @@ impl ToolProfile {
                 SnedTool::WriteToFile,
                 SnedTool::ListFiles,
                 SnedTool::SearchFiles,
+                SnedTool::GetFunction,
+                SnedTool::GetFileSkeleton,
                 SnedTool::AttemptCompletion,
                 SnedTool::AskFollowupQuestion,
             ],
@@ -788,6 +790,8 @@ impl ToolProfile {
                 SnedTool::SearchFiles,
                 SnedTool::ExecuteCommand,
                 SnedTool::DiagnosticsScan,
+                SnedTool::GetFunction,
+                SnedTool::GetFileSkeleton,
                 SnedTool::AttemptCompletion,
                 SnedTool::AskFollowupQuestion,
             ],
@@ -1358,8 +1362,8 @@ mod tests {
         assert_eq!(ToolProfile::DirectAnswer.tools().len(), 0);
         assert_eq!(ToolProfile::AnswerOnly.tools().len(), 2);
         assert_eq!(ToolProfile::WriteOnly.tools().len(), 3);
-        assert!(ToolProfile::CoreEdit.tools().len() >= 7);
-        assert!(ToolProfile::Validate.tools().len() >= 9);
+        assert!(ToolProfile::CoreEdit.tools().len() >= 9);
+        assert!(ToolProfile::Validate.tools().len() >= 11);
         assert!(ToolProfile::Symbol.tools().len() >= 9);
         assert_eq!(ToolProfile::Plan.tools().len(), 17);
         assert_eq!(ToolProfile::Full.tools().len(), 20);
@@ -1448,8 +1452,8 @@ mod tests {
             validate_bytes
         );
         assert!(
-            symbol_bytes < 9000,
-            "Symbol should be under 9000 bytes: got {}",
+            symbol_bytes < 10000,
+            "Symbol should be under 10000 bytes: got {}",
             symbol_bytes
         );
         assert!(

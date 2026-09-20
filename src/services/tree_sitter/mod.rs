@@ -23,6 +23,12 @@ pub struct ParsedDefinition {
     pub line_index: usize,
     pub text: String,
     pub indentation: String,
+    /// Last line of the definition's enclosing scope (1-indexed, matches the
+    /// `Lines X–Y` convention in read_file). Defaults to `line_index` when the
+    /// query did not emit a `@definition.*` span that covers the body — the
+    /// skeleton then renders a single-line "lines X–X" range rather than
+    /// guessing the body's end.
+    pub end_line: usize,
 }
 
 /// Parses a file and extracts definitions using tree-sitter queries.
@@ -50,8 +56,11 @@ pub fn parse_file(
     let mut definitions: Vec<ParsedDefinition> = Vec::new();
     let root_node = tree.root_node();
 
-    // Collect name.definition captures and sort by line
+    // Collect name.definition and definition captures. The @definition.* span
+    // covers the entire body and gives us end_line for the skeleton output;
+    // @name.definition is the symbol name we emit on the second line.
     let mut name_captures: Vec<(tree_sitter::Node, &str)> = Vec::new();
+    let mut def_captures: Vec<(tree_sitter::Node, &str)> = Vec::new();
     let mut query_cursor2 = tree_sitter::QueryCursor::new();
     let mut captures2 = query_cursor2.captures(&entry.query, root_node, file_content.as_bytes());
 
@@ -61,16 +70,24 @@ pub fn parse_file(
 
         if capture_name.contains("name.definition") {
             name_captures.push((capture.node, capture_name));
+        } else if capture_name.starts_with("@definition.") || capture_name == "@definition" {
+            def_captures.push((capture.node, capture_name));
         }
     }
 
     name_captures.sort_by_key(|(node, _)| node.start_position().row);
+    // Match each name capture to the smallest enclosing @definition span by
+    // finding the def whose range contains the name's start byte. The query
+    // emits both as part of the same pattern, so the smallest def containing
+    // a name is the function/class the name belongs to.
+    def_captures.sort_by_key(|(node, _)| node.start_byte());
 
     let lines: Vec<&str> = file_content.lines().collect();
     let mut last_line_added: i32 = -1;
 
     for (node, _capture_name) in name_captures {
         let start_line = node.start_position().row;
+        let name_byte = node.start_byte();
 
         if start_line >= lines.len() {
             continue;
@@ -83,10 +100,23 @@ pub fn parse_file(
                 .take_while(|c| c.is_whitespace())
                 .collect();
 
+            // Smallest def containing the name; if none matches (e.g. partial
+            // queries for some languages), fall back to start_line so the
+            // skeleton still renders a sane single-line range.
+            let end_line = def_captures
+                .iter()
+                .filter(|(def_node, _)| {
+                    def_node.start_byte() <= name_byte && def_node.end_byte() >= name_byte
+                })
+                .min_by_key(|(def_node, _)| def_node.end_byte().saturating_sub(def_node.start_byte()))
+                .map(|(def_node, _)| def_node.end_position().row)
+                .unwrap_or(start_line);
+
             let def = ParsedDefinition {
                 line_index: start_line,
                 text: line_text.to_string(),
                 indentation,
+                end_line,
             };
 
             last_line_added = start_line as i32;
@@ -140,8 +170,14 @@ pub fn get_file_skeleton(
 
         if start_line as i32 > last_line_added {
             let anchor = anchors.get(start_line).cloned().unwrap_or_default();
+            // Two-line outline: range on its own row (orientation), then the
+            // anchor-prefixed symbol text on the next row (targeting for edit).
+            // Putting the range first lets the model scan file structure
+            // without parsing the anchor prefix from every line.
             formatted_output.push_str(&format!(
-                "│{}\n",
+                "│lines {}–{}\n│  {}\n",
+                start_line + 1,
+                def.end_line + 1,
                 format_line_with_hash(&def.text, &anchor, &[])
             ));
             last_line_added = start_line as i32;
