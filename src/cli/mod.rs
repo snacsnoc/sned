@@ -69,6 +69,9 @@ where
             event.record(&mut visitor);
             let mut stdout = std::io::stdout().lock();
             let _ = writeln!(stdout, "{}", visitor.0);
+            // Result file writing is handled in InteractiveSession::run after the agent
+            // completes (which produces the authoritative payload with status, error,
+            // and result text). This layer only emits the streaming JSON event to stdout.
         }
     }
 }
@@ -366,6 +369,14 @@ pub struct TaskOptions {
     /// Enable debug logging to /tmp/sned-debug.log. Default disabled
     #[arg(long, hide_short_help = true)]
     pub debug: bool,
+
+    /// Read session prompt from a file instead of argv (for subagents)
+    #[arg(long, value_name = "path", hide = true)]
+    pub prompt_file: Option<String>,
+
+    /// Write subagent result JSON to a file (for parent collection)
+    #[arg(long, value_name = "path", hide = true)]
+    pub result_file: Option<String>,
 }
 
 /// Additional options only on the root (default) command, not on `task`.
@@ -494,8 +505,9 @@ pub enum Command {
     /// Run a new session
     #[command(alias = "s")]
     Session {
-        /// The session prompt
-        prompt: String,
+        /// The session prompt (starts session immediately)
+        #[arg(required = false)]
+        prompt: Option<String>,
 
         #[command(flatten)]
         opts: Box<TaskOptions>,
@@ -1802,6 +1814,13 @@ async fn run_task_inner(
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,
 ) -> anyhow::Result<String> {
+    let prompt = match (&task_opts.prompt_file, prompt) {
+        (Some(path), None) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("Failed to read prompt file {}: {}", path, e))?,
+        ),
+        (_, existing) => existing,
+    };
     let session = InteractiveSession::build(task_opts, root_opts).await?;
     session.run(prompt).await?;
     let task_id = session.agent_loop().await.task_id().to_string();
@@ -1867,15 +1886,28 @@ pub fn run() -> anyhow::Result<()> {
             cli.task_opts.json,
         );
 
+    // Resolve the effective TaskOptions: the Session subcommand's flattened opts
+    // take precedence over the top-level task_opts. This matters for --json,
+    // which the subagent invocation passes via the Session subcommand, not
+    // at the top level.
+    let (effective_json, effective_verbose, effective_debug) = match &cli.command {
+        Some(Command::Session { opts, .. }) => (opts.json, opts.verbose, opts.debug),
+        _ => (
+            cli.task_opts.json,
+            cli.task_opts.verbose,
+            cli.task_opts.debug,
+        ),
+    };
+
     init_tracing(
-        tracing_mode(cli.task_opts.json, cli.task_opts.verbose),
-        cli.task_opts.debug,
+        tracing_mode(effective_json, effective_verbose),
+        effective_debug,
         tui_mode,
     );
     let _tui_trace_session = TuiTraceSessionGuard::new(tui_mode);
 
     match cli.command {
-        Some(Command::Session { prompt, opts }) => run_task(Some(prompt), *opts, cli.root_opts),
+        Some(Command::Session { prompt, opts }) => run_task(prompt, *opts, cli.root_opts),
         Some(Command::History { opts }) => run_history(&opts),
         Some(Command::Config { opts }) => run_config(opts),
         Some(Command::Auth { opts }) => run_auth(opts),
@@ -1981,7 +2013,7 @@ mod tests {
         let cli = Cli::try_parse_from(["sned", "session", "fix the bug", "--act"]).unwrap();
         match cli.command {
             Some(Command::Session { prompt, opts }) => {
-                assert_eq!(prompt, "fix the bug");
+                assert_eq!(prompt, Some("fix the bug".to_string()));
                 assert!(opts.act);
             }
             _ => panic!("expected Session command"),
@@ -1993,7 +2025,7 @@ mod tests {
         let cli = Cli::try_parse_from(["sned", "s", "hello world"]).unwrap();
         match cli.command {
             Some(Command::Session { prompt, .. }) => {
-                assert_eq!(prompt, "hello world");
+                assert_eq!(prompt, Some("hello world".to_string()));
             }
             _ => panic!("expected Session command via alias"),
         }
@@ -2842,6 +2874,8 @@ mod tests {
                 max_context_turns: None,
                 max_tokens: None,
                 debug: false,
+                prompt_file: None,
+                result_file: None,
             };
             let result = create_provider(&task_opts, None);
             assert!(result.is_ok(), "Expected Ok when ANTHROPIC_API_KEY is set");
@@ -2914,6 +2948,8 @@ mod tests {
                 max_context_turns: None,
                 max_tokens: None,
                 debug: false,
+                prompt_file: None,
+                result_file: None,
             };
             let result = create_provider(&task_opts, None);
             assert!(
@@ -3038,6 +3074,8 @@ mod tests {
                 max_context_turns: None,
                 max_tokens: None,
                 debug: false,
+                prompt_file: None,
+                result_file: None,
             };
             let result = create_provider(&task_opts, None);
             assert!(result.is_ok(), "Expected Ok with explicit provider");

@@ -1741,6 +1741,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = ToolHandler::execute(
@@ -1778,6 +1779,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = ToolHandler::execute(
@@ -2466,6 +2468,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"commands": ["pwd"]}))
@@ -2501,6 +2504,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = ToolHandler::execute(

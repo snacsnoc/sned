@@ -2008,6 +2008,13 @@ impl AgentLoop {
 
     /// Executes a single turn of the agent loop.
     async fn execute_turn(&mut self) -> TurnResult {
+        // Reset per-turn counters so cumulative token totals stay correct but
+        // per-turn deltas (like turn_tool_calls) restart from zero each turn.
+        {
+            let mut state = self.state.lock().await;
+            state.turn_tool_calls = 0;
+        }
+
         // Keep the current plan state in the conversation history before we
         // derive the request snapshot so the model actually sees the latest
         // plan context on this turn.
@@ -2151,6 +2158,7 @@ impl AgentLoop {
                 self.deps.hook_manager.clone(),
                 false, // Initial context: not explicitly approved (approval happens per-tool)
                 self.config.output_writer.clone(),
+                self.deps.yolo,
             )
             .with_cancellation_flag(cancellation_flag)
             .with_consecutive_failures(consecutive_failures),
@@ -3689,6 +3697,7 @@ impl AgentLoop {
                                     match approval {
                                         Ok(crate::core::approval::ApprovalResult::Denied) => {
                                             let mut state = self.state.lock().await;
+                                            let is_subagent = state.is_subagent_execution;
                                             state.record_denied_tool_action(
                                                 crate::core::agent_types::DeniedToolAction {
                                                     tool_name: tool_name.clone(),
@@ -3697,8 +3706,9 @@ impl AgentLoop {
                                                 },
                                             );
                                             Some(ToolExecutionOutput::error(
-                                                crate::core::approval::format_denial_message(
+                                                crate::core::approval::format_denial_message_with_context(
                                                     &tool_name,
+                                                    is_subagent,
                                                 ),
                                                 Some(ToolFailureMetadata {
                                                     class: ToolFailureClass::ApprovalDenied,
@@ -3793,6 +3803,7 @@ impl AgentLoop {
                                         // (no TUI available to prompt the user).
                                         if !self.config.interactive_mode {
                                             let mut state = self.state.lock().await;
+                                            let is_subagent = state.is_subagent_execution;
                                             state.record_denied_tool_action(
                                                 crate::core::agent_types::DeniedToolAction {
                                                     tool_name: tool_name.clone(),
@@ -3801,8 +3812,9 @@ impl AgentLoop {
                                                 },
                                             );
                                             Some(ToolExecutionOutput::error(
-                                                crate::core::approval::format_denial_message(
+                                                crate::core::approval::format_denial_message_with_context(
                                                     &tool_name,
+                                                    is_subagent,
                                                 ),
                                                 Some(ToolFailureMetadata {
                                                     class: ToolFailureClass::ApprovalDenied,
@@ -3827,6 +3839,7 @@ impl AgentLoop {
                                                     crate::core::approval::ApprovalResult::Denied,
                                                 ) => {
                                                     let mut state = self.state.lock().await;
+                                                    let is_subagent = state.is_subagent_execution;
                                                     state.record_denied_tool_action(
                                                         crate::core::agent_types::DeniedToolAction {
                                                             tool_name: tool_name.clone(),
@@ -3836,8 +3849,9 @@ impl AgentLoop {
                                                         },
                                                     );
                                                     Some(ToolExecutionOutput::error(
-                                                        crate::core::approval::format_denial_message(
+                                                        crate::core::approval::format_denial_message_with_context(
                                                             &tool_name,
+                                                            is_subagent,
                                                         ),
                                                         Some(ToolFailureMetadata {
                                                             class: ToolFailureClass::ApprovalDenied,
@@ -4004,6 +4018,12 @@ impl AgentLoop {
                 .system_prompt_context
                 .as_ref()
                 .is_some_and(|context| context.enable_parallel_tool_calling);
+            {
+                let mut state = self.state.lock().await;
+                let batch = tool_tasks.len() as u32;
+                state.turn_tool_calls = state.turn_tool_calls.saturating_add(batch);
+                state.cumulative_tool_calls = state.cumulative_tool_calls.saturating_add(batch);
+            }
             let mut result_map: std::collections::HashMap<usize, ToolExecutionOutput> =
                 std::collections::HashMap::with_capacity(tool_tasks.len());
             if !parallel_enabled {
@@ -4700,13 +4720,88 @@ impl AgentLoop {
                     self.config.output_writer.flush();
                 }
             }
+            if self.config.json_output {
+                self.emit_turn_result_event(true).await;
+            }
             TurnResult::Complete
         } else {
             // Same turn-end signal for the "more turns coming" branch.
             let markdown_text = response_text.as_deref().unwrap_or("");
             self.emit_turn_end(markdown_text).await;
+            if self.config.json_output {
+                // Intermediate turn: emit metrics under a different type so the
+                // JsonOutputLayer doesn't overwrite the final result_file payload.
+                self.emit_turn_result_event(false).await;
+            }
             TurnResult::Continue
         }
+    }
+
+    async fn emit_turn_result_event(&self, is_final: bool) {
+        let (
+            tool_calls,
+            input_tokens,
+            output_tokens,
+            cache_write_tokens,
+            cache_read_tokens,
+            total_cost,
+            context_tokens,
+            context_window,
+            context_usage_pct,
+        ) = {
+            let state = self.state.lock().await;
+            let tool_calls = state.turn_tool_calls;
+            let input_tokens = state.cumulative_tokens_in;
+            let output_tokens = state.cumulative_tokens_out;
+            let cache_write_tokens = state.cumulative_cache_writes;
+            let cache_read_tokens = state.cumulative_cache_reads;
+            let total_cost = state.cumulative_cost;
+            let context_tokens = state
+                .last_api_req_info
+                .as_ref()
+                .and_then(|r| r.context_tokens)
+                .unwrap_or(0);
+            let context_window = state
+                .last_api_req_info
+                .as_ref()
+                .and_then(|r| r.context_window)
+                .unwrap_or(0);
+            let context_usage_pct = state
+                .last_api_req_info
+                .as_ref()
+                .and_then(|r| r.context_usage_percentage)
+                .unwrap_or(0.0);
+            (
+                tool_calls,
+                input_tokens,
+                output_tokens,
+                cache_write_tokens,
+                cache_read_tokens,
+                total_cost,
+                context_tokens,
+                context_window,
+                context_usage_pct,
+            )
+        };
+
+        let event_type = if is_final { "result" } else { "turn_end" };
+        tracing::info!(
+            target: "json_output",
+            "{}",
+            serde_json::json!({
+                "type": event_type,
+                "tool_calls": tool_calls,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_write_tokens": cache_write_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "total_cost": total_cost,
+                "context_tokens": context_tokens,
+                "context_window": context_window,
+                "context_usage_pct": context_usage_pct,
+            })
+            .to_string()
+        );
     }
 
     async fn inject_plan_state_into_history(&self) {
@@ -6243,6 +6338,7 @@ mod tests {
                     None,
                     true,
                     agent.config.output_writer.clone(),
+                    false,
                 ));
                 let rejected = AgentLoop::execute_tool_with_hooks_internal(
                     &agent.config, None, context, "edit_file",
@@ -6399,6 +6495,7 @@ mod tests {
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         ));
 
         let output = AgentLoop::execute_tool_with_hooks_internal(
@@ -10574,7 +10671,9 @@ Irrespective of whether additional information or instructions are given, you ar
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
-        let _openai_env_lock = crate::providers::openai::OPENAI_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _openai_env_lock = crate::providers::openai::OPENAI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let old_cumulative_text_stream = std::env::var_os("SNED_OPENAI_CUMULATIVE_TEXT_STREAM");
         // SAFETY: this test holds the shared OpenAI environment lock.
         unsafe {

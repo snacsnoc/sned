@@ -461,6 +461,65 @@ impl InteractiveSession {
                 .map_err(|e| anyhow::anyhow!("Agent error: {e}"))
         };
 
+        // Write result file if configured (for subagent result collection)
+        if let Some(ref result_path) = self.task_opts.result_file {
+            let (status, error_text) = match &run_result {
+                Ok(()) => ("completed".to_string(), None),
+                Err(e) => ("failed".to_string(), Some(e.to_string())),
+            };
+            let agent_lock = agent.lock().await;
+            let state_handle = agent_lock.state_handle();
+            let state = state_handle.lock().await;
+            let history = agent_lock.get_conversation_history().await;
+            // Collect the last assistant text from history — this is the actual
+            // output the subagent produced for the parent agent. Assistant
+            // responses are stored as AssistantBlocks, not bare Text.
+            let result_text = history.iter().rev().find_map(|m| match m.role {
+                crate::providers::MessageRole::Assistant => match &m.content {
+                    crate::providers::MessageContent::Text(t) if !t.trim().is_empty() => {
+                        Some(t.clone())
+                    }
+                    crate::providers::MessageContent::AssistantBlocks(blocks) => {
+                        let text = blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                crate::providers::AssistantContentBlock::Text(t) => {
+                                    Some(t.text.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        if text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(text)
+                        }
+                    }
+                    _ => None,
+                },
+                _ => None,
+            });
+            let payload = serde_json::json!({
+                "type": "result",
+                "status": status,
+                "result": result_text,
+                "error": error_text,
+                "tool_calls": state.cumulative_tool_calls,
+                "input_tokens": state.cumulative_tokens_in,
+                "output_tokens": state.cumulative_tokens_out,
+                "cache_write_tokens": state.cumulative_cache_writes,
+                "cache_read_tokens": state.cumulative_cache_reads,
+                "total_cost": state.cumulative_cost,
+                "context_tokens": state.last_api_req_info.as_ref().and_then(|r| r.context_tokens).unwrap_or(0),
+                "context_window": state.last_api_req_info.as_ref().and_then(|r| r.context_window).unwrap_or(0),
+                "context_usage_pct": state.last_api_req_info.as_ref().and_then(|r| r.context_usage_percentage).unwrap_or(0.0),
+            });
+            if let Err(e) = std::fs::write(result_path, payload.to_string()) {
+                tracing::warn!(error = %e, "Failed to write subagent result file");
+            }
+        }
+
         // Always export on exit, even if the agent errored out.
         // This ensures the conversation is saved for debugging failed runs.
         if let Some(export_path) = self.task_opts.export.clone() {
@@ -11469,6 +11528,8 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             debug: false,
+            prompt_file: None,
+            result_file: None,
         }
     }
 
@@ -11852,6 +11913,8 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             debug: false,
+            prompt_file: None,
+            result_file: None,
         };
         let root_opts = RootOnlyOptions {
             session_id: None,
@@ -12511,6 +12574,8 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             debug: false,
+            prompt_file: None,
+            result_file: None,
         };
         let root_opts = RootOnlyOptions {
             session_id: None,
@@ -12646,6 +12711,8 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             debug: false,
+            prompt_file: None,
+            result_file: None,
         };
         let root_opts = RootOnlyOptions {
             session_id: None,
@@ -12773,6 +12840,8 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             debug: false,
+            prompt_file: None,
+            result_file: None,
         };
         let root_opts = RootOnlyOptions {
             session_id: None,
@@ -12910,6 +12979,8 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             debug: false,
+            prompt_file: None,
+            result_file: None,
         };
         let root_opts = RootOnlyOptions {
             session_id: None,
@@ -13032,6 +13103,8 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             debug: false,
+            prompt_file: None,
+            result_file: None,
         };
         let root_opts = RootOnlyOptions {
             session_id: None,
@@ -13157,6 +13230,8 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             debug: false,
+            prompt_file: None,
+            result_file: None,
         };
         let root_opts = RootOnlyOptions {
             session_id: None,

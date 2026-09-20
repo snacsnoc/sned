@@ -8,7 +8,7 @@ use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use std::future::Future;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitStatus;
 use std::process::Stdio;
@@ -19,7 +19,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
 
-const MAX_SUBAGENT_PROMPTS: usize = 5;
+pub(crate) const MAX_SUBAGENT_PROMPTS: usize = 5;
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_SUBAGENT_OUTPUT_LIMIT: usize = 1024 * 1024;
 const MAX_SUBAGENT_LINE_BYTES: usize = 64 * 1024;
@@ -117,6 +117,13 @@ impl UseSubagentsHandler {
             .get("max_turns")
             .and_then(serde_json::Value::as_i64)
             .map(|t| if t > 0 { t as u32 } else { 1 })
+    }
+
+    fn parse_allow_commands(params: &serde_json::Value) -> bool {
+        params
+            .get("allow_commands")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     }
 
     fn append_stream_line(
@@ -286,6 +293,68 @@ impl UseSubagentsHandler {
         }
     }
 
+    fn read_result_file(path: &Path) -> Option<SubagentResult> {
+        let content = std::fs::read_to_string(path).ok()?;
+        if content.trim().is_empty() {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        if value.get("type").and_then(|v| v.as_str()) != Some("result") {
+            return None;
+        }
+        Some(SubagentResult {
+            status: value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("completed")
+                .to_string(),
+            result: value
+                .get("result")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            error: value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            tool_calls: value
+                .get("tool_calls")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            input_tokens: value
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            output_tokens: value
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            cache_write_tokens: value
+                .get("cache_write_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            cache_read_tokens: value
+                .get("cache_read_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            total_cost: value
+                .get("total_cost")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            context_tokens: value
+                .get("context_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            context_window: value
+                .get("context_window")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            context_usage_pct: value
+                .get("context_usage_pct")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+        })
+    }
+
     async fn stop_subagent(child: &mut tokio::process::Child, child_pid: Option<i32>) {
         #[cfg(unix)]
         if let Some(child_pid) = child_pid {
@@ -349,22 +418,67 @@ impl UseSubagentsHandler {
         task_state: Option<Arc<Mutex<TaskState>>>,
         cancellation_flag: Option<Arc<AtomicBool>>,
         progress_writer: Option<crate::cli::output::OutputWriterArc>,
+        allow_commands: bool,
     ) -> SubagentResult {
-        let mut cmd = Command::new("sned");
-        cmd.arg("task");
-        cmd.arg("--prompt");
-        cmd.arg(prompt);
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sned"));
+
+        let prompt_file = match tempfile::NamedTempFile::new() {
+            Ok(f) => f,
+            Err(e) => {
+                return SubagentResult {
+                    status: "failed".to_string(),
+                    error: Some(format!("Failed to create prompt temp file: {e}")),
+                    ..Default::default()
+                };
+            }
+        };
+        if let Err(e) = std::fs::write(prompt_file.path(), prompt) {
+            return SubagentResult {
+                status: "failed".to_string(),
+                error: Some(format!("Failed to write prompt file: {e}")),
+                ..Default::default()
+            };
+        }
+        let prompt_path = prompt_file.path().to_path_buf();
+        let _prompt_file = Some(prompt_file);
+
+        let result_file = match tempfile::NamedTempFile::new() {
+            Ok(f) => f,
+            Err(e) => {
+                return SubagentResult {
+                    status: "failed".to_string(),
+                    error: Some(format!("Failed to create result temp file: {e}")),
+                    ..Default::default()
+                };
+            }
+        };
+        let result_path = result_file.path().to_path_buf();
+        let _result_file = Some(result_file);
+
+        let mut cmd = Command::new(&exe);
+        cmd.arg("session");
+        cmd.arg("--prompt-file");
+        cmd.arg(&prompt_path);
         cmd.arg("--is-subagent");
+        cmd.arg("--json");
+        cmd.arg("--auto-approve-all");
+        cmd.arg("--result-file");
+        cmd.arg(&result_path);
         cmd.current_dir(cwd);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.stdin(Stdio::null());
+        cmd.env("SNED_IS_SUBAGENT", "1");
+        cmd.env_remove("SNED_APPROVAL_DENY");
         #[cfg(unix)]
         cmd.process_group(0);
 
         if let Some(turns) = max_turns {
             cmd.arg("--max-turns");
             cmd.arg(turns.to_string());
+        }
+        if allow_commands {
+            cmd.arg("--yolo");
         }
 
         let emit_progress = progress_writer.is_some();
@@ -487,11 +601,23 @@ impl UseSubagentsHandler {
                             Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
                         ));
                     }
-                    SubagentResult {
-                        status: "completed".to_string(),
-                        result: Some(stdout_buf.trim().to_string()),
-                        error: None,
-                        ..Default::default()
+                    if let Some(parsed) = Self::read_result_file(&result_path) {
+                        parsed
+                    } else {
+                        tracing::warn!(
+                            subagent_index = subagent_index + 1,
+                            result_path = %result_path.display(),
+                            "Subagent exited successfully but produced no parseable result file"
+                        );
+                        SubagentResult {
+                            status: "completed".to_string(),
+                            result: None,
+                            error: Some(
+                                "subagent exited without producing a parseable result file"
+                                    .to_string(),
+                            ),
+                            ..Default::default()
+                        }
                     }
                 } else {
                     if let Some(ref writer) = progress_writer {
@@ -503,15 +629,31 @@ impl UseSubagentsHandler {
                             Style::default().fg(WARNING_FG),
                         ));
                     }
-                    SubagentResult {
-                        status: "failed".to_string(),
-                        result: None,
-                        error: Some(if stderr_buf.trim().is_empty() {
-                            stdout_buf.trim().to_string()
-                        } else {
-                            stderr_buf.trim().to_string()
-                        }),
-                        ..Default::default()
+                    // Try to recover token/cost metrics from the result file the
+                    // child wrote before failing; fall back to stderr for the
+                    // error message.
+                    let stderr_text = stderr_buf.trim().to_string();
+                    let stdout_text = stdout_buf.trim().to_string();
+                    let error_text = if !stderr_text.is_empty() {
+                        stderr_text
+                    } else {
+                        stdout_text
+                    };
+                    if let Some(mut parsed) = Self::read_result_file(&result_path) {
+                        // Promote the recovered metrics; keep stderr as the
+                        // authoritative error message.
+                        parsed.status = "failed".to_string();
+                        if parsed.error.is_none() {
+                            parsed.error = Some(error_text);
+                        }
+                        parsed
+                    } else {
+                        SubagentResult {
+                            status: "failed".to_string(),
+                            result: None,
+                            error: Some(error_text),
+                            ..Default::default()
+                        }
                     }
                 }
             }
@@ -605,6 +747,7 @@ impl UseSubagentsHandler {
         workspace_root: &Path,
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
+        parent_yolo: bool,
     ) -> Result<String, ToolError> {
         self.execute_with_workspace_root_and_cancellation(
             state,
@@ -613,6 +756,7 @@ impl UseSubagentsHandler {
             json_output,
             output_writer,
             None,
+            parent_yolo,
         )
         .await
     }
@@ -625,10 +769,13 @@ impl UseSubagentsHandler {
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
         cancellation_flag: Option<Arc<AtomicBool>>,
+        parent_yolo: bool,
     ) -> Result<String, ToolError> {
         {
             let mut state = state.lock().await;
-            if state.is_subagent_execution {
+            let is_subagent_recursive =
+                state.is_subagent_execution || std::env::var("SNED_IS_SUBAGENT").is_ok();
+            if is_subagent_recursive {
                 state.consecutive_mistakes += 1;
                 tracing::warn!(
                     consecutive_mistakes = state.consecutive_mistakes,
@@ -692,6 +839,7 @@ impl UseSubagentsHandler {
         }
         let timeout_secs = Self::parse_timeout(&params);
         let max_turns = Self::parse_max_turns(&params);
+        let allow_commands = Self::parse_allow_commands(&params);
 
         let validation_error = if prompt_count_in_json > MAX_SUBAGENT_PROMPTS {
             Some((
@@ -726,6 +874,18 @@ impl UseSubagentsHandler {
                 "use_subagents: invalid configuration"
             );
             return Err(error);
+        }
+
+        if allow_commands && !parent_yolo {
+            let mut state = state.lock().await;
+            state.consecutive_mistakes += 1;
+            tracing::warn!(
+                consecutive_mistakes = state.consecutive_mistakes,
+                "use_subagents: allow_commands requires parent --yolo"
+            );
+            return Err(ToolError::InvalidInput(
+                "allow_commands requires parent session to run with --yolo".to_string(),
+            ));
         }
 
         {
@@ -770,6 +930,7 @@ impl UseSubagentsHandler {
                         Some(state_clone),
                         cancellation_flag_clone,
                         progress_writer_clone,
+                        allow_commands,
                     )
                     .await
                 }),
@@ -904,6 +1065,7 @@ impl UseSubagentsHandler {
                 workspace_root.as_path(),
                 false,
                 &output_writer,
+                false,
             )
             .await;
         // Sync back consecutive_mistakes for tests
@@ -943,6 +1105,7 @@ impl ToolHandler for UseSubagentsHandler {
                     ctx.json_output,
                     &ctx.output_writer,
                     ctx.cancellation_flag.clone(),
+                    ctx.parent_yolo,
                 )
                 .await
                 .map(serde_json::Value::String)
@@ -969,6 +1132,35 @@ mod tests {
     use super::*;
     use crate::cli::output::{OutputEvent, OutputWriter};
     use tokio::io::AsyncWriteExt;
+
+    /// RAII guard that unsets an env var on drop, so test panics don't leak state
+    /// into other tests.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        /// SAFETY: caller must hold `crate::test_support::env_lock()`.
+        unsafe fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: caller guarantees exclusive access via env_lock.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: test holds env_lock until after this Drop runs.
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[derive(Default)]
     struct RecordingOutputWriter {
@@ -1245,5 +1437,109 @@ mod tests {
             UseSubagentsHandler::finish_stream_collector(handle, "stdout", 0).await;
         assert!(stalled);
         assert!(output.contains("stdout collection timed out"));
+    }
+
+    #[test]
+    fn test_parse_allow_commands_default_false() {
+        let params = serde_json::json!({"prompt_1": "test"});
+        assert!(!UseSubagentsHandler::parse_allow_commands(&params));
+    }
+
+    #[test]
+    fn test_parse_allow_commands_explicit_true() {
+        let params = serde_json::json!({"prompt_1": "test", "allow_commands": true});
+        assert!(UseSubagentsHandler::parse_allow_commands(&params));
+    }
+
+    #[test]
+    fn test_parse_allow_commands_explicit_false() {
+        let params = serde_json::json!({"prompt_1": "test", "allow_commands": false});
+        assert!(!UseSubagentsHandler::parse_allow_commands(&params));
+    }
+
+    #[test]
+    fn test_read_result_file_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("result.json");
+        std::fs::write(
+            &path,
+            r#"{"type":"result","status":"completed","result":"hello","tool_calls":3,"input_tokens":100,"output_tokens":50,"cache_write_tokens":10,"cache_read_tokens":20,"total_cost":0.05,"context_tokens":500,"context_window":100000,"context_usage_pct":0.5}"#,
+        )
+        .unwrap();
+        let result = UseSubagentsHandler::read_result_file(&path);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.status, "completed");
+        assert_eq!(r.result.as_deref(), Some("hello"));
+        assert_eq!(r.tool_calls, 3);
+        assert_eq!(r.input_tokens, 100);
+        assert_eq!(r.output_tokens, 50);
+        assert_eq!(r.cache_write_tokens, 10);
+        assert_eq!(r.cache_read_tokens, 20);
+        assert!((r.total_cost - 0.05).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_read_result_file_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        assert!(UseSubagentsHandler::read_result_file(&path).is_none());
+    }
+
+    #[test]
+    fn test_read_result_file_wrong_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("result.json");
+        std::fs::write(&path, r#"{"type":"usage","input_tokens":100}"#).unwrap();
+        assert!(UseSubagentsHandler::read_result_file(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handler_allow_commands_requires_parent_yolo() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // SAFETY: guarded by env_lock
+        unsafe { std::env::remove_var("SNED_IS_SUBAGENT") };
+        let handler = UseSubagentsHandler::new();
+        let mut state = TaskState {
+            subagents_enabled: true,
+            ..Default::default()
+        };
+        let params = serde_json::json!({
+            "prompt_1": "test",
+            "allow_commands": true,
+        });
+        let result = handler.execute(&mut state, params).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("allow_commands requires parent"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handler_recursion_blocked_via_env_var() {
+        let _env_guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // SAFETY: guarded by env_lock; EnvVarGuard restores prior value on drop.
+        let _env = unsafe { EnvVarGuard::set("SNED_IS_SUBAGENT", "1") };
+        let handler = UseSubagentsHandler::new();
+        let mut state = TaskState {
+            subagents_enabled: true,
+            ..Default::default()
+        };
+        let result = handler
+            .execute(&mut state, serde_json::json!({"prompt_1": "test"}))
+            .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("Subagents cannot spawn other subagents"),
+            "unexpected error: {msg}"
+        );
     }
 }

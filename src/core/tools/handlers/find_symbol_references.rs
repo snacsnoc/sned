@@ -567,6 +567,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -599,6 +600,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let references = FindSymbolReferencesHandler::new()
@@ -655,6 +657,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         FindSymbolReferencesHandler::new()
@@ -689,6 +692,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let canonical = std::fs::canonicalize(file_path).unwrap();
         let held = ctx.lock_file_paths(std::slice::from_ref(&canonical)).await;
@@ -749,6 +753,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let handler = FindSymbolReferencesHandler::new().with_symbol_index(symbol_index);
 
@@ -775,6 +780,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let handler =
             FindSymbolReferencesHandler::new().with_symbol_index(Arc::new(std::sync::Mutex::new(
@@ -827,6 +833,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let handler = FindSymbolReferencesHandler::new().with_symbol_index(symbol_index);
 

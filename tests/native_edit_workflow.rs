@@ -851,6 +851,7 @@ impl Workflow {
             None,
             true,
             Arc::new(sned::cli::output::StderrOutputWriter),
+            false,
         );
         Self { dir, ctx }
     }

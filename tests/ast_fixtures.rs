@@ -163,6 +163,7 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                     None,
                     false,
                     Arc::new(StderrOutputWriter),
+                    false,
                 );
                 let result = rt.block_on(ToolHandler::execute(
                     &handler,
@@ -220,6 +221,7 @@ fn run_language_fixtures(lang: &str, extension: &str) {
                     None,
                     false,
                     Arc::new(StderrOutputWriter),
+                    false,
                 );
                 let result = rt.block_on(ToolHandler::execute(
                     &handler,

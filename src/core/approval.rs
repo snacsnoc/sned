@@ -1519,10 +1519,23 @@ impl ApprovalRequest {
 /// Centralizes the wording so agent_loop and tool handlers stay in sync.
 #[must_use]
 pub fn format_denial_message(tool_name: &str) -> String {
-    format!(
-        "Tool '{tool_name}' was denied by user. Ask the user what approach they would prefer. \
-         Do not attempt to bypass this denial with alternative tools."
-    )
+    format_denial_message_with_context(tool_name, false)
+}
+
+#[must_use]
+pub fn format_denial_message_with_context(tool_name: &str, is_subagent: bool) -> String {
+    if is_subagent {
+        format!(
+            "Tool '{tool_name}' was denied. In subagent mode, tool execution is limited: \
+             commands and external writes are disabled by default. \
+             Report this limitation to your parent task and adapt your approach."
+        )
+    } else {
+        format!(
+            "Tool '{tool_name}' was denied by user. Ask the user what approach they would prefer. \
+             Do not attempt to bypass this denial with alternative tools."
+        )
+    }
 }
 
 /// Format tool parameters for display in approval prompts.
@@ -1704,6 +1717,35 @@ fn format_tool_parameters_in_workspace(
             }
             if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
                 output.push_str(&format!(" in {path}"));
+            }
+            output
+        }
+        "use_subagents" => {
+            let mut output = String::new();
+            let mut prompt_count = 0;
+            for i in 1..=crate::core::tools::handlers::use_subagents::MAX_SUBAGENT_PROMPTS {
+                let key = format!("prompt_{i}");
+                if obj
+                    .get(&key)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.trim().is_empty())
+                {
+                    prompt_count += 1;
+                }
+            }
+            let allow_commands = obj
+                .get("allow_commands")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let timeout = obj.get("timeout").and_then(|v| v.as_i64()).unwrap_or(300);
+            output.push_str(&format!(
+                "\n    Subagents: {prompt_count} prompt(s), timeout {timeout}s"
+            ));
+            output.push_str("\n    Subagent auto-approves: reads, workspace writes");
+            if allow_commands {
+                output.push_str(", commands (parent --yolo)");
+            } else {
+                output.push_str(". Commands and external writes: denied");
             }
             output
         }

@@ -149,6 +149,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = handler.execute(&ctx, serde_json::json!({})).await;
         assert!(result.is_err());
@@ -171,6 +172,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = handler
             .execute(
@@ -198,6 +200,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = handler
             .execute(
@@ -225,6 +228,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = handler
             .execute(&ctx, serde_json::json!({"response": "1. only one step"}))

@@ -192,6 +192,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let output = GetFileSkeletonHandler
@@ -224,6 +225,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let output = GetFileSkeletonHandler
@@ -275,6 +277,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let error = ToolHandler::execute(
@@ -301,6 +304,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let error = ToolHandler::execute(
@@ -330,6 +334,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let canonical = std::fs::canonicalize(file_path).unwrap();
         let held = ctx.lock_file_paths(std::slice::from_ref(&canonical)).await;

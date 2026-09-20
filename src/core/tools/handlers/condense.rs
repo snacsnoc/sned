@@ -222,6 +222,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = handler.execute(&ctx, serde_json::json!({})).await;
@@ -246,6 +247,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = handler
@@ -294,6 +296,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = handler
@@ -350,6 +353,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = handler
@@ -402,6 +406,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = handler
@@ -439,6 +444,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = handler
@@ -481,6 +487,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = handler
@@ -520,6 +527,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         // First compaction should succeed
@@ -576,6 +584,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         // First compaction
@@ -719,6 +728,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = handler
@@ -755,6 +765,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = tokio::time::timeout(
@@ -810,6 +821,7 @@ mod tests {
             Some(Arc::new(hook_manager)),
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = CondenseHandler::new()

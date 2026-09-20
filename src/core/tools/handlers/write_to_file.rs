@@ -531,6 +531,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = ToolHandler::execute(
@@ -562,6 +563,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         )
     }
 
@@ -755,6 +757,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         handler
@@ -794,6 +797,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = ToolHandler::execute(
@@ -834,6 +838,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let first = ToolHandler::execute(
@@ -886,6 +891,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = ToolHandler::execute(

@@ -163,6 +163,12 @@ pub struct TaskState {
     /// Used to detect the "read loop" pattern where the model reads the same
     /// file repeatedly without taking action.
     pub consecutive_reads: std::collections::HashMap<String, u32>,
+    /// Number of tool calls executed in the current turn (for subagent result reporting).
+    pub turn_tool_calls: u32,
+    /// Cumulative total tool calls across all turns in the session (never
+    /// reset between turns). Reported in the subagent result file so the
+    /// parent sees the full session, not just the final turn.
+    pub cumulative_tool_calls: u32,
     /// Plan state for the interactive Plan -> Approve -> Act workflow.
     pub plan_state: Option<crate::core::plan_state::PlanState>,
     /// Last injected plan state hash to avoid duplicate injections.
@@ -241,6 +247,8 @@ impl Default for TaskState {
             last_injected_plan_state_hash: None,
             denied_tool_actions: Vec::new(),
             retryable_failed_request: None,
+            turn_tool_calls: 0,
+            cumulative_tool_calls: 0,
         }
     }
 }

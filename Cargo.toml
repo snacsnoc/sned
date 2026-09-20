@@ -85,6 +85,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }  # Updated from 0.32, 0.
 dhat = { version = "0.3", optional = true }
 
 ulid = "1"
+tempfile = "3"
 base64 = "0.22"
 clap_complete = "4.6"  # Updated to 4.6.x
 vte = "0.15.0"

@@ -232,6 +232,8 @@ pub struct ToolContext {
     pub session_command_scope_approved: bool,
     /// Output writer for decoupled terminal output.
     pub output_writer: crate::cli::output::OutputWriterArc,
+    /// Whether the parent agent is running in yolo mode (for subagent allow_commands validation).
+    pub parent_yolo: bool,
 }
 
 impl ToolContext {
@@ -245,6 +247,7 @@ impl ToolContext {
         hook_manager: Option<Arc<crate::core::hooks::HookManager>>,
         explicitly_approved: bool,
         output_writer: crate::cli::output::OutputWriterArc,
+        parent_yolo: bool,
     ) -> Self {
         Self {
             state,
@@ -260,6 +263,7 @@ impl ToolContext {
             explicitly_approved,
             session_command_scope_approved: false,
             output_writer,
+            parent_yolo,
         }
     }
 
@@ -1018,6 +1022,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let path = PathBuf::from("/workspace/src/main.rs");
         let guard = ctx.lock_file_paths(std::slice::from_ref(&path)).await;

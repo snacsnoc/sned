@@ -1315,8 +1315,10 @@ impl EditFileHandler {
                         .await
                     {
                         Ok(crate::core::approval::ApprovalResult::Denied) => {
-                            return Ok(crate::core::approval::format_denial_message(
+                            let is_subagent = state.lock().await.is_subagent_execution;
+                            return Ok(crate::core::approval::format_denial_message_with_context(
                                 SnedTool::EditFile.name(),
+                                is_subagent,
                             ));
                         }
                         Ok(crate::core::approval::ApprovalResult::Always) => {
@@ -1879,8 +1881,10 @@ impl EditFileHandler {
                 .await
                 {
                     Ok(crate::core::approval::ApprovalResult::Denied) => {
-                        return Ok(crate::core::approval::format_denial_message(
+                        let is_subagent = state.lock().await.is_subagent_execution;
+                        return Ok(crate::core::approval::format_denial_message_with_context(
                             SnedTool::EditFile.name(),
+                            is_subagent,
                         ));
                     }
                     Ok(crate::core::approval::ApprovalResult::Always) => {
@@ -2877,6 +2881,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({})).await;
         assert!(
@@ -2914,6 +2919,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(
             &EditFileHandler::new(),
@@ -2959,6 +2965,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let error = ToolHandler::execute(
             &EditFileHandler::new(),
@@ -3008,6 +3015,7 @@ mod tests {
             None,
             false,
             channel_writer,
+            false,
         );
         let params = serde_json::json!({"files":[{
             "path":"file.txt",
@@ -3062,6 +3070,7 @@ mod tests {
             None,
             false,
             channel_writer,
+            false,
         );
         let params = serde_json::json!({"files":[{
             "path":"file.txt",
@@ -3105,6 +3114,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(
             &EditFileHandler::new(),
@@ -3124,10 +3134,7 @@ mod tests {
                 .unwrap()
                 .contains("Applied 1 edit(s) successfully")
         );
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"head\nreplacement\nnext\n"
-        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"head\nreplacement\nnext\n");
     }
 
     #[tokio::test]
@@ -3188,6 +3195,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let no_op = ToolHandler::execute(
             &EditFileHandler::new(),
@@ -3233,6 +3241,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": []})).await;
         assert!(
@@ -3257,6 +3266,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({})).await;
         assert_eq!(
@@ -3279,6 +3289,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": []})).await;
         assert_eq!(
@@ -3310,6 +3321,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let error = ToolHandler::execute(
             &handler,
@@ -3347,6 +3359,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": "[]"})).await;
         assert_eq!(
@@ -3369,6 +3382,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let msg = ToolHandler::execute(&handler, &ctx, serde_json::json!({"files": 42}))
             .await
@@ -3404,6 +3418,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let anchor = format!("{}§line 1", anchors[0]);
         let stringified_files = serde_json::json!({
@@ -3452,6 +3467,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "files": [{
@@ -3504,6 +3520,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "path": "test.txt",
@@ -3548,6 +3565,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "path": "test.txt",
@@ -3589,6 +3607,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let first_anchor = format!("{}§alpha", anchors[0]);
         let second_anchor = format!("{}§beta", anchors[1]);
@@ -3632,6 +3651,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let anchor = format!("{}§line 1", anchors[0]);
         let stringified_files = serde_json::json!({
@@ -3672,6 +3692,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let anchor = format!("{}§line 1", anchors[0]);
         let anchored_text = format!(
@@ -3723,6 +3744,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let anchor_mgr = AnchorStateManager::new();
         let lines = crate::core::file_editor::split_content_lines("line 1\nline 2\nline 3\n");
@@ -3778,6 +3800,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -3822,6 +3845,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         // Model sends path inside edit object (common mistake)
@@ -3865,6 +3889,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         // Model sends anchor/text as siblings of path (no edits array)
@@ -3914,6 +3939,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -3955,6 +3981,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "files": [{
@@ -3991,6 +4018,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -4031,6 +4059,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -4066,6 +4095,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         // Use proper anchor format (with §) but file doesn't exist, so edit will fail
@@ -4138,6 +4168,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result_str = ToolHandler::execute(&handler, &ctx, params)
             .await
@@ -4202,6 +4233,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         let err = result.expect_err("edit_file should block until read_file clears reread state");
@@ -4267,6 +4299,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, params)
             .await
@@ -4335,6 +4368,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         let err = result.expect_err("stale external edits should require a reread first");
@@ -4393,6 +4427,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
@@ -4428,6 +4463,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let read_output = ToolHandler::execute(
             &read_handler,
@@ -4503,6 +4539,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
@@ -4564,6 +4601,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
@@ -4627,6 +4665,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
@@ -4690,6 +4729,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(result.is_ok(), "Edit should succeed in yolo mode");
@@ -4751,6 +4791,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(result.is_err(), "rejected edit must be a tool failure");
@@ -4809,6 +4850,7 @@ mod tests {
             None,
             true, // explicitly_approved required — silent no longer bypasses approval
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let result = ToolHandler::execute(&handler, &ctx, params).await;
         assert!(
@@ -4866,6 +4908,7 @@ mod tests {
                     None,
                     false,
                     Arc::new(crate::cli::output::StderrOutputWriter),
+                    false,
                 );
 
                 let params = serde_json::json!({
@@ -4944,6 +4987,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "files": [{
@@ -5001,6 +5045,7 @@ mod tests {
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let initial_content = tokio::fs::read_to_string(&file_path).await.unwrap();
@@ -5102,6 +5147,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -5150,6 +5196,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let long_anchor = "你好世界".repeat(20);
@@ -5196,6 +5243,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -5234,6 +5282,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -5275,6 +5324,7 @@ edition = "2021"
                 None,
                 false,
                 Arc::new(crate::cli::output::StderrOutputWriter),
+                false,
             );
 
             let params = serde_json::json!({
@@ -5324,6 +5374,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -5381,6 +5432,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "files": [{
@@ -5426,6 +5478,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -5486,6 +5539,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({"files": [{"path": path, "edits": [{
             "anchor": format!("{}§first", anchors[0]), "edit_type": "replace", "text": "changed"
@@ -5799,6 +5853,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "files": [
@@ -5903,6 +5958,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "files": [
@@ -5981,6 +6037,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({"files": [
             {"path": "valid.txt", "edits": [{
@@ -6027,6 +6084,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({"files": [{
             "path": "atomic.txt",
@@ -6071,6 +6129,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({"files": [
             {"path": "insert.txt", "edits": [{
@@ -6127,6 +6186,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({"files": [{
             "path": "same-mtime.txt",
@@ -6182,6 +6242,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({"files": [
             {"path": "first.txt", "edits": [{
@@ -6249,6 +6310,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({"files": [
             {"path": "first.txt", "edits": [{
@@ -6335,6 +6397,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let anchor_l1 = format!("{}§line 1", anchors[0]);
@@ -6416,6 +6479,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let handler = EditFileHandler::new();
 
@@ -6504,6 +6568,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let anchor = format!("{}§line 1", anchors[0]);
@@ -6579,6 +6644,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let anchor = format!("{}§alpha", anchors[0]);
@@ -6699,6 +6765,7 @@ edition = "2021"
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({
@@ -6775,6 +6842,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let anchor = format!("{}§fn alpha() {{}}", anchors[0]);
         let params = serde_json::json!({
@@ -6870,6 +6938,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let anchor = format!("{}§void f(void) {{}}", anchors[0]);
         // The model wants a C string with `\n` (two chars) inside it.
@@ -6935,6 +7004,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let anchor = format!("{}§void f(void) {{}}", anchors[0]);
         // The model sends a real newline in the JSON (`\n` in JSON
@@ -6990,6 +7060,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "files": [{
@@ -7026,6 +7097,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "files": [{
@@ -7072,6 +7144,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         // First line is just `Word§` with no content after the delimiter.
         // The second line continues with another anchor.
@@ -7133,6 +7206,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let anchor = format!("{}§void f(void) {{}}", anchors[0]);
         // The model sends `files` as a stringified JSON array with edits
@@ -7197,6 +7271,7 @@ edition = "2021"
             None,
             false,
             writer,
+            false,
         );
         let anchor = format!("{}§void f(void) {{}}", anchors[0]);
         let params = serde_json::json!({
@@ -7253,6 +7328,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let anchor = format!("{}§Hello World", anchors[0]);
         let params = serde_json::json!({
@@ -7308,6 +7384,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         // Model sends files as stringified JSON with no top-level path
         // and no per-file path. This is unrecoverable: the tool cannot
@@ -7385,6 +7462,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let anchor = format!("{}§fn missing() {{}}", initial_anchors[0]);
         let edit_params = serde_json::json!({
@@ -7413,6 +7491,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let read_params = serde_json::json!({
             "paths": [file_path.to_string_lossy()]
@@ -7470,6 +7549,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = ToolHandler::execute(
@@ -7510,6 +7590,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let params = serde_json::json!({
             "files": "this is not valid json {["
@@ -7634,6 +7715,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let result = ToolHandler::execute(
@@ -7683,6 +7765,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
         let edits = (0..8)
             .map(|idx| {
@@ -7750,6 +7833,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         )
     }
 
@@ -7809,6 +7893,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         // Exact structure from prompt 4 msg_13 (Mimo)
@@ -7931,6 +8016,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         // Exact structure from prompt 3 msg_13 (Qwen) — anchor has unescaped quotes
@@ -7966,6 +8052,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         // Exact structure from prompt 4 msg_23 (Mimo) — missing comma before "path"
@@ -8000,6 +8087,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         // Exact structure from prompt 3 msg_21 (Qwen)
@@ -8037,6 +8125,7 @@ edition = "2021"
             None,
             false,
             Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
         );
 
         let params = serde_json::json!({

@@ -259,7 +259,7 @@ pub fn edit_file_schema() -> ToolSchema {
                                 "end_line": {
                                     "type": "integer",
                                     "minimum": 1,
-                                    "description": "1-based inclusive end line. Defaults to start_line; insertions require one line."
+                                    "description": "1-based inclusive end line; use only with expected_file_hash (revision-checked mode). Ignored when editing by anchor."
                                 },
                                 "expected_text": {
                                     "type": "string",
@@ -599,6 +599,14 @@ pub fn use_subagents_schema() -> ToolSchema {
                 required: false,
                 param_type: "integer",
                 description: "Optional maximum number of turns for each subagent.",
+                items: None,
+                extra: None,
+            },
+            ToolParameter {
+                name: "allow_commands",
+                required: false,
+                param_type: "boolean",
+                description: "Set to true to allow subagents to execute shell commands. REQUIRES the parent to be running with --yolo. When false (default), execute_command is denied in subagents.",
                 items: None,
                 extra: None,
             },
@@ -1159,9 +1167,7 @@ mod tests {
                 if child.is_object() {
                     check(child, &format!("{trail}.{key}"));
                 } else if child.is_array() {
-                    for (index, item) in
-                        child.as_array().into_iter().flatten().enumerate()
-                    {
+                    for (index, item) in child.as_array().into_iter().flatten().enumerate() {
                         check(item, &format!("{trail}.{key}[{index}]"));
                     }
                 }
