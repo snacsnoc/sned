@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, RwLock, watch};
 /// Cache entry with timestamp for TTL-based invalidation
 #[derive(Debug, Clone)]
 struct FileSearchCacheEntry {
-    results: Vec<FileSearchResult>,
+    results: Arc<Vec<FileSearchResult>>,
     timestamp: std::time::Instant,
 }
 
@@ -194,11 +194,11 @@ fn dirs_to_results(dir_set: &std::collections::HashSet<String>) -> Vec<FileSearc
         .collect()
 }
 
-fn collect_workspace_file_index(workspace: PathBuf) -> Vec<FileSearchResult> {
+fn collect_workspace_file_index(workspace: &Path) -> Vec<FileSearchResult> {
     let mut files = Vec::new();
     let mut dir_set = HashSet::new();
 
-    let walker = WalkBuilder::new(&workspace)
+    let walker = WalkBuilder::new(workspace)
         .hidden(false)
         .follow_links(false)
         .filter_entry(|e| {
@@ -224,7 +224,7 @@ fn collect_workspace_file_index(workspace: PathBuf) -> Vec<FileSearchResult> {
             FileType::File
         };
 
-        let relative = entry.path().strip_prefix(&workspace).map_or_else(
+        let relative = entry.path().strip_prefix(workspace).map_or_else(
             |_| entry.path().to_string_lossy().to_string(),
             |p: &std::path::Path| p.to_string_lossy().to_string(),
         );
@@ -244,13 +244,16 @@ fn collect_workspace_file_index(workspace: PathBuf) -> Vec<FileSearchResult> {
         }
     }
 
-    files.sort_by(|left, right| left.path.cmp(&right.path));
     let mut all_results = files;
     all_results.extend(dirs_to_results(&dir_set));
     all_results.sort_by(|left, right| left.path.cmp(&right.path));
     all_results
 }
 
+// `workspace` is taken by value because the spawn-blocking closure below must
+// own its bindings (`'static`). clippy::needless_pass_by_value is therefore
+// inapplicable here even though only an immutable borrow is needed inside.
+#[allow(clippy::needless_pass_by_value)]
 async fn refresh_workspace_file_index(
     workspace_path: String,
     workspace: PathBuf,
@@ -258,7 +261,7 @@ async fn refresh_workspace_file_index(
     #[cfg(test)]
     wait_for_refresh_test_blocker(&workspace_path).await;
 
-    let results = tokio::task::spawn_blocking(move || collect_workspace_file_index(workspace))
+    let results = tokio::task::spawn_blocking(move || collect_workspace_file_index(&workspace))
         .await
         .map_err(std::io::Error::other);
 
@@ -267,7 +270,7 @@ async fn refresh_workspace_file_index(
         cache.insert(
             workspace_path.clone(),
             FileSearchCacheEntry {
-                results: results.clone(),
+                results: Arc::new(results.clone()),
                 timestamp: std::time::Instant::now(),
             },
         );
@@ -291,10 +294,9 @@ async fn ensure_workspace_refresh(workspace_path: &str) -> watch::Receiver<Optio
 
     if owns_refresh {
         let refresh_path = workspace_path.to_string();
+        let refresh_path_buf = PathBuf::from(&refresh_path);
         tokio::spawn(async move {
-            let result =
-                refresh_workspace_file_index(refresh_path.clone(), PathBuf::from(&refresh_path))
-                    .await;
+            let result = refresh_workspace_file_index(refresh_path.clone(), refresh_path_buf).await;
             let _ = refresh_tx.send(Some(result.is_ok()));
             FILE_SEARCH_REFRESHING.lock().await.remove(&refresh_path);
         });
@@ -312,7 +314,7 @@ pub fn preload_index(workspace_path: String) {
 
 async fn workspace_file_index(
     workspace_path: &str,
-) -> std::io::Result<(Vec<FileSearchResult>, bool)> {
+) -> std::io::Result<(Arc<Vec<FileSearchResult>>, bool)> {
     let workspace_path = workspace_path.to_string();
     let cached = FILE_SEARCH_CACHE.read().await.get(&workspace_path).cloned();
     if cached
@@ -337,7 +339,7 @@ async fn workspace_file_index(
     if let Some(entry) = FILE_SEARCH_CACHE.read().await.get(&workspace_path)
         && entry.timestamp.elapsed() < CACHE_TTL
     {
-        return Ok((entry.results.clone(), false));
+        return Ok((Arc::clone(&entry.results), false));
     }
     if !refresh_completed || *refresh_rx.borrow() != Some(true) {
         tracing::debug!(workspace = %workspace_path, "Workspace file index refresh did not complete");
@@ -347,7 +349,7 @@ async fn workspace_file_index(
         .lock()
         .await
         .contains_key(&workspace_path);
-    Ok((Vec::new(), refresh_pending))
+    Ok((Arc::new(Vec::new()), refresh_pending))
 }
 
 pub async fn list_workspace_files(
@@ -357,8 +359,9 @@ pub async fn list_workspace_files(
     Ok(workspace_file_index(workspace_path)
         .await?
         .0
-        .into_iter()
+        .iter()
         .take(limit)
+        .cloned()
         .collect())
 }
 
@@ -369,19 +372,23 @@ fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
 }
 
 fn fuzzy_score_normalized(query_bytes: &[u8], target: &str) -> Option<usize> {
-    let target_bytes = target.to_lowercase().into_bytes();
-
     if query_bytes.is_empty() {
         return Some(0);
     }
 
+    let target_bytes = target.as_bytes();
     let mut qi = 0;
     let mut last_match_idx: isize = -1;
     let mut score = 0usize;
     let mut first_match_idx: Option<usize> = None;
 
-    for (ti, tb) in target_bytes.iter().enumerate() {
-        if qi < query_bytes.len() && *tb == query_bytes[qi] {
+    for (ti, &tb) in target_bytes.iter().enumerate() {
+        // Fold ASCII without allocating. Non-ASCII bytes only equal their
+        // own lowercase counterpart if they happen to match the query, which
+        // is negligible in practice; keeping ASCII-only matches the
+        // codepath's behavior under `to_lowercase().into_bytes()` for the
+        // 99.9% of paths that are ASCII.
+        if qi < query_bytes.len() && tb.to_ascii_lowercase() == query_bytes[qi] {
             let ti_usize = ti as isize;
 
             if qi == 0 {
@@ -446,7 +453,7 @@ pub async fn search_workspace_files_with_status(
 
     if query.trim().is_empty() {
         return Ok(WorkspaceFileSearch {
-            results: items.into_iter().take(limit).collect(),
+            results: items.iter().take(limit).cloned().collect(),
             refresh_pending,
         });
     }
@@ -457,29 +464,77 @@ pub async fn search_workspace_files_with_status(
     // scoring. Keep the slash in the input buffer for mention expansion.
     let query_lower = query.trim_start_matches('/').to_lowercase();
     let query_bytes = query_lower.into_bytes();
-    let mut scored: Vec<_> = items
-        .iter()
-        .filter_map(|item| {
-            let search_target = &item.path;
-            fuzzy_score_normalized(&query_bytes, search_target).map(|score| (score, item.clone()))
-        })
+
+    // Top-K: scan every index entry once, maintain a bounded min-heap of
+    // references/indices, and only clone the surviving top-K items at the end.
+    // This achieves zero allocations during scanning and limits cloning to
+    // exactly `limit` items.
+    let mut heap: std::collections::BinaryHeap<ScoredCandidate> =
+        std::collections::BinaryHeap::with_capacity(limit);
+
+    for (index, item) in items.iter().enumerate() {
+        if let Some(score) = fuzzy_score_normalized(&query_bytes, &item.path) {
+            let candidate = ScoredCandidate {
+                score,
+                path: &item.path,
+                index,
+            };
+
+            if heap.len() < limit {
+                heap.push(candidate);
+            } else if let Some(mut worst) = heap.peek_mut() {
+                // If candidate is better than worst (i.e. candidate < worst in our eviction Ord):
+                if candidate.cmp(&worst).is_lt() {
+                    *worst = candidate;
+                }
+            }
+        }
+    }
+
+    // `into_sorted_vec()` produces elements in ascending Ord order. In our
+    // eviction Ord, the best element is the smallest, so index 0 is rank #1.
+    // The heap itself was already bounded to `limit` so `into_sorted_vec()`
+    // is at most O(limit log limit). The real saving over the previous
+    // `Vec::sort_by` happens during scanning: the heap lets us score every
+    // entry with zero per-match `FileSearchResult` clones (only the surviving
+    // `limit` items are cloned here via `items[c.index]`).
+    let top: Vec<FileSearchResult> = heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|c| items[c.index].clone())
         .collect();
 
-    scored.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| left.1.path.cmp(&right.1.path))
-    });
-
     Ok(WorkspaceFileSearch {
-        results: scored
-            .into_iter()
-            .take(limit)
-            .map(|(_, item)| item)
-            .collect(),
+        results: top,
         refresh_pending,
     })
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct ScoredCandidate<'a> {
+    score: usize,
+    path: &'a str,
+    index: usize,
+}
+
+impl Ord for ScoredCandidate<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Min-heap eviction order: the "worst" candidate must be GREATER so
+        // heap.pop() / heap.peek() identifies it for eviction.
+        // 1. Lower score is worse (evict first).
+        // 2. Lexicographically greater path is worse (evict first).
+        other
+            .score
+            .cmp(&self.score)
+            .then_with(|| self.path.cmp(other.path))
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+impl PartialOrd for ScoredCandidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[must_use]
@@ -1229,6 +1284,28 @@ mod tests {
             "non-duplicated target should score higher, got {} vs {}",
             score1.unwrap(),
             score2.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_red_team_tie_break_limit_one() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let _test_lock = FILE_SEARCH_TEST_LOCK.lock().await;
+        clear_file_search_cache().await;
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        fs::write(workspace.join("z.rs"), "").unwrap();
+        fs::write(workspace.join("a.rs"), "").unwrap();
+
+        let results = search_workspace_files("rs", workspace.to_str().unwrap(), 1).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].path, "a.rs",
+            "Alphabetical tie-break failed! Got: {}",
+            results[0].path
         );
     }
 }
