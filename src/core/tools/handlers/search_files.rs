@@ -6,6 +6,7 @@ use crate::core::process_output::{capture_async, configured_output_limit};
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use std::future::Future;
 use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use std::process::Output;
@@ -46,13 +47,18 @@ pub struct SearchFilesHandler;
 impl SearchFilesHandler {
     /// Search for files matching a regex pattern.
     ///
+    /// `workspace_root` is the directory ripgrep chdirs into so it walks the
+    /// correct tree regardless of the process's launch directory, and so the
+    /// emitted paths stay workspace-relative (or external-root-relative when
+    /// `path` resolves outside the workspace).
     pub async fn search_files(
         &self,
-        path: Option<&str>,
+        workspace_root: &Path,
+        path: Option<&Path>,
         regex: &str,
         file_pattern: Option<&str>,
     ) -> anyhow::Result<String> {
-        let search_path = path.unwrap_or(".");
+        let (cwd, search_target) = resolve_cwd_and_target(workspace_root, path);
 
         // Check ripgrep availability once per process lifetime
         let use_ripgrep = *RIPGREP_AVAILABLE.get_or_init(|| {
@@ -83,6 +89,27 @@ impl SearchFilesHandler {
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(DEFAULT_SEARCH_MAX_LINES);
             c.arg("--max-count").arg(max_per_file.to_string());
+
+            // With --hidden in play, rg happily walks .git, node_modules,
+            // target, and build caches. Add default exclude globs so broad
+            // searches do not waste time (and context) on vendor artifacts.
+            // Vendor/registry directories (`.git`, `node_modules`) can appear
+            // at any depth (submodules, nested packages) so they stay
+            // unanchored. Build caches are anchored with a leading slash so
+            // a `src/build/codegen.rs` source tree is not silently pruned.
+            for glob in [
+                "!.git",
+                "!node_modules",
+                "!/target",
+                "!/build",
+                "!/.build",
+                "!/dist",
+                "!/.cache",
+                "!/.next",
+            ] {
+                c.arg("--glob").arg(glob);
+            }
+
             c
         } else {
             // grep flags:
@@ -91,8 +118,19 @@ impl SearchFilesHandler {
             // -E: extended regex
             // -I: skip binary files
             // -H: print filename
+            // grep has no built-in .gitignore awareness, so explicit
+            // --exclude-dir is required to keep it out of vendor caches and
+            // packfile directories on systems without rg installed.
             let mut c = Command::new("grep");
             c.arg("-rnEIH");
+            c.arg("--exclude-dir=.git")
+                .arg("--exclude-dir=node_modules")
+                .arg("--exclude-dir=target")
+                .arg("--exclude-dir=build")
+                .arg("--exclude-dir=.build")
+                .arg("--exclude-dir=dist")
+                .arg("--exclude-dir=.cache")
+                .arg("--exclude-dir=.next");
             c
         };
 
@@ -130,7 +168,8 @@ impl SearchFilesHandler {
         }
 
         // Keep a leading '-' in the pattern from being interpreted as a search-tool option.
-        cmd.arg("--").arg(regex).arg(search_path);
+        cmd.current_dir(&cwd);
+        cmd.arg("--").arg(regex).arg(&search_target);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = run_with_timeout(cmd, search_timeout()).await?;
@@ -155,22 +194,28 @@ impl SearchFilesHandler {
             let err = crate::cli::actionable_errors::search_no_results(regex);
             Ok(err.display())
         } else {
-            // rg already limited results via --max-count
             let max_lines = std::env::var(SEARCH_MAX_LINES_ENV)
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_SEARCH_MAX_LINES as usize);
 
-            if lines.len() >= max_lines {
-                let mut result = lines.join("\n");
-                result.push_str(&format!(
-                    "\n\n(Too many matches, showing first {}. Please refine your search.)",
-                    lines.len()
-                ));
-                Ok(result)
+            // rg's --max-count is per-file, so a result of, say, 400 lines
+            // can come from 10 files each emitting their own 40 matches. The
+            // agent-visible output must still be capped to `max_lines` total
+            // so context windows are not blown by a single broad search.
+            let truncated = lines.len() >= max_lines;
+            let emitted: &[&str] = if lines.len() > max_lines {
+                &lines[..max_lines]
             } else {
-                Ok(lines.join("\n"))
+                &lines
+            };
+            let mut result = emitted.join("\n");
+            if truncated {
+                result.push_str(&format!(
+                    "\n\n(Too many matches, showing first {max_lines}. Please refine your search.)"
+                ));
             }
+            Ok(result)
         }
     }
 
@@ -220,12 +265,12 @@ impl SearchFilesHandler {
             crate::core::tools::resolve_authorized_path(workspace_root, allowed_external_roots, p)
         });
         let search_path = match sanitized_path {
-            Some(Ok(p)) => Some(p.to_string_lossy().into_owned()),
+            Some(Ok(p)) => Some(p),
             Some(Err(e)) => return Err(e),
             None => None,
         };
 
-        self.search_files(search_path.as_deref(), regex, file_pattern)
+        self.search_files(workspace_root, search_path.as_deref(), regex, file_pattern)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
     }
@@ -255,6 +300,49 @@ fn regex_group_count(regex: &str) -> usize {
     count
 }
 
+/// Compute the directory ripgrep should chdir into and the search target to
+/// pass it, given the agent's workspace root and an optional user-supplied
+/// path. Paths that already live inside `workspace_root` are reduced to a
+/// workspace-relative form so rg's emitted paths stay compact; paths that
+/// resolve outside the workspace (e.g. an authorized external root) keep
+/// their absolute form and become the new cwd, with rg searching `.`.
+fn resolve_cwd_and_target(workspace_root: &Path, path: Option<&Path>) -> (PathBuf, PathBuf) {
+    match path {
+        None => (workspace_root.to_path_buf(), PathBuf::from(".")),
+        Some(p) => {
+            if p.is_absolute() {
+                if let Ok(canonical_root) = std::fs::canonicalize(workspace_root)
+                    && let Ok(canonical_target) = std::fs::canonicalize(p)
+                    && let Ok(rel) = canonical_target.strip_prefix(&canonical_root)
+                {
+                    let target = if rel.as_os_str().is_empty() {
+                        PathBuf::from(".")
+                    } else {
+                        rel.to_path_buf()
+                    };
+                    return (workspace_root.to_path_buf(), target);
+                }
+                if p.is_dir() {
+                    (p.to_path_buf(), PathBuf::from("."))
+                } else if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
+                    && (parent.is_dir() || !parent.as_os_str().is_empty())
+                {
+                    (parent.to_path_buf(), PathBuf::from(name))
+                } else {
+                    (workspace_root.to_path_buf(), p.to_path_buf())
+                }
+            } else {
+                let target = if p.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    p.to_path_buf()
+                };
+                (workspace_root.to_path_buf(), target)
+            }
+        }
+    }
+}
+
 async fn run_with_timeout(mut cmd: Command, timeout_duration: Duration) -> anyhow::Result<Output> {
     let mut child = cmd.spawn()?;
     let stdout = child
@@ -269,11 +357,6 @@ async fn run_with_timeout(mut cmd: Command, timeout_duration: Duration) -> anyho
     let output_limit = search_output_limit();
     let stdout_task = tokio::spawn(capture_async(stdout, output_limit));
     let stderr_task = tokio::spawn(capture_async(stderr, output_limit));
-
-    // Drop child's stdout/stderr so kill() + wait() returns promptly.
-    // The reader tasks still hold their own handles and will drain remaining data.
-    drop(child.stdout.take());
-    drop(child.stderr.take());
 
     let status = if let Ok(status) = timeout(timeout_duration, child.wait()).await {
         status?
@@ -335,12 +418,11 @@ impl ToolHandler for SearchFilesHandler {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
     use std::time::Instant;
     use tempfile::TempDir;
 
     // Mutex to serialize env var mutations across tests
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn test_limited_search_reader_drains_after_reaching_its_budget() {
@@ -375,7 +457,7 @@ mod tests {
 
         let handler = SearchFilesHandler::new();
         let result = handler
-            .search_files(Some(temp_dir.path().to_str().unwrap()), "hello", None)
+            .search_files(temp_dir.path(), None, "hello", None)
             .await
             .unwrap();
 
@@ -390,7 +472,7 @@ mod tests {
 
         let handler = SearchFilesHandler::new();
         let result = handler
-            .search_files(Some(temp_dir.path().to_str().unwrap()), "nonexistent", None)
+            .search_files(temp_dir.path(), None, "nonexistent", None)
             .await
             .unwrap();
 
@@ -407,7 +489,7 @@ mod tests {
         fs::write(temp_dir.path().join("file1.txt"), "hello world").unwrap();
 
         let result = SearchFilesHandler::new()
-            .search_files(Some(temp_dir.path().to_str().unwrap()), "--files", None)
+            .search_files(temp_dir.path(), None, "--files", None)
             .await
             .unwrap();
 
@@ -423,11 +505,7 @@ mod tests {
 
         let handler = SearchFilesHandler::new();
         let result = handler
-            .search_files(
-                Some(temp_dir.path().to_str().unwrap()),
-                "hello",
-                Some("*.rs"),
-            )
+            .search_files(temp_dir.path(), None, "hello", Some("*.rs"))
             .await
             .unwrap();
 
@@ -442,7 +520,7 @@ mod tests {
 
         let handler = SearchFilesHandler::new();
         let result = handler
-            .search_files(Some(temp_dir.path().to_str().unwrap()), "needle", None)
+            .search_files(temp_dir.path(), None, "needle", None)
             .await
             .unwrap();
 
@@ -461,17 +539,16 @@ mod tests {
         let result;
         let line_count;
         {
-            let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = ENV_MUTEX.lock().await;
             // SAFETY: setting env var under mutex lock
             unsafe {
                 std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
             }
             result = SearchFilesHandler::new()
-                .search_files(Some(temp_dir.path().to_str().unwrap()), "match", None)
+                .search_files(temp_dir.path(), None, "match", None)
                 .await
                 .unwrap();
 
-            // Count only lines with filename:linenum: pattern (actual rg output)
             line_count = result
                 .lines()
                 .filter(|l| l.contains("large_file.txt:"))
@@ -490,9 +567,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_files_truncates_globally_across_multiple_files() {
+        // 5 files × 5 matches = 25 total matches against a 10-line cap; the
+        // emitted body must be sliced to 10 lines and the banner must report
+        // the cap (10), not the un-truncated count (25).
+        let temp_dir = TempDir::new().unwrap();
+        for i in 0..5 {
+            fs::write(
+                temp_dir.path().join(format!("file_{i}.txt")),
+                "needle\nneedle\nneedle\nneedle\nneedle\n",
+            )
+            .unwrap();
+        }
+
+        let result;
+        let match_lines;
+        {
+            let _guard = ENV_MUTEX.lock().await;
+            unsafe {
+                std::env::set_var(SEARCH_MAX_LINES_ENV, "10");
+            }
+            result = SearchFilesHandler::new()
+                .search_files(temp_dir.path(), None, "needle", None)
+                .await
+                .unwrap();
+            match_lines = result.lines().filter(|l| l.contains(":needle")).count();
+            unsafe {
+                std::env::remove_var(SEARCH_MAX_LINES_ENV);
+            }
+        }
+        assert_eq!(
+            match_lines, 10,
+            "global cap must hold across files: {result}"
+        );
+        assert!(
+            result.contains("showing first 10"),
+            "banner must report the cap, not the un-truncated count: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_files_custom_max_count_via_env() {
         let temp_dir = TempDir::new().unwrap();
-        // Create a single file with more matches than the limit
         let content = (0..50)
             .map(|i| format!("match {}", i))
             .collect::<Vec<_>>()
@@ -502,13 +618,13 @@ mod tests {
         let result;
         let line_count;
         {
-            let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = ENV_MUTEX.lock().await;
             // SAFETY: setting env var under mutex lock
             unsafe {
                 std::env::set_var(SEARCH_MAX_LINES_ENV, "3");
             }
             result = SearchFilesHandler::new()
-                .search_files(Some(temp_dir.path().to_str().unwrap()), "match", None)
+                .search_files(temp_dir.path(), None, "match", None)
                 .await
                 .unwrap();
             line_count = result
@@ -608,6 +724,169 @@ mod tests {
                 assert!(message.contains("max 10 groups"));
             }
             other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_files_skips_default_excluded_directories() {
+        // Vendor and build dirs must be skipped even though --hidden is on, so
+        // that broad searches do not blow context on generated artifacts.
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("keep.txt"), "needle\n").unwrap();
+        fs::create_dir(temp_dir.path().join("node_modules")).unwrap();
+        fs::write(temp_dir.path().join("node_modules/pkg.js"), "needle\n").unwrap();
+        fs::create_dir(temp_dir.path().join("target")).unwrap();
+        fs::write(temp_dir.path().join("target/bundle.js"), "needle\n").unwrap();
+        fs::create_dir(temp_dir.path().join(".git")).unwrap();
+        fs::write(temp_dir.path().join(".git/HEAD"), "needle\n").unwrap();
+
+        let result = SearchFilesHandler::new()
+            .search_files(temp_dir.path(), None, "needle", None)
+            .await
+            .unwrap();
+
+        assert!(
+            result.contains("keep.txt"),
+            "must surface in-workspace hit: {result}"
+        );
+        assert!(
+            !result.contains("node_modules"),
+            "must skip node_modules: {result}"
+        );
+        assert!(!result.contains("target/"), "must skip target/: {result}");
+        assert!(!result.contains(".git/"), "must skip .git/: {result}");
+    }
+
+    #[test]
+    fn test_resolve_cwd_and_target_uses_workspace_root_when_path_none() {
+        let workspace = Path::new("/custom/workspace");
+        let (cwd, target) = resolve_cwd_and_target(workspace, None);
+        assert_eq!(cwd, workspace);
+        assert_eq!(target, Path::new("."));
+    }
+
+    #[test]
+    fn test_resolve_cwd_and_target_workspace_root_path_resolves_to_dot() {
+        let workspace = TempDir::new().unwrap();
+        let (cwd, target) = resolve_cwd_and_target(workspace.path(), Some(Path::new(".")));
+        assert_eq!(cwd, workspace.path());
+        assert_eq!(target, Path::new("."));
+
+        let (cwd_abs, target_abs) =
+            resolve_cwd_and_target(workspace.path(), Some(workspace.path()));
+        assert_eq!(cwd_abs, workspace.path());
+        assert_eq!(target_abs, Path::new("."));
+    }
+
+    #[tokio::test]
+    async fn test_search_files_explicit_dot_path_succeeds() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("hello.txt"), "needle in dot path\n").unwrap();
+
+        let result = SearchFilesHandler::new()
+            .search_files(workspace.path(), Some(Path::new(".")), "needle", None)
+            .await
+            .unwrap();
+
+        assert!(
+            result.contains("hello.txt:1:needle in dot path"),
+            "search with path '.' must succeed without IO error: {result}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cwd_and_target_external_file_uses_parent_dir() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let external_file = external.path().join("sub/file.rs");
+        std::fs::create_dir_all(external.path().join("sub")).unwrap();
+        std::fs::write(&external_file, "fn main() {}\n").unwrap();
+
+        let (cwd, target) = resolve_cwd_and_target(workspace.path(), Some(&external_file));
+        assert_eq!(cwd, external.path().join("sub"));
+        assert_eq!(target, Path::new("file.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_search_files_does_not_swallow_src_build_directory() {
+        // Build caches must be anchored to the workspace root so a source
+        // tree legitimately named `build/` (e.g. src/build/codegen.rs) is
+        // not silently pruned by the default excludes.
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir_all(temp_dir.path().join("src/build")).unwrap();
+        fs::write(temp_dir.path().join("src/build/codegen.rs"), "needle\n").unwrap();
+
+        let result = SearchFilesHandler::new()
+            .search_files(temp_dir.path(), None, "needle", None)
+            .await
+            .unwrap();
+
+        assert!(
+            result.contains("src/build/codegen.rs"),
+            "must surface src/build source tree: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_files_external_file_does_not_enotdir() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let external_canonical = external.path().canonicalize().unwrap();
+        let external_file = external_canonical.join("external_config.json");
+        fs::write(&external_file, "{\n  \"port\": 8080\n}\n").unwrap();
+
+        let handler = SearchFilesHandler::new();
+        let result = handler
+            .execute_with_external_roots(
+                workspace.path(),
+                &[external_canonical],
+                serde_json::json!({
+                    "path": external_file.to_str().unwrap(),
+                    "regex": "port",
+                }),
+            )
+            .await
+            .expect("must successfully search external file without ENOTDIR");
+
+        assert!(
+            result.contains("8080"),
+            "must find content in external file: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_files_external_nonexistent_file_under_existing_dir() {
+        // Path lives under an authorized external root but the file itself
+        // has not been written yet. canonicalize fails, so the resolver must
+        // fall back to "chdir to parent dir, search basename" rather than
+        // walking the drive root.
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let external_canonical = external.path().canonicalize().unwrap();
+        let nonexistent = external_canonical.join("not_yet_created.rs");
+        assert!(!nonexistent.exists());
+
+        let handler = SearchFilesHandler::new();
+        // We do not require this to succeed — rg returning no matches or a
+        // graceful error is fine. What we MUST NOT do is walk up to the drive
+        // root and emit absolute paths like "/Users/.../something".
+        let outcome = handler
+            .execute_with_external_roots(
+                workspace.path(),
+                &[external_canonical],
+                serde_json::json!({
+                    "path": nonexistent.to_str().unwrap(),
+                    "regex": "needle",
+                }),
+            )
+            .await;
+
+        match outcome {
+            Ok(text) => assert!(
+                !text.lines().any(|line| line.starts_with('/')),
+                "must not walk the drive root: {text}"
+            ),
+            Err(_) => {}
         }
     }
 }
