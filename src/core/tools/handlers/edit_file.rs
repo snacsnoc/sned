@@ -193,26 +193,17 @@ impl EditFileHandler {
 
     fn normalized_anchor(field_name: &str, path: &str, raw: &str) -> Result<String, String> {
         // Whitespace after § belongs to the source line, not the envelope.
-        let anchor = raw.trim_start();
-        // Models sometimes paste adjacent anchored lines into one selector.
-        // A complete first anchored line remains a usable single-line selector.
-        if raw.contains(['\n', '\r']) {
-            let first_line = anchor.lines().next().unwrap_or("");
-            let (_, first_content) = split_anchor(first_line);
-            let starts_with_line_break = raw
-                .trim_start_matches([' ', '\t'])
-                .starts_with(['\n', '\r']);
-            let concatenated_anchors = !starts_with_line_break
-                && anchor.lines().all(|line| {
-                    let (word, content) = split_anchor(line);
-                    !word.is_empty() && !content.is_empty() && line.contains(ANCHOR_DELIMITER)
-                });
-            if concatenated_anchors
-                && first_line.contains(ANCHOR_DELIMITER)
-                && !first_content.is_empty()
-            {
-                return Ok(first_line.to_string());
-            }
+        let trimmed_leading_space = raw.trim_start_matches([' ', '\t']);
+        let has_leading_line_break = trimmed_leading_space.starts_with(['\n', '\r']);
+        let anchor = trimmed_leading_space.trim_end_matches(['\r', '\n']);
+
+        // Anchors must refer to exactly one source line. Multi-line pastes
+        // (e.g. the model copy-pasting several `Word§content` lines into one
+        // `anchor` selector) or leading line breaks are rejected so the model
+        // picks the right shape (`anchor` + optional `end_anchor`) instead of
+        // having the tool pick one anchored line on its behalf and silently
+        // narrowing the range.
+        if has_leading_line_break || anchor.contains(['\n', '\r']) {
             return Err(format!(
                 "File '{path}': '{field_name}' must contain exactly one source line, not a multi-line block. No changes were made to this file, and no reread is needed. Copy one complete Word§source line from your current read into anchor. For a range, put the first line in anchor and the last line in end_anchor; put only unprefixed replacement source in text (use \"\" to delete the selected range)."
             ));
@@ -464,8 +455,7 @@ impl EditFileHandler {
                             })?;
                         if content_bytes > MAX_FINGERPRINT_CONTENT_BYTES {
                             return Err(ToolError::InvalidInput(format!(
-                                "The 'content' fingerprint for '{path}' is limited to {} bytes; use a narrower anchor range or write_to_file for a broad rewrite.",
-                                MAX_FINGERPRINT_CONTENT_BYTES
+                                "The 'content' fingerprint for '{path}' is limited to {MAX_FINGERPRINT_CONTENT_BYTES} bytes; use a narrower anchor range or write_to_file for a broad rewrite."
                             )));
                         }
                         content_lines.push(strip_hashes(line));
@@ -718,6 +708,8 @@ impl EditFileHandler {
         state.must_reread_before_edit.insert(key.clone());
         state.file_content_cache.pop(&key);
         state.consecutive_reads.remove(&key);
+        state.last_read_turn.remove(&key);
+        state.recent_read_windows.remove(&key);
     }
 
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
@@ -1282,10 +1274,24 @@ impl EditFileHandler {
             };
         }
 
-        if files
-            .iter()
-            .any(|file| file.get("expected_file_hash").is_some())
-        {
+        let is_revision_checked = files.iter().any(|file| {
+            file.get("expected_file_hash")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+                && file
+                    .get("edits")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|edits| {
+                        !edits.is_empty()
+                            && edits.iter().all(|e| {
+                                e.get("anchor")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_none_or(str::is_empty)
+                            })
+                    })
+        });
+
+        if is_revision_checked {
             if files.len() != 1 {
                 return Err(ToolError::InvalidInput(
                     "Revision-checked line-range editing currently accepts exactly one file per edit_file call so its streamed atomic replacement cannot be mixed with another file transaction."
@@ -1480,6 +1486,17 @@ impl EditFileHandler {
                 .entry(absolute_path.clone())
                 .or_default() += edit_count;
             resolved_paths.insert(display_path.to_string(), absolute_path.clone());
+
+            if file
+                .get("expected_file_hash")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            {
+                tracing::debug!(
+                    path = %display_path,
+                    "edit_file: ignoring expected_file_hash because edits use anchors"
+                );
+            }
 
             let validation = self.validate_anchors(
                 std::slice::from_ref(file),
@@ -2795,14 +2812,14 @@ impl ToolHandler for EditFileHandler {
                 .iter()
                 .filter_map(|path| ctx.resolve_path(path).ok())
                 .collect::<Vec<_>>();
-            let _file_locks = ctx.lock_file_paths(&resolved_paths).await;
+            let file_locks = ctx.lock_file_paths(&resolved_paths).await;
             let result = handler
                 .execute_with_workspace_root(
                     &ctx.state,
                     params,
                     ctx.workspace_root.as_path(),
                     &ctx.allowed_external_roots,
-                    _file_locks,
+                    file_locks,
                     &ctx.anchor_mgr,
                     Some(ctx.task_id.as_str()),
                     ctx.explicitly_approved,
@@ -7032,18 +7049,19 @@ edition = "2021"
 
     /// Regression test: the model sends multiple `§`-delimited pairs concatenated
     /// across newlines. Reject rather than silently changing the selected range.
+    /// The error must teach the model to use `anchor` + `end_anchor` so it does
+    /// not loop re-reading the file after a partial line-1-only replacement.
     #[tokio::test]
-    async fn test_edit_file_accepts_concatenated_anchor_pairs() {
+    async fn test_edit_file_rejects_concatenated_anchor_pairs() {
         use tempfile::tempdir;
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("concat.c");
-        std::fs::write(&file_path, "static int\nload_ax_hiservices(void)\n{\n").unwrap();
+        let original = "static int\nload_ax_hiservices(void)\n{\n";
+        std::fs::write(&file_path, original).unwrap();
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
-        let lines = crate::core::file_editor::split_content_lines(
-            "static int\nload_ax_hiservices(void)\n{\n",
-        );
+        let lines = crate::core::file_editor::split_content_lines(original);
         let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("regr-task"));
         let first_anchor = format!("{}§static int", anchors[0]);
         let concatenated = format!(
@@ -7072,12 +7090,65 @@ edition = "2021"
                 }]
             }]
         });
-        ToolHandler::execute(&handler, &ctx, params).await.unwrap();
+        let err = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect_err("concatenated anchor must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must contain exactly one source line"),
+            "error must call out the multi-line anchor problem, got: {msg}"
+        );
+        assert!(
+            msg.contains("end_anchor"),
+            "error must point the model at the end_anchor solution for range replacements, got: {msg}"
+        );
         let updated = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(
-            updated,
-            "static int replaced\nload_ax_hiservices(void)\n{\n"
+            updated, original,
+            "rejected edit must not modify the file"
         );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_accepts_anchor_with_trailing_newline() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("trailing_nl.swift");
+        let original = "struct Bookmark {\n    var name: String\n}\n";
+        std::fs::write(&file_path, original).unwrap();
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(original);
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("trailing-nl-task"));
+        let anchor_with_nl = format!("{}§struct Bookmark {{\n", anchors[0]);
+        let end_anchor_with_nl = format!("{}§}}\n", anchors[2]);
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "trailing-nl-task".into(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        );
+        let params = serde_json::json!({
+            "files": [{
+                "path": "trailing_nl.swift",
+                "edits": [{
+                    "anchor": anchor_with_nl,
+                    "end_anchor": end_anchor_with_nl,
+                    "edit_type": "replace",
+                    "text": "// replaced"
+                }]
+            }]
+        });
+        ToolHandler::execute(&handler, &ctx, params).await.unwrap();
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(updated, "// replaced\n");
     }
 
     /// Error message quality: when parse_edits fails, the error must teach the
@@ -8776,6 +8847,106 @@ edition = "2021"
         assert!(
             err.contains("anchor + end_anchor + the lines between them"),
             "replace rejection must keep fingerprint escape hatch: {err}"
+        );
+    }
+
+    // =====================================================================
+    // Regression: dispatch must route by anchor presence, not by incidental
+    // expected_file_hash. Models copy the read_file Hash line into the
+    // optional schema field; that must not hijack an otherwise valid anchor
+    // edit into revision-checked mode.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_edit_file_anchor_edit_ignores_included_expected_file_hash() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("line 1\nline 2\nline 3\n", "hash-ignored").await;
+        let ctx = ctx_for_dir(&dir, "hash-ignored");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "expected_file_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "edits": [{
+                    "anchor": format!("{}§line 2", anchors[1]),
+                    "edit_type": "replace",
+                    "text": "replaced"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "anchor edit with incidental expected_file_hash must succeed; got error: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(
+            content.contains("replaced"),
+            "edit must have been applied despite incidental hash: {content}"
+        );
+        assert!(
+            !content.contains("0000000000000000000000000000000000000000000000000000000000000000"),
+            "bogus hash must not have leaked into the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_revision_checked_requires_all_edits_lacking_anchors() {
+        // A mixed batch (one file with anchor, one without) must route to the
+        // anchor path; the anchorless file's edit then fails anchored-edit
+        // validation with a clear error rather than silently being treated as
+        // a revision-checked edit.
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, _file_path, anchors) = setup_test_file("line 1\nline 2\n", "mixed-batch").await;
+        let ctx = ctx_for_dir(&dir, "mixed-batch");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "expected_file_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "edits": [{
+                    "anchor": format!("{}§line 1", anchors[0]),
+                    "edit_type": "replace",
+                    "text": "changed"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "file whose edits contain an anchor must route to anchor path even when expected_file_hash is present; got error: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_null_expected_file_hash_routes_to_anchor() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, _file_path, anchors) =
+            setup_test_file("line 1\nline 2\n", "null-hash-test").await;
+        let ctx = ctx_for_dir(&dir, "null-hash-test");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "expected_file_hash": serde_json::Value::Null,
+                "edits": [{
+                    "anchor": format!("{}§line 1", anchors[0]),
+                    "edit_type": "replace",
+                    "text": "changed with null hash"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(
+            result.is_ok(),
+            "explicit null expected_file_hash must route to anchor edit; got error: {:?}",
+            result.err()
         );
     }
 }
