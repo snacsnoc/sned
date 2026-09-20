@@ -147,7 +147,8 @@ impl Perform for RatatuiPerformer {
                             self.current_style.remove_modifier(Modifier::UNDERLINED);
                     }
                     [25] => {
-                        self.current_style = self.current_style.remove_modifier(Modifier::SLOW_BLINK);
+                        self.current_style =
+                            self.current_style.remove_modifier(Modifier::SLOW_BLINK);
                     }
                     [27] => {
                         self.current_style = self.current_style.remove_modifier(Modifier::REVERSED);

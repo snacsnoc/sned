@@ -2558,7 +2558,9 @@ impl App {
             }
             self.output_line_ids.pop_front();
             self.output_line_kinds.pop_front();
-            let _ = self.visual_layout_index.evict_front_output(self.last_wrap_width(), 10_000, false);
+            let _ =
+                self.visual_layout_index
+                    .evict_front_output(self.last_wrap_width(), 10_000, false);
         }
 
         self.turn_stream_entries = saved_entries

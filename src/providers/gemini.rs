@@ -11,8 +11,8 @@
 
 use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
-    ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, ModelInfo,
-    Provider, ProviderError, ProviderHttpError, ProviderModel, ProviderRequest, SseLineBuffer,
+    ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, ModelInfo, Provider,
+    ProviderError, ProviderHttpError, ProviderModel, ProviderRequest, SseLineBuffer,
     ThinkingConfig, gemini_format, is_retryable_stream_transport_error,
 };
 use futures::StreamExt;
@@ -333,9 +333,9 @@ fn sanitize_function_parameters(params: &serde_json::Value) -> serde_json::Value
             }
             serde_json::Value::Object(clean)
         }
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items.iter().map(sanitize_function_parameters).collect(),
-        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(sanitize_function_parameters).collect())
+        }
         scalar => scalar.clone(),
     }
 }
@@ -2139,9 +2139,7 @@ mod tests {
                 if child.is_object() {
                     check(child, &format!("{trail}.{key}"));
                 } else if child.is_array() {
-                    for (index, item) in
-                        child.as_array().into_iter().flatten().enumerate()
-                    {
+                    for (index, item) in child.as_array().into_iter().flatten().enumerate() {
                         check(item, &format!("{trail}.{key}[{index}]"));
                     }
                 }

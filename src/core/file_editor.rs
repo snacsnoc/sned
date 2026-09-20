@@ -2291,7 +2291,7 @@ impl EditExecutor {
             word_bound_lines.len(),
             content_idx
         );
-        return (
+        (
             usize::MAX,
             Some(format!(
                 "{anchor_type} \"{anchor_name}{ANCHOR_DELIMITER}{provided_content}\" is ambiguous — the quoted word resolves to {} line(s) [{}], but the supplied content matches line {} ({:?}, anchor \"{correct_anchor}\"). Use one of:\n  - \"{correct_anchor}{ANCHOR_DELIMITER}{provided_content}\" to edit line {}\n  - quote one of the word-bound lines verbatim with that line's anchor to edit a different line. Do NOT re-read; the file has not changed.",
@@ -2301,7 +2301,7 @@ impl EditExecutor {
                 content_line,
                 content_idx + 1,
             )),
-        );
+        )
     }
 
     /// Resolves an anchor to a line index using ONLY the word identity
