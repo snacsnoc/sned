@@ -588,11 +588,22 @@ impl ExecuteCommandHandler {
             if !json_output {
                 use crate::cli::tui::theme::INFO_FG;
                 use ratatui::style::{Modifier, Style};
-                let header = Line::from(Span::styled(
-                    format!("Running: {cmd_str}"),
-                    Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
-                ));
-                output_writer.emit(OutputEvent::CommandHeaderLine(header));
+                let style = Style::default().fg(INFO_FG).add_modifier(Modifier::DIM);
+                // Emit one CommandHeaderLine event per logical row so non-interactive
+                // runners (StderrOutputWriter) and the TUI both render multi-line
+                // commands like `git commit -m $'Subject\n\n- Body'` as separate
+                // lines instead of flattening them via Ratatui's `Span: Display`.
+                let prefix = "Running: ";
+                for (i, row) in cmd_str.split('\n').enumerate() {
+                    let content = if i == 0 {
+                        format!("{prefix}{row}")
+                    } else {
+                        // Indent continuation rows so the prefix visually anchors.
+                        format!("{}{row}", " ".repeat(prefix.chars().count()))
+                    };
+                    let line = Line::from(Span::styled(content, style));
+                    output_writer.emit(OutputEvent::CommandHeaderLine(line));
+                }
             }
 
             // Execute via shell for portability and shell feature support

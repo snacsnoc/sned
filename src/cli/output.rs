@@ -663,6 +663,34 @@ fn non_interactive_approval_message(title: &str) -> String {
     )
 }
 
+/// Print a Ratatui `Line` to stderr, preserving embedded `\n` characters as
+/// real newlines. Ratatui's `impl Display for Span` iterates
+/// `self.content.lines()` without re-emitting the separators, so the default
+/// `"{line}"` formatting would flatten `"API\n\n- Body"` to `"API- Body"`.
+/// Mirrors the TUI's `split_output_line_on_newlines` behavior so multi-line
+/// commands (e.g. `git commit -m` with a body) render as separate stderr rows.
+fn print_line_with_real_newlines(line: &ratatui::text::Line<'_>) {
+    let mut current = String::new();
+    for span in &line.spans {
+        let mut parts = span.content.split('\n');
+        if let Some(first) = parts.next() {
+            current.push_str(first);
+        }
+        for rest in parts {
+            print_row(&current);
+            current.clear();
+            current.push_str(rest);
+        }
+    }
+    print_row(&current);
+}
+
+fn print_row(row: &str) {
+    // Preserve a literal empty row produced by a `\n\n` sequence so the
+    // on-disk output matches the TUI's display.
+    eprintln!("{row}");
+}
+
 impl OutputWriter for StderrOutputWriter {
     fn emit(&self, event: OutputEvent) {
         match event {
@@ -674,7 +702,7 @@ impl OutputWriter for StderrOutputWriter {
             | OutputEvent::CommandOutputLine(line)
             | OutputEvent::UserPromptLine(line)
             | OutputEvent::LocalCommandEcho(line) => {
-                eprintln!("{line}");
+                print_line_with_real_newlines(&line);
             }
             OutputEvent::ReasoningChunk(chunk) => {
                 for segment in chunk.split_inclusive('\n') {
