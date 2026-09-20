@@ -3520,6 +3520,8 @@ impl AgentLoop {
                 if tool_name != "read_file" {
                     let mut state = self.state.lock().await;
                     state.consecutive_reads.clear();
+                    state.last_read_turn.clear();
+                    state.recent_read_windows.clear();
                 }
 
                 let tool_id = prepared.tool_id.clone();

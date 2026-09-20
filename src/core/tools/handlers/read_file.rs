@@ -63,6 +63,12 @@ async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
 const DEFAULT_MAX_FILE_READ_SIZE: usize = 512 * 1024;
 const MAX_FILE_READ_SIZE: usize = 100 * 1024 * 1024;
 
+/// Cap on the recent-read-windows ring buffer per file. The diagnostic warning
+/// surfaces up to this many recent windows so the model can self-diagnose
+/// narrow-slice thrashing versus sequential scanning, while bounding memory
+/// growth across long sessions.
+const MAX_TRACKED_READ_WINDOWS: usize = 5;
+
 fn max_file_read_size_from_value(value: Option<&str>) -> usize {
     value
         .and_then(|value| value.parse::<usize>().ok())
@@ -481,8 +487,21 @@ impl ReadFileHandler {
         } else {
             ANCHOR_GUIDANCE.to_string()
         };
-        let mut content =
-            format!("[File: {display_path}, Hash: {hash}]\n{guidance}\n{anchored_content}");
+        let total_lines = lines_for_reconcile.len();
+        // Spatial awareness: surface total file size + window coordinates so the
+        // model knows where it is relative to EOF without burning an extra read.
+        // Without this, models in a "narrow slice read loop" cannot tell if line
+        // 600 is near EOF or in the middle, so they keep fetching small windows.
+        let header = if has_line_range && refreshes_edit_context {
+            let displayed_start = range_start + 1;
+            let displayed_end = range_end;
+            format!(
+                "[File: {display_path} ({total_lines} lines total), Lines {displayed_start}–{displayed_end}, Hash: {hash}]\n{guidance}\n{anchored_content}"
+            )
+        } else {
+            format!("[File: {display_path} ({total_lines} lines total), Hash: {hash}]\n{guidance}\n{anchored_content}")
+        };
+        let mut content = header;
         if let Some(note) = clamping_note {
             content = format!("{note}\n{content}");
         }
@@ -953,7 +972,15 @@ impl ReadFileHandler {
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
         output_writer: Option<&crate::cli::output::OutputWriterArc>,
-    ) -> Result<(Vec<String>, Vec<FileReadResult>), ToolError> {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<FileReadResult>,
+            Option<usize>,
+            Option<usize>,
+        ),
+        ToolError,
+    > {
         let (paths, start_line, end_line) = Self::parse_params(&params)?;
         let results = self
             .read_files(
@@ -965,10 +992,16 @@ impl ReadFileHandler {
                 output_writer,
             )
             .await;
-        Ok((paths, results))
+        Ok((paths, results, start_line, end_line))
     }
 
-    fn track_read_files(state: &mut TaskState, paths: &[String], results: &[FileReadResult]) {
+    fn track_read_files(
+        state: &mut TaskState,
+        paths: &[String],
+        results: &[FileReadResult],
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    ) {
         for (path_str, res) in paths.iter().zip(results.iter()) {
             if res.success && res.refreshes_edit_context {
                 let canonical = res.canonical_path.as_deref().unwrap_or(path_str);
@@ -979,12 +1012,39 @@ impl ReadFileHandler {
                     || !state.consecutive_reads.contains_key(canonical)
                 {
                     state.consecutive_reads.clear();
+                    state.recent_read_windows.clear();
+                    state.last_read_turn.clear();
                 }
-                let count = state
-                    .consecutive_reads
-                    .entry(canonical.to_string())
-                    .or_insert(0);
-                *count += 1;
+                // Multiple reads of the same file inside a single agent turn
+                // (parallel slice fetches like lines 655–660 + 680–695 + 705–720)
+                // count as one consecutive read for the loop-warning heuristic.
+                // The warning is meant to flag across-turn re-reads, not
+                // intra-turn parallel slicing.
+                let current_turn = state.turns_completed;
+                let last_turn = state.last_read_turn.get(canonical).copied();
+                if last_turn != Some(current_turn) {
+                    state
+                        .last_read_turn
+                        .insert(canonical.to_string(), current_turn);
+                    let count = state
+                        .consecutive_reads
+                        .entry(canonical.to_string())
+                        .or_insert(0);
+                    *count += 1;
+                    // Record the window for this turn so the diagnostic warning
+                    // can surface thrashing vs. sequential scanning. The buffer
+                    // is capped at MAX_TRACKED_READ_WINDOWS to bound memory
+                    // growth across long sessions.
+                    let window = (start_line.unwrap_or(1), end_line.unwrap_or(0));
+                    let ring = state
+                        .recent_read_windows
+                        .entry(canonical.to_string())
+                        .or_default();
+                    if ring.len() == MAX_TRACKED_READ_WINDOWS {
+                        ring.pop_front();
+                    }
+                    ring.push_back(window);
+                }
             }
         }
     }
@@ -997,10 +1057,10 @@ impl ReadFileHandler {
         task_id: Option<&str>,
         output_writer: Option<&crate::cli::output::OutputWriterArc>,
     ) -> Result<String, ToolError> {
-        let (paths, results) = self
+        let (paths, results, start_line, end_line) = self
             .execute_with_results(params, anchor_mgr, task_id, output_writer)
             .await?;
-        Self::track_read_files(state, &paths, &results);
+        Self::track_read_files(state, &paths, &results, start_line, end_line);
         let warnings = Self::read_loop_warnings(state, &paths, &results);
 
         // Read-loop detection: if a file was read 3+ times in a row with no
@@ -1060,9 +1120,29 @@ impl ReadFileHandler {
                 let lookup_key = res.canonical_path.as_deref().unwrap_or(path_str);
                 let count = state.consecutive_reads.get(lookup_key).copied().unwrap_or(0);
                 (count >= 3).then(|| {
-                    format!(
-                        "Warning: {path_str} has been read {count} times consecutively with no edit. If you have the anchors you need, call edit_file now."
-                    )
+                    let windows = state.recent_read_windows.get(lookup_key);
+                    let recent: Vec<(usize, usize)> = windows
+                        .map(|ring| ring.iter().copied().collect())
+                        .unwrap_or_default();
+                    // Distinguish narrow-slice thrashing (high overlap) from
+                    // legitimate sequential scanning (low overlap). Only nag
+                    // when the model is repeating itself — sequential readers
+                    // see unique windows with no overlap.
+                    let overlap = detect_high_overlap(&recent);
+                    let recent_str = if recent.is_empty() {
+                        "(no windows recorded)".to_string()
+                    } else {
+                        format_windows(&recent)
+                    };
+                    if overlap {
+                        format!(
+                            "Warning: {path_str} has been read {count} times consecutively with overlapping slices (recent windows: {recent_str}). You appear to be searching for a syntax or scope boundary. Stop reading narrow slices: call read_file with paths: [\"{path_str}\"] (omit start_line/end_line) to load the full file in one turn, OR run get_file_skeleton to see class and function boundaries at a glance."
+                        )
+                    } else {
+                        format!(
+                            "Warning: {path_str} has been read {count} times consecutively without edits (recent windows: {recent_str}). If you have the anchors you need, call edit_file now."
+                        )
+                    }
                 })
             })
             .collect()
@@ -1097,6 +1177,53 @@ impl ReadFileHandler {
         }
         output
     }
+}
+
+/// Render the recent-window ring buffer as a comma-separated human-readable
+/// string for the read-loop warning. A window of `(0, 0)` represents a
+/// full-file read (start/end unset) and is rendered as "full file" to avoid
+/// printing a misleading "lines 1–0" range.
+fn format_windows(windows: &[(usize, usize)]) -> String {
+    let parts: Vec<String> = windows
+        .iter()
+        .map(|&(s, e)| {
+            if e == 0 || e < s {
+                "full file".to_string()
+            } else {
+                format!("lines {s}–{e}")
+            }
+        })
+        .collect();
+    parts.join(", ")
+}
+
+/// Detect narrow-slice thrashing: returns true when any two windows in the
+/// ring buffer overlap by ≥50% of the smaller window's span. Sequential
+/// forward scans (1–100, 101–200, 201–300) have zero overlap and pass;
+/// fetching 575–600 then 590–610 has ~83% overlap of the smaller window
+/// and triggers the thrashing diagnostic.
+fn detect_high_overlap(windows: &[(usize, usize)]) -> bool {
+    if windows.len() < 2 {
+        return false;
+    }
+    for i in 0..windows.len() {
+        for j in (i + 1)..windows.len() {
+            let (a_start, a_end) = windows[i];
+            let (b_start, b_end) = windows[j];
+            let span_a = a_end.saturating_sub(a_start);
+            let span_b = b_end.saturating_sub(b_start);
+            let smaller_span = span_a.min(span_b);
+            if smaller_span == 0 {
+                continue;
+            }
+            let intersection = a_start.max(b_start)..a_end.min(b_end);
+            let intersection_size = intersection.end.saturating_sub(intersection.start);
+            if intersection_size * 2 >= smaller_span {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl ToolHandler for ReadFileHandler {
@@ -1147,7 +1274,7 @@ impl ToolHandler for ReadFileHandler {
                 .await;
             {
                 let mut state = ctx.state.lock().await;
-                Self::track_read_files(&mut state, &paths, &results);
+                Self::track_read_files(&mut state, &paths, &results, start_line, end_line);
                 let warnings = Self::read_loop_warnings(&state, &paths, &results);
                 Ok(serde_json::Value::String(Self::append_warnings(
                     Self::format_results(results),
@@ -1310,7 +1437,14 @@ mod tests {
         .unwrap();
         let output = result.as_str().unwrap();
 
-        assert!(output.starts_with(&format!("[File: {}, Hash: ", relative_path.display())));
+        assert!(output.starts_with(&format!(
+            "[File: {} (",
+            relative_path.display()
+        )));
+        assert!(
+            output.contains("lines total), Hash: "),
+            "header must surface total line count for spatial awareness, got: {output}"
+        );
         assert!(!output.contains(&workspace.path().to_string_lossy().to_string()));
     }
 
@@ -2071,6 +2205,7 @@ mod tests {
         let file_path = workspace.path().join("loop.txt");
         std::fs::write(&file_path, "content\n").unwrap();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let state_handle = Arc::clone(&state);
         let ctx = ToolContext::new(
             state,
             None,
@@ -2084,7 +2219,11 @@ mod tests {
             false,
         );
 
-        for _ in 0..2 {
+        // Three reads across three distinct turns. Reads within one turn
+        // are deduped, so without bumping `turns_completed` the counter
+        // would stay at 1 and the warning would never fire.
+        for turn in 1..=3 {
+            state_handle.lock().await.turns_completed = turn;
             let _ = ToolHandler::execute(
                 &ReadFileHandler::new(),
                 &ctx,
@@ -2105,7 +2244,7 @@ mod tests {
             result
                 .as_str()
                 .unwrap()
-                .contains("has been read 3 times consecutively with no edit")
+                .contains("has been read 3 times consecutively without edits")
         );
     }
 
@@ -2224,8 +2363,11 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        // Read the file 3 times in a row (no intervening edit).
+        // Read the file 3 times across 3 distinct turns (no intervening edit).
+        // Reads within a single turn are deduped; the counter increments once
+        // per turn boundary that re-reads the same file.
         for i in 1..=3 {
+            state.turns_completed = i;
             let params = serde_json::json!({
                 "paths": [temp_file.path().to_str().unwrap()]
             });
@@ -2241,7 +2383,7 @@ mod tests {
                 .unwrap_or(0);
             assert_eq!(
                 count, i,
-                "consecutive_reads should be {} after {} reads",
+                "consecutive_reads should be {} after {} cross-turn reads",
                 i, i
             );
         }
@@ -2249,6 +2391,7 @@ mod tests {
         let mut other_file = NamedTempFile::new().unwrap();
         writeln!(other_file, "other").unwrap();
         other_file.flush().unwrap();
+        state.turns_completed = 4;
         let other_params = serde_json::json!({
             "paths": [other_file.path().to_str().unwrap()]
         });
@@ -2273,6 +2416,7 @@ mod tests {
             "reading another file must break the prior file's read sequence"
         );
 
+        state.turns_completed = 5;
         handler
             .execute(
                 &mut state,
@@ -2287,6 +2431,172 @@ mod tests {
             state.consecutive_reads.get(&canonical_path_str).copied(),
             Some(1),
             "a read after another file starts a new sequence"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_reads_in_same_turn_do_not_trigger_loop_warning() {
+        use crate::core::agent_types::TaskState;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        // Make the file big enough that the model is likely to fetch slices
+        // (655-660, 680-695, 705-720) in parallel rather than read it whole.
+        for i in 1..=800 {
+            writeln!(temp_file, "line {i}").unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let mut state = TaskState::default();
+        let canonical_path_str = std::fs::canonicalize(temp_file.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        // Simulate three parallel slice fetches inside one agent turn.
+        // turns_completed stays at 0 because the loop is intra-turn.
+        for (start, end) in [(655, 660), (680, 695), (705, 720)] {
+            let params = serde_json::json!({
+                "paths": [temp_file.path().to_str().unwrap()],
+                "start_line": start,
+                "end_line": end,
+            });
+            handler
+                .execute(&mut state, params, &anchor_mgr, Some("slicing-task"), None)
+                .await
+                .expect("slice read should succeed");
+        }
+
+        // Same-turn parallel slices count as ONE consecutive read so the
+        // 3-read warning does not fire on the model.
+        assert_eq!(
+            state.consecutive_reads.get(&canonical_path_str).copied(),
+            Some(1),
+            "intra-turn parallel slice reads must collapse to a single consecutive read entry"
+        );
+
+        // Advance the turn counter (the agent finished a turn without editing)
+        // and re-read the same file twice more — those reads now span two
+        // distinct turns, so the counter should rise to 3 and the warning
+        // should fire on the third read.
+        for round in 2..=3 {
+            state.turns_completed = round;
+            let params = serde_json::json!({
+                "paths": [temp_file.path().to_str().unwrap()]
+            });
+            let output = handler
+                .execute(&mut state, params, &anchor_mgr, Some("slicing-task"), None)
+                .await
+                .expect("re-read should succeed");
+            if round == 3 {
+                assert!(
+                    output.contains("has been read 3 times consecutively"),
+                    "warning should fire on the 3rd cross-turn read, got: {output}"
+                );
+            } else {
+                assert!(
+                    !output.contains("has been read"),
+                    "warning must not fire before the 3rd cross-turn read, got: {output}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_loop_warning_distinguishes_thrashing_from_sequential_scanning() {
+        use crate::core::agent_types::TaskState;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for i in 1..=2000 {
+            writeln!(temp_file, "line {i}").unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let mut state = TaskState::default();
+
+        // Case 1: thrashing — overlapping narrow slices across 3 turns.
+        for turn in 1..=3 {
+            state.turns_completed = turn;
+            // 575-600 then 590-610 then 575-600 again: ~83% overlap of the
+            // 590-610 window with the prior 575-600, clearly a hunt loop.
+            let windows = [(575, 600), (590, 610), (575, 600)];
+            let (start, end) = windows[(turn - 1) as usize];
+            let params = serde_json::json!({
+                "paths": [temp_file.path().to_str().unwrap()],
+                "start_line": start,
+                "end_line": end,
+            });
+            let output = handler
+                .execute(&mut state, params, &anchor_mgr, Some("thrash-task"), None)
+                .await
+                .expect("thrash read should succeed");
+            if turn == 3 {
+                assert!(
+                    output.contains("overlapping slices"),
+                    "third cross-turn overlapping read should fire the thrash warning, got: {output}"
+                );
+                assert!(
+                    output.contains("lines 575"),
+                    "warning must surface the recent windows so the model can self-diagnose, got: {output}"
+                );
+                assert!(
+                    output.contains("get_file_skeleton"),
+                    "warning must point the model at the structural tool, got: {output}"
+                );
+            }
+        }
+
+        // Reset and try Case 2: sequential forward scan, no overlap.
+        let mut state = TaskState::default();
+        for turn in 1..=3 {
+            state.turns_completed = turn;
+            let start = (turn - 1) * 600 + 1;
+            let end = turn * 600;
+            let params = serde_json::json!({
+                "paths": [temp_file.path().to_str().unwrap()],
+                "start_line": start,
+                "end_line": end,
+            });
+            let output = handler
+                .execute(&mut state, params, &anchor_mgr, Some("scan-task"), None)
+                .await
+                .expect("sequential read should succeed");
+            assert!(
+                !output.contains("overlapping slices"),
+                "sequential forward scanning must not trigger the thrash warning, got: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_high_overlap_distinguishes_thrash_from_scan() {
+        // Two windows that overlap by ~83% of the smaller one.
+        assert!(detect_high_overlap(&[(575, 600), (590, 610)]));
+        // Three sequential, non-overlapping reads.
+        assert!(!detect_high_overlap(&[(1, 100), (101, 200), (201, 300)]));
+        // Two disjoint slices.
+        assert!(!detect_high_overlap(&[(1, 50), (1000, 1050)]));
+        // Single window — no overlap possible.
+        assert!(!detect_high_overlap(&[(1, 100)]));
+        // Empty list — no overlap possible.
+        assert!(!detect_high_overlap(&[]));
+    }
+
+    #[test]
+    fn format_windows_renders_ranges_and_full_file_marker() {
+        assert_eq!(
+            format_windows(&[(1, 100), (200, 300)]),
+            "lines 1–100, lines 200–300"
+        );
+        // A (0, 0) window represents a full-file read (start/end unset);
+        // emit "full file" so the model doesn't see a confusing 1–0 range.
+        assert_eq!(format_windows(&[(0, 0)]), "full file");
+        assert_eq!(
+            format_windows(&[(0, 0), (575, 600)]),
+            "full file, lines 575–600"
         );
     }
 

@@ -316,6 +316,8 @@ impl ToolContext {
         let mut state = self.state.lock().await;
         state.file_content_cache.pop(&key);
         state.consecutive_reads.remove(&key);
+        state.last_read_turn.remove(&key);
+        state.recent_read_windows.remove(&key);
         // A write does not deliver fresh anchors. Keep the old dictionary so the
         // next read can retire old words, and require that read before editing.
         state.must_reread_before_edit.insert(key);

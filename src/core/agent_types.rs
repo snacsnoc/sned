@@ -163,6 +163,18 @@ pub struct TaskState {
     /// Used to detect the "read loop" pattern where the model reads the same
     /// file repeatedly without taking action.
     pub consecutive_reads: std::collections::HashMap<String, u32>,
+    /// Last agent-turn index (`turns_completed`) at which each path was recorded
+    /// by `track_read_files`. Reads of the same file within a single turn
+    /// (e.g. parallel slice fetches) only count as one entry toward the
+    /// read-loop counter — the warning fires when the model re-reads across
+    /// turns, not when it slices one turn into multiple parallel reads.
+    pub last_read_turn: std::collections::HashMap<String, u32>,
+    /// Ring buffer of recent `(start_line, end_line)` windows read for each
+    /// canonical path, capped at [`MAX_TRACKED_READ_WINDOWS`] entries. The
+    /// read-loop warning surfaces this list so the model can self-diagnose
+    /// narrow-slice thrashing versus legitimate sequential scanning.
+    pub recent_read_windows:
+        std::collections::HashMap<String, std::collections::VecDeque<(usize, usize)>>,
     /// Number of tool calls executed in the current turn (for subagent result reporting).
     pub turn_tool_calls: u32,
     /// Cumulative total tool calls across all turns in the session (never
@@ -243,6 +255,8 @@ impl Default for TaskState {
             last_executed_command: None,
             must_reread_before_edit: HashSet::new(),
             consecutive_reads: std::collections::HashMap::new(),
+            last_read_turn: std::collections::HashMap::new(),
+            recent_read_windows: std::collections::HashMap::new(),
             plan_state: None,
             last_injected_plan_state_hash: None,
             denied_tool_actions: Vec::new(),
