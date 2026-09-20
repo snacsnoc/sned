@@ -2,15 +2,107 @@
 //!
 
 use crate::cli::actionable_errors;
+use crate::core::stream_parsing::{is_fence_closer, parse_fence_start};
 use crate::core::tools::handlers::error_guidance;
 use crate::core::tools::{
     ToolContext, ToolError, ToolFailureClass, ToolFailureMetadata, ToolHandler,
 };
 use crate::services::symbol_index::SymbolIndexService;
+use std::borrow::Cow;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+
+/// Strip an outer CommonMark code fence pair from `content` only when doing so
+/// is unambiguous. Returns the inner body on success, or the original content
+/// unchanged when the body isn't a fence-wrapped block.
+///
+/// Reuses `parse_fence_start` / `is_fence_closer` from the streaming parser so
+/// indentation, marker type, run length, and closer-vs-opener length are
+/// handled in lockstep with the rest of Sned.
+///
+/// Extensions are checked to avoid corrupting markdown documents that
+/// legitimately begin with a non-markdown code block (e.g. a README whose
+/// only content is a shell snippet). Markdown files only lose their outer
+/// fence when the opener's info string is `md` or `markdown`.
+fn strip_outer_markdown_fences<'a>(path: &'a Path, content: &'a str) -> Cow<'a, str> {
+    if content.is_empty() {
+        return Cow::Borrowed(content);
+    }
+
+    let mut lines = content.split('\n');
+    let Some(first_line) = lines.next() else {
+        return Cow::Borrowed(content);
+    };
+    let Some((opener, info)) = parse_fence_start(first_line) else {
+        return Cow::Borrowed(content);
+    };
+
+    let last_line = content
+        .lines()
+        .rev()
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    if !is_fence_closer(last_line, opener) {
+        return Cow::Borrowed(content);
+    }
+
+    let ext_lc = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+    let info_lc = info.trim().to_ascii_lowercase();
+    let is_markdown_extension = matches!(
+        ext_lc.as_deref(),
+        Some("md" | "markdown" | "mdx" | "mdown" | "mkdn")
+    );
+    let markdown_only = is_markdown_extension && !matches!(info_lc.as_str(), "md" | "markdown");
+    if markdown_only {
+        return Cow::Borrowed(content);
+    }
+
+    let opener_prefix_len = first_line.len();
+    let after_opener = &content[opener_prefix_len..];
+    // Skip the newline that terminated the opener line — it belongs to the
+    // opener, not to the fence body.
+    let body_start = after_opener.strip_prefix('\n').unwrap_or(after_opener);
+
+    // CommonMark §4.5: the first fence line whose run length is ≥ the opener
+    // closes the block. Iterate line-by-line using `is_fence_closer` so the
+    // first matching closer terminates the block, rather than doing an
+    // ambiguous substring search or picking the last closer via `rfind`.
+    let mut offset = 0;
+    let mut closer_found = false;
+    let mut body_end = 0;
+    let mut after_closer_start = body_start.len();
+
+    for line in body_start.split_inclusive('\n') {
+        let trimmed_line = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        if is_fence_closer(trimmed_line, opener) {
+            body_end = offset;
+            after_closer_start = offset + line.len();
+            closer_found = true;
+            break;
+        }
+        offset += line.len();
+    }
+
+    if closer_found {
+        let body = &body_start[..body_end];
+        let after_closer = &body_start[after_closer_start..];
+        Cow::Owned(format!("{body}{after_closer}"))
+    } else if body_start.trim() == last_line.trim() || body_start.trim().is_empty() {
+        // Empty fenced body (e.g. ````\n````\n``); downstream `is_empty`
+        // check on the cleaned content will surface the empty-content error.
+        Cow::Owned(String::new())
+    } else {
+        Cow::Borrowed(content)
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct WriteToFileHandler {
@@ -251,6 +343,15 @@ impl ToolHandler for WriteToFileHandler {
                     ))
                 })?
                 .to_string();
+            // LLMs frequently wrap file bodies in markdown code fences; strip
+            // the outer pair so fence characters don't leak into source files.
+            let content = strip_outer_markdown_fences(Path::new(&path), &content).into_owned();
+            if let Some(obj) = resolved_params.as_object_mut() {
+                obj.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(content.clone()),
+                );
+            }
             let lines_added = content.lines().count() as u32;
 
             // Keep reads and edits from observing this file while it is being
@@ -909,5 +1010,258 @@ mod tests {
 
         let state = state.lock().await;
         assert_eq!(state.consecutive_mistakes, 0);
+    }
+
+    #[test]
+    fn strip_outer_fence_removes_backtick_pair_from_gitignore() {
+        let stripped =
+            strip_outer_markdown_fences(Path::new(".gitignore"), "```\nfoo\n```\n").into_owned();
+        assert_eq!(stripped, "foo\n");
+    }
+
+    #[test]
+    fn strip_outer_fence_removes_language_fence_from_rust_file() {
+        let stripped =
+            strip_outer_markdown_fences(Path::new("main.rs"), "```rust\nfn main(){}\n```\n")
+                .into_owned();
+        assert_eq!(stripped, "fn main(){}\n");
+    }
+
+    #[test]
+    fn strip_outer_fence_accepts_longer_closer() {
+        let stripped =
+            strip_outer_markdown_fences(Path::new("foo.txt"), "```\nfoo\n````\n").into_owned();
+        assert_eq!(stripped, "foo\n");
+    }
+
+    #[test]
+    fn strip_outer_fence_uses_first_closer_when_body_contains_longer_fence() {
+        // CommonMark §4.5: the FIRST fence whose run length ≥ opener's closes
+        // the block. A 4-backtick fence inside a 3-backtick outer fence is a
+        // valid closer for the outer (4 ≥ 3), so the outer fence ends at the
+        // first 4-backtick row — leaving the body before it and everything
+        // after it. Previously the implementation used `rfind`, which
+        // incorrectly matched the LAST closer and left the first closer row
+        // as stray content in the body.
+        let stripped = strip_outer_markdown_fences(
+            Path::new("foo.txt"),
+            "```\nfirst\n````\nsecond\n````\n",
+        )
+        .into_owned();
+        assert_eq!(
+            stripped, "first\nsecond\n````\n",
+            "first valid closer wins, not the last"
+        );
+
+        // When the first valid closer sits immediately after the opener line:
+        let stripped_immediate = strip_outer_markdown_fences(
+            Path::new("foo.txt"),
+            "```\n````\nfoo\n````\n",
+        )
+        .into_owned();
+        assert_eq!(
+            stripped_immediate, "foo\n````\n",
+            "immediate first closer leaves subsequent lines intact"
+        );
+    }
+
+    #[test]
+    fn strip_outer_fence_removes_tilde_fence_from_config() {
+        let stripped =
+            strip_outer_markdown_fences(Path::new("config.toml"), "~~~toml\nkey = \"v\"\n~~~\n")
+                .into_owned();
+        assert_eq!(stripped, "key = \"v\"\n");
+    }
+
+    #[test]
+    fn strip_outer_fence_preserves_rust_fence_in_readme() {
+        let original = "```rust\ncargo install sned\n```\n";
+        let stripped = strip_outer_markdown_fences(Path::new("README.md"), original).into_owned();
+        assert_eq!(
+            stripped, original,
+            "non-markdown info string must not be stripped from .md"
+        );
+    }
+
+    #[test]
+    fn strip_outer_fence_removes_markdown_info_string_from_markdown_file() {
+        let stripped =
+            strip_outer_markdown_fences(Path::new("README.md"), "```markdown\n# Title\n```\n")
+                .into_owned();
+        assert_eq!(stripped, "# Title\n");
+    }
+
+    #[test]
+    fn strip_outer_fence_removes_md_info_string_from_markdown_file() {
+        let stripped = strip_outer_markdown_fences(Path::new("README.md"), "```md\n# Title\n```\n")
+            .into_owned();
+        assert_eq!(stripped, "# Title\n");
+    }
+
+    #[test]
+    fn strip_outer_fence_preserves_naked_outer_fence_in_markdown_file() {
+        let original = "```\nsome snippet\n```\n";
+        let stripped = strip_outer_markdown_fences(Path::new("README.md"), original).into_owned();
+        assert_eq!(
+            stripped, original,
+            "naked fence on a markdown file must not be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_outer_fence_extension_check_is_case_insensitive() {
+        let stripped =
+            strip_outer_markdown_fences(Path::new("README.MD"), "```markdown\n# Title\n```\n")
+                .into_owned();
+        assert_eq!(stripped, "# Title\n");
+    }
+
+    #[test]
+    fn strip_outer_fence_preserves_inner_only_fence() {
+        let original = "before\n```\nliteral\n```\nafter\n";
+        let stripped = strip_outer_markdown_fences(Path::new("main.rs"), original).into_owned();
+        assert_eq!(stripped, original);
+    }
+
+    #[test]
+    fn strip_outer_fence_preserves_partial_fence_without_closer() {
+        let original = "```rust\nfoo\n";
+        let stripped = strip_outer_markdown_fences(Path::new("main.rs"), original).into_owned();
+        assert_eq!(stripped, original);
+    }
+
+    #[test]
+    fn strip_outer_fence_preserves_short_closer_with_long_opener() {
+        // CommonMark requires the closer to be at least as long as the opener.
+        // `````\nfoo\n``` has a shorter closer; must NOT be stripped.
+        let original = "`````rust\nfoo\n```\n";
+        let stripped = strip_outer_markdown_fences(Path::new("main.rs"), original).into_owned();
+        assert_eq!(stripped, original);
+    }
+
+    #[test]
+    fn strip_outer_fence_preserves_non_fenced_content() {
+        let original = "plain text\n";
+        let stripped =
+            strip_outer_markdown_fences(Path::new("anything.txt"), original).into_owned();
+        assert_eq!(stripped, original);
+    }
+
+    #[test]
+    fn strip_outer_fence_preserves_trailing_newline_after_strip() {
+        // The original closer was followed by an extra blank line; the strip
+        // must keep that blank line since it lies outside the fence pair.
+        let stripped =
+            strip_outer_markdown_fences(Path::new(".gitignore"), "```\nfoo\n```\n\n").into_owned();
+        assert_eq!(stripped, "foo\n\n");
+    }
+
+    #[tokio::test]
+    async fn test_write_to_file_strips_outer_markdown_fence_end_to_end() {
+        let workspace_root = TempDir::new().unwrap();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace_root.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "fence-strip".into(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        );
+
+        let result = ToolHandler::execute(
+            &WriteToFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "path": ".gitignore",
+                "content": "```\nnode_modules/\n*.log\n```\n"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.as_str().unwrap().contains("Successfully wrote to"));
+
+        let on_disk = std::fs::read_to_string(workspace_root.path().join(".gitignore")).unwrap();
+        assert_eq!(on_disk, "node_modules/\n*.log\n");
+        assert!(!on_disk.starts_with("```"));
+    }
+
+    #[tokio::test]
+    async fn test_write_to_file_preserves_legitimate_code_block_in_readme() {
+        let workspace_root = TempDir::new().unwrap();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace_root.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "fence-preserve".into(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        );
+
+        let original = "```rust\ncargo install sned\n```\n";
+        let result = ToolHandler::execute(
+            &WriteToFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "path": "README.md",
+                "content": original
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.as_str().unwrap().contains("Successfully wrote to"));
+
+        let on_disk = std::fs::read_to_string(workspace_root.path().join("README.md")).unwrap();
+        assert_eq!(on_disk, original);
+    }
+
+    #[test]
+    fn strip_outer_fence_crlf_with_trailing_blank_lines() {
+        let input = "```rust\r\nfn main() {}\r\n```\r\n\r\n";
+        let stripped = strip_outer_markdown_fences(Path::new("main.rs"), input).into_owned();
+        assert_eq!(stripped, "fn main() {}\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_write_to_file_does_not_double_strip_nested_fences() {
+        let workspace_root = TempDir::new().unwrap();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            state,
+            None,
+            workspace_root.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "nested-strip".into(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        );
+
+        let input = "````markdown\n# Doc\n```rust\nfn inner() {}\n```\n````\n";
+        let result = ToolHandler::execute(
+            &WriteToFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "path": "guide.md",
+                "content": input
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.as_str().unwrap().contains("Successfully wrote to"));
+
+        let on_disk = std::fs::read_to_string(workspace_root.path().join("guide.md")).unwrap();
+        assert_eq!(on_disk, "# Doc\n```rust\nfn inner() {}\n```\n");
     }
 }
