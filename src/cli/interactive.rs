@@ -997,28 +997,34 @@ fn apply_output_event(
         }
         OutputEvent::ToolHeaderLine(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
-            persist_transcript_line(app, storage, crate::cli::tui::BlockKind::ToolHeader, &line);
-            app.push_output_with_kind(line, crate::cli::tui::BlockKind::ToolHeader);
+            for line in split_output_line_on_newlines(line) {
+                persist_transcript_line(app, storage, crate::cli::tui::BlockKind::ToolHeader, &line);
+                app.push_output_with_kind(line, crate::cli::tui::BlockKind::ToolHeader);
+            }
         }
         OutputEvent::CommandHeaderLine(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
-            persist_transcript_line(
-                app,
-                storage,
-                crate::cli::tui::BlockKind::CommandHeader,
-                &line,
-            );
-            app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandHeader);
+            for line in split_output_line_on_newlines(line) {
+                persist_transcript_line(
+                    app,
+                    storage,
+                    crate::cli::tui::BlockKind::CommandHeader,
+                    &line,
+                );
+                app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandHeader);
+            }
         }
         OutputEvent::CommandOutputLine(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
-            persist_transcript_line(
-                app,
-                storage,
-                crate::cli::tui::BlockKind::CommandOutput,
-                &line,
-            );
-            app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandOutput);
+            for line in split_output_line_on_newlines(line) {
+                persist_transcript_line(
+                    app,
+                    storage,
+                    crate::cli::tui::BlockKind::CommandOutput,
+                    &line,
+                );
+                app.push_output_with_kind(line, crate::cli::tui::BlockKind::CommandOutput);
+            }
         }
         OutputEvent::ReasoningChunk(chunk) => {
             flush_pending_model_update(app, pending_model_update, storage);
@@ -2927,6 +2933,8 @@ async fn invalidate_restored_file_context(
             let key = key.to_string_lossy().into_owned();
             state.file_content_cache.pop(&key);
             state.consecutive_reads.remove(&key);
+            state.last_read_turn.remove(&key);
+            state.recent_read_windows.remove(&key);
             // A restored checkpoint invalidates the model's file snapshot. Require a
             // fresh read so reconciliation can bind anchors to the restored bytes.
             state.must_reread_before_edit.insert(key);
@@ -5959,7 +5967,8 @@ mod tests {
     use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
     use ratatui::buffer::Cell;
     use ratatui::layout::{Position, Size};
-    use ratatui::text::Line;
+    use ratatui::text::{Line, Span};
+    use ratatui::style::{Color, Style};
     use serde::ser::{Error as _, Serialize, Serializer};
 
     #[test]
@@ -13536,6 +13545,35 @@ mod tests {
                 .await
                 .is_cancelled_atomic
                 .load(Ordering::Acquire)
+        );
+    }
+
+    #[test]
+    fn split_output_line_on_newlines_preserves_indentation_and_style_across_embedded_newlines() {
+        // Multi-line shell string: a `git commit -m` body that the agent passed
+        // through to the TUI. Before the fix, ratatui's cell grid would render
+        // `\n` as an in-span control and the whole header flattened onto one
+        // row. After the fix, the helper expands it into multiple Lines while
+        // keeping each part's style and trimming no characters.
+        let raw = Line::from(vec![
+            Span::styled("API", Style::default().fg(Color::Cyan)),
+            Span::raw("\n\n"),
+            Span::styled("- Remove unused param", Style::default().fg(Color::Gray)),
+        ]);
+        let lines = split_output_line_on_newlines(raw);
+        assert_eq!(lines.len(), 3, "expected 3 display lines, got: {:?}", lines);
+        let rendered: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(
+            rendered,
+            vec!["API", "", "- Remove unused param"],
+            "each split line should preserve its visible content verbatim"
+        );
+        // The middle "row" must keep the same default style we constructed the
+        // blank span with, so transcript persistence and rendering match.
+        assert!(
+            lines[1].spans.is_empty(),
+            "the row between two embedded newlines must be empty, got: {:?}",
+            lines[1].spans
         );
     }
 }
