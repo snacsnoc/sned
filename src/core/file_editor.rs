@@ -219,6 +219,9 @@ pub(crate) enum EditFailureReason {
     RangeOverlap,
     GluedAnchor,
     DuplicateInsertion,
+    /// Anchor resolved uniquely, but supplied content matches a different
+    /// line in the same file. The file was NOT modified — no re-read required.
+    MismatchedAnchorContent,
 }
 
 impl EditFailureReason {
@@ -283,11 +286,18 @@ impl EditFailureReason {
         {
             add(Self::MissingAnchor);
         }
-        if lower.contains("not found in the file")
-            || lower.contains("anchor is stale")
-            || lower.contains("does not match the line")
-        {
+        if lower.contains("not found in the file") || lower.contains("anchor is stale") {
             add(Self::UnknownAnchor);
+        }
+        // Anchor and supplied content resolve to different lines in the
+        // same file — file is not modified, so this is a misquote, not a
+        // stale anchor.
+        if (lower.contains("binds to line")
+            && lower.contains("supplied content")
+            && lower.contains("matches line"))
+            || (lower.contains("is ambiguous") && lower.contains("supplied content matches line"))
+        {
+            add(Self::MismatchedAnchorContent);
         }
 
         if reasons.is_empty() {
@@ -306,6 +316,7 @@ impl EditFailureReason {
             Self::RangeOverlap => "overlapping edit ranges",
             Self::GluedAnchor => "glued anchor fragments",
             Self::DuplicateInsertion => "duplicate insertion",
+            Self::MismatchedAnchorContent => "anchor and content refer to different lines",
         }
     }
 
@@ -2123,6 +2134,27 @@ impl EditExecutor {
                     )),
                 );
             }
+            // File is not modified, so point at both lines and the correct
+            // anchor — the model can self-correct without a wasted read.
+            if content_matches.len() == 1 {
+                let content_idx = content_matches[0];
+                let correct_anchor = normalized_line_hashes
+                    .get(content_idx)
+                    .map(String::as_str)
+                    .unwrap_or("?");
+                return (
+                    usize::MAX,
+                    Some(format!(
+                        "{anchor_type} \"{anchor_name}\" binds to line {} ({:?}), but the supplied content {:?} matches line {} (anchor \"{correct_anchor}\"). Use one of:\n  - \"{correct_anchor}{ANCHOR_DELIMITER}{provided_content}\" to edit line {}\n  - \"{anchor_name}{ANCHOR_DELIMITER}{bound_content}\" to edit line {}",
+                        bound + 1,
+                        bound_content,
+                        provided_content,
+                        content_idx + 1,
+                        content_idx + 1,
+                        bound + 1,
+                    )),
+                );
+            }
             return (
                 usize::MAX,
                 Some(format!(
@@ -2222,31 +2254,54 @@ impl EditExecutor {
         }
 
         let content_idx = content_matches[0];
+        let content_line = lines.get(content_idx).map(String::as_str).unwrap_or("");
+        let correct_anchor = normalized_line_hashes
+            .get(content_idx)
+            .map(String::as_str)
+            .unwrap_or("?");
         let word_idx = word_bound_lines[0];
-        if word_idx != content_idx {
+        // The anchor's word resolves to multiple lines but the supplied
+        // content identifies exactly one. If that one line is the first
+        // word-bound line, the user unambiguously picked it; succeed.
+        if word_idx == content_idx {
             tracing::debug!(
-                "Anchor resolution: rebind detected. quoted_word={} now binds to line {} but supplied content matches line {}",
+                "Anchor resolved via content-disambiguation: word={} matched {} line(s), content matches line {}",
                 anchor_name,
-                word_idx,
+                word_bound_lines.len(),
                 content_idx
             );
-            return (
-                usize::MAX,
-                Some(format!(
-                    "{anchor_type} \"{anchor_name}{ANCHOR_DELIMITER}{provided_content}\" now binds to content that appears at a different line: the quoted word resolves to line {} but the supplied content matches line {}. Re-read the file with read_file to refresh anchors before retrying.",
-                    word_idx + 1,
-                    content_idx + 1
-                )),
-            );
+            return (content_idx, None);
         }
-
+        // Otherwise the user's content lives on a different word-bound
+        // line than word_bound_lines[0]. Surface the rebind instead of
+        // landing on the wrong line.
+        let word_bound_listing: Vec<String> = word_bound_lines
+            .iter()
+            .map(|&idx| {
+                format!(
+                    "line {}: {:?}",
+                    idx + 1,
+                    lines.get(idx).map(String::as_str).unwrap_or("")
+                )
+            })
+            .collect();
         tracing::debug!(
-            "Anchor resolved successfully: anchor_type={}, anchor_name={}, line_index={}",
-            anchor_type,
+            "Anchor resolution: rebind detected (ambiguous word). quoted_word={} resolves to {} line(s) but supplied content matches line {}",
             anchor_name,
+            word_bound_lines.len(),
             content_idx
         );
-        (content_idx, None)
+        return (
+            usize::MAX,
+            Some(format!(
+                "{anchor_type} \"{anchor_name}{ANCHOR_DELIMITER}{provided_content}\" is ambiguous — the quoted word resolves to {} line(s) [{}], but the supplied content matches line {} ({:?}, anchor \"{correct_anchor}\"). Use one of:\n  - \"{correct_anchor}{ANCHOR_DELIMITER}{provided_content}\" to edit line {}\n  - quote one of the word-bound lines verbatim with that line's anchor to edit a different line. Do NOT re-read; the file has not changed.",
+                word_bound_lines.len(),
+                word_bound_listing.join("; "),
+                content_idx + 1,
+                content_line,
+                content_idx + 1,
+            )),
+        );
     }
 
     /// Resolves an anchor to a line index using ONLY the word identity
@@ -3589,8 +3644,8 @@ mod tests {
         assert_eq!(idx, usize::MAX);
         let err_msg = error.expect("rebind must surface an error");
         assert!(
-            err_msg.contains("now binds to content that appears at a different line"),
-            "got: {err_msg}"
+            err_msg.contains("is ambiguous") && err_msg.contains("supplied content matches line"),
+            "rebind must surface ambiguous-word diagnostic, got: {err_msg}"
         );
 
         // Wrong content for the anchor should fail
