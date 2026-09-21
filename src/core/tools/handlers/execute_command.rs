@@ -5,7 +5,10 @@ use crate::cli::output::OutputEvent;
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::CommandSafetyChecker;
 use crate::core::process_output::{capture_async_with_raw_output, configured_output_limit};
-use crate::core::tools::{ToolContext, ToolError, ToolHandler, coerce_command_array};
+use crate::core::tools::{
+    ToolContext, ToolError, ToolHandler, coerce_command_array,
+    parse_relaxed_stringified_string_array,
+};
 use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -389,6 +392,10 @@ fn is_serialized_command_container(value: &str) -> bool {
         && let Some(items) = parsed.as_array()
     {
         return !items.iter().all(serde_json::Value::is_string);
+    }
+
+    if parse_relaxed_stringified_string_array(value).is_some() {
+        return false;
     }
 
     matches!(rest.trim_start().as_bytes().first(), Some(b'\'' | b'\"'))
@@ -1846,6 +1853,9 @@ mod tests {
         assert!(!is_serialized_command_container("[]"));
         assert!(!is_serialized_command_container("echo valid"));
         assert!(!is_serialized_command_container("{ echo valid; }"));
+        assert!(!is_serialized_command_container(
+            r#"["grep 'setupPipelines\|makeFunction'"]"#
+        ));
     }
 
     #[tokio::test]
@@ -1957,6 +1967,33 @@ mod tests {
             .expect("valid JSON-stringified command arrays should execute");
 
         assert!(result.contains("stringified-json-array"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_execute_recovers_unescaped_shell_backslashes_in_command_array() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let params = serde_json::json!({
+            "commands": r#"["printf '%s' 'left\|right'"]"#
+        });
+
+        let result = handler
+            .execute_without_state(
+                None,
+                params,
+                None,
+                false,
+                false,
+                None,
+                None,
+                false,
+                &output_writer,
+            )
+            .await
+            .expect("recoverable stringified command arrays should execute");
+
+        assert!(result.contains(r#"left\|right"#), "got: {result}");
     }
 
     #[tokio::test]

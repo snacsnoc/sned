@@ -723,6 +723,9 @@ pub fn coerce_command_array(params: &serde_json::Value) -> Vec<String> {
         if let Some(values) = parse_unambiguous_stringified_string_array(value) {
             return values;
         }
+        if let Some(values) = parse_relaxed_stringified_string_array(value) {
+            return values;
+        }
         return vec![value.to_string()];
     }
 
@@ -754,6 +757,38 @@ pub fn parse_unambiguous_stringified_string_array(value: &str) -> Option<Vec<Str
             .filter_map(|value| value.as_str().map(String::from))
             .collect(),
     )
+}
+
+/// Recover a stringified command array when a provider failed to escape a
+/// shell backslash for JSON (for example, `\|` in a grep expression). The
+/// opening `[` followed immediately by `"` is still unambiguous enough to
+/// distinguish this shape from shell test syntax such as `[ "foo" ]`.
+pub(crate) fn parse_relaxed_stringified_string_array(value: &str) -> Option<Vec<String>> {
+    let trimmed = value.trim();
+    if !trimmed.starts_with("[\"") || !trimmed.ends_with(']') {
+        return None;
+    }
+
+    let mut repaired = String::with_capacity(trimmed.len());
+    let mut chars = trimmed.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            let Some(&next) = chars.peek() else {
+                repaired.push_str("\\\\");
+                continue;
+            };
+            if !matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') {
+                repaired.push_str("\\\\");
+            } else {
+                repaired.push('\\');
+            }
+        } else {
+            repaired.push(character);
+        }
+    }
+
+    let values = serde_json::from_str::<Vec<String>>(&repaired).ok()?;
+    Some(values)
 }
 
 #[cfg(test)]
@@ -995,6 +1030,17 @@ mod tests {
     fn test_coerce_command_array_accepts_canonical_stringified_array() {
         let params = serde_json::json!({"commands": "[\"echo one\", \"echo two\"]"});
         assert_eq!(coerce_command_array(&params), vec!["echo one", "echo two"]);
+    }
+
+    #[test]
+    fn test_coerce_command_array_recovers_unescaped_shell_backslashes() {
+        let params = serde_json::json!({
+            "commands": r#"["grep -r 'setupPipelines\|makeFunction'"]"#
+        });
+        assert_eq!(
+            coerce_command_array(&params),
+            vec!["grep -r 'setupPipelines\\|makeFunction'"]
+        );
     }
 
     #[test]
