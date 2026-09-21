@@ -1407,10 +1407,9 @@ impl AgentLoop {
     /// intentionally higher than the (later) build-failure breaker's 3
     /// because validation errors are normal on a file's first read; the
     /// danger pattern is sustained retry without success.
-    async fn maybe_emit_edit_failure_diagnostic(
+    async fn collect_edit_failure_diagnostic(
         state: &Arc<Mutex<TaskState>>,
-        output_writer: &crate::cli::output::OutputWriterArc,
-    ) {
+    ) -> Option<String> {
         const FAILURE_LOOP_THRESHOLD: u32 = 5;
         let snapshot: Vec<(String, u32)> = {
             let guard = state.lock().await;
@@ -1427,20 +1426,32 @@ impl AgentLoop {
                 .collect()
         };
         if snapshot.is_empty() {
-            return;
+            return None;
         }
+        Some(
+            snapshot
+                .into_iter()
+                .map(|(path, count)| {
+                    format!(
+                "--- Note (Edit Retry Circuit Breaker) ---\nFile '{path}' has had {count} consecutive failed edit_file attempts. The same broken anchor/format pattern is being reused. STOP retrying with the same anchors. Re-read the file with read_file (the anchor prefixes may have rotated or shifted) and verify each anchor's prefix matches the exact source line you intend to edit. Multi-line replacements must use anchor + end_anchor, not a multi-line `anchor` field."
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    }
+
+    fn emit_warning_note(
+        output_writer: &crate::cli::output::OutputWriterArc,
+        note: &str,
+    ) {
         use crate::cli::output::OutputEvent;
         use crate::cli::tui::theme::WARNING_FG;
         use ratatui::style::Style;
-        for (path, count) in snapshot {
-            let note = format!(
-                "--- Note (Edit Retry Circuit Breaker) ---\nFile '{path}' has had {count} consecutive failed edit_file attempts. The same broken anchor/format pattern is being reused. STOP retrying with the same anchors. Re-read the file with read_file (the anchor prefixes may have rotated or shifted) and verify each anchor's prefix matches the exact source line you intend to edit. Multi-line replacements must use anchor + end_anchor, not a multi-line `anchor` field."
-            );
-            output_writer.emit(OutputEvent::tool_output_line(
-                note,
-                Style::default().fg(WARNING_FG),
-            ));
-        }
+        output_writer.emit(OutputEvent::tool_output_line(
+            note,
+            Style::default().fg(WARNING_FG),
+        ));
     }
 
     async fn maybe_emit_edit_compile_diagnostic(
@@ -1477,14 +1488,8 @@ impl AgentLoop {
     }
 
     /// Heuristic: does this `execute_command` invocation look like a
-    /// build or test runner? Used by the failure-loop circuit breaker to
-    /// decide when a successful command is independent confirmation that
-    /// the on-disk code is no longer in a thrashing state. Must NOT
-    /// match `git diff`, `ls`, `wc`, `awk`, etc. — those count as
-    /// inspection, not progress, and a successful inspection should
-    /// never reset the failure counter (otherwise the diagnostic becomes
-    /// toothless the moment the model follows its own advice to run
-    /// `git diff`).
+    /// build or test runner? Kept separate from retry-loop state because a
+    /// passing build does not prove that a rejected edit retry has stopped.
     fn looks_like_build_or_test_command(tool_params: &serde_json::Value) -> bool {
         // Pull the first entry from `commands[]` OR the `script` string.
         // Both shapes are documented in the execute_command schema.
@@ -1545,6 +1550,80 @@ impl AgentLoop {
         }
     }
 
+    /// Shell commands are normally inspection commands, but a subset can
+    /// change workspace bytes behind the native write handlers. Those writes
+    /// invalidate every tracked read window because the command may touch a
+    /// path we cannot reliably identify from its shell syntax.
+    fn command_may_mutate_files(tool_params: &serde_json::Value) -> bool {
+        let mut commands = Vec::new();
+        if let Some(values) = tool_params.get("commands").and_then(|v| v.as_array()) {
+            commands.extend(values.iter().filter_map(|value| value.as_str()));
+        }
+        if let Some(script) = tool_params.get("script").and_then(|value| value.as_str()) {
+            commands.push(script);
+        }
+
+        commands.into_iter().any(|command| {
+            let lower = command.to_ascii_lowercase();
+            if lower.contains(" >")
+                || lower.contains(">>")
+                || lower.contains(" 2>")
+                || lower.contains("| tee ")
+            {
+                return true;
+            }
+            for segment in lower.split([';', '\n', '|', '&']) {
+                let mut tokens = segment.split_whitespace();
+                let Some(program) = tokens.next() else {
+                    continue;
+                };
+                let program = program.rsplit(['/', '\\']).next().unwrap_or(program);
+                let args: Vec<_> = tokens.collect();
+                let first_arg = args.first().copied().unwrap_or_default();
+                if matches!(
+                    program,
+                    "cp" | "mv"
+                        | "rm"
+                        | "mkdir"
+                        | "rmdir"
+                        | "touch"
+                        | "truncate"
+                        | "install"
+                        | "ln"
+                        | "tee"
+                        | "rustfmt"
+                        | "gofmt"
+                        | "black"
+                        | "prettier"
+                        | "clang-format"
+                        | "swift-format"
+                ) {
+                    return true;
+                }
+                if (program == "sed" || program == "perl")
+                    && args.iter().any(|arg| arg == &"-i" || arg.starts_with("-i"))
+                {
+                    return true;
+                }
+                if matches!(program, "python" | "python3" | "ruby" | "node") {
+                    return true;
+                }
+                if program == "cargo" && first_arg == "fmt" {
+                    return true;
+                }
+                if program == "git"
+                    && matches!(
+                        first_arg,
+                        "apply" | "checkout" | "clean" | "restore" | "reset"
+                    )
+                {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
     /// Tools whose execution keeps the read-loop state alive. The model
     /// alternates between slicing a file and probing its surroundings
     /// (compile errors, shell greps, file listings, symbol lookups) — that
@@ -1575,7 +1654,7 @@ impl AgentLoop {
     /// read-tracking for it must start fresh. A failed write must NOT
     /// wipe because (a) the file on disk did not change and (b) the
     /// per-file counter is what the edit-retry diagnostic in
-    /// `maybe_emit_edit_failure_diagnostic` uses; clearing it on every
+    /// `collect_edit_failure_diagnostic` uses; clearing it on every
     /// failure would defeat that path.
     ///
     /// The wipe runs unconditionally for these tools; success/failure
@@ -1598,8 +1677,8 @@ impl AgentLoop {
     /// `last_read_turn` (which is updated on every read with the
     /// current `turns_completed`) so the detector eventually forgets
     /// files the model abandoned. The `READ_LOOP_INSPECTION_TOOLS`
-    /// allowlist is the fix for the live-log regression where every
-    /// `execute_command` silently reset the detector.
+    /// allowlist preserves state across read-only shell commands; mutating
+    /// shell commands are invalidated after execution separately.
     fn decay_read_loop_state(state: &mut TaskState, tool_name: &str) {
         if Self::READ_LOOP_INSPECTION_TOOLS.contains(&tool_name) {
             return;
@@ -4399,6 +4478,58 @@ impl AgentLoop {
                     })
                 };
 
+                // Keep retry-loop state independent of presentation mode so
+                // JSON/non-TTY runs receive the same circuit breaker. The
+                // diagnostic is appended to the model-visible tool result;
+                // TTY rendering below only mirrors it visually.
+                let mut edit_failure_diagnostic = None;
+                if tool_name == "edit_file" {
+                    if result_output.is_error {
+                        {
+                            let mut state = self.state.lock().await;
+                            for path in &edit_file_path {
+                                let count = state
+                                    .consecutive_edit_failures
+                                    .entry(path.normalized.clone())
+                                    .or_insert(0);
+                                *count += 1;
+                            }
+                        }
+                        edit_failure_diagnostic =
+                            Self::collect_edit_failure_diagnostic(&self.state).await;
+                        if let Some(note) = &edit_failure_diagnostic {
+                            result_output.text.push_str("\n\n");
+                            result_output.text.push_str(note);
+                        }
+                    } else {
+                        let mut state = self.state.lock().await;
+                        for path in &edit_file_path {
+                            state.consecutive_edit_failures.remove(&path.normalized);
+                        }
+                    }
+                }
+
+                if tool_name == "execute_command"
+                    && Self::command_may_mutate_files(&tool_params)
+                {
+                    let mut state = self.state.lock().await;
+                    state.consecutive_reads.clear();
+                    state.last_read_turn.clear();
+                    state.recent_read_windows.clear();
+                }
+
+                // A successful build/test confirms the current successful
+                // edits have been checked, so start a fresh edit-compile
+                // window. It must not clear rejected-edit retries: a passing
+                // build does not prove that an unchanged bad edit stopped.
+                if tool_name == "execute_command"
+                    && !result_output.is_error
+                    && Self::looks_like_build_or_test_command(&tool_params)
+                {
+                    let mut state = self.state.lock().await;
+                    state.consecutive_edits.clear();
+                }
+
                 // Display compact tool result in TTY mode
                 if !self.config.json_output {
                     // Hold lock across check-and-set to avoid TOCTOU race
@@ -4436,44 +4567,10 @@ impl AgentLoop {
                                         Style::default().fg(ERROR_FG),
                                     ));
                             }
-                            // Failure-loop circuit breaker: when the model
-                            // retries a rejected edit_file batch against
-                            // the same file repeatedly without ever
-                            // producing a successful write, the build
-                            // breaker (which needs consecutive_edits ≥ 3)
-                            // stays silent. Track per-file rejection
-                            // counts so we can surface a "stop retrying,
-                            // re-read the file" diagnostic before the
-                            // model burns another dozen turns on an
-                            // off-by-one anchor or a multi-line `anchor`
-                            // field. Mirrors the comment block on
-                            // `consecutive_edit_failures` in agent_types.rs.
-                            {
-                                let mut state = self.state.lock().await;
-                                for path in &edit_file_path {
-                                    let count = state
-                                        .consecutive_edit_failures
-                                        .entry(path.normalized.clone())
-                                        .or_insert(0);
-                                    *count += 1;
-                                }
+                            if let Some(note) = &edit_failure_diagnostic {
+                                Self::emit_warning_note(&self.config.output_writer, note);
                             }
-                            Self::maybe_emit_edit_failure_diagnostic(
-                                &self.state,
-                                &self.config.output_writer,
-                            )
-                            .await;
                         } else {
-                            // Successful edit clears the failure counter
-                            // for every file touched so a future
-                            // failure-loop can be detected from a clean
-                            // baseline.
-                            {
-                                let mut state = self.state.lock().await;
-                                for path in &edit_file_path {
-                                    state.consecutive_edit_failures.remove(&path.normalized);
-                                }
-                            }
                             for preview in edit_result_diff_previews(&result_output.text) {
                                 for mut line in
                                     crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&preview)
@@ -4555,19 +4652,6 @@ impl AgentLoop {
                                 ));
                         }
                     }
-                }
-
-                // A successful build/test is independent confirmation that
-                // the on-disk code is healthy. Reset both edit-loop counters
-                // in every output mode; inspection commands must not clear
-                // them just because they succeeded.
-                if tool_name == "execute_command"
-                    && !result_output.is_error
-                    && Self::looks_like_build_or_test_command(&tool_params)
-                {
-                    let mut state = self.state.lock().await;
-                    state.consecutive_edits.clear();
-                    state.consecutive_edit_failures.clear();
                 }
 
                 if tool_name == "edit_file"
@@ -7676,7 +7760,11 @@ Irrespective of whether additional information or instructions are given, you ar
                 .insert("/tmp/foo.c".to_string(), 4);
         }
         // 4 is below the threshold of 5 — must stay silent.
-        AgentLoop::maybe_emit_edit_failure_diagnostic(&state, &writer).await;
+        assert!(
+            AgentLoop::collect_edit_failure_diagnostic(&state)
+                .await
+                .is_none()
+        );
         let mut below = Vec::new();
         while let Ok(event) = rx.try_recv() {
             below.push(format!("{event:?}"));
@@ -7692,7 +7780,10 @@ Irrespective of whether additional information or instructions are given, you ar
                 .consecutive_edit_failures
                 .insert("/tmp/foo.c".to_string(), 5);
         }
-        AgentLoop::maybe_emit_edit_failure_diagnostic(&state, &writer).await;
+        let note = AgentLoop::collect_edit_failure_diagnostic(&state)
+            .await
+            .expect("at-threshold failures should produce a diagnostic");
+        AgentLoop::emit_warning_note(&writer, &note);
         let mut above = Vec::new();
         while let Ok(event) = rx.try_recv() {
             above.push(format!("{event:?}"));
@@ -7744,10 +7835,8 @@ Irrespective of whether additional information or instructions are given, you ar
         );
     }
 
-    /// Build/test classifier used by the failure-loop breaker reset
-    /// path. Locks down the boundary between build/test commands (which
-    /// confirm on-disk health) and inspection commands (which must NOT
-    /// silently reset the counter).
+    /// Keep the build/test classifier's boundary explicit for callers that
+    /// need to distinguish compilation from inspection commands.
     #[tokio::test]
     async fn test_looks_like_build_or_test_command_classifies_patterns() {
         let build_or_test: Vec<serde_json::Value> = vec![
@@ -7821,6 +7910,35 @@ Irrespective of whether additional information or instructions are given, you ar
             assert!(
                 !AgentLoop::looks_like_build_or_test_command(params),
                 "empty or malformed params must not classify as build, got: {params}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_command_may_mutate_files_classifies_shell_writes() {
+        let mutating = [
+            serde_json::json!({"commands": ["sed -i 's/foo/bar/' src/foo.rs"]}),
+            serde_json::json!({"commands": ["echo changed > src/foo.rs"]}),
+            serde_json::json!({"commands": ["cargo fmt"]}),
+            serde_json::json!({"commands": ["python3 rewrite.py"]}),
+            serde_json::json!({"commands": ["git restore src/foo.rs"]}),
+        ];
+        for params in mutating {
+            assert!(
+                AgentLoop::command_may_mutate_files(&params),
+                "expected file mutation for {params}"
+            );
+        }
+        let read_only = [
+            serde_json::json!({"commands": ["git diff src/foo.rs"]}),
+            serde_json::json!({"commands": ["grep -n TODO src/"]}),
+            serde_json::json!({"commands": ["cargo test --lib"]}),
+            serde_json::json!({"commands": ["ls -la"]}),
+        ];
+        for params in read_only {
+            assert!(
+                !AgentLoop::command_may_mutate_files(&params),
+                "unexpected file mutation for {params}"
             );
         }
     }
