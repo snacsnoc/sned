@@ -194,8 +194,53 @@ impl EditFileHandler {
     fn normalized_anchor(field_name: &str, path: &str, raw: &str) -> Result<String, String> {
         // Whitespace after § belongs to the source line, not the envelope.
         let trimmed_leading_space = raw.trim_start_matches([' ', '\t']);
-        let has_leading_line_break = trimmed_leading_space.starts_with(['\n', '\r']);
-        let anchor = trimmed_leading_space.trim_end_matches(['\r', '\n']);
+
+        // Strip git diff markers (+/-) that models copy when they echo
+        // the diff preview that Sned itself emitted on the previous
+        // successful edit. Sned formats its diff output with `+` / `-`
+        // prefixes and then tells the model "Use the shown anchors for
+        // changed lines", so the model copies `+AXeXDnV5WaXnvNON§foo`
+        // verbatim. ANCHOR_NAME_REGEX rejects the leading `+`. Gemini
+        // hit this in gemini.log:45068 and spent two retries before
+        // stripping the prefix by hand. Stripping here makes the parser
+        // resilient so the next anchor retry succeeds without the model
+        // having to know the internal envelope format.
+        let without_diff_marker = trimmed_leading_space
+            .trim_start_matches(['+', '-'])
+            .trim_start_matches([' ', '\t']);
+
+        // Strip line-number prefixes that models copy from compiler /
+        // shell / awk output: "801: AXeX§..." or "801 | AXeX§...".
+        // ANCHOR_NAME_REGEX requires the anchor name to begin with an
+        // uppercase ASCII letter, so a numeric prefix can never be a
+        // valid anchor name — anything that looks like `<digits>:` or
+        // `<digits> |` ahead of the anchor is by definition output
+        // format noise from another tool. Qwen copy-pasted "801: foo"
+        // from `awk 'NR==801'` output in qwen1.log and the parser
+        // rejected it as a malformed anchor.
+        let without_line_prefix = if let Some(idx) = without_diff_marker.find([':', '|']) {
+            let prefix = &without_diff_marker[..idx];
+            // The prefix may include trailing whitespace before the
+            // separator (e.g. "801 " before "|"), so trim it before
+            // the all-digit check. `awk 'NR==801'`, compiler
+            // diagnostics (`801: foo`), and ripgrep `--line-number`
+            // (`801 | foo`) all produce this shape.
+            let trimmed_prefix = prefix.trim_matches([' ', '\t']);
+            if !trimmed_prefix.is_empty()
+                && trimmed_prefix.chars().all(|c| c.is_ascii_digit())
+            {
+                without_diff_marker[idx + 1..]
+                    .trim_start_matches([' ', '\t'])
+                    .to_string()
+            } else {
+                without_diff_marker.to_string()
+            }
+        } else {
+            without_diff_marker.to_string()
+        };
+
+        let has_leading_line_break = without_line_prefix.starts_with(['\n', '\r']);
+        let anchor = without_line_prefix.trim_end_matches(['\r', '\n']);
 
         // Anchors must refer to exactly one source line. Multi-line pastes
         // (e.g. the model copy-pasting several `Word§content` lines into one
@@ -203,9 +248,16 @@ impl EditFileHandler {
         // picks the right shape (`anchor` + optional `end_anchor`) instead of
         // having the tool pick one anchored line on its behalf and silently
         // narrowing the range.
+        //
+        // The error puts the corrective JSON shape in the very first
+        // sentence. Live debug logs (qwen1, gemini) both showed the model
+        // retrying the same multi-line anchor paste 2-4 times in a row; the
+        // previous message buried the `anchor + end_anchor` recipe four
+        // sentences deep, where the model never reached it. Front-loading
+        // the exact working JSON stops the loop on the first rejection.
         if has_leading_line_break || anchor.contains(['\n', '\r']) {
             return Err(format!(
-                "File '{path}': '{field_name}' must contain exactly one source line, not a multi-line block. No changes were made to this file, and no reread is needed. Copy one complete Word§source line from your current read into anchor. For a range, put the first line in anchor and the last line in end_anchor; put only unprefixed replacement source in text (use \"\" to delete the selected range)."
+                "Use 'anchor' + 'end_anchor' for multi-line ranges, not multi-line '{field_name}'. File '{path}': '{field_name}' must contain exactly one source line (copy one complete Word§source line from read_file). No changes were made to this file, and no reread is needed. Example: {{\"anchor\": \"Prefix§first line\", \"end_anchor\": \"Prefix§last line\", \"text\": \"replacement\"}}. To delete the range, set \"text\": \"\"."
             ));
         }
 
@@ -2417,11 +2469,26 @@ impl EditFileHandler {
         {
             let mut state = state.lock().await;
             for item in &write_items {
-                state
-                    .consecutive_reads
-                    .remove(&crate::core::tools::canonical_path_key(Path::new(
-                        &item.absolute_path,
-                    )));
+                let key = crate::core::tools::canonical_path_key(Path::new(&item.absolute_path));
+                // All three read-tracking maps must be cleared together.
+                // Leaving `last_read_turn` populated caused a race where a
+                // post-edit verification read in the same turn was
+                // silently skipped by `track_read_files` because
+                // `last_read_turn[curr_path] == current_turn`. Leaving
+                // `recent_read_windows` populated made the thrash detector
+                // see pre-edit windows long after the file changed.
+                state.consecutive_reads.remove(&key);
+                state.last_read_turn.remove(&key);
+                state.recent_read_windows.remove(&key);
+                // Increment the edit-compile thrash counter for this file
+                // so the diagnostic in agent_loop can fire if a subsequent
+                // execute_command reports a build failure. Cleared by
+                // agent_loop when build/test succeeds.
+                let count = state
+                    .consecutive_edits
+                    .entry(key)
+                    .or_insert(0);
+                *count += 1;
             }
         }
 
@@ -3801,6 +3868,132 @@ mod tests {
             );
             assert!(error.contains("no reread is needed"), "{error}");
         }
+    }
+
+    /// Audit (Fix 2): when a model copies an anchor from Sned's own diff
+    /// preview output (e.g. `+AXeXDnV5WaXnvNON§        return color`),
+    /// the `+` prefix from the diff column must be stripped before
+    /// ANCHOR_NAME_REGEX validates the name. Otherwise the model hits
+    /// `anchor '+AXeX...' must include a non-numeric anchor name` even
+    /// though the anchor itself was generated by Sned one turn earlier.
+    /// Gemini hit this in gemini.log:45068.
+    #[test]
+    fn normalized_anchor_strips_diff_plus_prefix() {
+        let raw = "+AXeXDnV5WaXnvNOO§    return color";
+        let result =
+            EditFileHandler::normalized_anchor("anchor", "test.swift", raw).unwrap();
+        assert_eq!(result, "AXeXDnV5WaXnvNOO§    return color");
+    }
+
+    /// Audit (Fix 2): a `-` prefix from a removed-line diff preview must
+    /// also be stripped. This mirrors `+` because both characters come
+    /// from the same git-style column in Sned's diff output.
+    #[test]
+    fn normalized_anchor_strips_diff_minus_prefix() {
+        let raw = "-AXeXDnV5WaXnvNOO§    return color";
+        let result =
+            EditFileHandler::normalized_anchor("anchor", "test.swift", raw).unwrap();
+        assert_eq!(result, "AXeXDnV5WaXnvNOO§    return color");
+    }
+
+    /// Audit (Fix 2): a `+` followed by extra whitespace must collapse
+    /// down to the same canonical form as the no-whitespace case. Models
+    /// that copy `+ AXeX§foo` (with a space) or `+\tAXeX§foo` must not
+    /// fail simply because of column padding in the source view.
+    #[test]
+    fn normalized_anchor_strips_diff_plus_with_whitespace() {
+        for raw in [
+            "+ AXeXDnV5WaXnvNOO§    return color",
+            "+  AXeXDnV5WaXnvNOO§    return color",
+            "+\tAXeXDnV5WaXnvNOO§    return color",
+            " + AXeXDnV5WaXnvNOO§    return color",
+        ] {
+            let result = EditFileHandler::normalized_anchor("anchor", "test.swift", raw).unwrap();
+            assert_eq!(
+                result,
+                "AXeXDnV5WaXnvNOO§    return color",
+                "raw input {raw:?} did not normalize to canonical form"
+            );
+        }
+    }
+
+    /// Audit (Fix 2): a line-number prefix copied from `awk 'NR==N'`,
+    /// compiler diagnostics, or `cat -n` output (`801: AXeX§foo`) or
+    /// ripgrep `--line-number` output (`801 | AXeX§foo`) must be
+    /// stripped. ANCHOR_NAME_REGEX requires the anchor name to start
+    /// with an uppercase ASCII letter, so a numeric prefix can never
+    /// be a valid anchor name — anything that looks like `<digits>:` or
+    /// `<digits> |` ahead of the anchor is by definition output format
+    /// noise from another tool. Qwen copy-pasted `801: foo` from awk
+    /// output in qwen1.log.
+    #[test]
+    fn normalized_anchor_strips_line_number_prefix() {
+        for (raw, expected) in [
+            ("801: AXeX§foo", "AXeX§foo"),
+            ("12:AXeX§foo", "AXeX§foo"),
+            ("801 | AXeX§foo", "AXeX§foo"),
+            ("801:AXeX§foo", "AXeX§foo"),
+            ("1234567 | AmprR8§    func setupScannerCallback() {", "AmprR8§    func setupScannerCallback() {"),
+        ] {
+            let result = EditFileHandler::normalized_anchor("anchor", "test.swift", raw).unwrap();
+            assert_eq!(
+                result, expected,
+                "raw input {raw:?} did not normalize to {expected:?}"
+            );
+        }
+    }
+
+    /// Audit (Fix 2): a colon-separated line number must NOT be stripped
+    /// if the prefix is not pure digits — otherwise legitimate anchor
+    /// names that happen to contain a colon would be corrupted. (In
+    /// practice anchor names never start with a digit, but the regex
+    /// pattern is the safety net and we must not weaken it.)
+    #[test]
+    fn normalized_anchor_does_not_strip_non_numeric_line_prefix() {
+        // "abc:" is not a line number; should be left alone.
+        let result = EditFileHandler::normalized_anchor("anchor", "test.swift", "abc:AXeX§foo")
+            .unwrap();
+        assert_eq!(result, "abc:AXeX§foo");
+        // Pure colon without prefix: not stripped (no digits to match).
+        let result =
+            EditFileHandler::normalized_anchor("anchor", "test.swift", ":AXeX§foo").unwrap();
+        assert_eq!(result, ":AXeX§foo");
+    }
+
+    /// Audit (Fix 2): the canonical `Word§source` form (no diff marker,
+    /// no line number) must still parse unchanged. This guards against
+    /// the new normalization accidentally corrupting well-formed anchors
+    /// that previously worked.
+    #[test]
+    fn normalized_anchor_canonical_form_unchanged() {
+        let result = EditFileHandler::normalized_anchor(
+            "anchor",
+            "test.swift",
+            "AmprR8§    func setupScannerCallback() {",
+        )
+        .unwrap();
+        assert_eq!(result, "AmprR8§    func setupScannerCallback() {");
+    }
+
+    /// Audit (Fix 2): the new normalization must not interact badly with
+    /// multi-line input. A `+` prefix on a multi-line anchor should
+    /// still produce the front-loaded multi-line rejection, not silently
+    /// strip the marker and let the malformed anchor through to the
+    /// downstream `ANCHOR_NAME_REGEX` validator. The front-loaded error
+    /// is the actionable one; the regex error is the worst case.
+    #[test]
+    fn normalized_anchor_diff_marker_with_multiline_still_rejects_with_front_loaded_error() {
+        let raw = "+AXeX§line one\nAmprR8§line two";
+        let error = EditFileHandler::normalized_anchor("anchor", "test.swift", raw)
+            .expect_err("multi-line input must still be rejected");
+        assert!(
+            error.contains("Use 'anchor' + 'end_anchor'"),
+            "front-loaded JSON guidance must survive diff-marker normalization, got: {error}"
+        );
+        assert!(
+            error.contains("must contain exactly one source line"),
+            "got: {error}"
+        );
     }
 
     #[tokio::test]
@@ -7236,13 +7429,26 @@ edition = "2021"
             msg.contains("must contain exactly one source line"),
             "error must call out the multi-line anchor problem, got: {msg}"
         );
+        // The corrective JSON shape must be at the very front of the
+        // message so the model sees the right call pattern before any
+        // rejection rationale. Qwen in the live logs repeated the same
+        // multi-line paste 4 times because the previous error buried the
+        // anchor + end_anchor recipe three sentences deep.
         assert!(
-            msg.contains("Word§source"),
-            "error must teach the selector format, got: {msg}"
+            msg.contains("Use 'anchor' + 'end_anchor'"),
+            "error must front-load the anchor + end_anchor instruction, got: {msg}"
         );
         assert!(
             msg.contains("end_anchor"),
-            "error must point the model at the end_anchor solution for range replacements, got: {msg}"
+            "error must reference the end_anchor field name, got: {msg}"
+        );
+        assert!(
+            msg.contains("\"anchor\":"),
+            "error must include a JSON example with the anchor field, got: {msg}"
+        );
+        assert!(
+            msg.contains("Word§source"),
+            "error must teach the selector format, got: {msg}"
         );
     }
 

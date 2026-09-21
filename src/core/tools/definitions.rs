@@ -109,7 +109,7 @@ pub fn read_file_schema() -> ToolSchema {
                 name: "start_line",
                 required: false,
                 param_type: "integer",
-                description: "First line (default 1). Prefer reading full files or generous windows (100-200+ lines); narrow slices (<30 lines) frequently lack the enclosing scope and anchors needed for subsequent edits. For syntactic orientation, prefer get_file_skeleton.",
+                description: "First line (default 1). For files under ~1,000 lines, omit start_line and end_line to read the entire file in one turn. The whole-file read returns scope context (enclosing class, imports, function boundaries) in a single turn and avoids narrow-slice thrashing.",
                 items: None,
                 extra: None,
             },
@@ -117,7 +117,7 @@ pub fn read_file_schema() -> ToolSchema {
                 name: "end_line",
                 required: false,
                 param_type: "integer",
-                description: "Last line (default EOF). Pair with start_line; the read window is [start_line, end_line] inclusive. For multi-megabyte files, a 100-200 line window is a reasonable default; for brace / scope hunting, start with 50 lines and widen if anchors fail to resolve.",
+                description: "Last line (default EOF). Pair with start_line; the read window is [start_line, end_line] inclusive. Omit both to read to EOF.",
                 items: None,
                 extra: None,
             },
@@ -249,7 +249,7 @@ pub fn edit_file_schema() -> ToolSchema {
                                 },
                                 "end_anchor": {
                                     "type": "string",
-                                    "description": "Optional for a single-line replace; required for a range/fingerprint. Inclusive endpoint: copy one exact Word§source line from current read/edit output."
+                                    "description": "Inclusive endpoint for a multi-line range. WARNING: Everything between anchor and end_anchor is replaced by text. NEVER set end_anchor if you only want to modify or replace a single line (like a function signature). Omit end_anchor entirely for single-line replaces."
                                 },
                                 "start_line": {
                                     "type": "integer",
@@ -1085,15 +1085,31 @@ mod tests {
         assert!(
             properties["end_anchor"]["description"]
                 .as_str()
-                .is_some_and(
-                    |description| description.contains("Optional for a single-line replace")
-                )
+                .is_some_and(|description| description
+                    .contains("NEVER set end_anchor if you only want to modify or replace a single line")),
+            "end_anchor schema must warn against single-line use to prevent accidental 40-line range wipeouts"
         );
         assert!(!required.iter().any(|field| field == "edit_type"));
         assert!(!required.iter().any(|field| field == "anchor"));
         assert!(required.iter().any(|field| field == "text"));
         assert_eq!(properties["start_line"]["minimum"], 1);
         assert_eq!(properties["expected_text"]["type"], "string");
+
+        let read_file_schema = read_file_schema();
+        let read_props = read_file_schema.parameters;
+        let start_line_desc = read_props
+            .iter()
+            .find(|p| p.name == "start_line")
+            .expect("read_file should expose start_line")
+            .description;
+        assert!(
+            start_line_desc.contains("~1,000 lines"),
+            "read_file schema must recommend whole-file reads for files under 1,000 lines, got: {start_line_desc}"
+        );
+        assert!(
+            !start_line_desc.contains("<50 lines"),
+            "read_file schema must not advertise 50-line slice reads, got: {start_line_desc}"
+        );
         // Gemini rejects `required` on subschemas without type: object plus
         // locally-defined properties, so the schema must stay flat: no
         // anyOf/oneOf branches, with the anchor-vs-range either/or carried
@@ -1605,6 +1621,92 @@ mod tests {
         assert_ne!(
             select_tool_profile("Can you write a test for this?", "act"),
             ToolProfile::AnswerOnly
+        );
+    }
+
+    /// Audit (Fix 1): the `end_anchor` schema description must explicitly
+    /// warn against using `end_anchor` for single-line edits. Qwen's
+    /// 35-turn thrashing spiral in qwen1.log was triggered by one
+    /// catastrophic edit on turn 9: the model wanted to remove `private`
+    /// from `private func setupScannerCallback() {`, but supplied
+    /// `end_anchor` on a line 40 lines down. Sned's replace logic then
+    /// deleted the entire 40-line function body. The schema-level
+    /// warning is the first line of defense against this pattern: the
+    /// model sees the warning before it constructs the JSON.
+    #[test]
+    fn edit_file_schema_warns_against_single_line_end_anchor() {
+        let schema = edit_file_schema();
+        let file_items = schema.parameters[0]
+            .items
+            .as_ref()
+            .expect("files should define item schema");
+        // file_items here is the JSON Value of the items subschema. The
+        // `edits` field is itself a ToolSchema, so its `items` is the
+        // shape of each edit entry — i.e. the place where `end_anchor`,
+        // `anchor`, `text`, etc. are defined.
+        let items_value = file_items
+            .as_object()
+            .and_then(|obj| obj.get("properties"))
+            .and_then(|p| p.as_object())
+            .and_then(|props| props.get("edits"))
+            .and_then(|e| e.get("items"))
+            .expect("files.properties.edits should define an items subschema");
+        let edit_properties = items_value
+            .as_object()
+            .and_then(|obj| obj.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("edit items should define properties");
+        let end_anchor_desc = edit_properties
+            .get("end_anchor")
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str())
+            .expect("end_anchor description should be a string");
+        assert!(
+            end_anchor_desc.contains("WARNING"),
+            "end_anchor schema must lead with a WARNING, got: {end_anchor_desc}"
+        );
+        assert!(
+            end_anchor_desc.contains("Everything between anchor and end_anchor is replaced"),
+            "end_anchor schema must explain the destructive range semantics, got: {end_anchor_desc}"
+        );
+        assert!(
+            end_anchor_desc.contains("NEVER set end_anchor if you only want to modify or replace a single line"),
+            "end_anchor schema must explicitly forbid single-line use, got: {end_anchor_desc}"
+        );
+    }
+
+    /// Audit (Fix 6): the `read_file` `start_line` schema description
+    /// must recommend whole-file reads for files under 1,000 lines and
+    /// must NOT advertise 50-line slice reads. The 50-line slice advice
+    /// pushed models toward hunting for matching braces in narrow
+    /// windows, which is exactly the thrashing pattern the circuit
+    /// breaker now detects. The 1,000-line rule tells the model to
+    /// default to a single whole-file read that returns scope context
+    /// in one turn.
+    #[test]
+    fn read_file_schema_recommends_whole_file_reads_under_thousand_lines() {
+        let schema = read_file_schema();
+        let start_line = schema
+            .parameters
+            .iter()
+            .find(|p| p.name == "start_line")
+            .expect("read_file should expose start_line");
+        let desc = start_line.description;
+        assert!(
+            desc.contains("~1,000 lines"),
+            "read_file schema must recommend whole-file reads for files under 1,000 lines, got: {desc}"
+        );
+        assert!(
+            desc.contains("scope context"),
+            "read_file schema must explain why whole-file reads are better, got: {desc}"
+        );
+        assert!(
+            !desc.contains("<50 lines"),
+            "read_file schema must not advertise 50-line slice reads, got: {desc}"
+        );
+        assert!(
+            !desc.contains("Narrow slices"),
+            "read_file schema must not push the narrow-slice anti-pattern, got: {desc}"
         );
     }
 }

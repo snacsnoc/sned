@@ -2935,6 +2935,12 @@ async fn invalidate_restored_file_context(
             state.consecutive_reads.remove(&key);
             state.last_read_turn.remove(&key);
             state.recent_read_windows.remove(&key);
+            // A restored checkpoint wipes out the cumulative edit history
+            // too — the edit counts were tracked against the bytes the
+            // model just threw away. Without this, the next execute_command
+            // failure would surface an edit-thrashing diagnostic for
+            // edits that no longer exist on disk.
+            state.consecutive_edits.remove(&key);
             // A restored checkpoint invalidates the model's file snapshot. Require a
             // fresh read so reconciliation can bind anchors to the restored bytes.
             state.must_reread_before_edit.insert(key);
@@ -13575,5 +13581,50 @@ mod tests {
             "the row between two embedded newlines must be empty, got: {:?}",
             lines[1].spans
         );
+    }
+
+    /// Bug 1 (Audit): restoring a checkpoint must wipe `consecutive_edits`
+    /// alongside the three read-tracking maps. Otherwise the next
+    /// build failure after a restore would surface the thrashing
+    /// diagnostic for edits that no longer exist on disk — a false
+    /// positive that would push the model to act on stale context.
+    #[tokio::test]
+    async fn test_invalidate_restored_file_context_clears_consecutive_edits() {
+        use crate::core::agent_types::TaskState;
+        let inner_state = Arc::new(Mutex::new(TaskState::default()));
+        {
+            let mut guard = inner_state.lock().await;
+            // Simulate three successful edits to a file plus four reads.
+            guard
+                .consecutive_edits
+                .insert("/tmp/restored.c".to_string(), 3);
+            guard
+                .consecutive_reads
+                .insert("/tmp/restored.c".to_string(), 4);
+            guard
+                .last_read_turn
+                .insert("/tmp/restored.c".to_string(), 7);
+            let mut ring = std::collections::VecDeque::new();
+            ring.push_back((1, 50));
+            guard
+                .recent_read_windows
+                .insert("/tmp/restored.c".to_string(), ring);
+        }
+        let state_handle = Arc::new(Mutex::new(Some(Arc::clone(&inner_state))));
+        invalidate_restored_file_context(
+            &state_handle,
+            Path::new("/tmp"),
+            &["restored.c".to_string()],
+        )
+        .await;
+        let guard = inner_state.lock().await;
+        assert!(
+            guard.consecutive_edits.is_empty(),
+            "restored checkpoint must clear consecutive_edits, got: {:?}",
+            guard.consecutive_edits
+        );
+        assert!(guard.consecutive_reads.is_empty());
+        assert!(guard.last_read_turn.is_empty());
+        assert!(guard.recent_read_windows.is_empty());
     }
 }

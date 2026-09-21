@@ -407,6 +407,29 @@ impl ToolHandler for WriteToFileHandler {
                         entry.lines_added = entry.lines_added.saturating_add(lines_added);
                         state.file_context_tracker.files_in_context().to_vec()
                     };
+                    {
+                        // Phase 4b cleanup: mirror edit_file's per-file state
+                        // reset so the read-loop and edit-thrash detectors
+                        // see a coherent file. Without this, write_to_file
+                        // creates an asymmetry where full-rewrites leave
+                        // stale read windows + edit counts pointing at
+                        // pre-rewrite bytes. edit_file already does this in
+                        // its own Phase 4b; write_to_file must do the same
+                        // because it overwrites the file in one shot rather
+                        // than applying incremental edits.
+                        let mut state = ctx.state.lock().await;
+                        let key = crate::core::tools::canonical_path_key(&resolved_path);
+                        state.consecutive_reads.remove(&key);
+                        state.last_read_turn.remove(&key);
+                        state.recent_read_windows.remove(&key);
+                        // Increment consecutive_edits so a subsequent build
+                        // failure can surface the thrashing diagnostic.
+                        // Cleared by agent_loop when build/test succeeds, or
+                        // by invalidate_restored_file_context on checkpoint
+                        // restore.
+                        let count = state.consecutive_edits.entry(key).or_insert(0);
+                        *count += 1;
+                    }
                     let task_id = ctx.task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         if let Ok(storage) =
@@ -1263,5 +1286,80 @@ mod tests {
 
         let on_disk = std::fs::read_to_string(workspace_root.path().join("guide.md")).unwrap();
         assert_eq!(on_disk, "# Doc\n```rust\nfn inner() {}\n```\n");
+    }
+
+    /// Bug 3 (Audit): write_to_file must mirror edit_file's Phase 4b
+    /// cleanup. After a successful write, the three read-tracking maps
+    /// (consecutive_reads, last_read_turn, recent_read_windows) must be
+    /// cleared for the written file, AND consecutive_edits must be
+    /// incremented so a subsequent build failure can surface the
+    /// thrashing diagnostic. Without this, full-rewrites leave stale
+    /// state pointing at pre-rewrite bytes.
+    #[tokio::test]
+    async fn test_write_to_file_phase_4b_clears_read_state_and_increments_consecutive_edits() {
+        let workspace_root = TempDir::new().unwrap();
+        let file_path = workspace_root.path().join("target.c");
+        std::fs::write(&file_path, "int original(void) { return 0; }\n").unwrap();
+
+        let handler = WriteToFileHandler::new();
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        // Seed stale read/edit state for this file.
+        {
+            let mut guard = state.lock().await;
+            let key = crate::core::tools::canonical_path_key(&file_path);
+            guard.consecutive_reads.insert(key.clone(), 5);
+            guard.last_read_turn.insert(key.clone(), 3);
+            let mut ring = std::collections::VecDeque::new();
+            ring.push_back((1, 50));
+            ring.push_back((60, 100));
+            guard.recent_read_windows.insert(key.clone(), ring);
+            // Pre-existing edits so we can verify increment (not just set).
+            guard.consecutive_edits.insert(key, 2);
+        }
+        let anchor_mgr = AnchorStateManager::new();
+        let ctx = ToolContext::new(
+            std::sync::Arc::clone(&state),
+            None,
+            workspace_root.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "write-phase4b-task".to_string(),
+            None,
+            false,
+            std::sync::Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        );
+        let params = serde_json::json!({
+            "path": file_path.to_str().unwrap(),
+            "content": "int rewritten(void) { return 42; }\n"
+        });
+        let result = ToolHandler::execute(&handler, &ctx, params)
+            .await
+            .expect("write_to_file should succeed");
+        assert!(result.as_str().unwrap().contains("Successfully wrote to"));
+
+        // Phase 4b cleanup must have fired for the canonical key.
+        let guard = state.lock().await;
+        let key = crate::core::tools::canonical_path_key(&file_path);
+        assert!(
+            !guard.consecutive_reads.contains_key(&key),
+            "consecutive_reads must be cleared after a successful write, got: {:?}",
+            guard.consecutive_reads
+        );
+        assert!(
+            !guard.last_read_turn.contains_key(&key),
+            "last_read_turn must be cleared after a successful write"
+        );
+        assert!(
+            !guard.recent_read_windows.contains_key(&key),
+            "recent_read_windows must be cleared after a successful write"
+        );
+        // consecutive_edits must have been incremented from 2 to 3.
+        assert_eq!(
+            guard.consecutive_edits.get(&key).copied(),
+            Some(3),
+            "consecutive_edits must be incremented after a successful write, got: {:?}",
+            guard.consecutive_edits
+        );
     }
 }

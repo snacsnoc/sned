@@ -175,6 +175,13 @@ pub struct TaskState {
     /// narrow-slice thrashing versus legitimate sequential scanning.
     pub recent_read_windows:
         std::collections::HashMap<String, std::collections::VecDeque<(usize, usize)>>,
+    /// Number of consecutive successful edits per file with no intervening
+    /// successful build/test run. When an execute_command result indicates
+    /// a build failure and any value in this map is ≥3, the agent_loop
+    /// surfaces an edit-compile thrashing diagnostic instructing the model
+    /// to step back and review the full diff instead of making localized
+    /// line edits in a loop. Cleared on any successful build/test result.
+    pub consecutive_edits: std::collections::HashMap<String, u32>,
     /// Number of tool calls executed in the current turn (for subagent result reporting).
     pub turn_tool_calls: u32,
     /// Cumulative total tool calls across all turns in the session (never
@@ -257,6 +264,7 @@ impl Default for TaskState {
             consecutive_reads: std::collections::HashMap::new(),
             last_read_turn: std::collections::HashMap::new(),
             recent_read_windows: std::collections::HashMap::new(),
+            consecutive_edits: std::collections::HashMap::new(),
             plan_state: None,
             last_injected_plan_state_hash: None,
             denied_tool_actions: Vec::new(),

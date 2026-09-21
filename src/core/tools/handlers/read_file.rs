@@ -1034,8 +1034,11 @@ impl ReadFileHandler {
                     // Record the window for this turn so the diagnostic warning
                     // can surface thrashing vs. sequential scanning. The buffer
                     // is capped at MAX_TRACKED_READ_WINDOWS to bound memory
-                    // growth across long sessions.
-                    let window = (start_line.unwrap_or(1), end_line.unwrap_or(0));
+                    // growth across long sessions. Unbounded (EOF) reads are
+                    // stored with `usize::MAX` as the upper bound so the
+                    // overlap and cluster detectors can recognize them
+                    // instead of treating them as zero-span slices.
+                    let window = (start_line.unwrap_or(1), end_line.unwrap_or(usize::MAX));
                     let ring = state
                         .recent_read_windows
                         .entry(canonical.to_string())
@@ -1119,30 +1122,41 @@ impl ReadFileHandler {
                 }
                 let lookup_key = res.canonical_path.as_deref().unwrap_or(path_str);
                 let count = state.consecutive_reads.get(lookup_key).copied().unwrap_or(0);
-                (count >= 3).then(|| {
-                    let windows = state.recent_read_windows.get(lookup_key);
-                    let recent: Vec<(usize, usize)> = windows
-                        .map(|ring| ring.iter().copied().collect())
-                        .unwrap_or_default();
-                    // Distinguish narrow-slice thrashing (high overlap) from
-                    // legitimate sequential scanning (low overlap). Only nag
-                    // when the model is repeating itself — sequential readers
-                    // see unique windows with no overlap.
-                    let overlap = detect_high_overlap(&recent);
-                    let recent_str = if recent.is_empty() {
-                        "(no windows recorded)".to_string()
-                    } else {
-                        format_windows(&recent)
-                    };
-                    if overlap {
-                        format!(
-                            "Warning: {path_str} has been read {count} times consecutively with overlapping slices (recent windows: {recent_str}). You appear to be searching for a syntax or scope boundary. Stop reading narrow slices: call read_file with paths: [\"{path_str}\"] (omit start_line/end_line) to load the full file in one turn, OR run get_file_skeleton to see class and function boundaries at a glance."
-                        )
-                    } else {
-                        format!(
-                            "Warning: {path_str} has been read {count} times consecutively without edits (recent windows: {recent_str}). If you have the anchors you need, call edit_file now."
-                        )
-                    }
+                if count < 3 {
+                    return None;
+                }
+                let windows = state.recent_read_windows.get(lookup_key);
+                let recent: Vec<(usize, usize)> = windows
+                    .map(|ring| ring.iter().copied().collect())
+                    .unwrap_or_default();
+                let overlap = detect_high_overlap(&recent);
+                let clustered = detect_center_clustering(&recent, 100);
+                let sequential = is_sequential_forward(&recent);
+                // Tier 1 — thrashing: overlapping slices OR centers
+                // clustered within a narrow region. The model is hunting
+                // inside a single region; push it back to a whole-file
+                // read. `detect_center_clustering` covers the case the
+                // 50%-overlap rule missed in the live logs (Qwen's
+                // 575-600 / 580-650 / 800-EOF pattern had only 25% overlap
+                // but centers within 50 lines of each other).
+                let thrashing = overlap || clustered;
+                // Tier 3 — silent suppression for legitimate pagination.
+                if !thrashing && sequential {
+                    return None;
+                }
+                let recent_str = if recent.is_empty() {
+                    "(no windows recorded)".to_string()
+                } else {
+                    format_windows(&recent)
+                };
+                Some(if thrashing {
+                    format!(
+                        "Warning: {path_str} has been read {count} times consecutively in a narrow region (recent windows: {recent_str}). Stop reading narrow slices: call read_file with paths: [\"{path_str}\"] (omit start_line/end_line) to load the full file in one turn."
+                    )
+                } else {
+                    format!(
+                        "Warning: {path_str} has been read {count} times consecutively without edits (recent windows: {recent_str}). If you have the anchors you need, call edit_file now."
+                    )
                 })
             })
             .collect()
@@ -1197,11 +1211,14 @@ fn format_windows(windows: &[(usize, usize)]) -> String {
     parts.join(", ")
 }
 
-/// Detect narrow-slice thrashing: returns true when any two windows in the
-/// ring buffer overlap by ≥50% of the smaller window's span. Sequential
-/// forward scans (1–100, 101–200, 201–300) have zero overlap and pass;
-/// fetching 575–600 then 590–610 has ~83% overlap of the smaller window
-/// and triggers the thrashing diagnostic.
+/// Detect narrow-slice thrashing: returns true when any two bounded
+/// windows in the ring buffer overlap by ≥50% of the smaller window's
+/// span. Sequential forward scans (1–100, 101–200, 201–300) have zero
+/// overlap and pass; fetching 575–600 then 590–610 has ~83% overlap of
+/// the smaller window and triggers the thrashing diagnostic. Unbounded
+/// reads (`e == usize::MAX`) are skipped because their span arithmetic
+/// would overflow at usize boundary and their intersection with any
+/// bounded window would always appear to fully overlap.
 fn detect_high_overlap(windows: &[(usize, usize)]) -> bool {
     if windows.len() < 2 {
         return false;
@@ -1210,6 +1227,11 @@ fn detect_high_overlap(windows: &[(usize, usize)]) -> bool {
         for j in (i + 1)..windows.len() {
             let (a_start, a_end) = windows[i];
             let (b_start, b_end) = windows[j];
+            // Skip unbounded reads — their overlap with anything is
+            // unmeasurable.
+            if a_end == usize::MAX || b_end == usize::MAX {
+                continue;
+            }
             let span_a = a_end.saturating_sub(a_start);
             let span_b = b_end.saturating_sub(b_start);
             let smaller_span = span_a.min(span_b);
@@ -1218,12 +1240,74 @@ fn detect_high_overlap(windows: &[(usize, usize)]) -> bool {
             }
             let intersection = a_start.max(b_start)..a_end.min(b_end);
             let intersection_size = intersection.end.saturating_sub(intersection.start);
-            if intersection_size * 2 >= smaller_span {
+            if intersection_size.saturating_mul(2) >= smaller_span {
                 return true;
             }
         }
     }
     false
+}
+
+/// Detect window-center clustering: returns true when two non-EOF windows
+/// have their centers within `gap` lines of each other, indicating the
+/// model is hunting inside a narrow region of the file rather than scanning
+/// the whole file. Unbounded reads (e == usize::MAX) are excluded because
+/// their center is meaningless (it'd be `usize::MAX/2`). The check is
+/// order-independent — we sort by center first so out-of-order ring buffer
+/// entries don't fool us. This complements `detect_high_overlap`: a model
+/// that reads (550, 590) then (580, 650) has only 25% overlap of the
+/// smaller window, which `detect_high_overlap` rejects, but the centers
+/// are 45 lines apart and the model is clearly lost.
+fn detect_center_clustering(windows: &[(usize, usize)], gap: usize) -> bool {
+    let mut centers: Vec<usize> = windows
+        .iter()
+        .filter_map(|&(s, e)| {
+            if e == usize::MAX || e < s {
+                None
+            } else {
+                Some((s + e) / 2)
+            }
+        })
+        .collect();
+    if centers.len() < 2 {
+        return false;
+    }
+    centers.sort_unstable();
+    centers
+        .windows(2)
+        .any(|pair| pair[1].saturating_sub(pair[0]) <= gap)
+}
+
+/// Detect the legitimate pagination pattern: each window's start is `>=`
+/// the previous window's end + 1, scanning forward through the file in
+/// order. Unbounded (EOF) reads must STILL satisfy the contiguity check —
+/// the previous version returned early whenever `next_end == usize::MAX`,
+/// which silently classified overlapping EOF reads as sequential and let
+/// the model bypass the circuit breaker (e.g. (500, 600) then (550, MAX)
+/// walks backward). The contiguity check now runs for every pair. Empty or
+/// single-window inputs return true so the caller does not suppress on
+/// degenerate data.
+fn is_sequential_forward(windows: &[(usize, usize)]) -> bool {
+    if windows.len() < 2 {
+        return true;
+    }
+    // Sort by start so out-of-order ring buffer entries don't fool us.
+    let mut sorted: Vec<(usize, usize)> = windows.to_vec();
+    sorted.sort_by_key(|&(s, _)| s);
+    for pair in sorted.windows(2) {
+        let (prev_start, prev_end) = pair[0];
+        let (next_start, next_end) = pair[1];
+        // `prev_end + 1` lets adjacent windows (1–100, 101–200) qualify;
+        // strictly overlapping windows fall through and trigger the
+        // warning. `next_end` is intentionally unused — see the doc
+        // comment above for why the contiguity check must run for ALL
+        // pairs, including those whose second element is `usize::MAX`.
+        if next_start < prev_end.saturating_add(1) {
+            return false;
+        }
+        let _ = (prev_start, next_end);
+    }
+    true
 }
 
 impl ToolHandler for ReadFileHandler {
@@ -2535,7 +2619,7 @@ mod tests {
                 .expect("thrash read should succeed");
             if turn == 3 {
                 assert!(
-                    output.contains("overlapping slices"),
+                    output.contains("in a narrow region"),
                     "third cross-turn overlapping read should fire the thrash warning, got: {output}"
                 );
                 assert!(
@@ -2543,8 +2627,8 @@ mod tests {
                     "warning must surface the recent windows so the model can self-diagnose, got: {output}"
                 );
                 assert!(
-                    output.contains("get_file_skeleton"),
-                    "warning must point the model at the structural tool, got: {output}"
+                    !output.contains("get_file_skeleton"),
+                    "warning must not steer the model at a tool that may not support this language, got: {output}"
                 );
             }
         }
@@ -2565,7 +2649,7 @@ mod tests {
                 .await
                 .expect("sequential read should succeed");
             assert!(
-                !output.contains("overlapping slices"),
+                !output.contains("in a narrow region"),
                 "sequential forward scanning must not trigger the thrash warning, got: {output}"
             );
         }
@@ -2652,5 +2736,146 @@ mod tests {
             "unique lines must remain unannotated: {}",
             result.content
         );
+    }
+
+    /// Audit (Gap A.1): an EOF-bounded read must NEVER be classified as a
+    /// narrow slice. The previous `all_narrow` formulation treated
+    /// `e == usize::MAX` as narrow, so a model reading the entire file
+    /// three times in a row would receive the "Stop reading narrow slices"
+    /// directive — a false-positive that would push the model off the
+    /// recommended pattern. The circuit breaker directive must not fire
+    /// on EOF reads; the generic "without edits" nag may fire because
+    /// three identical re-reads of the same file is unusual regardless of
+    /// slice size, but the loud "Stop reading narrow slices" call-to-action
+    /// must be reserved for genuinely thrashing patterns.
+    #[tokio::test]
+    async fn test_three_consecutive_eof_reads_do_not_trigger_circuit_breaker() {
+        use crate::core::agent_types::TaskState;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for i in 1..=200 {
+            writeln!(temp_file, "line {i}").unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let mut state = TaskState::default();
+
+        for turn in 1..=3 {
+            state.turns_completed = turn;
+            let params = serde_json::json!({
+                "paths": [temp_file.path().to_str().unwrap()],
+            });
+            let output = handler
+                .execute(&mut state, params, &anchor_mgr, Some("eof-task"), None)
+                .await
+                .expect("full file read should succeed");
+            assert!(
+                !output.contains("Stop reading narrow slices"),
+                "EOF reads must never trigger the circuit breaker directive, got: {output}"
+            );
+            assert!(
+                !output.contains("in a narrow region"),
+                "EOF reads must never be classified as thrashing, got: {output}"
+            );
+        }
+    }
+
+    /// Audit (Gap A.2): narrow slices with centers within 100 lines of
+    /// each other but no ≥50% overlap should fire the circuit breaker
+    /// (Tier 1 — thrashing). Models in the live logs alternated between
+    /// (550–590) and (580–650) on the same file; overlap is only 25% but
+    /// the centers are clustered and the model is clearly hunting.
+    #[tokio::test]
+    async fn test_circuit_breaker_fires_on_center_clustering_without_overlap() {
+        use crate::core::agent_types::TaskState;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        for i in 1..=2000 {
+            writeln!(temp_file, "line {i}").unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let handler = ReadFileHandler::new();
+        let anchor_mgr = AnchorStateManager::new();
+        let mut state = TaskState::default();
+
+        let windows = [(550, 590), (580, 650), (800, usize::MAX)];
+        for (idx, (start, end)) in windows.iter().enumerate() {
+            state.turns_completed = (idx + 1) as u32;
+            let params = if *end == usize::MAX {
+                serde_json::json!({
+                    "paths": [temp_file.path().to_str().unwrap()],
+                    "start_line": start,
+                })
+            } else {
+                serde_json::json!({
+                    "paths": [temp_file.path().to_str().unwrap()],
+                    "start_line": start,
+                    "end_line": end,
+                })
+            };
+            let output = handler
+                .execute(&mut state, params, &anchor_mgr, Some("cluster-task"), None)
+                .await
+                .expect("cluster read should succeed");
+            if idx == 2 {
+                assert!(
+                    output.contains("in a narrow region"),
+                    "clustered slices must fire the circuit breaker, got: {output}"
+                );
+                assert!(
+                    output.contains("omit start_line/end_line"),
+                    "circuit breaker must direct the model at the whole-file read, got: {output}"
+                );
+                assert!(
+                    !output.contains("get_file_skeleton"),
+                    "warning must not steer the model at an unsupported tool, got: {output}"
+                );
+            }
+        }
+    }
+
+    /// Audit (Gap A.3): the previous `is_sequential_forward` returned
+    /// early whenever `next_end == usize::MAX`, which let an overlapping
+    /// (550, MAX) after (500, 600) be classified as pagination. The fix
+    /// enforces `next_start >= prev_end + 1` for all pairs.
+    #[test]
+    fn is_sequential_forward_rejects_overlapping_eof_window() {
+        // Pagination that legitimately includes an EOF read at the end.
+        assert!(is_sequential_forward(&[(1, 100), (101, 200), (201, usize::MAX)]));
+        // EOF read that walks backward over the previous window — hunt.
+        assert!(!is_sequential_forward(&[(500, 600), (550, usize::MAX)]));
+        // EOF read that jumps forward — still pagination.
+        assert!(is_sequential_forward(&[(1, 100), (200, usize::MAX)]));
+    }
+
+    /// Audit (Gap A.4): unit test on the center-clustering helper itself.
+    #[test]
+    fn detect_center_clustering_classifies_patterns() {
+        // Two windows with centers 50 lines apart — clustered.
+        assert!(detect_center_clustering(&[(550, 590), (580, 650)], 100));
+        // Three windows with centers 50, 50, 50 apart — clustered.
+        assert!(detect_center_clustering(
+            &[(550, 590), (580, 650), (700, 760)],
+            100
+        ));
+        // Centers 400 lines apart — not clustered.
+        assert!(!detect_center_clustering(&[(1, 50), (400, 450)], 100));
+        // Centers 800 lines apart — not clustered.
+        assert!(!detect_center_clustering(
+            &[(1, 50), (400, 450), (1200, 1250)],
+            100
+        ));
+        // EOF read mixed in — center ignored, only bounded centers matter.
+        assert!(detect_center_clustering(
+            &[(550, 590), (580, 650), (800, usize::MAX)],
+            100
+        ));
+        // Single window — no clustering possible.
+        assert!(!detect_center_clustering(&[(1, 100)], 100));
+        // Empty — no clustering possible.
+        assert!(!detect_center_clustering(&[], 100));
     }
 }
