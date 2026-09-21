@@ -1261,7 +1261,7 @@ fn detect_high_overlap(windows: &[(usize, usize)]) -> bool {
 }
 
 /// Detect window-center clustering: returns true when two non-EOF windows
-/// have their centers within `gap` lines of each other, indicating the
+/// have their centers fewer than `gap` lines apart, indicating the
 /// model is hunting inside a narrow region of the file rather than scanning
 /// the whole file. Unbounded reads (e == usize::MAX) are excluded because
 /// their center is meaningless (it'd be `usize::MAX/2`). The check is
@@ -1277,7 +1277,7 @@ fn detect_center_clustering(windows: &[(usize, usize)], gap: usize) -> bool {
             if e == usize::MAX || e < s {
                 None
             } else {
-                Some((s + e) / 2)
+                Some((s / 2) + (e / 2) + ((s % 2 + e % 2) / 2))
             }
         })
         .collect();
@@ -1287,7 +1287,7 @@ fn detect_center_clustering(windows: &[(usize, usize)], gap: usize) -> bool {
     centers.sort_unstable();
     centers
         .windows(2)
-        .any(|pair| pair[1].saturating_sub(pair[0]) <= gap)
+        .any(|pair| pair[1].saturating_sub(pair[0]) < gap)
 }
 
 /// Detect the legitimate pagination pattern: each window's start is `>=`
@@ -2892,6 +2892,9 @@ mod tests {
         ));
         // Centers 400 lines apart — not clustered.
         assert!(!detect_center_clustering(&[(1, 50), (400, 450)], 100));
+        // Adjacent pagination whose centers are exactly at the threshold is
+        // not clustered; this keeps a 1–100, 101–200 scan out of the warning.
+        assert!(!detect_center_clustering(&[(1, 100), (101, 200)], 100));
         // Centers 800 lines apart — not clustered.
         assert!(!detect_center_clustering(
             &[(1, 50), (400, 450), (1200, 1250)],
