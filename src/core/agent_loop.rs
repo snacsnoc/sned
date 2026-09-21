@@ -1392,6 +1392,212 @@ impl AgentLoop {
     /// 6. Append tool results
     /// 7. Repeat until complete, cancelled, or max turns reached
     ///
+    /// Circuit breaker for the failure loop where a model retries a
+    /// rejected `edit_file` batch over and over against the same file
+    /// without ever producing a successful write. Live logs (miniMAX-M3
+    /// on SDRSkeleton) showed the model holding 241 retries of the
+    /// same 3-edit batch with the same off-by-one anchor — the
+    /// `consecutive_edits` counter only grows on Phase 4b commit, so
+    /// the build-failure path never fires for validation rejections.
+    /// This tracker complements that: every rejected edit_file increments
+    /// `consecutive_edit_failures[path]`; once any file hits the
+    /// threshold (5) we surface a diagnostic that names the file, says
+    /// the model is reusing a broken anchor pattern, and tells it to
+    /// re-read the file before the next attempt. The threshold is
+    /// intentionally higher than the (later) build-failure breaker's 3
+    /// because validation errors are normal on a file's first read; the
+    /// danger pattern is sustained retry without success.
+    async fn maybe_emit_edit_failure_diagnostic(
+        state: &Arc<Mutex<TaskState>>,
+        output_writer: &crate::cli::output::OutputWriterArc,
+    ) {
+        const FAILURE_LOOP_THRESHOLD: u32 = 5;
+        let snapshot: Vec<(String, u32)> = {
+            let guard = state.lock().await;
+            guard
+                .consecutive_edit_failures
+                .iter()
+                .filter_map(|(path, &count)| {
+                    if count >= FAILURE_LOOP_THRESHOLD {
+                        Some((path.clone(), count))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        if snapshot.is_empty() {
+            return;
+        }
+        use crate::cli::output::OutputEvent;
+        use crate::cli::tui::theme::WARNING_FG;
+        use ratatui::style::Style;
+        for (path, count) in snapshot {
+            let note = format!(
+                "--- Note (Edit Retry Circuit Breaker) ---\nFile '{path}' has had {count} consecutive failed edit_file attempts. The same broken anchor/format pattern is being reused. STOP retrying with the same anchors. Re-read the file with read_file (the anchor prefixes may have rotated or shifted) and verify each anchor's prefix matches the exact source line you intend to edit. Multi-line replacements must use anchor + end_anchor, not a multi-line `anchor` field."
+            );
+            output_writer.emit(OutputEvent::tool_output_line(
+                note,
+                Style::default().fg(WARNING_FG),
+            ));
+        }
+    }
+
+    /// Heuristic: does this `execute_command` invocation look like a
+    /// build or test runner? Used by the failure-loop circuit breaker to
+    /// decide when a successful command is independent confirmation that
+    /// the on-disk code is no longer in a thrashing state. Must NOT
+    /// match `git diff`, `ls`, `wc`, `awk`, etc. — those count as
+    /// inspection, not progress, and a successful inspection should
+    /// never reset the failure counter (otherwise the diagnostic becomes
+    /// toothless the moment the model follows its own advice to run
+    /// `git diff`).
+    fn looks_like_build_or_test_command(tool_params: &serde_json::Value) -> bool {
+        // Pull the first entry from `commands[]` OR the `script` string.
+        // Both shapes are documented in the execute_command schema.
+        let first = tool_params
+            .get("commands")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .or_else(|| tool_params.get("script").and_then(|v| v.as_str()));
+        let Some(line) = first else { return false };
+        let mut tokens = line.split_whitespace();
+        let Some(bin) = tokens.next() else { return false };
+        // Strip path prefix so /usr/local/bin/cargo and ./node_modules/.bin/jest
+        // classify the same as the bare tool name.
+        let basename = bin.rsplit(['/', '\\']).next().unwrap_or(bin);
+        match basename {
+            "cargo" => matches!(
+                tokens.next().map(str::as_ref),
+                Some(
+                    "build"
+                        | "test"
+                        | "check"
+                        | "bench"
+                        | "run"
+                        | "clippy"
+                        | "fmt"
+                        | "rustc"
+                )
+            ),
+            "rustc" => true,
+            "swift" => matches!(
+                tokens.next().map(str::as_ref),
+                Some("build" | "test" | "run" | "compile")
+            ),
+            "xcodebuild" | "xcrun" => true,
+            "npm" | "pnpm" | "yarn" => matches!(
+                tokens.next().map(str::as_ref),
+                Some("run" | "test" | "build" | "lint" | "typecheck")
+            ),
+            "make" | "gmake" => true,
+            "go" => matches!(
+                tokens.next().map(str::as_ref),
+                Some("build" | "test" | "vet" | "run")
+            ),
+            "pytest" | "tox" => true,
+            "mvn" => true,
+            "gradle" | "gradlew" => true,
+            "ant" => true,
+            "cmake" => true,
+            "tsc" => true,
+            "jest" | "vitest" | "mocha" => true,
+            "rspec" | "cucumber" => true,
+            "dotnet" => matches!(
+                tokens.next().map(str::as_ref),
+                Some("build" | "test" | "run")
+            ),
+            _ => false,
+        }
+    }
+
+    /// Tools whose execution keeps the read-loop state alive. The model
+    /// alternates between slicing a file and probing its surroundings
+    /// (compile errors, shell greps, file listings, symbol lookups) — that
+    /// is the SAME investigation phase, not a fresh task. Wiping on every
+    /// non-read_file tool was the root cause of the live-log failure mode
+    /// where the model did 9 narrow slices of `MetalWaterfallView.swift`
+    /// (with intervening execute_command Python brace-depth scripts and
+    /// `xcodebuild` greps) and the read-loop circuit breaker never fired,
+    /// because each non-read tool reset `consecutive_reads` back to 1.
+    /// Inspection tools include anything that reads from disk or the
+    /// workspace and does not mutate state.
+    const READ_LOOP_INSPECTION_TOOLS: &'static [&'static str] = &[
+        "read_file",
+        "search_files",
+        "list_files",
+        "get_function",
+        "get_file_skeleton",
+        "find_symbol_references",
+        "diagnostics_scan",
+        "execute_command",
+        "web_fetch",
+        "condense",
+    ];
+
+    /// Mutating tools whose own Phase 4b commit handles per-file cleanup
+    /// on success. Wiping the read-loop counters here is the right
+    /// semantic: a successful write resets the file's content and the
+    /// read-tracking for it must start fresh. A failed write must NOT
+    /// wipe because (a) the file on disk did not change and (b) the
+    /// per-file counter is what the edit-retry diagnostic in
+    /// `maybe_emit_edit_failure_diagnostic` uses; clearing it on every
+    /// failure would defeat that path.
+    ///
+    /// The wipe runs unconditionally for these tools; success/failure
+    /// does not gate it because both states reset the model's mental
+    /// model of the file — success because the bytes changed, failure
+    /// because the model must plan a new approach. (The edit-failure
+    /// counter is a SEPARATE map, `consecutive_edit_failures`, and is
+    /// NOT touched here.)
+    const READ_LOOP_MUTATING_TOOLS: &'static [&'static str] = &[
+        "edit_file",
+        "write_to_file",
+        "replace_symbol",
+        "rename_symbol",
+    ];
+
+    /// Read-loop decay applied between tool calls. Inspection tools
+    /// keep state alive (the model is still investigating). Mutating
+    /// tools reset state (the file's content changed or the model's
+    /// plan must pivot). Unknown tools apply a 2-turn cooldown via
+    /// `last_read_turn` (which is updated on every read with the
+    /// current `turns_completed`) so the detector eventually forgets
+    /// files the model abandoned. The `READ_LOOP_INSPECTION_TOOLS`
+    /// allowlist is the fix for the live-log regression where every
+    /// `execute_command` silently reset the detector.
+    fn decay_read_loop_state(state: &mut TaskState, tool_name: &str) {
+        if Self::READ_LOOP_INSPECTION_TOOLS.contains(&tool_name) {
+            return;
+        }
+        if Self::READ_LOOP_MUTATING_TOOLS.contains(&tool_name) {
+            state.consecutive_reads.clear();
+            state.last_read_turn.clear();
+            state.recent_read_windows.clear();
+            return;
+        }
+        // Unknown tool: apply a 2-turn cooldown. If the model hasn't
+        // touched any tracked file for 2 turns, the next read will see
+        // `last_read_turn[curr_path] != current_turn - 1`, which would
+        // otherwise continue accumulating the count past the natural
+        // investigation boundary. We approximate this by clearing when
+        // the most recent read turn is more than 1 behind current.
+        let current_turn = state.turns_completed;
+        let mut abandon = false;
+        for (_, last) in state.last_read_turn.iter() {
+            if current_turn.saturating_sub(*last) > 1 {
+                abandon = true;
+                break;
+            }
+        }
+        if abandon {
+            state.consecutive_reads.clear();
+            state.last_read_turn.clear();
+            state.recent_read_windows.clear();
+        }
+    }
+
     async fn record_task_history(&self, state_manager: &Arc<StateManager>, task_text: &str) {
         let workspace_root_str = self.resolve_workspace_root().to_str().map(String::from);
         let state_guard = self.state.lock().await;
@@ -3514,14 +3720,19 @@ impl AgentLoop {
                     continue;
                 }
 
-                // A read-loop warning is meaningful only when read_file calls
-                // are adjacent tool actions; unrelated work resets that
-                // state before the next read can be counted.
-                if tool_name != "read_file" {
+                // Read-loop state decay. The blanket `tool_name != "read_file"`
+                // wipe that lived here previously silently reset
+                // `consecutive_reads` on every `execute_command`, which made
+                // the circuit breaker useless the moment the model interleaved
+                // reads with shell commands — the exact pattern that hit
+                // miniMAX-M3 on SDRSkeleton (9 narrow reads with intervening
+                // `xcodebuild` greps and a Python brace-depth script, no
+                // diagnostic ever fired). Inspection tools keep state alive;
+                // mutating tools reset state. See `decay_read_loop_state`
+                // for the full classification.
+                {
                     let mut state = self.state.lock().await;
-                    state.consecutive_reads.clear();
-                    state.last_read_turn.clear();
-                    state.recent_read_windows.clear();
+                    Self::decay_read_loop_state(&mut state, &tool_name);
                 }
 
                 let tool_id = prepared.tool_id.clone();
@@ -4192,7 +4403,44 @@ impl AgentLoop {
                                         Style::default().fg(ERROR_FG),
                                     ));
                             }
+                            // Failure-loop circuit breaker: when the model
+                            // retries a rejected edit_file batch against
+                            // the same file repeatedly without ever
+                            // producing a successful write, the build
+                            // breaker (which needs consecutive_edits ≥ 3)
+                            // stays silent. Track per-file rejection
+                            // counts so we can surface a "stop retrying,
+                            // re-read the file" diagnostic before the
+                            // model burns another dozen turns on an
+                            // off-by-one anchor or a multi-line `anchor`
+                            // field. Mirrors the comment block on
+                            // `consecutive_edit_failures` in agent_types.rs.
+                            {
+                                let mut state = self.state.lock().await;
+                                for path in &edit_file_path {
+                                    let count = state
+                                        .consecutive_edit_failures
+                                        .entry(path.normalized.clone())
+                                        .or_insert(0);
+                                    *count += 1;
+                                }
+                            }
+                            Self::maybe_emit_edit_failure_diagnostic(
+                                &self.state,
+                                &self.config.output_writer,
+                            )
+                            .await;
                         } else {
+                            // Successful edit clears the failure counter
+                            // for every file touched so a future
+                            // failure-loop can be detected from a clean
+                            // baseline.
+                            {
+                                let mut state = self.state.lock().await;
+                                for path in &edit_file_path {
+                                    state.consecutive_edit_failures.remove(&path.normalized);
+                                }
+                            }
                             for preview in edit_result_diff_previews(&result_output.text) {
                                 for mut line in
                                     crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&preview)
@@ -4227,6 +4475,20 @@ impl AgentLoop {
                             self.config
                                 .output_writer
                                 .emit(OutputEvent::tool_output_line(line.text, style));
+                        }
+                        // Clear the failure-loop counter on a successful
+                        // build/test run. We don't gate on `is_error`
+                        // because the diagnostic only fires after 5
+                        // consecutive rejections, and a passing build is
+                        // independent confirmation that the on-disk code
+                        // is no longer in a thrashing state — whether or
+                        // not the diagnostic fired. `git diff` and other
+                        // non-build commands must NOT clear the counter
+                        // (a model following the diagnostic's own advice
+                        // shouldn't reset it).
+                        if !is_error && Self::looks_like_build_or_test_command(&tool_params) {
+                            let mut state = self.state.lock().await;
+                            state.consecutive_edit_failures.clear();
                         }
                     } else if !matches!(
                         tool_name.as_str(),
@@ -7176,6 +7438,318 @@ Irrespective of whether additional information or instructions are given, you ar
         assert_eq!(state.consecutive_mistakes, 0);
         assert!(!state.is_cancelled);
         assert!(!state.did_complete_reading_stream);
+        assert!(state.consecutive_edit_failures.is_empty());
+    }
+
+    /// Read-loop decay: inspection tools MUST keep state alive. The
+    /// live-log regression on SDRSkeleton was caused by the blanket
+    /// `tool_name != "read_file"` wipe silently resetting
+    /// `consecutive_reads` on every `execute_command` call — so the
+    /// detector never tripped even after 9 narrow reads interleaved
+    /// with shell commands.
+    #[test]
+    fn decay_read_loop_state_keeps_state_for_inspection_tools() {
+        let mut state = TaskState::default();
+        state.turns_completed = 5;
+        state
+            .consecutive_reads
+            .insert("/tmp/foo.c".to_string(), 3);
+        state
+            .last_read_turn
+            .insert("/tmp/foo.c".to_string(), 4);
+        let mut ring = std::collections::VecDeque::new();
+        ring.push_back((370, 410));
+        ring.push_back((380, 403));
+        ring.push_back((340, 400));
+        state
+            .recent_read_windows
+            .insert("/tmp/foo.c".to_string(), ring);
+        for tool in &[
+            "execute_command",
+            "search_files",
+            "list_files",
+            "get_function",
+            "get_file_skeleton",
+            "find_symbol_references",
+            "diagnostics_scan",
+            "web_fetch",
+            "condense",
+            "read_file",
+        ] {
+            AgentLoop::decay_read_loop_state(&mut state, tool);
+            assert_eq!(
+                state.consecutive_reads.get("/tmp/foo.c").copied(),
+                Some(3),
+                "{tool} must preserve consecutive_reads, got: {:?}",
+                state.consecutive_reads
+            );
+            assert_eq!(
+                state.last_read_turn.get("/tmp/foo.c").copied(),
+                Some(4),
+                "{tool} must preserve last_read_turn, got: {:?}",
+                state.last_read_turn
+            );
+            assert_eq!(
+                state
+                    .recent_read_windows
+                    .get("/tmp/foo.c")
+                    .map(|r| r.len()),
+                Some(3),
+                "{tool} must preserve recent_read_windows, got: {:?}",
+                state.recent_read_windows
+            );
+        }
+    }
+
+    /// Read-loop decay: mutating tools MUST reset state because the
+    /// file's content changes (or the model's plan must pivot on
+    /// failure). A successful edit resets the file; a failed edit
+    /// resets the model's mental model. The edit-retry counter is a
+    /// separate map and is NOT touched here.
+    #[test]
+    fn decay_read_loop_state_clears_state_for_mutating_tools() {
+        for tool in &["edit_file", "write_to_file", "replace_symbol", "rename_symbol"] {
+            let mut state = TaskState::default();
+            state.turns_completed = 5;
+            state
+                .consecutive_reads
+                .insert("/tmp/foo.c".to_string(), 3);
+            state
+                .last_read_turn
+                .insert("/tmp/foo.c".to_string(), 4);
+            let mut ring = std::collections::VecDeque::new();
+            ring.push_back((370, 410));
+            state
+                .recent_read_windows
+                .insert("/tmp/foo.c".to_string(), ring);
+            // Seed consecutive_edit_failures too — must NOT be cleared.
+            state
+                .consecutive_edit_failures
+                .insert("/tmp/foo.c".to_string(), 2);
+            AgentLoop::decay_read_loop_state(&mut state, tool);
+            assert!(
+                state.consecutive_reads.is_empty(),
+                "{tool} must clear consecutive_reads, got: {:?}",
+                state.consecutive_reads
+            );
+            assert!(
+                state.last_read_turn.is_empty(),
+                "{tool} must clear last_read_turn, got: {:?}",
+                state.last_read_turn
+            );
+            assert!(
+                state.recent_read_windows.is_empty(),
+                "{tool} must clear recent_read_windows, got: {:?}",
+                state.recent_read_windows
+            );
+            assert_eq!(
+                state
+                    .consecutive_edit_failures
+                    .get("/tmp/foo.c")
+                    .copied(),
+                Some(2),
+                "{tool} must NOT touch consecutive_edit_failures"
+            );
+        }
+    }
+
+    /// Read-loop decay: unknown tools apply a 2-turn cooldown. If the
+    /// model hasn't touched any tracked file for 2 turns (the gap
+    /// between `current_turn` and the latest `last_read_turn`), the
+    /// detector forgets the file. Without this, the detector would
+    /// resurrect stale counts from a previous investigation phase when
+    /// the model finally returns to the same file in a new task.
+    #[test]
+    fn decay_read_loop_state_applies_cooldown_for_unknown_tools() {
+        let mut state = TaskState::default();
+        state.turns_completed = 5;
+        state
+            .consecutive_reads
+            .insert("/tmp/foo.c".to_string(), 3);
+        state
+            .last_read_turn
+            .insert("/tmp/foo.c".to_string(), 4);
+        // 1-turn gap (current=5, last=4) — must NOT clear.
+        AgentLoop::decay_read_loop_state(&mut state, "ask_followup_question");
+        assert_eq!(
+            state.consecutive_reads.get("/tmp/foo.c").copied(),
+            Some(3),
+            "1-turn gap must preserve state, got: {:?}",
+            state.consecutive_reads
+        );
+        // Push past the 2-turn window — must clear.
+        state
+            .last_read_turn
+            .insert("/tmp/foo.c".to_string(), 0);
+        AgentLoop::decay_read_loop_state(&mut state, "ask_followup_question");
+        assert!(
+            state.consecutive_reads.is_empty(),
+            "5+ turn gap must clear, got: {:?}",
+            state.consecutive_reads
+        );
+    }
+
+    /// End-to-end shape: alternating read_file + execute_command (the
+    /// SDRSkeleton failure mode) now accumulates count=3 across 3
+    /// turns and reaches the circuit-breaker threshold. Without the
+    /// inspection-tool allowlist this would still be 1.
+    #[test]
+    fn decay_read_loop_state_alternating_read_execute_accumulates() {
+        let mut state = TaskState::default();
+        state.turns_completed = 1;
+        for turn in 1..=3u32 {
+            // Simulate: read_file increments count, then a shell grep
+            // follows without wiping.
+            state.turns_completed = turn;
+            state
+                .consecutive_reads
+                .insert("/tmp/foo.c".to_string(), turn);
+            state
+                .last_read_turn
+                .insert("/tmp/foo.c".to_string(), turn);
+            AgentLoop::decay_read_loop_state(&mut state, "execute_command");
+        }
+        assert_eq!(
+            state.consecutive_reads.get("/tmp/foo.c").copied(),
+            Some(3),
+            "interleaved execute_command must not wipe, got: {:?}",
+            state.consecutive_reads
+        );
+    }
+
+    /// Failure-loop circuit breaker: emit the diagnostic only after the
+    /// per-file rejection threshold (5) is crossed, and stay silent
+    /// below it. Locks down the live-log regression where the model
+    /// burned 200+ turns on a broken batch before giving up.
+    #[tokio::test]
+    async fn test_edit_failure_diagnostic_fires_above_threshold_only() {
+        use crate::cli::output::ChannelOutputWriter;
+        let (tx, mut rx) = mpsc::channel(16);
+        let writer: crate::cli::output::OutputWriterArc =
+            Arc::new(ChannelOutputWriter::new(tx));
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        {
+            let mut guard = state.lock().await;
+            guard
+                .consecutive_edit_failures
+                .insert("/tmp/foo.c".to_string(), 4);
+        }
+        // 4 is below the threshold of 5 — must stay silent.
+        AgentLoop::maybe_emit_edit_failure_diagnostic(&state, &writer).await;
+        let mut below = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            below.push(format!("{event:?}"));
+        }
+        assert!(
+            below.is_empty(),
+            "below-threshold failures must not emit, got: {below:?}"
+        );
+        // Bump to 5 (threshold) — must emit exactly one note for this file.
+        {
+            let mut guard = state.lock().await;
+            guard
+                .consecutive_edit_failures
+                .insert("/tmp/foo.c".to_string(), 5);
+        }
+        AgentLoop::maybe_emit_edit_failure_diagnostic(&state, &writer).await;
+        let mut above = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            above.push(format!("{event:?}"));
+        }
+        let joined = above.join("\n");
+        assert!(
+            joined.contains("Edit Retry Circuit Breaker"),
+            "at-threshold failures must emit the diagnostic, got: {joined}"
+        );
+        assert!(
+            joined.contains("/tmp/foo.c"),
+            "diagnostic must name the offending path, got: {joined}"
+        );
+        assert!(
+            joined.contains("consecutive failed edit_file"),
+            "diagnostic must summarize the loop, got: {joined}"
+        );
+    }
+
+    /// Build/test classifier used by the failure-loop breaker reset
+    /// path. Locks down the boundary between build/test commands (which
+    /// confirm on-disk health) and inspection commands (which must NOT
+    /// silently reset the counter).
+    #[tokio::test]
+    async fn test_looks_like_build_or_test_command_classifies_patterns() {
+        let build_or_test: Vec<serde_json::Value> = vec![
+            serde_json::json!({"commands": ["cargo build"]}),
+            serde_json::json!({"commands": ["cargo test --lib"]}),
+            serde_json::json!({"commands": ["cargo clippy -- -D warnings"]}),
+            serde_json::json!({"commands": ["xcodebuild -scheme MyApp build"]}),
+            serde_json::json!({"commands": ["swift test"]}),
+            serde_json::json!({"commands": ["npm test"]}),
+            serde_json::json!({"commands": ["npm run build"]}),
+            serde_json::json!({"commands": ["pnpm test"]}),
+            serde_json::json!({"commands": ["yarn build"]}),
+            serde_json::json!({"commands": ["make"]}),
+            serde_json::json!({"commands": ["make test"]}),
+            serde_json::json!({"commands": ["go test ./..."]}),
+            serde_json::json!({"commands": ["go vet ./..."]}),
+            serde_json::json!({"commands": ["pytest -x"]}),
+            serde_json::json!({"commands": ["tox"]}),
+            serde_json::json!({"commands": ["mvn package"]}),
+            serde_json::json!({"commands": ["./gradlew test"]}),
+            serde_json::json!({"commands": ["cmake --build build/"]}),
+            serde_json::json!({"commands": ["tsc --noEmit"]}),
+            serde_json::json!({"commands": ["jest"]}),
+            serde_json::json!({"commands": ["vitest run"]}),
+            serde_json::json!({"commands": ["dotnet test"]}),
+            serde_json::json!({"script": "cargo test --lib\n"}),
+            serde_json::json!({"script": "xcodebuild -scheme Foo build 2>&1 | tail -50\n"}),
+            serde_json::json!({"commands": ["/usr/local/bin/cargo build"]}),
+            serde_json::json!({"commands": ["./node_modules/.bin/jest"]}),
+        ];
+        for params in &build_or_test {
+            assert!(
+                AgentLoop::looks_like_build_or_test_command(params),
+                "expected build/test classification for {params}"
+            );
+        }
+        let non_build: Vec<serde_json::Value> = vec![
+            serde_json::json!({"commands": ["git diff src/foo.rs"]}),
+            serde_json::json!({"commands": ["ls -la"]}),
+            serde_json::json!({"commands": ["pwd"]}),
+            serde_json::json!({"commands": ["echo hello"]}),
+            serde_json::json!({"commands": ["cat README.md"]}),
+            serde_json::json!({"commands": ["grep -n 'TODO' src/"]}),
+            serde_json::json!({"commands": ["find . -name '*.rs'"]}),
+            serde_json::json!({"commands": ["awk 'NR==801' src/foo.rs"]}),
+            serde_json::json!({"commands": ["sed -i 's/foo/bar/' src/foo.rs"]}),
+            serde_json::json!({"commands": ["wc -l src/foo.rs"]}),
+            serde_json::json!({"commands": ["mkdir -p /tmp/x"]}),
+            serde_json::json!({"commands": ["rm -f /tmp/x"]}),
+            serde_json::json!({"commands": ["curl -fsS https://example.com"]}),
+            // Bare `cargo` with no subcommand is ambiguous — must NOT
+            // classify as build so we don't accidentally clear on
+            // `cargo --version` or `cargo install`.
+            serde_json::json!({"commands": ["cargo --version"]}),
+            serde_json::json!({"commands": ["cargo install foo"]}),
+        ];
+        for params in &non_build {
+            assert!(
+                !AgentLoop::looks_like_build_or_test_command(params),
+                "expected non-build classification for {params}"
+            );
+        }
+        let malformed: Vec<serde_json::Value> = vec![
+            serde_json::json!({}),
+            serde_json::json!({"commands": []}),
+            serde_json::json!({"script": ""}),
+            serde_json::json!(null),
+            serde_json::json!("not an object"),
+        ];
+        for params in &malformed {
+            assert!(
+                !AgentLoop::looks_like_build_or_test_command(params),
+                "empty or malformed params must not classify as build, got: {params}"
+            );
+        }
     }
 
     #[test]

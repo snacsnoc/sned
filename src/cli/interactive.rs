@@ -2941,6 +2941,14 @@ async fn invalidate_restored_file_context(
             // failure would surface an edit-thrashing diagnostic for
             // edits that no longer exist on disk.
             state.consecutive_edits.remove(&key);
+            // Mirror the edit-success counter: a restored checkpoint
+            // discards the bytes the model was trying to edit, so the
+            // failure-loop counter against those (now-reverted) bytes is
+            // also stale. Without clearing, the next rejected edit attempt
+            // would resume from a high baseline and trigger the retry
+            // diagnostic too early on a file the model hasn't actually
+            // failed against since the restore.
+            state.consecutive_edit_failures.remove(&key);
             // A restored checkpoint invalidates the model's file snapshot. Require a
             // fresh read so reconciliation can bind anchors to the restored bytes.
             state.must_reread_before_edit.insert(key);
