@@ -663,32 +663,36 @@ fn non_interactive_approval_message(title: &str) -> String {
     )
 }
 
-/// Print a Ratatui `Line` to stderr, preserving embedded `\n` characters as
+/// Render a Ratatui `Line` for stderr, preserving embedded `\n` characters as
 /// real newlines. Ratatui's `impl Display for Span` iterates
 /// `self.content.lines()` without re-emitting the separators, so the default
 /// `"{line}"` formatting would flatten `"API\n\n- Body"` to `"API- Body"`.
 /// Mirrors the TUI's `split_output_line_on_newlines` behavior so multi-line
 /// commands (e.g. `git commit -m` with a body) render as separate stderr rows.
-fn print_line_with_real_newlines(line: &ratatui::text::Line<'_>) {
+fn render_line_with_real_newlines(line: &ratatui::text::Line<'_>) -> String {
     let mut current = String::new();
+    let mut rendered = String::new();
     for span in &line.spans {
         let mut parts = span.content.split('\n');
         if let Some(first) = parts.next() {
             current.push_str(first);
         }
         for rest in parts {
-            print_row(&current);
+            rendered.push_str(&current);
+            rendered.push('\n');
             current.clear();
             current.push_str(rest);
         }
     }
-    print_row(&current);
+    rendered.push_str(&current);
+    rendered.push('\n');
+    rendered
 }
 
-fn print_row(row: &str) {
-    // Preserve a literal empty row produced by a `\n\n` sequence so the
-    // on-disk output matches the TUI's display.
-    eprintln!("{row}");
+fn print_line_with_real_newlines(line: &ratatui::text::Line<'_>) {
+    let rendered = render_line_with_real_newlines(line);
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(rendered.as_bytes());
 }
 
 impl OutputWriter for StderrOutputWriter {
@@ -1464,7 +1468,9 @@ mod tests {
     use super::{
         ProviderTimingRecord, TimingHistogram, TuiTimingRecord, format_timing_phases,
         format_timing_phases_with_retries, non_interactive_approval_message,
+        render_line_with_real_newlines,
     };
+    use ratatui::text::{Line, Span};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1619,6 +1625,12 @@ mod tests {
             "✗ Approval required · web_fetch: non-interactive mode cannot accept approval. Re-run interactively or with --yolo to allow this action."
         );
         assert!(!message.contains("Execute this tool?"));
+    }
+
+    #[test]
+    fn test_render_line_with_real_newlines_keeps_empty_rows() {
+        let line = Line::from(Span::raw("first\n\nthird"));
+        assert_eq!(render_line_with_real_newlines(&line), "first\n\nthird\n");
     }
 
     #[test]

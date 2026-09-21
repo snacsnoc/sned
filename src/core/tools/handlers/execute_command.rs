@@ -29,6 +29,22 @@ fn script_output_limit() -> usize {
     configured_output_limit("SNED_SCRIPT_OUTPUT_LIMIT", DEFAULT_SCRIPT_OUTPUT_LIMIT)
 }
 
+fn format_command_header(command: &str) -> String {
+    let prefix = "Running: ";
+    command
+        .split('\n')
+        .enumerate()
+        .map(|(index, row)| {
+            if index == 0 {
+                format!("{prefix}{row}")
+            } else {
+                format!("{}{row}", " ".repeat(prefix.chars().count()))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 enum StreamLine {
     Text(String),
     Overlong,
@@ -589,21 +605,10 @@ impl ExecuteCommandHandler {
                 use crate::cli::tui::theme::INFO_FG;
                 use ratatui::style::{Modifier, Style};
                 let style = Style::default().fg(INFO_FG).add_modifier(Modifier::DIM);
-                // Emit one CommandHeaderLine event per logical row so non-interactive
-                // runners (StderrOutputWriter) and the TUI both render multi-line
-                // commands like `git commit -m $'Subject\n\n- Body'` as separate
-                // lines instead of flattening them via Ratatui's `Span: Display`.
-                let prefix = "Running: ";
-                for (i, row) in cmd_str.split('\n').enumerate() {
-                    let content = if i == 0 {
-                        format!("{prefix}{row}")
-                    } else {
-                        // Indent continuation rows so the prefix visually anchors.
-                        format!("{}{row}", " ".repeat(prefix.chars().count()))
-                    };
-                    let line = Line::from(Span::styled(content, style));
-                    output_writer.emit(OutputEvent::CommandHeaderLine(line));
-                }
+                // Keep the complete header in one event so parallel commands
+                // cannot interleave another event between its continuation rows.
+                let line = Line::from(Span::styled(format_command_header(&cmd_str), style));
+                output_writer.emit(OutputEvent::CommandHeaderLine(line));
             }
 
             // Execute via shell for portability and shell feature support
@@ -1726,6 +1731,14 @@ mod tests {
     use crate::core::process_output::capture_async;
     use crate::core::tools::{ToolContext, ToolHandler};
     use std::sync::Arc;
+
+    #[test]
+    fn test_format_command_header_keeps_multiline_command_atomic() {
+        assert_eq!(
+            format_command_header("git commit -m $'Subject\n\n- Body'"),
+            "Running: git commit -m $'Subject\n         \n         - Body'"
+        );
+    }
 
     #[tokio::test]
     async fn test_execute_commands_success() {
