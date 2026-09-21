@@ -762,6 +762,7 @@ impl EditFileHandler {
         state.consecutive_reads.remove(&key);
         state.last_read_turn.remove(&key);
         state.recent_read_windows.remove(&key);
+        state.read_file_snapshots.remove(&key);
     }
 
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
@@ -2480,6 +2481,7 @@ impl EditFileHandler {
                 state.consecutive_reads.remove(&key);
                 state.last_read_turn.remove(&key);
                 state.recent_read_windows.remove(&key);
+                state.read_file_snapshots.remove(&key);
                 if write_failed_paths.contains(&item.absolute_path) {
                     continue;
                 }

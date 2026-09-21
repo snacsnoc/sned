@@ -1029,6 +1029,13 @@ impl ReadFileHandler {
                     state.consecutive_reads.clear();
                     state.recent_read_windows.clear();
                     state.last_read_turn.clear();
+                    state.read_file_snapshots.clear();
+                }
+                if let Ok(metadata) = std::fs::metadata(canonical) {
+                    state.read_file_snapshots.insert(
+                        canonical.to_string(),
+                        (metadata.len(), metadata.modified().ok()),
+                    );
                 }
                 // Multiple reads of the same file inside a single agent turn
                 // (parallel slice fetches like lines 655–660 + 680–695 + 705–720)

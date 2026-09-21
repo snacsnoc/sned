@@ -1454,10 +1454,9 @@ impl AgentLoop {
         ));
     }
 
-    async fn maybe_emit_edit_compile_diagnostic(
+    async fn collect_edit_compile_diagnostic(
         state: &Arc<Mutex<TaskState>>,
-        output_writer: &crate::cli::output::OutputWriterArc,
-    ) {
+    ) -> Option<String> {
         const EDIT_COMPILE_THRESHOLD: u32 = 3;
         let snapshot: Vec<(String, u32)> = {
             let guard = state.lock().await;
@@ -1470,21 +1469,19 @@ impl AgentLoop {
                 .collect()
         };
         if snapshot.is_empty() {
-            return;
+            return None;
         }
-
-        use crate::cli::output::OutputEvent;
-        use crate::cli::tui::theme::WARNING_FG;
-        use ratatui::style::Style;
-        for (path, count) in snapshot {
-            let note = format!(
-                "--- Note (Edit-Compile Thrashing) ---\nFile '{path}' has been edited {count} consecutive times without a successful build or test. STOP making localized edits. Review the full diff, fix the build failure, then run the build or tests again."
-            );
-            output_writer.emit(OutputEvent::tool_output_line(
-                note,
-                Style::default().fg(WARNING_FG),
-            ));
-        }
+        Some(
+            snapshot
+                .into_iter()
+                .map(|(path, count)| {
+                    format!(
+                        "--- Note (Edit-Compile Thrashing) ---\nFile '{path}' has been edited {count} consecutive times without a successful build or test. STOP making localized edits. Review the full diff, fix the build failure, then run the build or tests again."
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
     }
 
     /// Heuristic: does this `execute_command` invocation look like a
@@ -1550,78 +1547,35 @@ impl AgentLoop {
         }
     }
 
-    /// Shell commands are normally inspection commands, but a subset can
-    /// change workspace bytes behind the native write handlers. Those writes
-    /// invalidate every tracked read window because the command may touch a
-    /// path we cannot reliably identify from its shell syntax.
-    fn command_may_mutate_files(tool_params: &serde_json::Value) -> bool {
-        let mut commands = Vec::new();
-        if let Some(values) = tool_params.get("commands").and_then(|v| v.as_array()) {
-            commands.extend(values.iter().filter_map(|value| value.as_str()));
-        }
-        if let Some(script) = tool_params.get("script").and_then(|value| value.as_str()) {
-            commands.push(script);
+    async fn invalidate_changed_read_state(state: &Arc<Mutex<TaskState>>) {
+        let snapshots = {
+            let guard = state.lock().await;
+            guard.read_file_snapshots.clone()
+        };
+        if snapshots.is_empty() {
+            return;
         }
 
-        commands.into_iter().any(|command| {
-            let lower = command.to_ascii_lowercase();
-            if lower.contains(" >")
-                || lower.contains(">>")
-                || lower.contains(" 2>")
-                || lower.contains("| tee ")
-            {
-                return true;
+        let mut changed_paths = Vec::new();
+        for (path, snapshot) in snapshots {
+            let current = tokio::fs::metadata(&path).await.ok().map(|metadata| {
+                (metadata.len(), metadata.modified().ok())
+            });
+            if current.as_ref() != Some(&snapshot) {
+                changed_paths.push(path);
             }
-            for segment in lower.split([';', '\n', '|', '&']) {
-                let mut tokens = segment.split_whitespace();
-                let Some(program) = tokens.next() else {
-                    continue;
-                };
-                let program = program.rsplit(['/', '\\']).next().unwrap_or(program);
-                let args: Vec<_> = tokens.collect();
-                let first_arg = args.first().copied().unwrap_or_default();
-                if matches!(
-                    program,
-                    "cp" | "mv"
-                        | "rm"
-                        | "mkdir"
-                        | "rmdir"
-                        | "touch"
-                        | "truncate"
-                        | "install"
-                        | "ln"
-                        | "tee"
-                        | "rustfmt"
-                        | "gofmt"
-                        | "black"
-                        | "prettier"
-                        | "clang-format"
-                        | "swift-format"
-                ) {
-                    return true;
-                }
-                if (program == "sed" || program == "perl")
-                    && args.iter().any(|arg| arg == &"-i" || arg.starts_with("-i"))
-                {
-                    return true;
-                }
-                if matches!(program, "python" | "python3" | "ruby" | "node") {
-                    return true;
-                }
-                if program == "cargo" && first_arg == "fmt" {
-                    return true;
-                }
-                if program == "git"
-                    && matches!(
-                        first_arg,
-                        "apply" | "checkout" | "clean" | "restore" | "reset"
-                    )
-                {
-                    return true;
-                }
-            }
-            false
-        })
+        }
+        if changed_paths.is_empty() {
+            return;
+        }
+
+        let mut guard = state.lock().await;
+        for path in changed_paths {
+            guard.consecutive_reads.remove(&path);
+            guard.last_read_turn.remove(&path);
+            guard.recent_read_windows.remove(&path);
+            guard.read_file_snapshots.remove(&path);
+        }
     }
 
     /// Tools whose execution keeps the read-loop state alive. The model
@@ -1687,6 +1641,7 @@ impl AgentLoop {
             state.consecutive_reads.clear();
             state.last_read_turn.clear();
             state.recent_read_windows.clear();
+            state.read_file_snapshots.clear();
             return;
         }
         // Unknown tool: apply a 2-turn cooldown. If the model hasn't
@@ -1707,6 +1662,7 @@ impl AgentLoop {
             state.consecutive_reads.clear();
             state.last_read_turn.clear();
             state.recent_read_windows.clear();
+            state.read_file_snapshots.clear();
         }
     }
 
@@ -4509,13 +4465,21 @@ impl AgentLoop {
                     }
                 }
 
+                let mut edit_compile_diagnostic = None;
                 if tool_name == "execute_command"
-                    && Self::command_may_mutate_files(&tool_params)
+                    && result_output.is_error
+                    && Self::looks_like_build_or_test_command(&tool_params)
                 {
-                    let mut state = self.state.lock().await;
-                    state.consecutive_reads.clear();
-                    state.last_read_turn.clear();
-                    state.recent_read_windows.clear();
+                    edit_compile_diagnostic =
+                        Self::collect_edit_compile_diagnostic(&self.state).await;
+                    if let Some(note) = &edit_compile_diagnostic {
+                        result_output.text.push_str("\n\n");
+                        result_output.text.push_str(note);
+                    }
+                }
+
+                if tool_name == "execute_command" {
+                    Self::invalidate_changed_read_state(&self.state).await;
                 }
 
                 // A successful build/test confirms the current successful
@@ -4606,14 +4570,8 @@ impl AgentLoop {
                                 .output_writer
                                 .emit(OutputEvent::tool_output_line(line.text, style));
                         }
-                        let is_build_or_test =
-                            Self::looks_like_build_or_test_command(&tool_params);
-                        if is_error && is_build_or_test {
-                            Self::maybe_emit_edit_compile_diagnostic(
-                                &self.state,
-                                &self.config.output_writer,
-                            )
-                            .await;
+                        if let Some(note) = &edit_compile_diagnostic {
+                            Self::emit_warning_note(&self.config.output_writer, note);
                         }
                     } else if !matches!(
                         tool_name.as_str(),
@@ -7816,7 +7774,11 @@ Irrespective of whether additional information or instructions are given, you ar
                 .consecutive_edits
                 .insert("/tmp/foo.c".to_string(), 2);
         }
-        AgentLoop::maybe_emit_edit_compile_diagnostic(&state, &writer).await;
+        assert!(
+            AgentLoop::collect_edit_compile_diagnostic(&state)
+                .await
+                .is_none()
+        );
         assert!(
             rx.try_recv().is_err(),
             "diagnostic must stay silent below the threshold"
@@ -7827,7 +7789,10 @@ Irrespective of whether additional information or instructions are given, you ar
                 .consecutive_edits
                 .insert("/tmp/foo.c".to_string(), 3);
         }
-        AgentLoop::maybe_emit_edit_compile_diagnostic(&state, &writer).await;
+        let note = AgentLoop::collect_edit_compile_diagnostic(&state)
+            .await
+            .expect("threshold diagnostic should emit");
+        AgentLoop::emit_warning_note(&writer, &note);
         let event = rx.try_recv().expect("threshold diagnostic should emit");
         assert!(
             format!("{event:?}").contains("Edit-Compile Thrashing"),
@@ -7914,33 +7879,45 @@ Irrespective of whether additional information or instructions are given, you ar
         }
     }
 
-    #[test]
-    fn test_command_may_mutate_files_classifies_shell_writes() {
-        let mutating = [
-            serde_json::json!({"commands": ["sed -i 's/foo/bar/' src/foo.rs"]}),
-            serde_json::json!({"commands": ["echo changed > src/foo.rs"]}),
-            serde_json::json!({"commands": ["cargo fmt"]}),
-            serde_json::json!({"commands": ["python3 rewrite.py"]}),
-            serde_json::json!({"commands": ["git restore src/foo.rs"]}),
-        ];
-        for params in mutating {
-            assert!(
-                AgentLoop::command_may_mutate_files(&params),
-                "expected file mutation for {params}"
+    #[tokio::test]
+    async fn invalidate_changed_read_state_preserves_unchanged_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let unchanged = directory.path().join("unchanged.rs");
+        let changed = directory.path().join("changed.rs");
+        std::fs::write(&unchanged, "same\n").unwrap();
+        std::fs::write(&changed, "before\n").unwrap();
+        let unchanged_key = unchanged.to_string_lossy().into_owned();
+        let changed_key = changed.to_string_lossy().into_owned();
+        let unchanged_metadata = std::fs::metadata(&unchanged).unwrap();
+        let changed_metadata = std::fs::metadata(&changed).unwrap();
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        {
+            let mut guard = state.lock().await;
+            for key in [&unchanged_key, &changed_key] {
+                guard.consecutive_reads.insert(key.clone(), 3);
+                guard.last_read_turn.insert(key.clone(), 2);
+                guard
+                    .recent_read_windows
+                    .insert(key.clone(), std::collections::VecDeque::from([(1, 10)]));
+            }
+            guard.read_file_snapshots.insert(
+                unchanged_key.clone(),
+                (unchanged_metadata.len(), unchanged_metadata.modified().ok()),
+            );
+            guard.read_file_snapshots.insert(
+                changed_key.clone(),
+                (changed_metadata.len(), changed_metadata.modified().ok()),
             );
         }
-        let read_only = [
-            serde_json::json!({"commands": ["git diff src/foo.rs"]}),
-            serde_json::json!({"commands": ["grep -n TODO src/"]}),
-            serde_json::json!({"commands": ["cargo test --lib"]}),
-            serde_json::json!({"commands": ["ls -la"]}),
-        ];
-        for params in read_only {
-            assert!(
-                !AgentLoop::command_may_mutate_files(&params),
-                "unexpected file mutation for {params}"
-            );
-        }
+        std::fs::write(&changed, "after external mutation\n").unwrap();
+
+        AgentLoop::invalidate_changed_read_state(&state).await;
+
+        let guard = state.lock().await;
+        assert!(guard.consecutive_reads.contains_key(&unchanged_key));
+        assert!(!guard.consecutive_reads.contains_key(&changed_key));
+        assert!(guard.read_file_snapshots.contains_key(&unchanged_key));
+        assert!(!guard.read_file_snapshots.contains_key(&changed_key));
     }
 
     #[test]

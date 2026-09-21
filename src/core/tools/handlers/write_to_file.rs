@@ -422,6 +422,7 @@ impl ToolHandler for WriteToFileHandler {
                         state.consecutive_reads.remove(&key);
                         state.last_read_turn.remove(&key);
                         state.recent_read_windows.remove(&key);
+                        state.read_file_snapshots.remove(&key);
                         // Increment consecutive_edits so a subsequent build
                         // failure can surface the thrashing diagnostic.
                         // Cleared by agent_loop when build/test succeeds, or

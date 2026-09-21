@@ -175,6 +175,11 @@ pub struct TaskState {
     /// narrow-slice thrashing versus legitimate sequential scanning.
     pub recent_read_windows:
         std::collections::HashMap<String, std::collections::VecDeque<(usize, usize)>>,
+    /// File metadata captured with the latest tracked read. Shell commands
+    /// compare these snapshots after execution so read-loop state is cleared
+    /// only for paths whose bytes may have changed externally.
+    pub read_file_snapshots:
+        std::collections::HashMap<String, (u64, Option<std::time::SystemTime>)>,
     /// Number of consecutive successful edits per file with no intervening
     /// successful build/test run. When an execute_command result indicates
     /// a build failure and any value in this map is ≥3, the agent_loop
@@ -274,6 +279,7 @@ impl Default for TaskState {
             consecutive_reads: std::collections::HashMap::new(),
             last_read_turn: std::collections::HashMap::new(),
             recent_read_windows: std::collections::HashMap::new(),
+            read_file_snapshots: std::collections::HashMap::new(),
             consecutive_edits: std::collections::HashMap::new(),
             consecutive_edit_failures: std::collections::HashMap::new(),
             plan_state: None,
