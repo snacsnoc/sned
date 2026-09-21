@@ -759,18 +759,87 @@ pub fn parse_unambiguous_stringified_string_array(value: &str) -> Option<Vec<Str
     )
 }
 
-/// Recover a stringified command array when a provider failed to escape a
-/// shell backslash for JSON (for example, `\|` in a grep expression). The
-/// opening `[` followed immediately by `"` is still unambiguous enough to
-/// distinguish this shape from shell test syntax such as `[ "foo" ]`.
+/// Recover an unambiguous stringified command array when a provider omitted
+/// shell-backslash escaping, inner-quote escaping, or the final array close.
+/// The opening `[` followed immediately by `"` still distinguishes this
+/// shape from shell test syntax such as `[ "foo" ]`.
 pub(crate) fn parse_relaxed_stringified_string_array(value: &str) -> Option<Vec<String>> {
     let trimmed = value.trim();
-    if !trimmed.starts_with("[\"") || !trimmed.ends_with(']') {
+    if !trimmed.starts_with("[\"") {
         return None;
     }
 
-    let mut repaired = String::with_capacity(trimmed.len());
+    let mut backslash_repaired = String::with_capacity(trimmed.len() + 4);
     let mut chars = trimmed.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            let Some(&next) = chars.peek() else {
+                backslash_repaired.push_str("\\\\");
+                continue;
+            };
+            if !matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') {
+                backslash_repaired.push_str("\\\\");
+            } else {
+                backslash_repaired.push('\\');
+            }
+        } else {
+            backslash_repaired.push(character);
+        }
+    }
+    if let Ok(values) = serde_json::from_str::<Vec<String>>(&backslash_repaired) {
+        return Some(values);
+    }
+
+    let unescaped_quotes = trimmed
+        .char_indices()
+        .filter_map(|(index, character)| {
+            if character != '"' || index < 2 {
+                return None;
+            }
+            let preceding_backslashes = trimmed[..index]
+                .chars()
+                .rev()
+                .take_while(|character| *character == '\\')
+                .count();
+            (preceding_backslashes % 2 == 0).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let last_quote = unescaped_quotes.last().copied()?;
+    let tail = trimmed[last_quote + 1..].trim();
+    if !tail.is_empty() && tail != "]" {
+        return None;
+    }
+    let has_outer_closing_quote = unescaped_quotes.len() % 2 == 1;
+    let interior_end = if has_outer_closing_quote {
+        last_quote
+    } else {
+        trimmed.strip_suffix(']').map_or(trimmed.len(), str::len)
+    };
+
+    // This fallback is intentionally limited to one command. If an interior
+    // quote is followed by a comma and another string, the intended array
+    // boundary is ambiguous and must be retried instead of guessed.
+    let interior = &trimmed[2..interior_end];
+    let mut scan = interior.char_indices().peekable();
+    while let Some((_, character)) = scan.next() {
+        if character == '\\' {
+            scan.next();
+            continue;
+        }
+        if character == '"' {
+            let remaining = scan.clone().map(|(_, character)| character).collect::<String>();
+            let remaining = remaining.trim_start();
+            if let Some(after_comma) = remaining.strip_prefix(',')
+                && after_comma.trim_start().starts_with('"')
+            {
+                return None;
+            }
+        }
+    }
+
+    let mut repaired = String::with_capacity(trimmed.len() + 8);
+    repaired.push_str("[\"");
+    let mut chars = interior.chars().peekable();
     while let Some(character) = chars.next() {
         if character == '\\' {
             let Some(&next) = chars.peek() else {
@@ -782,10 +851,13 @@ pub(crate) fn parse_relaxed_stringified_string_array(value: &str) -> Option<Vec<
             } else {
                 repaired.push('\\');
             }
+        } else if character == '"' {
+            repaired.push_str("\\\"");
         } else {
             repaired.push(character);
         }
     }
+    repaired.push_str("\"]");
 
     let values = serde_json::from_str::<Vec<String>>(&repaired).ok()?;
     Some(values)
@@ -1041,6 +1113,34 @@ mod tests {
             coerce_command_array(&params),
             vec!["grep -r 'setupPipelines\\|makeFunction'"]
         );
+    }
+
+    #[test]
+    fn test_coerce_command_array_recovers_unescaped_inner_quotes() {
+        let params = serde_json::json!({
+            "commands": r#"["awk 'NR>=115 && NR<=125 {print NR": "}' file.swift"]"#
+        });
+        assert_eq!(
+            coerce_command_array(&params),
+            vec![r#"awk 'NR>=115 && NR<=125 {print NR": "}' file.swift"#]
+        );
+    }
+
+    #[test]
+    fn test_coerce_command_array_closes_unambiguous_single_command_array() {
+        let params = serde_json::json!({
+            "commands": r#"["python3 -c "print('ok')""#
+        });
+        assert_eq!(
+            coerce_command_array(&params),
+            vec![r#"python3 -c "print('ok')""#]
+        );
+    }
+
+    #[test]
+    fn test_coerce_command_array_rejects_ambiguous_relaxed_array() {
+        let value = r#"["echo "one", "echo two"]"#;
+        assert!(parse_relaxed_stringified_string_array(value).is_none());
     }
 
     #[test]

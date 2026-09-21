@@ -960,11 +960,36 @@ impl AgentLoop {
             return Ok(serde_json::json!({}));
         }
         match serde_json::from_str::<serde_json::Value>(raw) {
-            Ok(parsed) => {
+            Ok(mut parsed) => {
                 if let Some(parse_error) = crate::providers::tool_arguments_error(&parsed) {
                     return Err(format!(
                         "Tool '{tool_name}' arguments could not be repaired as JSON (id: {tool_id}): {parse_error} Please retry the same tool call with valid JSON arguments."
                     ));
+                }
+                let normalized = match tool_name {
+                    "execute_command" => {
+                        if let Some(raw) = parsed
+                            .get("commands")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|raw| raw.trim().starts_with("[\""))
+                        {
+                            let commands = crate::core::tools::parse_unambiguous_stringified_string_array(raw)
+                                .or_else(|| crate::core::tools::parse_relaxed_stringified_string_array(raw))
+                                .ok_or_else(|| format!(
+                                    "Tool '{tool_name}' arguments contain an ambiguous stringified 'commands' array (id: {tool_id}). Re-issue the tool call with a literal JSON array of command strings."
+                                ))?;
+                            parsed["commands"] = serde_json::json!(commands);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    "edit_file" => crate::core::tools::handlers::edit_file::EditFileHandler::normalize_stringified_files_param(&mut parsed)
+                        .map_err(|error| format!("Tool '{tool_name}' arguments could not be normalized (id: {tool_id}): {error}"))?,
+                    _ => false,
+                };
+                if normalized {
+                    tracing::debug!(tool_name = %tool_name, tool_id = %tool_id, "normalized compatibility tool arguments");
                 }
                 Ok(parsed)
             }
@@ -10749,6 +10774,34 @@ Irrespective of whether additional information or instructions are given, you ar
             format_tool_summary("read_file", parsed_args),
             format_tool_summary("read_file", &expected_args)
         );
+    }
+
+    #[test]
+    fn test_prepared_tool_call_normalizes_stringified_command_array() {
+        let raw = serde_json::json!({
+            "commands": r#"["awk 'NR>=115 && NR<=125 {print NR": "}' file.swift"]"#
+        })
+        .to_string();
+        let parsed = AgentLoop::parse_tool_arguments("execute_command", "command-1", Some(&raw))
+            .expect("recoverable commands should normalize before dispatch");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "commands": [r#"awk 'NR>=115 && NR<=125 {print NR": "}' file.swift"#]
+            })
+        );
+    }
+
+    #[test]
+    fn test_prepared_tool_call_normalizes_stringified_edit_files() {
+        let raw = serde_json::json!({
+            "files": r#"[{"edits":[{"anchor":"one§old","text":"new"},"path":"src/main.rs"}]"#
+        })
+        .to_string();
+        let parsed = AgentLoop::parse_tool_arguments("edit_file", "edit-1", Some(&raw))
+            .expect("recoverable edit files should normalize before dispatch");
+        assert_eq!(parsed["files"][0]["path"], "src/main.rs");
+        assert_eq!(parsed["files"][0]["edits"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

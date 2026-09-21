@@ -333,6 +333,13 @@ impl EditFileHandler {
                     return Ok(files);
                 }
 
+                if let Some(repaired) = Self::repair_path_misplaced_in_edits(raw) {
+                    let repaired = crate::providers::repair_json_args(&repaired);
+                    if let Ok(files) = serde_json::from_str::<Vec<serde_json::Value>>(&repaired) {
+                        return Ok(files);
+                    }
+                }
+
                 if err.classify() == serde_json::error::Category::Eof
                     && let Some(repaired) = Self::repair_truncated_files_json(raw)
                     && let Ok(files) = serde_json::from_str::<Vec<serde_json::Value>>(&repaired)
@@ -343,6 +350,116 @@ impl EditFileHandler {
                 Err(err)
             }
         }
+    }
+
+    fn repair_path_misplaced_in_edits(raw: &str) -> Option<String> {
+        let bytes = raw.as_bytes();
+        let mut stack = Vec::new();
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut string_start = 0;
+        let mut edits_array_depth = None;
+        let mut candidates = Vec::new();
+        let mut index = 0;
+
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                    let token = &raw[string_start..index];
+                    let mut next = index + 1;
+                    while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                        next += 1;
+                    }
+                    if token == "edits" && bytes.get(next) == Some(&b':') {
+                        next += 1;
+                        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                            next += 1;
+                        }
+                        if bytes.get(next) == Some(&b'[') {
+                            edits_array_depth = Some(stack.len() + 1);
+                        }
+                    } else if token == "path"
+                        && bytes.get(next) == Some(&b':')
+                        && edits_array_depth == Some(stack.len())
+                        && stack.last() == Some(&b'[')
+                    {
+                        let mut comma = string_start.saturating_sub(2);
+                        while comma > 0 && bytes[comma].is_ascii_whitespace() {
+                            comma -= 1;
+                        }
+                        if bytes.get(comma) == Some(&b',') {
+                            let mut previous = comma.saturating_sub(1);
+                            while previous > 0 && bytes[previous].is_ascii_whitespace() {
+                                previous -= 1;
+                            }
+                            if bytes.get(previous) == Some(&b'}') {
+                                candidates.push(comma);
+                            }
+                        }
+                    }
+                }
+                index += 1;
+                continue;
+            }
+
+            match byte {
+                b'"' => {
+                    in_string = true;
+                    string_start = index + 1;
+                }
+                b'{' | b'[' => stack.push(byte),
+                b'}' => {
+                    if stack.pop() != Some(b'{') {
+                        if !candidates.is_empty() {
+                            break;
+                        }
+                        return None;
+                    }
+                }
+                b']' => {
+                    let depth = stack.len();
+                    if stack.pop() != Some(b'[') {
+                        return None;
+                    }
+                    if edits_array_depth == Some(depth) {
+                        edits_array_depth = None;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+
+        if candidates.len() != 1 {
+            return None;
+        }
+        let insertion = candidates[0];
+        let mut repaired = String::with_capacity(raw.len() + 1);
+        repaired.push_str(&raw[..insertion]);
+        repaired.push(']');
+        repaired.push_str(&raw[insertion..]);
+        Some(repaired)
+    }
+
+    pub(crate) fn normalize_stringified_files_param(
+        params: &mut serde_json::Value,
+    ) -> Result<bool, String> {
+        let Some(raw) = params.get("files").and_then(serde_json::Value::as_str) else {
+            return Ok(false);
+        };
+        let files = Self::parse_stringified_files_array(raw).map_err(|error| {
+            format!(
+                "Failed to parse 'files' as an array of {{path, edits}} objects: {error}. Re-issue the tool call with a literal JSON array."
+            )
+        })?;
+        params["files"] = serde_json::Value::Array(files);
+        Ok(true)
     }
 
     fn apply_top_level_path_fallback(files: &mut [serde_json::Value], fallback_path: Option<&str>) {
@@ -7909,6 +8026,25 @@ edition = "2021"
         let edit = &files[0]["edits"][0];
         assert_eq!(edit["anchor"], "FootlooseFeedback§\t$(SRC)/vga.c");
         assert_eq!(edit["text"], "\t$(SRC)/vga.c \\\n\t$(SRC)/portstub.c");
+    }
+
+    #[test]
+    fn test_parse_stringified_files_array_moves_path_after_edits() {
+        let raw = r#"[{"edits": [{"anchor": "AOTZW0WhJVHh3NFG§            }", "edit_type": "replace", "end_anchor": "AOTZW0WhJVHh3N3F§        }", "text": "            }"}, "path": "SDRSkeleton/SDRSkeleton/MetalWaterfallView.swift"}]"#;
+
+        let files = EditFileHandler::parse_stringified_files_array(raw)
+            .expect("a file-level path misplaced after the edits array should be repaired");
+        assert_eq!(
+            files[0]["path"],
+            "SDRSkeleton/SDRSkeleton/MetalWaterfallView.swift"
+        );
+        assert_eq!(files[0]["edits"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_parse_stringified_files_array_does_not_guess_multiple_misplaced_paths() {
+        let raw = r#"[{"edits":[{"anchor":"one","text":"x"},"path":"a",{"anchor":"two","text":"y"},"path":"b"}]"#;
+        assert!(EditFileHandler::parse_stringified_files_array(raw).is_err());
     }
 
     #[tokio::test]
