@@ -503,7 +503,11 @@ impl ReadFileHandler {
                 line_number_offset
             };
             let displayed_start = displayed_offset.saturating_add(1);
-            let displayed_end = displayed_offset.saturating_add(range_end);
+            let displayed_end = if refreshes_edit_context {
+                range_end
+            } else {
+                displayed_offset.saturating_add(range_end)
+            };
             format!(
                 "[File: {display_path}, Hash: {hash}] ({line_count}, Lines {displayed_start}–{displayed_end})\n{guidance}\n{anchored_content}"
             )
@@ -1686,6 +1690,8 @@ mod tests {
         assert!(result.success);
         assert!(result.content.contains("line 2"));
         assert!(result.content.contains("line 3"));
+        assert!(result.content.contains("Lines 2–3"));
+        assert!(!result.content.contains("Lines 2–5"));
         assert!(!result.content.contains("line 1"));
         assert!(!result.content.contains("line 4"));
     }
