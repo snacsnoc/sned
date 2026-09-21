@@ -1443,6 +1443,39 @@ impl AgentLoop {
         }
     }
 
+    async fn maybe_emit_edit_compile_diagnostic(
+        state: &Arc<Mutex<TaskState>>,
+        output_writer: &crate::cli::output::OutputWriterArc,
+    ) {
+        const EDIT_COMPILE_THRESHOLD: u32 = 3;
+        let snapshot: Vec<(String, u32)> = {
+            let guard = state.lock().await;
+            guard
+                .consecutive_edits
+                .iter()
+                .filter_map(|(path, &count)| {
+                    (count >= EDIT_COMPILE_THRESHOLD).then(|| (path.clone(), count))
+                })
+                .collect()
+        };
+        if snapshot.is_empty() {
+            return;
+        }
+
+        use crate::cli::output::OutputEvent;
+        use crate::cli::tui::theme::WARNING_FG;
+        use ratatui::style::Style;
+        for (path, count) in snapshot {
+            let note = format!(
+                "--- Note (Edit-Compile Thrashing) ---\nFile '{path}' has been edited {count} consecutive times without a successful build or test. STOP making localized edits. Review the full diff, fix the build failure, then run the build or tests again."
+            );
+            output_writer.emit(OutputEvent::tool_output_line(
+                note,
+                Style::default().fg(WARNING_FG),
+            ));
+        }
+    }
+
     /// Heuristic: does this `execute_command` invocation look like a
     /// build or test runner? Used by the failure-loop circuit breaker to
     /// decide when a successful command is independent confirmation that
@@ -4476,19 +4509,14 @@ impl AgentLoop {
                                 .output_writer
                                 .emit(OutputEvent::tool_output_line(line.text, style));
                         }
-                        // Clear the failure-loop counter on a successful
-                        // build/test run. We don't gate on `is_error`
-                        // because the diagnostic only fires after 5
-                        // consecutive rejections, and a passing build is
-                        // independent confirmation that the on-disk code
-                        // is no longer in a thrashing state — whether or
-                        // not the diagnostic fired. `git diff` and other
-                        // non-build commands must NOT clear the counter
-                        // (a model following the diagnostic's own advice
-                        // shouldn't reset it).
-                        if !is_error && Self::looks_like_build_or_test_command(&tool_params) {
-                            let mut state = self.state.lock().await;
-                            state.consecutive_edit_failures.clear();
+                        let is_build_or_test =
+                            Self::looks_like_build_or_test_command(&tool_params);
+                        if is_error && is_build_or_test {
+                            Self::maybe_emit_edit_compile_diagnostic(
+                                &self.state,
+                                &self.config.output_writer,
+                            )
+                            .await;
                         }
                     } else if !matches!(
                         tool_name.as_str(),
@@ -4527,6 +4555,19 @@ impl AgentLoop {
                                 ));
                         }
                     }
+                }
+
+                // A successful build/test is independent confirmation that
+                // the on-disk code is healthy. Reset both edit-loop counters
+                // in every output mode; inspection commands must not clear
+                // them just because they succeeded.
+                if tool_name == "execute_command"
+                    && !result_output.is_error
+                    && Self::looks_like_build_or_test_command(&tool_params)
+                {
+                    let mut state = self.state.lock().await;
+                    state.consecutive_edits.clear();
+                    state.consecutive_edit_failures.clear();
                 }
 
                 if tool_name == "edit_file"
@@ -7668,6 +7709,38 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(
             joined.contains("consecutive failed edit_file"),
             "diagnostic must summarize the loop, got: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_compile_diagnostic_emits_at_threshold() {
+        use crate::cli::output::ChannelOutputWriter;
+        let (tx, mut rx) = mpsc::channel(16);
+        let writer: crate::cli::output::OutputWriterArc =
+            Arc::new(ChannelOutputWriter::new(tx));
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        {
+            let mut guard = state.lock().await;
+            guard
+                .consecutive_edits
+                .insert("/tmp/foo.c".to_string(), 2);
+        }
+        AgentLoop::maybe_emit_edit_compile_diagnostic(&state, &writer).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "diagnostic must stay silent below the threshold"
+        );
+        {
+            let mut guard = state.lock().await;
+            guard
+                .consecutive_edits
+                .insert("/tmp/foo.c".to_string(), 3);
+        }
+        AgentLoop::maybe_emit_edit_compile_diagnostic(&state, &writer).await;
+        let event = rx.try_recv().expect("threshold diagnostic should emit");
+        assert!(
+            format!("{event:?}").contains("Edit-Compile Thrashing"),
+            "diagnostic should identify edit/compile thrashing: {event:?}"
         );
     }
 

@@ -2480,6 +2480,9 @@ impl EditFileHandler {
                 state.consecutive_reads.remove(&key);
                 state.last_read_turn.remove(&key);
                 state.recent_read_windows.remove(&key);
+                if write_failed_paths.contains(&item.absolute_path) {
+                    continue;
+                }
                 // Increment the edit-compile thrash counter for this file
                 // so the diagnostic in agent_loop can fire if a subsequent
                 // execute_command reports a build failure. Cleared by

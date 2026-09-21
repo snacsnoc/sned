@@ -366,11 +366,15 @@ impl RenameSymbolHandler {
             if let Some(ctx) = edit_context {
                 ctx.invalidate_edit_context(&write.path).await;
             }
-            state
-                .lock()
-                .await
-                .file_context_tracker
-                .mark_file_as_edited_by_sned(&write.path);
+            {
+                let mut state = state.lock().await;
+                state
+                    .file_context_tracker
+                    .mark_file_as_edited_by_sned(&write.path);
+                let key = crate::core::tools::canonical_path_key(&write.path);
+                let count = state.consecutive_edits.entry(key).or_insert(0);
+                *count += 1;
+            }
             if let Some(symbol_index_service) = &self.symbol_index_service
                 && let Ok(rel_path) = write.path.strip_prefix(&index_root)
             {
@@ -839,6 +843,8 @@ mod tests {
             .unwrap();
         assert!(new_content.contains("new_func"));
         assert!(!new_content.contains("old_func"));
+        let key = crate::core::tools::canonical_path_key(&workspace_root.join("test.rs"));
+        assert_eq!(state.consecutive_edits.get(&key).copied(), Some(1));
     }
 
     #[cfg(unix)]

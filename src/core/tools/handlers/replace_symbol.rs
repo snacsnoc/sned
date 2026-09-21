@@ -155,11 +155,15 @@ impl ReplaceSymbolHandler {
                 ctx.invalidate_edit_context(&prepared_batch.write.path)
                     .await;
             }
-            state
-                .lock()
-                .await
-                .file_context_tracker
-                .mark_file_as_edited_by_sned(&prepared_batch.write.path);
+            {
+                let mut state = state.lock().await;
+                state
+                    .file_context_tracker
+                    .mark_file_as_edited_by_sned(&prepared_batch.write.path);
+                let key = crate::core::tools::canonical_path_key(&prepared_batch.write.path);
+                let count = state.consecutive_edits.entry(key).or_insert(0);
+                *count += 1;
+            }
             file_results.push(prepared_batch.result);
         }
 
@@ -901,6 +905,8 @@ mod tests {
             .unwrap();
         assert!(new_content.contains("FOO"));
         assert!(!new_content.contains("fn foo()"));
+        let key = crate::core::tools::canonical_path_key(&workspace_root.join("test.rs"));
+        assert_eq!(state.consecutive_edits.get(&key).copied(), Some(1));
     }
 
     #[tokio::test]
