@@ -695,6 +695,19 @@ struct OpenAiStreamChunk {
 }
 
 #[derive(Debug, Deserialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorBody {
+    message: String,
+    #[serde(rename = "type")]
+    error_type: Option<String>,
+    code: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenAiCompletionResponse {
     id: Option<String>,
     #[serde(default)]
@@ -1031,6 +1044,55 @@ fn is_safe_tool_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+fn openai_error_chunk(data: &str) -> Option<ApiStreamChunk> {
+    let envelope = serde_json::from_str::<OpenAiErrorEnvelope>(data).ok()?;
+    let code = envelope.error.code.as_ref().and_then(|value| match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    });
+    let retryable_status = code
+        .as_deref()
+        .and_then(|value| value.parse::<u16>().ok())
+        .is_some_and(|status| matches!(status, 408 | 429 | 500 | 502 | 503 | 504));
+    let retryable_label = envelope
+        .error
+        .error_type
+        .as_deref()
+        .into_iter()
+        .chain(code.as_deref())
+        .map(str::to_ascii_lowercase)
+        .any(|value| {
+            value.contains("overload")
+                || value.contains("rate_limit")
+                || value.contains("service_unavailable")
+                || value.contains("server_error")
+                || value.contains("timeout")
+                || value.contains("temporarily_unavailable")
+        });
+    let mut details = Vec::new();
+    if let Some(error_type) = envelope.error.error_type {
+        details.push(format!("type: {error_type}"));
+    }
+    if let Some(code) = code {
+        details.push(format!("code: {code}"));
+    }
+    let details = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    };
+    let retryable = if retryable_status || retryable_label {
+        " (retryable)"
+    } else {
+        ""
+    };
+    Some(ApiStreamChunk::Error(format!(
+        "OpenAI SSE error: {}{details}{retryable}",
+        envelope.error.message
+    )))
+}
+
 #[allow(clippy::unused_async)]
 async fn process_openai_sse_line(
     line: &str,
@@ -1050,9 +1112,16 @@ async fn process_openai_sse_line(
         .strip_prefix("data:")
         .map(|s| s.strip_prefix(" ").unwrap_or(s));
     if let Some(data) = data {
-        let Ok(chunk) = serde_json::from_str::<OpenAiStreamChunk>(data) else {
-            tracing::warn!(line = %line, "OpenAI SSE: failed to parse chunk");
-            return;
+        let chunk = match serde_json::from_str::<OpenAiStreamChunk>(data) {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                if let Some(chunk) = openai_error_chunk(data) {
+                    send_chunk(tx, chunk, "error").await;
+                    return;
+                }
+                tracing::warn!(line = %line, error = %error, "OpenAI SSE: failed to parse chunk");
+                return;
+            }
         };
         if let Some(choice) = chunk.choices.into_iter().next() {
             let delta = choice.delta;
@@ -2874,6 +2943,88 @@ mod tests {
             &mut completed_tool_call_indices,
             &mut last_stop_reason,
             model_info.as_ref(),
+            &mut usage_sent,
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_process_openai_sse_line_emits_retryable_error_envelope() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason = None;
+        let mut usage_sent = false;
+
+        process_openai_sse_line(
+            r#"data: {"error":{"message":"Service temporarily overloaded","type":"service_unavailable","code":503}}"#,
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+
+        let ApiStreamChunk::Error(error) = rx.try_recv().unwrap() else {
+            panic!("error envelope must produce an error chunk");
+        };
+        assert!(error.contains("Service temporarily overloaded"));
+        assert!(error.contains("service_unavailable"));
+        assert!(error.contains("code: 503"));
+        assert!(error.contains("(retryable)"));
+    }
+
+    #[tokio::test]
+    async fn test_process_openai_sse_line_emits_non_retryable_error_envelope() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason = None;
+        let mut usage_sent = false;
+
+        process_openai_sse_line(
+            r#"data: {"error":{"message":"Invalid request","type":"invalid_request_error","code":400}}"#,
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+
+        let ApiStreamChunk::Error(error) = rx.try_recv().unwrap() else {
+            panic!("error envelope must produce an error chunk");
+        };
+        assert!(error.contains("Invalid request"));
+        assert!(!error.contains("(retryable)"));
+    }
+
+    #[tokio::test]
+    async fn test_process_openai_sse_line_ignores_unknown_malformed_data() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason = None;
+        let mut usage_sent = false;
+
+        process_openai_sse_line(
+            "data: not-json",
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
             &mut usage_sent,
         )
         .await;

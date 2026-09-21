@@ -8373,6 +8373,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 .await
                 .did_automatically_retry_failed_api_request
         );
+        assert_eq!(agent.state.lock().await.consecutive_mistakes, 0);
     }
 
     #[tokio::test]
