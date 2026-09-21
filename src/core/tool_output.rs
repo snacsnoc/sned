@@ -468,7 +468,7 @@ pub fn summarize_single_section(section: &str) -> String {
             if let Some(rest) = l.strip_prefix("[File: ") {
                 rest.split(", Hash: ")
                     .last()
-                    .and_then(|h| h.strip_suffix(']'))
+                    .and_then(|h| h.split(']').next())
             } else if let Some(rest) = l.strip_prefix("[File Hash: ") {
                 rest.strip_suffix(']')
             } else {
@@ -686,6 +686,11 @@ mod tests {
 
     #[test]
     fn pruned_read_retains_large_file_revision_edit_guidance() {
+        let summary = summarize_single_section(
+            "[File: src/main.rs, Hash: abc] (2 lines total, Lines 10–11)\nFoo§bar",
+        );
+        assert!(summary.contains("Hash: abc]"));
+
         let summary = summarize_single_section(
             "[File: large.txt, Hash: abc]\nLabcN1§old\n[Note: These large-file snapshot anchors are valid only for this file version.]",
         );

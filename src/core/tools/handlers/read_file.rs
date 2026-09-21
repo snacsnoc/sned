@@ -332,7 +332,7 @@ impl ReadFileHandler {
             full_lines,
             range_start,
             range_end,
-            _line_number_offset,
+            line_number_offset,
             refreshes_edit_context,
         ) = if has_line_range {
             let large_file_range = metadata.len() > max_read_size as u64;
@@ -487,19 +487,30 @@ impl ReadFileHandler {
         } else {
             ANCHOR_GUIDANCE.to_string()
         };
-        let total_lines = lines_for_reconcile.len();
+        let line_count = if refreshes_edit_context {
+            format!("{} lines total", lines_for_reconcile.len())
+        } else {
+            format!("{} lines shown", lines_for_reconcile.len())
+        };
         // Spatial awareness: surface total file size + window coordinates so the
         // model knows where it is relative to EOF without burning an extra read.
         // Without this, models in a "narrow slice read loop" cannot tell if line
         // 600 is near EOF or in the middle, so they keep fetching small windows.
-        let header = if has_line_range && refreshes_edit_context {
-            let displayed_start = range_start + 1;
-            let displayed_end = range_end;
+        let header = if has_line_range {
+            let displayed_offset = if refreshes_edit_context {
+                range_start
+            } else {
+                line_number_offset
+            };
+            let displayed_start = displayed_offset.saturating_add(1);
+            let displayed_end = displayed_offset.saturating_add(range_end);
             format!(
-                "[File: {display_path} ({total_lines} lines total), Lines {displayed_start}–{displayed_end}, Hash: {hash}]\n{guidance}\n{anchored_content}"
+                "[File: {display_path}, Hash: {hash}] ({line_count}, Lines {displayed_start}–{displayed_end})\n{guidance}\n{anchored_content}"
             )
         } else {
-            format!("[File: {display_path} ({total_lines} lines total), Hash: {hash}]\n{guidance}\n{anchored_content}")
+            format!(
+                "[File: {display_path}, Hash: {hash}] ({line_count})\n{guidance}\n{anchored_content}"
+            )
         };
         let mut content = header;
         if let Some(note) = clamping_note {
@@ -1240,7 +1251,8 @@ fn detect_high_overlap(windows: &[(usize, usize)]) -> bool {
             }
             let intersection = a_start.max(b_start)..a_end.min(b_end);
             let intersection_size = intersection.end.saturating_sub(intersection.start);
-            if intersection_size.saturating_mul(2) >= smaller_span {
+            let minimum_intersection = smaller_span / 2 + smaller_span % 2;
+            if intersection_size >= minimum_intersection {
                 return true;
             }
         }
@@ -1521,13 +1533,14 @@ mod tests {
         .unwrap();
         let output = result.as_str().unwrap();
 
-        assert!(output.starts_with(&format!(
-            "[File: {} (",
-            relative_path.display()
-        )));
+        assert!(output.starts_with(&format!("[File: {}, Hash: ", relative_path.display())));
         assert!(
-            output.contains("lines total), Hash: "),
+            output.contains("(2 lines total)"),
             "header must surface total line count for spatial awareness, got: {output}"
+        );
+        assert_eq!(
+            crate::core::tool_output::path_from_read_file_header(output),
+            Some(relative_path.to_str().unwrap())
         );
         assert!(!output.contains(&workspace.path().to_string_lossy().to_string()));
     }
@@ -1770,6 +1783,8 @@ mod tests {
         assert!(result.error.is_none());
         assert!(!result.refreshes_edit_context);
         assert!(result.content.contains("truncated to 512KB"));
+        assert!(result.content.contains("lines shown"));
+        assert!(!result.content.contains("lines total"));
         assert!(result.content.contains("Hash:"));
     }
 
@@ -1871,6 +1886,7 @@ mod tests {
         assert!(result.success, "range read failed: {:?}", result.error);
         assert!(result.content.contains("line 10"));
         assert!(result.content.contains("line 12"));
+        assert!(result.content.contains("Lines 10–12"));
         assert!(!result.content.contains("line 9"));
         assert!(
             !result.refreshes_edit_context,
@@ -1881,6 +1897,8 @@ mod tests {
                 .content
                 .contains("ordinary Word§ anchors remain inspection-only")
         );
+        assert!(result.content.contains("lines shown"));
+        assert!(!result.content.contains("lines total"));
         use sha2::Digest;
         let expected = format!(
             "sha256:{:x}",
@@ -2652,6 +2670,10 @@ mod tests {
                 !output.contains("in a narrow region"),
                 "sequential forward scanning must not trigger the thrash warning, got: {output}"
             );
+            assert!(
+                !output.contains("without edits"),
+                "sequential forward scanning must not trigger the generic read warning, got: {output}"
+            );
         }
     }
 
@@ -2667,6 +2689,9 @@ mod tests {
         assert!(!detect_high_overlap(&[(1, 100)]));
         // Empty list — no overlap possible.
         assert!(!detect_high_overlap(&[]));
+        // The comparison must remain correct when spans approach usize::MAX.
+        let max = usize::MAX;
+        assert!(detect_high_overlap(&[(0, max - 1), (0, max - 1)]));
     }
 
     #[test]
@@ -2844,7 +2869,11 @@ mod tests {
     #[test]
     fn is_sequential_forward_rejects_overlapping_eof_window() {
         // Pagination that legitimately includes an EOF read at the end.
-        assert!(is_sequential_forward(&[(1, 100), (101, 200), (201, usize::MAX)]));
+        assert!(is_sequential_forward(&[
+            (1, 100),
+            (101, 200),
+            (201, usize::MAX)
+        ]));
         // EOF read that walks backward over the previous window — hunt.
         assert!(!is_sequential_forward(&[(500, 600), (550, usize::MAX)]));
         // EOF read that jumps forward — still pagination.
