@@ -1513,23 +1513,50 @@ impl AgentLoop {
     /// build or test runner? Kept separate from retry-loop state because a
     /// passing build does not prove that a rejected edit retry has stopped.
     fn looks_like_build_or_test_command(tool_params: &serde_json::Value) -> bool {
-        // Pull the first entry from `commands[]` OR the `script` string.
-        // Both shapes are documented in the execute_command schema.
-        let first = tool_params
-            .get("commands")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|v| v.as_str())
-            .or_else(|| tool_params.get("script").and_then(|v| v.as_str()));
-        let Some(line) = first else { return false };
-        let mut tokens = line.split_whitespace();
-        let Some(bin) = tokens.next() else { return false };
+        let commands = coerce_command_array(tool_params);
+        let lines = commands
+            .iter()
+            .map(String::as_str)
+            .chain(tool_params.get("script").and_then(|value| value.as_str()));
+        lines
+            .flat_map(crate::core::approval::split_command_segments)
+            .any(Self::command_segment_looks_like_build_or_test)
+    }
+
+    fn command_segment_looks_like_build_or_test(segment: &str) -> bool {
+        let tokens = segment.split_whitespace().collect::<Vec<_>>();
+        let mut index = 0;
+        if tokens.first().is_some_and(|token| *token == "env") {
+            index += 1;
+            while let Some(option) = tokens.get(index) {
+                match *option {
+                    "-u" | "--unset" | "-C" | "--chdir" => index += 2,
+                    "--" => {
+                        index += 1;
+                        break;
+                    }
+                    option if option.starts_with('-') => index += 1,
+                    _ => break,
+                }
+            }
+        }
+        while tokens
+            .get(index)
+            .is_some_and(|token| Self::is_shell_assignment(token))
+        {
+            index += 1;
+        }
+        let Some(bin) = tokens.get(index).copied() else {
+            return false;
+        };
+        index += 1;
         // Strip path prefix so /usr/local/bin/cargo and ./node_modules/.bin/jest
         // classify the same as the bare tool name.
         let basename = bin.rsplit(['/', '\\']).next().unwrap_or(bin);
+        let subcommand = tokens.get(index).copied();
         match basename {
             "cargo" => matches!(
-                tokens.next().map(str::as_ref),
+                subcommand,
                 Some(
                     "build"
                         | "test"
@@ -1543,17 +1570,17 @@ impl AgentLoop {
             ),
             "rustc" => true,
             "swift" => matches!(
-                tokens.next().map(str::as_ref),
+                subcommand,
                 Some("build" | "test" | "run" | "compile")
             ),
             "xcodebuild" | "xcrun" => true,
             "npm" | "pnpm" | "yarn" => matches!(
-                tokens.next().map(str::as_ref),
+                subcommand,
                 Some("run" | "test" | "build" | "lint" | "typecheck")
             ),
             "make" | "gmake" => true,
             "go" => matches!(
-                tokens.next().map(str::as_ref),
+                subcommand,
                 Some("build" | "test" | "vet" | "run")
             ),
             "pytest" | "tox" => true,
@@ -1565,11 +1592,26 @@ impl AgentLoop {
             "jest" | "vitest" | "mocha" => true,
             "rspec" | "cucumber" => true,
             "dotnet" => matches!(
-                tokens.next().map(str::as_ref),
+                subcommand,
                 Some("build" | "test" | "run")
             ),
             _ => false,
         }
+    }
+
+    fn is_shell_assignment(token: &str) -> bool {
+        let Some((name, _)) = token.split_once('=') else {
+            return false;
+        };
+        !name.is_empty()
+            && name
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| {
+                    byte == b'_'
+                        || byte.is_ascii_alphabetic()
+                        || index > 0 && byte.is_ascii_digit()
+                })
     }
 
     async fn invalidate_changed_read_state(state: &Arc<Mutex<TaskState>>) {
@@ -7856,6 +7898,11 @@ Irrespective of whether additional information or instructions are given, you ar
             serde_json::json!({"script": "xcodebuild -scheme Foo build 2>&1 | tail -50\n"}),
             serde_json::json!({"commands": ["/usr/local/bin/cargo build"]}),
             serde_json::json!({"commands": ["./node_modules/.bin/jest"]}),
+            serde_json::json!({"commands": ["cd SDRSkeleton && xcodebuild -scheme App build 2>&1 | tail -50"]}),
+            serde_json::json!({"commands": "[\"cd SDRSkeleton && xcodebuild -scheme App build\"]"}),
+            serde_json::json!({"commands": ["BUILD_MODE=debug cargo check"]}),
+            serde_json::json!({"commands": ["env BUILD_MODE=debug cargo test"]}),
+            serde_json::json!({"commands": ["env -u BUILD_MODE cargo test"]}),
         ];
         for params in &build_or_test {
             assert!(
@@ -7877,6 +7924,7 @@ Irrespective of whether additional information or instructions are given, you ar
             serde_json::json!({"commands": ["mkdir -p /tmp/x"]}),
             serde_json::json!({"commands": ["rm -f /tmp/x"]}),
             serde_json::json!({"commands": ["curl -fsS https://example.com"]}),
+            serde_json::json!({"commands": ["grep cargo src/lib.rs | tail -1"]}),
             // Bare `cargo` with no subcommand is ambiguous — must NOT
             // classify as build so we don't accidentally clear on
             // `cargo --version` or `cargo install`.

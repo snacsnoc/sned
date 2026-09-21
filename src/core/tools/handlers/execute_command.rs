@@ -588,8 +588,6 @@ impl ExecuteCommandHandler {
         raw_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> anyhow::Result<String> {
-        use std::process::Stdio;
-        use tokio::process::Command;
         use tokio::time::timeout;
 
         let mut combined_output = String::new();
@@ -618,39 +616,35 @@ impl ExecuteCommandHandler {
                 output_writer.emit(OutputEvent::CommandHeaderLine(line));
             }
 
-            // Execute via shell for portability and shell feature support
-            let mut cmd = if cfg!(target_os = "windows") {
-                let mut c = Command::new("cmd");
-                c.args(["/C", &cmd_str]);
-                c
-            } else {
-                let mut c = Command::new("sh");
-                c.args(["-c", &cmd_str]);
-                // Create a new process group so we can kill all children on timeout
-                #[cfg(unix)]
-                c.process_group(0);
-                c
-            };
-
             let (sandboxed_env, env_report) = Self::build_sandbox_env(cwd);
-            cmd.env_clear().envs(sandboxed_env);
             sandbox_env_report.extend(env_report);
-
-            if let Some(dir) = cwd {
-                if !dir.exists() || !dir.is_dir() {
-                    let err = crate::cli::actionable_errors::directory_not_found(
-                        &dir.display().to_string(),
-                    );
-                    return Err(anyhow::anyhow!("{}", err.display()));
-                }
-                cmd.current_dir(dir);
+            if let Some(dir) = cwd
+                && (!dir.exists() || !dir.is_dir())
+            {
+                let err = crate::cli::actionable_errors::directory_not_found(
+                    &dir.display().to_string(),
+                );
+                return Err(anyhow::anyhow!("{}", err.display()));
             }
 
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut cmd = Self::configured_command_process(
+                &cmd_str,
+                cwd,
+                &sandboxed_env,
+                !cfg!(target_os = "windows"),
+            );
 
             let timeout_duration =
                 timeout_override.unwrap_or_else(|| Self::resolve_timeout(&cmd_str));
-            let mut child = cmd.spawn()?;
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                #[cfg(unix)]
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!("bash was not found on PATH; falling back to sh without pipefail");
+                    Self::configured_command_process(&cmd_str, cwd, &sandboxed_env, false).spawn()?
+                }
+                Err(error) => return Err(error.into()),
+            };
             #[cfg(unix)]
             let child_pid = child.id().unwrap_or(0) as i32;
 
@@ -1222,6 +1216,38 @@ impl ExecuteCommandHandler {
         } else {
             Ok(assembled_output)
         }
+    }
+
+    fn configured_command_process(
+        command: &str,
+        cwd: Option<&Path>,
+        sandboxed_env: &std::collections::HashMap<String, String>,
+        use_bash: bool,
+    ) -> tokio::process::Command {
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        let mut process = if cfg!(target_os = "windows") {
+            let mut process = Command::new("cmd");
+            process.args(["/C", command]);
+            process
+        } else if use_bash {
+            let mut process = Command::new("bash");
+            process.args(["-o", "pipefail", "-c", command]);
+            process
+        } else {
+            let mut process = Command::new("sh");
+            process.args(["-c", command]);
+            process
+        };
+        #[cfg(unix)]
+        process.process_group(0);
+        process.env_clear().envs(sandboxed_env);
+        if let Some(cwd) = cwd {
+            process.current_dir(cwd);
+        }
+        process.stdout(Stdio::piped()).stderr(Stdio::piped());
+        process
     }
 
     /// Execute a script in a specific language.
@@ -1840,7 +1866,6 @@ mod tests {
             "{ \"command\" : \"echo invalid\"}",
             "['echo invalid']",
             "[\"echo invalid\", 42]",
-            "[\"echo invalid\"",
         ] {
             assert!(
                 is_serialized_command_container(value),
@@ -1849,6 +1874,7 @@ mod tests {
         }
 
         assert!(!is_serialized_command_container("[\"echo valid\"]"));
+        assert!(!is_serialized_command_container("[\"echo valid\""));
         assert!(!is_serialized_command_container("[ \"echo valid\" ]"));
         assert!(!is_serialized_command_container("[]"));
         assert!(!is_serialized_command_container("echo valid"));
@@ -2281,6 +2307,27 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("bash works"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_commands_preserves_pipeline_failure_status() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let result = handler
+            .execute_commands(vec!["false | tail -1".to_string()], None)
+            .await;
+        assert!(result.is_err(), "pipefail must preserve the upstream failure");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_commands_allows_successful_pipeline() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let result = handler
+            .execute_commands(vec!["printf 'ok\\n' | tail -1".to_string()], None)
+            .await
+            .expect("a successful pipeline should remain successful");
+        assert!(result.contains("ok"));
     }
 
     #[tokio::test]

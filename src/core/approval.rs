@@ -630,7 +630,7 @@ fn is_reusable_read_only_sed(parts: &[&str]) -> bool {
 /// Split a command on `|`, `&`, `;`, and newline boundaries, but only
 /// at the top level: operators inside single or double quotes don't
 /// terminate a segment.
-fn split_command_segments(s: &str) -> Vec<&str> {
+pub(crate) fn split_command_segments(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0;
