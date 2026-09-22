@@ -24,19 +24,19 @@ async fn native_workflow_multiline_anchor_recovery_deletes_range_without_reread(
         let error = w.edit(json!([edit])).await.unwrap_err();
         let message = error.to_string();
         assert!(
-            message.contains("must contain exactly one source line"),
+            message.contains("does not match consecutive current Word§source lines"),
             "{message}"
         );
-        assert!(message.contains("no reread is needed"));
-        assert!(error.metadata().is_none());
-        w.assert_bytes(before);
-        w.assert_reread(false).await;
-        let visible = sned::core::tool_output::edit_failure_details(&message).join("\n");
-        assert!(
-            visible.contains("must contain exactly one source line"),
-            "{visible}"
+        assert!(message.contains("Read the changed range again"));
+        assert_eq!(
+            error
+                .metadata()
+                .and_then(|metadata| metadata.required_next_step.clone()),
+            Some(ToolRequiredNextStep::ReadFile)
         );
-        assert!(!visible.contains(&copied[1]));
+        w.assert_bytes(before);
+        w.assert_reread(true).await;
+        w.read(None).await;
     }
     w.edit(json!([{"anchor": copied[2], "end_anchor": copied[4], "text": ""}]))
         .await
@@ -857,7 +857,7 @@ impl Workflow {
     }
 
     async fn read_path(&self, path: &str, range: Option<(usize, usize)>) -> Vec<String> {
-        let mut params = json!({"paths": [path]});
+        let mut params = json!({"paths": [path], "refresh": true});
         if let Some((start, end)) = range {
             params["start_line"] = json!(start);
             params["end_line"] = json!(end);
@@ -1255,7 +1255,7 @@ async fn native_workflow_large_snapshot_never_retargets_duplicate() {
     let guidance = ToolHandler::execute(
         &ReadFileHandler::new(),
         &w.ctx,
-        json!({"paths": ["fixture.txt"], "start_line": 1, "end_line": 3}),
+        json!({"paths": ["fixture.txt"], "start_line": 1, "end_line": 3, "refresh": true}),
     )
     .await
     .unwrap();

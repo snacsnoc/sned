@@ -16,8 +16,8 @@ use crate::core::edit_batch::{
     MAX_FINGERPRINT_CONTENT_LINES, PreparedEdits,
 };
 use crate::core::file_editor::{
-    AnchorStateManager, Edit, EditFailureReason, FileTextFormat, normalize_file_content,
-    restore_file_content,
+    ANCHOR_NAME_REGEX, AnchorStateManager, Edit, EditFailureReason, FileTextFormat,
+    normalize_file_content, restore_file_content,
 };
 use crate::core::hash_utils::{ANCHOR_DELIMITER, split_anchor, strip_hashes};
 use crate::core::tools::handlers::diagnostics_scan::{DiagnosticsScanHandler, ProjectType};
@@ -242,12 +242,9 @@ impl EditFileHandler {
         let has_leading_line_break = without_line_prefix.starts_with(['\n', '\r']);
         let anchor = without_line_prefix.trim_end_matches(['\r', '\n']);
 
-        // Anchors must refer to exactly one source line. Multi-line pastes
-        // (e.g. the model copy-pasting several `Word§content` lines into one
-        // `anchor` selector) or leading line breaks are rejected so the model
-        // picks the right shape (`anchor` + optional `end_anchor`) instead of
-        // having the tool pick one anchored line on its behalf and silently
-        // narrowing the range.
+        // This helper validates one selector line. Multiline selector blocks
+        // are parsed by normalized_selector_block so their complete copied
+        // context can be verified before an edit is applied.
         //
         // The error puts the corrective JSON shape in the very first
         // sentence. Live debug logs (qwen1, gemini) both showed the model
@@ -268,6 +265,82 @@ impl EditFileHandler {
         }
 
         Ok(anchor.to_string())
+    }
+
+    fn normalized_edit_anchor(path: &str, raw: &str) -> Result<String, String> {
+        let without_trailing_newline = raw.strip_suffix("\r\n").or_else(|| raw.strip_suffix('\n'));
+        if !raw.contains(['\n', '\r'])
+            || without_trailing_newline.is_some_and(|value| !value.contains(['\n', '\r']))
+        {
+            return Self::normalized_anchor("anchor", path, raw);
+        }
+
+        if raw.len() > MAX_FINGERPRINT_CONTENT_BYTES {
+            return Err(format!(
+                "File '{path}': anchored block exceeds {MAX_FINGERPRINT_CONTENT_BYTES} bytes; use a narrower range."
+            ));
+        }
+
+        let block = without_trailing_newline.unwrap_or(raw);
+        let lines = block.split('\n').collect::<Vec<_>>();
+        if lines.len() < 2 || lines.len() > MAX_FINGERPRINT_CONTENT_LINES + 2 {
+            return Err(format!(
+                "File '{path}': anchored block must contain 2 to {} lines.",
+                MAX_FINGERPRINT_CONTENT_LINES + 2
+            ));
+        }
+
+        let first = Self::normalized_anchor("anchor", path, lines[0])?;
+        let (word, _) = split_anchor(&first);
+        if !first.contains(ANCHOR_DELIMITER) || !ANCHOR_NAME_REGEX.is_match(&word) {
+            return Self::normalized_anchor("anchor", path, raw);
+        }
+        let anchored_continuations = lines[1..].iter().any(|line| line.contains(ANCHOR_DELIMITER));
+        let mut normalized = vec![first];
+        for line in &lines[1..] {
+            if anchored_continuations {
+                let anchor = Self::normalized_anchor("anchor", path, line)?;
+                let (word, _) = split_anchor(&anchor);
+                if !anchor.contains(ANCHOR_DELIMITER) || !ANCHOR_NAME_REGEX.is_match(&word) {
+                    return Self::normalized_anchor("anchor", path, raw);
+                }
+                normalized.push(anchor);
+            } else {
+                normalized.push(line.strip_suffix('\r').unwrap_or(line).to_string());
+            }
+        }
+
+        Ok(normalized.join("\n"))
+    }
+
+    fn normalized_selector_block(
+        field_name: &str,
+        path: &str,
+        raw: &str,
+    ) -> Result<Vec<String>, String> {
+        if field_name == "anchor" {
+            return Ok(Self::normalized_edit_anchor(path, raw)?
+                .split('\n')
+                .map(str::to_string)
+                .collect());
+        }
+
+        let block = raw.strip_suffix("\r\n").or_else(|| raw.strip_suffix('\n')).unwrap_or(raw);
+        let lines = block.split('\n').collect::<Vec<_>>();
+        if lines.len() == 1 {
+            return Ok(vec![Self::normalized_anchor(field_name, path, lines[0])?]);
+        }
+        if block.len() > MAX_FINGERPRINT_CONTENT_BYTES
+            || lines.len() > MAX_FINGERPRINT_CONTENT_LINES + 2
+        {
+            return Err(format!(
+                "File '{path}': multiline {field_name} exceeds the supported selector size; use the first and last Word§source lines."
+            ));
+        }
+        lines
+            .into_iter()
+            .map(|line| Self::normalized_anchor(field_name, path, line))
+            .collect()
     }
 
     fn repair_truncated_files_json(raw: &str) -> Option<String> {
@@ -348,6 +421,36 @@ impl EditFileHandler {
                 }
 
                 Err(err)
+            }
+        }
+    }
+
+    fn json_error_context(raw: &str, error: &serde_json::Error) -> String {
+        let line_number = error.line().max(1);
+        let column = error.column().max(1);
+        let line = raw.lines().nth(line_number - 1).unwrap_or(raw);
+        let start = column.saturating_sub(1).saturating_sub(32);
+        let end = (start + 96).min(line.len());
+        let snippet = line.get(start..end).unwrap_or(line);
+        format!(
+            "{error} near line {line_number}, column {column}: {:?}",
+            snippet
+        )
+    }
+
+    fn parse_stringified_edits_array(
+        raw: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        match serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+            Ok(edits) => Ok(edits),
+            Err(error) => {
+                let repaired = crate::providers::repair_json_args(raw);
+                if repaired != raw
+                    && let Ok(edits) = serde_json::from_str::<Vec<serde_json::Value>>(&repaired)
+                {
+                    return Ok(edits);
+                }
+                Err(Self::json_error_context(raw, &error))
             }
         }
     }
@@ -450,15 +553,69 @@ impl EditFileHandler {
     pub(crate) fn normalize_stringified_files_param(
         params: &mut serde_json::Value,
     ) -> Result<bool, String> {
-        let Some(raw) = params.get("files").and_then(serde_json::Value::as_str) else {
+        if let Some(raw) = params.get("files").and_then(serde_json::Value::as_str) {
+            let files = Self::parse_stringified_files_array(raw).map_err(|error| {
+                format!(
+                    "Failed to parse 'files' as an array of {{path, edits}} objects: {}. Re-issue the tool call with a literal JSON array.",
+                    Self::json_error_context(raw, &error)
+                )
+            })?;
+            params["files"] = serde_json::Value::Array(files);
+            return Ok(true);
+        }
+
+        if params.get("files").is_some() {
             return Ok(false);
+        }
+        if params.get("path").is_some() && params.get("edits").is_some() {
+            if params.get("paths").is_some() {
+                return Err("Ambiguous edit_file arguments: use either 'paths' or 'path' with 'edits'.".to_string());
+            }
+            let path = params
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|path| !path.is_empty())
+                .ok_or("Invalid 'path': expected a nonempty file path")?
+                .to_string();
+            let edits = match params.get("edits") {
+                Some(serde_json::Value::Array(edits)) => edits.clone(),
+                Some(serde_json::Value::String(raw)) => Self::parse_stringified_edits_array(raw)
+                    .map_err(|error| format!("Invalid 'edits' JSON array: {error}"))?,
+                _ => return Err("Invalid 'edits': expected an array of edit objects".to_string()),
+            };
+            if edits.is_empty() || edits.iter().any(|edit| !edit.is_object()) {
+                return Err("Invalid 'edits': expected a nonempty array of edit objects".to_string());
+            }
+            let object = params.as_object_mut().ok_or("edit_file arguments must be a JSON object")?;
+            object.remove("path");
+            object.remove("edits");
+            object.insert("files".to_string(), serde_json::json!([{"path": path, "edits": edits}]));
+            return Ok(true);
+        }
+        let files = match params.get("paths") {
+            Some(serde_json::Value::Array(files)) => files.clone(),
+            Some(serde_json::Value::String(raw)) => serde_json::from_str::<Vec<serde_json::Value>>(raw)
+                .map_err(|error| format!("Invalid 'paths' edit payload: {error}. Use a literal 'files' array of {{path, edits}} objects."))?,
+            _ => return Ok(false),
         };
-        let files = Self::parse_stringified_files_array(raw).map_err(|error| {
-            format!(
-                "Failed to parse 'files' as an array of {{path, edits}} objects: {error}. Re-issue the tool call with a literal JSON array."
-            )
-        })?;
-        params["files"] = serde_json::Value::Array(files);
+        if files.is_empty()
+            || files.iter().any(|file| {
+                file.get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|path| path.is_empty())
+                    || file
+                        .get("edits")
+                        .and_then(serde_json::Value::as_array)
+                        .is_none_or(|edits| edits.is_empty())
+            })
+        {
+            return Err("Invalid 'paths' edit payload: expected a nonempty JSON array of {path, edits} objects. Use the 'files' parameter.".to_string());
+        }
+        let object = params
+            .as_object_mut()
+            .ok_or("edit_file arguments must be a JSON object")?;
+        object.remove("paths");
+        object.insert("files".to_string(), serde_json::Value::Array(files));
         Ok(true)
     }
 
@@ -526,10 +683,15 @@ impl EditFileHandler {
         for file in files {
             let path = Self::file_entry_path(file).map_err(ToolError::InvalidInput)?;
 
-            let edits_raw = file
-                .get("edits")
-                .and_then(|e| e.as_array())
-                .ok_or_else(|| {
+            let edits_raw = match file.get("edits") {
+                Some(serde_json::Value::Array(edits)) => edits.clone(),
+                Some(serde_json::Value::String(raw)) => Self::parse_stringified_edits_array(raw)
+                    .map_err(|error| {
+                        ToolError::InvalidInput(format!(
+                            "Failed to parse 'edits' for file '{path}': {error}. Use a literal JSON array of edit objects."
+                        ))
+                    })?,
+                _ => return Err({
                     // Lenient: models sometimes put anchor/edit_type/text as
                     // siblings at the file-entry level instead of inside an
                     // edits array. Detect this and give a targeted error.
@@ -549,10 +711,11 @@ impl EditFileHandler {
                             error_guidance::missing_parameter("edits", 0)
                         ))
                     }
-                })?;
+                }),
+            };
 
             let mut edits = Vec::new();
-            for edit_raw in edits_raw {
+            for edit_raw in &edits_raw {
                 let anchor_raw =
                     edit_raw
                         .get("anchor")
@@ -564,8 +727,13 @@ impl EditFileHandler {
                                 error_guidance::missing_parameter("anchor", 0)
                             ))
                         })?;
-                let anchor = Self::normalized_anchor("anchor", path, anchor_raw)
+                let anchor_block = Self::normalized_selector_block("anchor", path, anchor_raw)
                     .map_err(ToolError::InvalidInput)?;
+                let anchor_is_anchored_block = anchor_block.len() > 1
+                    && anchor_block
+                        .iter()
+                        .all(|line| line.contains(ANCHOR_DELIMITER));
+                let anchor = anchor_block.join("\n");
 
                 let edit_type = edit_raw
                     .get("edit_type")
@@ -574,12 +742,27 @@ impl EditFileHandler {
 
                 Self::validate_edit_type(edit_type)?;
 
-                let end_anchor = edit_raw
+                let end_block = edit_raw
                     .get("end_anchor")
                     .and_then(|e| e.as_str())
-                    .map(|s| Self::normalized_anchor("end_anchor", path, s))
+                    .map(|raw| Self::normalized_selector_block("end_anchor", path, raw))
                     .transpose()
-                    .map_err(ToolError::InvalidInput)?;
+                    .map_err(ToolError::InvalidInput)?
+                    .unwrap_or_default();
+                let end_is_anchored_block = end_block.len() > 1;
+                let end_anchor = (!end_block.is_empty()).then(|| end_block.join("\n"));
+
+                if (anchor.contains('\n') || end_is_anchored_block) && edit_type != "replace"
+                {
+                    return Err(ToolError::InvalidInput(format!(
+                        "File '{path}': multiline anchor blocks are supported only for replace edits; use a single-line anchor for insertions."
+                    )));
+                }
+                if anchor.contains('\n') && end_anchor.is_some() && !anchor_is_anchored_block {
+                    return Err(ToolError::InvalidInput(format!(
+                        "File '{path}': a multiline anchor with plain source continuations cannot also use end_anchor; omit end_anchor and content, or use complete Word§source lines."
+                    )));
+                }
 
                 let text_value = edit_raw.get("text").ok_or_else(|| {
                     ToolError::InvalidInput(format!(
@@ -594,7 +777,7 @@ impl EditFileHandler {
 
                 // Multi-line fingerprint: lets the model disambiguate
                 // identical-content lines when both anchor and end_anchor resolve.
-                let content = if let Some(content_value) = edit_raw.get("content") {
+                let explicit_content = if let Some(content_value) = edit_raw.get("content") {
                     let arr = content_value.as_array().ok_or_else(|| {
                         ToolError::InvalidInput(format!(
                             "Invalid 'content' in edit for file '{path}': expected an array of exact interior fingerprint lines. Put replacement text in the required 'text' string; do not use 'content' as a replacement-text alias."
@@ -633,6 +816,8 @@ impl EditFileHandler {
                 } else {
                     None
                 };
+
+                let content = explicit_content;
 
                 // Strip leaked anchor prefixes that the model may have
                 // copy-pasted from the diff output (e.g. `QualitySocial§...`
@@ -726,7 +911,7 @@ impl EditFileHandler {
                     .get("anchor")
                     .and_then(|a: &serde_json::Value| a.as_str())
                     .unwrap_or("");
-                let anchor = match Self::normalized_anchor("anchor", path, anchor_raw) {
+                let anchor_block = match Self::normalized_selector_block("anchor", path, anchor_raw) {
                     Ok(anchor) => anchor,
                     Err(message) => {
                         if anchor_raw.trim_start().contains(['\n', '\r']) {
@@ -736,6 +921,15 @@ impl EditFileHandler {
                         }
                         continue;
                     }
+                };
+                let anchor = if anchor_block.len() > 1
+                    && anchor_block
+                        .iter()
+                        .all(|line| line.contains(ANCHOR_DELIMITER))
+                {
+                    anchor_block[0].clone()
+                } else {
+                    anchor_block.join("\n")
                 };
 
                 if anchor.contains(ANCHOR_DELIMITER) {
@@ -769,8 +963,8 @@ impl EditFileHandler {
                     .get("end_anchor")
                     .and_then(|a: &serde_json::Value| a.as_str())
                 {
-                    let end_anchor =
-                        match Self::normalized_anchor("end_anchor", path, end_anchor_raw) {
+                    let end_block =
+                        match Self::normalized_selector_block("end_anchor", path, end_anchor_raw) {
                             Ok(anchor) => anchor,
                             Err(message) => {
                                 if end_anchor_raw.trim_start().contains(['\n', '\r']) {
@@ -781,6 +975,7 @@ impl EditFileHandler {
                                 continue;
                             }
                         };
+                    let end_anchor = end_block.last().cloned().unwrap_or_default();
                     if end_anchor.contains(ANCHOR_DELIMITER) {
                         let (end_anchor_name, _) = split_anchor(&end_anchor);
                         if end_anchor_name.is_empty()
@@ -880,6 +1075,7 @@ impl EditFileHandler {
         state.last_read_turn.remove(&key);
         state.recent_read_windows.remove(&key);
         state.read_file_snapshots.remove(&key);
+        state.visible_read_coverage.remove(&key);
     }
 
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
@@ -2599,6 +2795,7 @@ impl EditFileHandler {
                 state.last_read_turn.remove(&key);
                 state.recent_read_windows.remove(&key);
                 state.read_file_snapshots.remove(&key);
+                state.visible_read_coverage.remove(&key);
                 if write_failed_paths.contains(&item.absolute_path) {
                     continue;
                 }
@@ -2996,6 +3193,14 @@ impl ToolHandler for EditFileHandler {
         let handler = self.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
+            let mut params = params;
+            if params.get("files").is_none()
+                && (params.get("paths").is_some()
+                    || params.get("path").is_some() && params.get("edits").is_some())
+            {
+                Self::normalize_stringified_files_param(&mut params)
+                    .map_err(ToolError::InvalidInput)?;
+            }
             let requested_paths = Self::requested_paths_for_locking(&params);
             let resolved_paths = requested_paths
                 .iter()
@@ -3973,10 +4178,253 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("must contain exactly one source line")
+                .contains("omit end_anchor and content")
         );
         let updated = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(updated, "line 1\nline 2\nline 3\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_accepts_verified_multiline_anchor_block() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("before\nfirst\nsecond\nthird\nafter\n", "anchor-block").await;
+        let ctx = ctx_for_dir(&dir, "anchor-block");
+        let block = format!(
+            "{}§first\n{}§second\n{}§third\n",
+            anchors[1], anchors[2], anchors[3]
+        );
+        let params = serde_json::json!({
+            "files": [{"path": "test.txt", "edits": [{"anchor": block, "text": "replacement"}]}]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "before\nreplacement\nafter\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_accepts_top_level_path_and_stringified_edits_with_plain_continuations() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("before\nfirst\n    second\n\nthird\nafter\n", "plain-anchor-block").await;
+        let ctx = ctx_for_dir(&dir, "plain-anchor-block");
+        let edits = serde_json::json!([{
+            "anchor": format!("{}§first\n    second\n\nthird", anchors[1]),
+            "text": "replacement"
+        }]);
+        let params = serde_json::json!({"path": "test.txt", "edits": edits.to_string()});
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "before\nreplacement\nafter\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_rejects_mismatched_plain_continuation_without_writing() {
+        let _guard = TEST_MUTEX.lock().await;
+        let content = "before\nfirst\nsecond\nafter\n";
+        let (dir, file_path, anchors) = setup_test_file(content, "plain-anchor-mismatch").await;
+        let ctx = ctx_for_dir(&dir, "plain-anchor-mismatch");
+        let params = serde_json::json!({
+            "path": "test.txt",
+            "edits": [{"anchor": format!("{}§first\nchanged", anchors[1]), "text": "replacement"}]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), content);
+    }
+
+    #[test]
+    fn test_edit_file_rejects_invalid_top_level_edits() {
+        for edits in [serde_json::json!("not JSON"), serde_json::json!([])] {
+            let mut params = serde_json::json!({"path": "test.txt", "edits": edits});
+            assert!(EditFileHandler::normalize_stringified_files_param(&mut params).is_err());
+            assert!(params.get("files").is_none());
+        }
+        let mut params = serde_json::json!({"path": "test.txt", "paths": "[]", "edits": [{}]});
+        assert!(EditFileHandler::normalize_stringified_files_param(&mut params).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_accepts_multiline_anchor_block_ending_with_empty_logical_line() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("first\nsecond\n", "anchor-block-trailing-empty").await;
+        let ctx = ctx_for_dir(&dir, "anchor-block-trailing-empty");
+        let block = format!("{}§first\n{}§second\n{}§\n", anchors[0], anchors[1], anchors[2]);
+        let params = serde_json::json!({
+            "files": [{"path": "test.txt", "edits": [{"anchor": block, "text": "replacement"}]}]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "replacement");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_accepts_multiline_anchor_and_end_anchor_blocks() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("start\nkeep\nend\nafter\n", "selector-blocks").await;
+        let ctx = ctx_for_dir(&dir, "selector-blocks");
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": format!("{}§start", anchors[0]),
+                    "end_anchor": format!("{}§keep\n{}§end\n", anchors[1], anchors[2]),
+                    "text": "replacement"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "replacement\nafter\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_repairs_stringified_file_entry_edits() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) = setup_test_file("old\n", "stringified-edits").await;
+        let ctx = ctx_for_dir(&dir, "stringified-edits");
+        let edits = format!(
+            "[{{\"anchor\":\"{}§old\",\"text\":\"new\"}}]",
+            anchors[0]
+        );
+        let params = serde_json::json!({
+            "files": [{"path": "test.txt", "edits": edits}]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn test_edit_file_reports_stringified_edits_parse_context() {
+        let mut params = serde_json::json!({
+            "path": "test.txt",
+            "edits": "[{\"anchor\":\"Word§old\" \"text\":\"new\"}]"
+        });
+        let error = EditFileHandler::normalize_stringified_files_param(&mut params)
+            .expect_err("incomplete stringified edits must be rejected");
+        assert!(error.contains("line"), "{error}");
+        assert!(error.contains("column"), "{error}");
+        assert!(error.contains("near"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_rejects_mismatched_line_in_anchor_block() {
+        let _guard = TEST_MUTEX.lock().await;
+        let content = "before\nfirst\nsecond\nthird\nafter\n";
+        let (dir, file_path, anchors) = setup_test_file(content, "anchor-block-mismatch").await;
+        let ctx = ctx_for_dir(&dir, "anchor-block-mismatch");
+        let block = format!(
+            "{}§first\n{}§second\n{}§third",
+            anchors[1], anchors[4], anchors[3]
+        );
+        let params = serde_json::json!({
+            "files": [{"path": "test.txt", "edits": [{"anchor": block, "text": "replacement"}]}]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_accepts_stringified_paths_alias() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) = setup_test_file("old\n", "paths-alias").await;
+        let ctx = ctx_for_dir(&dir, "paths-alias");
+        let files = serde_json::json!([{
+            "path": "test.txt",
+            "edits": [{"anchor": format!("{}§old", anchors[0]), "text": "new"}]
+        }]);
+        let params = serde_json::json!({"paths": files.to_string()});
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "new\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_accepts_literal_array_paths_alias() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) = setup_test_file("old\n", "paths-array-alias").await;
+        let ctx = ctx_for_dir(&dir, "paths-array-alias");
+        let params = serde_json::json!({
+            "paths": [{
+                "path": "test.txt",
+                "edits": [{"anchor": format!("{}§old", anchors[0]), "text": "new"}]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "new\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_accepts_multiline_anchor_with_crlf() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("first\nsecond\nthird\nafter\n", "anchor-crlf").await;
+        let ctx = ctx_for_dir(&dir, "anchor-crlf");
+        // The file on disk has LF, but the client/model payload sends CRLF inside the anchor block
+        let block = format!("{}§first\r\nsecond\r\nthird\r\n", anchors[0]);
+        let params = serde_json::json!({
+            "files": [{"path": "test.txt", "edits": [{"anchor": block, "text": "replacement"}]}]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "replacement\nafter\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_rejects_plain_continuation_anchor_for_insertion() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, anchors) =
+            setup_test_file("first\nsecond\n", "anchor-plain-insertion").await;
+        let ctx = ctx_for_dir(&dir, "anchor-plain-insertion");
+        let block = format!("{}§first\nsecond", anchors[0]);
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "anchor": block,
+                    "edit_type": "insert_after",
+                    "text": "inserted"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let err = result.expect_err("multiline plain continuation must be rejected for insertion");
+        assert!(
+            err.to_string().contains("multiline anchor blocks are supported only for replace edits"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
+    fn test_edit_file_rejects_ambiguous_paths_alias() {
+        for raw in [r#"["test.txt"]"#, r#"[{"path":"test.txt"}]"#] {
+            let mut params = serde_json::json!({"paths": raw});
+            assert!(EditFileHandler::normalize_stringified_files_param(&mut params).is_err());
+            assert!(params.get("files").is_none());
+        }
     }
 
     #[test]
@@ -7362,10 +7810,7 @@ edition = "2021"
         );
     }
 
-    /// Regression test: the model sends multiple `§`-delimited pairs concatenated
-    /// across newlines. Reject rather than silently changing the selected range.
-    /// The error must teach the model to use `anchor` + `end_anchor` so it does
-    /// not loop re-reading the file after a partial line-1-only replacement.
+    /// Reject an anchored block when the copied words do not match the file.
     #[tokio::test]
     async fn test_edit_file_rejects_concatenated_anchor_pairs() {
         use tempfile::tempdir;
@@ -7410,12 +7855,8 @@ edition = "2021"
             .expect_err("concatenated anchor must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("must contain exactly one source line"),
-            "error must call out the multi-line anchor problem, got: {msg}"
-        );
-        assert!(
-            msg.contains("end_anchor"),
-            "error must point the model at the end_anchor solution for range replacements, got: {msg}"
+            msg.contains("does not match consecutive current Word§source lines"),
+            "error must reject stale or fabricated words, got: {msg}"
         );
         let updated = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(
@@ -7510,68 +7951,41 @@ edition = "2021"
         );
     }
 
-    /// Regression test: the model submits an anchor that spans multiple
-    /// physical lines (e.g. `Word§\nNextWord§content`). The first line
-    /// is incomplete (ends with `§` with no content after it). The tool
-    /// must reject this with a clear error pointing at the incomplete
-    /// first line, not silently truncate to a useless first-line-only
-    /// anchor. See convo-2222-export-33.json.
+    /// Logical empty source lines are valid selector lines and must round-trip
+    /// through read_file and edit_file without being mistaken for malformed
+    /// multiline input.
     #[tokio::test]
-    async fn test_edit_file_rejects_incomplete_multiline_anchor() {
+    async fn test_edit_file_accepts_empty_line_in_multiline_anchor() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("multiline.c");
+        let content = "\nstatic int show_window(void) {\n";
+        std::fs::write(&file_path, content).unwrap();
         let handler = EditFileHandler::new();
-        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
-        let ctx = ToolContext::new(
-            state,
-            None,
-            std::env::current_dir().unwrap(),
-            AnchorStateManager::new(),
-            false,
-            "multiline-anchor-task".to_string(),
-            None,
-            false,
-            Arc::new(crate::cli::output::StderrOutputWriter),
-            false,
+        let anchor_mgr = AnchorStateManager::new();
+        let lines = crate::core::file_editor::split_content_lines(content);
+        let anchors = anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &lines,
+            Some("multiline-anchor-task"),
         );
-        // First line is just `Word§` with no content after the delimiter.
-        // The second line continues with another anchor.
+        let ctx = ctx_for_dir(&dir, "multiline-anchor-task");
         let params = serde_json::json!({
             "files": [{
                 "path": "multiline.c",
                 "edits": [{
-                    "anchor": "Countertop§\nElectrochemicalMorphology§static int show_window(void) {",
+                    "anchor": format!(
+                        "{}§\n{}§static int show_window(void) {{",
+                        anchors[0], anchors[1]
+                    ),
                     "edit_type": "replace",
-                    "text": "static int show_window(void) {}"
+                    "text": "replacement"
                 }]
             }]
         });
         let result = ToolHandler::execute(&handler, &ctx, params).await;
-        let err = result.expect_err("incomplete multi-line anchor must error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("must contain exactly one source line"),
-            "error must call out the multi-line anchor problem, got: {msg}"
-        );
-        // The corrective JSON shape must be at the very front of the
-        // message so the model sees the right call pattern before any
-        // rejection rationale. Qwen in the live logs repeated the same
-        // multi-line paste 4 times because the previous error buried the
-        // anchor + end_anchor recipe three sentences deep.
-        assert!(
-            msg.contains("Use 'anchor' + 'end_anchor'"),
-            "error must front-load the anchor + end_anchor instruction, got: {msg}"
-        );
-        assert!(
-            msg.contains("end_anchor"),
-            "error must reference the end_anchor field name, got: {msg}"
-        );
-        assert!(
-            msg.contains("\"anchor\":"),
-            "error must include a JSON example with the anchor field, got: {msg}"
-        );
-        assert!(
-            msg.contains("Word§source"),
-            "error must teach the selector format, got: {msg}"
-        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "replacement\n");
     }
 
     /// Regression test: the model in convo-2222-export-33.json submitted

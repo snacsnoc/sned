@@ -109,7 +109,7 @@ pub fn read_file_schema() -> ToolSchema {
                 name: "start_line",
                 required: false,
                 param_type: "integer",
-                description: "First line (default 1). For files under ~1,000 lines, omit start_line and end_line to read the entire file in one turn. The whole-file read returns scope context (enclosing class, imports, function boundaries) in a single turn and avoids narrow-slice thrashing.",
+                description: "First line (default 1). Large results are limited by the tool-history byte cap; use a line range to inspect lines beyond the returned preview.",
                 items: None,
                 extra: None,
             },
@@ -118,6 +118,14 @@ pub fn read_file_schema() -> ToolSchema {
                 required: false,
                 param_type: "integer",
                 description: "Last line (default EOF). Pair with start_line; the read window is [start_line, end_line] inclusive. Omit both to read to EOF.",
+                items: None,
+                extra: None,
+            },
+            ToolParameter {
+                name: "refresh",
+                required: false,
+                param_type: "boolean",
+                description: "Set true to receive the requested lines again even when the same unchanged lines are already visible from an earlier read. Defaults to false.",
                 items: None,
                 extra: None,
             },
@@ -245,11 +253,11 @@ pub fn edit_file_schema() -> ToolSchema {
                                 },
                                 "anchor": {
                                     "type": "string",
-                                    "description": "Start/insertion anchor: copy one complete Word§source line exactly from read_file, get_function, get_file_skeleton, or successful edit output. No newline; never paste a block here. Select a range with anchor and end_anchor, each containing one line. Either anchor or start_line plus expected_text is required."
+                                    "description": "Copy Word§source lines from read_file, get_function, get_file_skeleton, or successful edit output. For replace, anchor may contain a consecutive multiline Word§source block, including Word§ with empty source; end_anchor may also contain a consecutive block. Sned uses the first anchor line and last end_anchor line while verifying every copied line. Replacement text is raw source without Word§ prefixes. Insertions require one line. Either anchor or start_line plus expected_text is required."
                                 },
                                 "end_anchor": {
                                     "type": "string",
-                                    "description": "Inclusive endpoint for a multi-line range. WARNING: Everything between anchor and end_anchor is replaced by text. NEVER set end_anchor if you only want to modify or replace a single line (like a function signature). Omit end_anchor entirely for single-line replaces."
+                                    "description": "Inclusive endpoint for a multi-line range. It may be one Word§source line or a consecutive multiline Word§source block; Sned uses its last line after verifying the copied block. WARNING: Everything between anchor and end_anchor is replaced by text. NEVER set end_anchor if you only want to modify or replace a single line. Omit it for single-line replaces."
                                 },
                                 "start_line": {
                                     "type": "integer",
@@ -400,7 +408,7 @@ pub fn plan_mode_respond_schema() -> ToolSchema {
 pub fn get_function_schema() -> ToolSchema {
     ToolSchema {
         name: "get_function",
-        description: "Get function/method code with editable anchors. Identical snapshots reuse identities; mandatory read_file recovery stays required. Above 5000 source lines, anchors expire after any edit. Oversized files are inspection-only.",
+        description: "Get function/method code with editable anchors for languages enabled in this build (Swift requires the lang-swift feature). For unsupported files use search_files or existing read_file content. Identical snapshots reuse identities; mandatory read_file recovery stays required. Above 5000 source lines, anchors expire after any edit. Oversized files are inspection-only.",
         parameters: vec![
             ToolParameter {
                 name: "path",
@@ -1085,8 +1093,9 @@ mod tests {
         assert!(
             properties["end_anchor"]["description"]
                 .as_str()
-                .is_some_and(|description| description
-                    .contains("NEVER set end_anchor if you only want to modify or replace a single line")),
+                .is_some_and(|description| description.contains(
+                    "NEVER set end_anchor if you only want to modify or replace a single line"
+                )),
             "end_anchor schema must warn against single-line use to prevent accidental 40-line range wipeouts"
         );
         assert!(!required.iter().any(|field| field == "edit_type"));
@@ -1103,8 +1112,8 @@ mod tests {
             .expect("read_file should expose start_line")
             .description;
         assert!(
-            start_line_desc.contains("~1,000 lines"),
-            "read_file schema must recommend whole-file reads for files under 1,000 lines, got: {start_line_desc}"
+            start_line_desc.contains("tool-history byte cap"),
+            "read_file schema must describe the output limit, got: {start_line_desc}"
         );
         assert!(
             !start_line_desc.contains("<50 lines"),
@@ -1670,21 +1679,17 @@ mod tests {
             "end_anchor schema must explain the destructive range semantics, got: {end_anchor_desc}"
         );
         assert!(
-            end_anchor_desc.contains("NEVER set end_anchor if you only want to modify or replace a single line"),
+            end_anchor_desc.contains(
+                "NEVER set end_anchor if you only want to modify or replace a single line"
+            ),
             "end_anchor schema must explicitly forbid single-line use, got: {end_anchor_desc}"
         );
     }
 
     /// Audit (Fix 6): the `read_file` `start_line` schema description
-    /// must recommend whole-file reads for files under 1,000 lines and
-    /// must NOT advertise 50-line slice reads. The 50-line slice advice
-    /// pushed models toward hunting for matching braces in narrow
-    /// windows, which is exactly the thrashing pattern the circuit
-    /// breaker now detects. The 1,000-line rule tells the model to
-    /// default to a single whole-file read that returns scope context
-    /// in one turn.
+    /// A line count alone cannot predict whether the result fits in history.
     #[test]
-    fn read_file_schema_recommends_whole_file_reads_under_thousand_lines() {
+    fn read_file_schema_describes_history_limit() {
         let schema = read_file_schema();
         let start_line = schema
             .parameters
@@ -1693,12 +1698,12 @@ mod tests {
             .expect("read_file should expose start_line");
         let desc = start_line.description;
         assert!(
-            desc.contains("~1,000 lines"),
-            "read_file schema must recommend whole-file reads for files under 1,000 lines, got: {desc}"
+            desc.contains("tool-history byte cap"),
+            "read_file schema must describe the output limit, got: {desc}"
         );
         assert!(
-            desc.contains("scope context"),
-            "read_file schema must explain why whole-file reads are better, got: {desc}"
+            desc.contains("line range"),
+            "read_file schema must explain how to request unseen lines, got: {desc}"
         );
         assert!(
             !desc.contains("<50 lines"),

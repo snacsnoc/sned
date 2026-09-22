@@ -1893,6 +1893,77 @@ impl EditExecutor {
             line_hashes.iter().map(|h| h.trim().to_string()).collect();
 
         for edit in edits {
+            let end_is_multiline = edit
+                .end_anchor
+                .as_deref()
+                .is_some_and(|anchor| anchor.contains('\n'));
+            if edit.anchor.contains('\n') || end_is_multiline {
+                let result = if edit.edit_type == "replace" {
+                    (|| -> Result<(usize, usize), String> {
+                        let (line_idx, anchor_end_idx) = if edit.anchor.contains('\n') {
+                            Self::resolve_anchored_block(
+                                &edit.anchor,
+                                &normalized_line_hashes,
+                                lines,
+                            )?
+                        } else {
+                            let (line_idx, error) = self.resolve_anchor(
+                                "anchor",
+                                &edit.anchor,
+                                &normalized_line_hashes,
+                                lines,
+                            );
+                            if let Some(error) = error {
+                                return Err(error);
+                            }
+                            (line_idx, line_idx)
+                        };
+                        let end_idx = if let Some(end_anchor) = edit.end_anchor.as_deref() {
+                            if end_anchor.contains('\n') {
+                                Self::resolve_anchored_block(
+                                    end_anchor,
+                                    &normalized_line_hashes,
+                                    lines,
+                                )?
+                                .1
+                            } else {
+                                let (end_idx, error) = self.resolve_anchor(
+                                    "end_anchor",
+                                    end_anchor,
+                                    &normalized_line_hashes,
+                                    lines,
+                                );
+                                if let Some(error) = error {
+                                    return Err(error);
+                                }
+                                end_idx
+                            }
+                        } else {
+                            anchor_end_idx
+                        };
+                        if end_idx < line_idx {
+                            Err("Range error: anchor must refer to a line that precedes or is the same as end_anchor.".to_string())
+                        } else {
+                            Ok((line_idx, end_idx))
+                        }
+                    })()
+                } else {
+                    Err("Multiline anchored selectors require edit_type 'replace'.".to_string())
+                };
+                match result {
+                    Ok((line_idx, end_idx)) => resolved_edits.push(ResolvedEdit {
+                        line_idx,
+                        end_idx,
+                        edit: edit.clone(),
+                    }),
+                    Err(error) => failed_edits.push(FailedEdit {
+                        edit: edit.clone(),
+                        error,
+                    }),
+                }
+                continue;
+            }
+
             let mut diagnostics: Vec<String> = Vec::new();
             let edit_type = &edit.edit_type;
 
@@ -2007,6 +2078,60 @@ impl EditExecutor {
         }
 
         (resolved_edits, failed_edits)
+    }
+
+    fn resolve_anchored_block(
+        raw: &str,
+        line_hashes: &[String],
+        lines: &[String],
+    ) -> Result<(usize, usize), String> {
+        let source_lines = raw.split('\n').collect::<Vec<_>>();
+        let first_line = source_lines[0].strip_suffix('\r').unwrap_or(source_lines[0]);
+        let (first_word, first_content) = split_anchor(first_line);
+        if !first_line.contains(ANCHOR_DELIMITER)
+            || !ANCHOR_NAME_REGEX.is_match(&first_word)
+        {
+            return Err("A multiline anchored block must start with a complete Word§source line from read_file.".to_string());
+        }
+        let anchored_continuations = source_lines[1..]
+            .iter()
+            .any(|line| line.contains(ANCHOR_DELIMITER));
+        let mut expected_lines = vec![(Some(first_word.clone()), first_content)];
+        for line in &source_lines[1..] {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if anchored_continuations {
+                let (word, content) = split_anchor(line);
+                if !line.contains(ANCHOR_DELIMITER) || !ANCHOR_NAME_REGEX.is_match(&word) {
+                    return Err("Every anchored continuation must be a complete Word§source line from read_file.".to_string());
+                }
+                expected_lines.push((Some(word), content));
+            } else {
+                expected_lines.push((None, line.to_string()));
+            }
+        }
+
+        let matches = line_hashes
+            .iter()
+            .enumerate()
+            .filter(|(start, word)| {
+                expected_lines.iter().enumerate().all(|(offset, (expected_word, expected_content))| {
+                    start
+                        .checked_add(offset)
+                        .is_some_and(|index| {
+                            expected_word.as_ref().is_none_or(|word| line_hashes.get(index) == Some(word))
+                                && lines.get(index) == Some(expected_content)
+                        })
+                }) && *word == &first_word
+            })
+            .map(|(start, _)| start)
+            .collect::<Vec<_>>();
+
+        match matches.as_slice() {
+            [start] => Ok((*start, start + expected_lines.len() - 1)),
+            [] if anchored_continuations => Err("The multiline anchored block does not match consecutive current Word§source lines. Read the changed range again before retrying; no edit was applied.".to_string()),
+            [] => Err("The multiline anchored block does not match consecutive current source lines. Read the changed range again before retrying; no edit was applied.".to_string()),
+            _ => Err("The multiline anchored block matches more than one range. Use a narrower unique range; no edit was applied.".to_string()),
+        }
     }
 
     /// Resolves an anchor to a line index.
