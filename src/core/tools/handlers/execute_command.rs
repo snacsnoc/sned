@@ -48,6 +48,38 @@ fn format_command_header(command: &str) -> String {
         .join("\n")
 }
 
+fn is_plain_search_command(command: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+        } else if character == '\'' || character == '"' {
+            quote = Some(character);
+        } else if matches!(character, '&' | '|' | ';' | '<' | '>' | '\n' | '\r' | '`') {
+            return false;
+        }
+    }
+    let executable = command
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    matches!(executable, "grep" | "egrep" | "fgrep" | "rg")
+}
+
 enum StreamLine {
     Text(String),
     Overlong,
@@ -597,10 +629,10 @@ impl ExecuteCommandHandler {
         let mut sandbox_env_report = SandboxEnvReport::default();
         let mut command_failed = false;
 
-        for cmd_str in commands {
+        for cmd_str in &commands {
             // Safety check: validate command against safe list and patterns
             // Skip safety checks for explicitly user-approved commands
-            if !explicitly_approved && let Err(e) = self.safety_checker.is_safe(&cmd_str) {
+            if !explicitly_approved && let Err(e) = self.safety_checker.is_safe(cmd_str) {
                 tracing::warn!(command = %cmd_str, reason = %e, "command rejected by safety checker");
                 return Err(anyhow::anyhow!("{e}"));
             }
@@ -612,7 +644,7 @@ impl ExecuteCommandHandler {
                 let style = Style::default().fg(INFO_FG).add_modifier(Modifier::DIM);
                 // Keep the complete header in one event so parallel commands
                 // cannot interleave another event between its continuation rows.
-                let line = Line::from(Span::styled(format_command_header(&cmd_str), style));
+                let line = Line::from(Span::styled(format_command_header(cmd_str), style));
                 output_writer.emit(OutputEvent::CommandHeaderLine(line));
             }
 
@@ -628,20 +660,20 @@ impl ExecuteCommandHandler {
             }
 
             let mut cmd = Self::configured_command_process(
-                &cmd_str,
+                cmd_str,
                 cwd,
                 &sandboxed_env,
                 !cfg!(target_os = "windows"),
             );
 
             let timeout_duration =
-                timeout_override.unwrap_or_else(|| Self::resolve_timeout(&cmd_str));
+                timeout_override.unwrap_or_else(|| Self::resolve_timeout(cmd_str));
             let mut child = match cmd.spawn() {
                 Ok(child) => child,
                 #[cfg(unix)]
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     tracing::warn!("bash was not found on PATH; falling back to sh without pipefail");
-                    Self::configured_command_process(&cmd_str, cwd, &sandboxed_env, false).spawn()?
+                    Self::configured_command_process(cmd_str, cwd, &sandboxed_env, false).spawn()?
                 }
                 Err(error) => return Err(error.into()),
             };
@@ -1024,7 +1056,7 @@ impl ExecuteCommandHandler {
                                         );
                                     }
                                 }
-                                let err = crate::cli::actionable_errors::command_timeout(&cmd_str, timeout_duration.as_secs());
+                                let err = crate::cli::actionable_errors::command_timeout(cmd_str, timeout_duration.as_secs());
                                 return Err(anyhow::anyhow!(
                                     "{}\nStdout: {}\nStderr: {}",
                                     err.display(),
@@ -1172,8 +1204,21 @@ impl ExecuteCommandHandler {
             }
 
             if !output.status.success() {
+                if output.status.code() == Some(1)
+                    && stderr.is_empty()
+                    && is_plain_search_command(cmd_str)
+                {
+                    append_limited_text(
+                        &mut combined_output,
+                        "No matches found (exit code 1). Use search_files or broaden the search pattern.",
+                        combined_output_limit,
+                        &mut combined_output_truncated,
+                        &mut combined_output_total_bytes,
+                    );
+                    continue;
+                }
                 let err = crate::cli::actionable_errors::command_exit_code(
-                    &cmd_str,
+                    cmd_str,
                     output.status.code(),
                 );
                 append_limited_text(
@@ -1208,8 +1253,19 @@ impl ExecuteCommandHandler {
             "execute_command result assembled"
         );
 
-        let assembled_output =
+        let mut assembled_output =
             assemble_sandboxed_output(combined_output, &sandbox_env_report, limit_bytes);
+
+        if !command_failed
+            && commands.iter().any(|cmd| {
+                (cmd.contains("sed ") && cmd.contains("-n"))
+                    || (cmd.contains("python") && cmd.contains("open("))
+            })
+        {
+            assembled_output.push_str(
+                "\n\n[Note: Shell commands output raw source without Sned's Word§ anchors. To edit this file, call read_file with {\"refresh\": true} to obtain valid anchors.]",
+            );
+        }
 
         if command_failed {
             Err(anyhow::anyhow!(assembled_output))
@@ -2103,6 +2159,38 @@ mod tests {
             .await
             .expect_err("a non-zero command exit must be a tool failure");
         assert!(result.to_string().contains("Command failed with exit code"));
+    }
+
+    #[test]
+    fn test_plain_search_command_rejects_compound_shell_commands() {
+        assert!(is_plain_search_command("grep -n startScanner file.swift"));
+        assert!(is_plain_search_command(
+            "/usr/bin/rg startScanner file.swift"
+        ));
+        assert!(is_plain_search_command(
+            "grep -E 'startScanner|stopScanner' file.swift"
+        ));
+        assert!(is_plain_search_command("grep 'a\\|b' file.swift"));
+        assert!(!is_plain_search_command(
+            "grep pattern file || echo fallback"
+        ));
+        assert!(!is_plain_search_command("grep pattern file; false"));
+        assert!(!is_plain_search_command("cargo test"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_no_match_is_not_a_tool_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("file.swift"), "func other() {}\n").unwrap();
+        let output = ExecuteCommandHandler::new()
+            .execute_commands(
+                vec!["grep -n startScanner file.swift".to_string()],
+                Some(directory.path()),
+            )
+            .await
+            .unwrap();
+        assert!(output.contains("No matches found (exit code 1)"));
+        assert!(!output.contains("Command failed with exit code"));
     }
 
     #[tokio::test]
