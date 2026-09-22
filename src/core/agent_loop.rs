@@ -30,7 +30,8 @@ use crate::core::tools::{
 use crate::providers::{
     ApiStreamChunk, ApiStreamToolCall, AssistantContentBlock, MessageContent, MessageRole,
     Provider, ProviderRequest, RedactedThinkingBlock, SharedContentFields, StorageMessage,
-    TextContentBlock, ThinkingBlock, ToolResultContent, ToolUseBlock, UserContentBlock,
+    TextContentBlock, ThinkingBlock, ToolResultContent, ToolResultContentBlock, ToolUseBlock,
+    UserContentBlock,
 };
 use crate::providers::{ProviderError, Providers};
 use crate::storage::global_state::HistoryItem;
@@ -413,11 +414,15 @@ fn append_tool_result_blocks(
 
 /// Truncate tool result text to fit within the configured history limit.
 /// Returns the truncated text with a marker if truncation occurred.
-fn truncate_tool_result(result: &str) -> String {
-    let limit = std::env::var(TOOL_RESULT_HISTORY_LIMIT_ENV)
+pub(crate) fn tool_result_history_limit() -> usize {
+    std::env::var(TOOL_RESULT_HISTORY_LIMIT_ENV)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_TOOL_RESULT_HISTORY_LIMIT);
+        .unwrap_or(DEFAULT_TOOL_RESULT_HISTORY_LIMIT)
+}
+
+pub(crate) fn truncate_tool_result(result: &str) -> String {
+    let limit = tool_result_history_limit();
 
     if result.len() <= limit {
         return result.to_string();
@@ -937,6 +942,23 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    fn new_history_was_discarded(
+        previous_deleted_range: Option<(usize, usize)>,
+        current_deleted_range: Option<(usize, usize)>,
+        original_len: usize,
+        current_len: usize,
+    ) -> bool {
+        previous_deleted_range != current_deleted_range
+            || (previous_deleted_range.is_none() && current_len < original_len)
+    }
+
+    fn clear_history_dependent_read_state(state: &mut TaskState) {
+        state.visible_read_coverage.clear();
+        state.consecutive_reads.clear();
+        state.last_read_turn.clear();
+        state.recent_read_windows.clear();
+    }
+
     fn current_turn_retry_candidate(history: &[StorageMessage]) -> Option<StorageMessage> {
         history.iter().rev().find_map(|message| {
             if message.role == MessageRole::User {
@@ -1488,9 +1510,8 @@ impl AgentLoop {
             guard
                 .consecutive_edits
                 .iter()
-                .filter_map(|(path, &count)| {
-                    (count >= EDIT_COMPILE_THRESHOLD).then(|| (path.clone(), count))
-                })
+                .filter(|&(_, &count)| count >= EDIT_COMPILE_THRESHOLD)
+                .map(|(path, &count)| (path.clone(), count))
                 .collect()
         };
         if snapshot.is_empty() {
@@ -1642,6 +1663,7 @@ impl AgentLoop {
             guard.last_read_turn.remove(&path);
             guard.recent_read_windows.remove(&path);
             guard.read_file_snapshots.remove(&path);
+            guard.visible_read_coverage.remove(&path);
         }
     }
 
@@ -1693,8 +1715,8 @@ impl AgentLoop {
 
     /// Read-loop decay applied between tool calls. Inspection tools
     /// keep state alive (the model is still investigating). Mutating
-    /// tools reset state (the file's content changed or the model's
-    /// plan must pivot). Unknown tools apply a 2-turn cooldown via
+    /// tools reset the warning counters; their handlers invalidate only
+    /// affected file coverage. Unknown tools apply a 2-turn cooldown via
     /// `last_read_turn` (which is updated on every read with the
     /// current `turns_completed`) so the detector eventually forgets
     /// files the model abandoned. The `READ_LOOP_INSPECTION_TOOLS`
@@ -1708,28 +1730,22 @@ impl AgentLoop {
             state.consecutive_reads.clear();
             state.last_read_turn.clear();
             state.recent_read_windows.clear();
-            state.read_file_snapshots.clear();
             return;
         }
-        // Unknown tool: apply a 2-turn cooldown. If the model hasn't
-        // touched any tracked file for 2 turns, the next read will see
-        // `last_read_turn[curr_path] != current_turn - 1`, which would
-        // otherwise continue accumulating the count past the natural
-        // investigation boundary. We approximate this by clearing when
-        // the most recent read turn is more than 1 behind current.
+        // Unknown tool: apply a 2-turn cooldown independently per path. A
+        // read of an active file must not keep an abandoned file's warning
+        // counter alive indefinitely.
         let current_turn = state.turns_completed;
-        let mut abandon = false;
-        for (_, last) in state.last_read_turn.iter() {
-            if current_turn.saturating_sub(*last) > 1 {
-                abandon = true;
-                break;
-            }
-        }
-        if abandon {
-            state.consecutive_reads.clear();
-            state.last_read_turn.clear();
-            state.recent_read_windows.clear();
-            state.read_file_snapshots.clear();
+        let stale_paths: Vec<String> = state
+            .last_read_turn
+            .iter()
+            .filter(|(_, last)| current_turn.saturating_sub(**last) > 1)
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in stale_paths {
+            state.consecutive_reads.remove(&path);
+            state.last_read_turn.remove(&path);
+            state.recent_read_windows.remove(&path);
         }
     }
 
@@ -2376,7 +2392,9 @@ impl AgentLoop {
 
             // Pass history by reference to context_manager — saves a full deep clone
             // of every message/tool-result per turn.
-            let conversation_guard = self.conversation_history.lock().await;
+            let mut conversation_guard = self.conversation_history.lock().await;
+            compact_old_read_results(&mut conversation_guard);
+            let original_history_len = conversation_guard.len();
             let result = context_manager::get_new_context_messages_and_metadata(
                 &conversation_guard,
                 api_req_info.as_ref(),
@@ -2416,10 +2434,18 @@ impl AgentLoop {
                 }
             }
 
-            result.truncated_conversation_history
+            let history_reduced = Self::new_history_was_discarded(
+                deleted_range,
+                result.conversation_history_deleted_range,
+                original_history_len,
+                result.truncated_conversation_history.len(),
+            );
+            (result.truncated_conversation_history, history_reduced)
         };
 
         // 2. Apply context pruning if enabled
+        let (truncated_history, context_reduced) = truncated_history;
+        let truncated_len = truncated_history.len();
         let pruned_history = self.prune_conversation_history(truncated_history);
         if self.current_turn_retry_candidate.is_none() {
             self.current_turn_retry_candidate = Self::current_turn_retry_candidate(&pruned_history);
@@ -2427,6 +2453,9 @@ impl AgentLoop {
         {
             let mut state = self.state.lock().await;
             state.retryable_failed_request = None;
+            if context_reduced || pruned_history.len() < truncated_len {
+                Self::clear_history_dependent_read_state(&mut state);
+            }
         }
 
         // 3. Select the tool profile before building the system prompt. The
@@ -3716,9 +3745,10 @@ impl AgentLoop {
                 }));
             }
 
-            // Truncate thinking blocks in older history entries before adding new message.
-            // This prevents token bloat from extended-thinking models (Claude, DeepSeek).
+            // Truncate thinking blocks and compact older read_file results before adding new message.
+            // This prevents token bloat and keeps context bounded across long multi-file turns.
             truncate_old_thinking_blocks(&mut history);
+            compact_old_read_results(&mut history);
 
             history.push(StorageMessage {
                 id: Some(Self::next_message_id(&self.message_counter)),
@@ -4714,6 +4744,48 @@ impl AgentLoop {
             if !tool_result_blocks.is_empty() {
                 if !self.config.json_output {
                     self.config.output_writer.flush();
+                }
+
+                let has_action_tool = prepared_tool_calls.iter().any(|ptc| {
+                    matches!(
+                        ptc.tool_name.as_str(),
+                        "edit_file"
+                            | "write_to_file"
+                            | "replace_symbol"
+                            | "rename_symbol"
+                            | "execute_command"
+                            | "attempt_completion"
+                    )
+                });
+
+                {
+                    let mut state = self.state.lock().await;
+                    if has_action_tool {
+                        state.consecutive_inspection_turns = 0;
+                    } else {
+                        state.consecutive_inspection_turns =
+                            state.consecutive_inspection_turns.saturating_add(1);
+                        if state.consecutive_inspection_turns >= 5 {
+                            let guidance = format!(
+                                "\n\n--- Guidance (Inspection Loop Circuit Breaker) ---\nYou have performed {} consecutive inspection turns (reading/searching files) without making code edits or executing commands. You have gathered extensive context across the codebase. Stop passive searching; take direct action now: modify code using edit_file/write_to_file, or run a build/test command using execute_command to verify behavior.",
+                                state.consecutive_inspection_turns
+                            );
+                            if let Some(UserContentBlock::ToolResult(tr)) =
+                                tool_result_blocks.last_mut()
+                            {
+                                match &mut tr.content {
+                                    ToolResultContent::Text(text) => {
+                                        text.push_str(&guidance);
+                                    }
+                                    ToolResultContent::Blocks(blocks) => {
+                                        blocks.push(ToolResultContentBlock::Text {
+                                            text: guidance,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 let mut history = self.conversation_history.lock().await;
@@ -5904,6 +5976,7 @@ impl AgentLoop {
 
         if truncated_any {
             let mut state = self.state.lock().await;
+            Self::clear_history_dependent_read_state(&mut state);
             if state.conversation_history_deleted_range.is_some() {
                 tracing::debug!(
                     "Reset conversation_history_deleted_range after emergency truncation"
@@ -6249,6 +6322,90 @@ fn truncate_thinking_text(thinking: &mut String, token_limit: usize) {
         thinking.truncate(safe_limit);
         thinking.push_str("\n\n[truncated]");
     }
+}
+
+/// Compacts older `read_file` results in the conversation history, preserving
+/// the most recent `RECENT_READS_TO_PRESERVE` reads in full with all anchors.
+/// Earlier reads are collapsed to their header and a brief placeholder note,
+/// preventing multi-file exploration loops from ballooning context size past
+/// provider limits (e.g. 100KB+ in 15 turns).
+fn compact_old_read_results(history: &mut [StorageMessage]) {
+    const RECENT_READS_TO_PRESERVE: usize = 2;
+    const MIN_BYTES_TO_COMPACT: usize = 1000;
+
+    let mut read_result_count = 0;
+
+    for message in history.iter_mut().rev() {
+        if message.role != MessageRole::User {
+            continue;
+        }
+        let MessageContent::UserBlocks(blocks) = &mut message.content else {
+            continue;
+        };
+
+        for block in blocks.iter_mut().rev() {
+            let UserContentBlock::ToolResult(tr) = block else {
+                continue;
+            };
+
+            let is_read_result = match &tr.content {
+                ToolResultContent::Text(text) => {
+                    text.starts_with("[File: ") || text.contains("\n[File: ")
+                }
+                ToolResultContent::Blocks(b) => b.iter().any(|cb| match cb {
+                    ToolResultContentBlock::Text { text } => {
+                        text.starts_with("[File: ") || text.contains("\n[File: ")
+                    }
+                    _ => false,
+                }),
+            };
+
+            if !is_read_result {
+                continue;
+            }
+
+            read_result_count += 1;
+            if read_result_count <= RECENT_READS_TO_PRESERVE {
+                continue;
+            }
+
+            match &mut tr.content {
+                ToolResultContent::Text(text) => {
+                    compact_single_read_text(text, MIN_BYTES_TO_COMPACT);
+                }
+                ToolResultContent::Blocks(b) => {
+                    for cb in b.iter_mut() {
+                        if let ToolResultContentBlock::Text { text } = cb {
+                            compact_single_read_text(text, MIN_BYTES_TO_COMPACT);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn compact_single_read_text(text: &mut String, min_bytes: usize) {
+    if text.len() <= min_bytes {
+        return;
+    }
+
+    let header_end = text
+        .find("\n[Anchors:")
+        .or_else(|| text.find("\n\n"))
+        .or_else(|| text.find('\n'))
+        .unwrap_or(text.len());
+    let header = &text[..header_end.min(text.len())];
+
+    let total_bytes = text.len();
+    let total_lines = text.lines().count();
+
+    *text = format!(
+        "{}\n[... Earlier read content ({} lines, {} bytes) collapsed to save context space. Call read_file again if fresh anchors are needed.]",
+        header.trim_end(),
+        total_lines,
+        total_bytes
+    );
 }
 
 #[cfg(test)]
@@ -7676,6 +7833,15 @@ Irrespective of whether additional information or instructions are given, you ar
             state
                 .consecutive_edit_failures
                 .insert("/tmp/foo.c".to_string(), 2);
+            state.visible_read_coverage.insert(
+                "/tmp/untouched.c".to_string(),
+                crate::core::agent_types::ReadCoverage {
+                    revision: "unchanged".to_string(),
+                    ranges: vec![(1, 2)],
+                    total_lines: 2,
+                    last_already_read_range: None,
+                },
+            );
             AgentLoop::decay_read_loop_state(&mut state, tool);
             assert!(
                 state.consecutive_reads.is_empty(),
@@ -7692,6 +7858,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 "{tool} must clear recent_read_windows, got: {:?}",
                 state.recent_read_windows
             );
+            assert!(state.visible_read_coverage.contains_key("/tmp/untouched.c"));
             assert_eq!(
                 state
                     .consecutive_edit_failures
@@ -7737,6 +7904,19 @@ Irrespective of whether additional information or instructions are given, you ar
             "5+ turn gap must clear, got: {:?}",
             state.consecutive_reads
         );
+
+        state.turns_completed = 20;
+        state
+            .consecutive_reads
+            .insert("/tmp/active.c".to_string(), 4);
+        state.last_read_turn.insert("/tmp/active.c".to_string(), 19);
+        state
+            .consecutive_reads
+            .insert("/tmp/abandoned.c".to_string(), 4);
+        state.last_read_turn.insert("/tmp/abandoned.c".to_string(), 1);
+        AgentLoop::decay_read_loop_state(&mut state, "ask_followup_question");
+        assert!(state.consecutive_reads.contains_key("/tmp/active.c"));
+        assert!(!state.consecutive_reads.contains_key("/tmp/abandoned.c"));
     }
 
     /// End-to-end shape: alternating read_file + execute_command (the
@@ -7972,6 +8152,15 @@ Irrespective of whether additional information or instructions are given, you ar
                 guard
                     .recent_read_windows
                     .insert(key.clone(), std::collections::VecDeque::from([(1, 10)]));
+                guard.visible_read_coverage.insert(
+                    key.clone(),
+                    crate::core::agent_types::ReadCoverage {
+                        revision: "hash".to_string(),
+                        ranges: vec![(1, 10)],
+                        total_lines: 10,
+                        last_already_read_range: None,
+                    },
+                );
             }
             guard.read_file_snapshots.insert(
                 unchanged_key.clone(),
@@ -7991,6 +8180,8 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(!guard.consecutive_reads.contains_key(&changed_key));
         assert!(guard.read_file_snapshots.contains_key(&unchanged_key));
         assert!(!guard.read_file_snapshots.contains_key(&changed_key));
+        assert!(guard.visible_read_coverage.contains_key(&unchanged_key));
+        assert!(!guard.visible_read_coverage.contains_key(&changed_key));
     }
 
     #[test]
@@ -9491,6 +9682,80 @@ Irrespective of whether additional information or instructions are given, you ar
         );
     }
 
+    #[test]
+    fn existing_deleted_range_does_not_discard_new_read_coverage() {
+        use crate::core::context::context_manager;
+        use crate::providers::{MessageContent, MessageRole, StorageMessage};
+
+        let history = (0..12)
+            .map(|index| StorageMessage {
+                id: None,
+                role: if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content: MessageContent::Text(format!("Message {index}")),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            })
+            .collect::<Vec<_>>();
+        let deleted_range = Some((2, 5));
+        let result = context_manager::get_new_context_messages_and_metadata(
+            &history,
+            None,
+            deleted_range,
+            false,
+            None,
+            "openai",
+        );
+
+        assert!(result.truncated_conversation_history.len() < history.len());
+        assert_eq!(result.conversation_history_deleted_range, deleted_range);
+        assert!(!AgentLoop::new_history_was_discarded(
+            deleted_range,
+            result.conversation_history_deleted_range,
+            history.len(),
+            result.truncated_conversation_history.len(),
+        ));
+        assert!(AgentLoop::new_history_was_discarded(
+            deleted_range,
+            Some((2, 7)),
+            history.len(),
+            result.truncated_conversation_history.len(),
+        ));
+    }
+
+    #[test]
+    fn context_reduction_clears_read_warnings_with_coverage() {
+        let mut state = TaskState::default();
+        let path = "/tmp/covered.swift".to_string();
+        state.visible_read_coverage.insert(
+            path.clone(),
+            crate::core::agent_types::ReadCoverage {
+                revision: "hash".to_string(),
+                ranges: vec![(1, 100)],
+                total_lines: 100,
+                last_already_read_range: Some((1, 100)),
+            },
+        );
+        state.consecutive_reads.insert(path.clone(), 3);
+        state.last_read_turn.insert(path.clone(), 4);
+        state
+            .recent_read_windows
+            .insert(path.clone(), std::collections::VecDeque::from([(1, 100)]));
+        state.read_file_snapshots.insert(path.clone(), (100, None));
+
+        AgentLoop::clear_history_dependent_read_state(&mut state);
+
+        assert!(state.visible_read_coverage.is_empty());
+        assert!(state.consecutive_reads.is_empty());
+        assert!(state.last_read_turn.is_empty());
+        assert!(state.recent_read_windows.is_empty());
+        assert!(state.read_file_snapshots.contains_key(&path));
+    }
+
     #[tokio::test]
     async fn test_emergency_truncation_iteratively_shrinks_until_context_fits() {
         use crate::core::context::context_window;
@@ -10853,6 +11118,18 @@ Irrespective of whether additional information or instructions are given, you ar
         assert_eq!(parsed["files"][0]["edits"].as_array().unwrap().len(), 1);
     }
 
+    #[test]
+    fn test_prepared_tool_call_normalizes_stringified_edit_paths_alias() {
+        let raw = serde_json::json!({
+            "paths": r#"[{"path":"src/main.rs","edits":[{"anchor":"Word§old","text":"new"}]}]"#
+        })
+        .to_string();
+        let parsed = AgentLoop::parse_tool_arguments("edit_file", "edit-2", Some(&raw))
+            .expect("unambiguous edit paths should normalize before dispatch");
+        assert_eq!(parsed["files"][0]["path"], "src/main.rs");
+        assert!(parsed.get("paths").is_none());
+    }
+
     #[tokio::test]
     async fn test_multiline_edit_error_emits_actionable_tool_output() {
         use crate::core::tools::ToolRegistry;
@@ -10885,12 +11162,11 @@ Irrespective of whether additional information or instructions are given, you ar
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            rendered.contains("must contain exactly one source line"),
+            rendered.contains("does not match consecutive current Word§source lines"),
             "{rendered}"
         );
-        assert!(rendered.contains("end_anchor"), "{rendered}");
-        assert!(rendered.contains("no reread is needed"), "{rendered}");
-        assert!(agent.state.lock().await.must_reread_before_edit.is_empty());
+        assert!(rendered.contains("Read the changed range again"), "{rendered}");
+        assert!(!agent.state.lock().await.must_reread_before_edit.is_empty());
     }
 
     #[tokio::test]
@@ -12134,6 +12410,84 @@ Irrespective of whether additional information or instructions are given, you ar
         unsafe {
             std::env::remove_var(THINKING_HISTORY_LIMIT_ENV);
         }
+    }
+
+    #[test]
+    fn test_compact_old_read_results_preserves_recent_reads() {
+        let make_read_msg = |file: &str, size: usize| StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                crate::providers::ToolResultBlock {
+                    tool_use_id: format!("call_{file}"),
+                    content: crate::providers::ToolResultContent::Text(format!(
+                        "[File: {file}, Hash: abc12345] (100 lines total)\n[Anchors: ...]\n{}",
+                        "x".repeat(size)
+                    )),
+                    shared: crate::providers::SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+
+        let mut history = vec![
+            make_read_msg("file1.rs", 5000),
+            make_read_msg("file2.rs", 5000),
+            make_read_msg("file3.rs", 5000),
+        ];
+
+        compact_old_read_results(&mut history);
+
+        // Most recent two reads (file2 and file3) must be preserved in full
+        let get_text = |msg: &StorageMessage| match &msg.content {
+            MessageContent::UserBlocks(blocks) => match &blocks[0] {
+                UserContentBlock::ToolResult(tr) => match &tr.content {
+                    ToolResultContent::Text(t) => t.clone(),
+                    _ => panic!("Expected text"),
+                },
+                _ => panic!("Expected ToolResult"),
+            },
+            _ => panic!("Expected UserBlocks"),
+        };
+
+        assert!(
+            get_text(&history[2]).contains(&"x".repeat(5000)),
+            "Most recent read must not be compacted"
+        );
+        assert!(
+            get_text(&history[1]).contains(&"x".repeat(5000)),
+            "Second most recent read must not be compacted"
+        );
+
+        let file1_text = get_text(&history[0]);
+        assert!(
+            !file1_text.contains(&"x".repeat(5000)),
+            "Oldest read should be compacted"
+        );
+        assert!(file1_text.starts_with("[File: file1.rs, Hash: abc12345] (100 lines total)"));
+        assert!(file1_text.contains("Earlier read content"));
+    }
+
+    #[test]
+    fn test_inspection_circuit_breaker_resets_on_action_tool() {
+        let mut state = TaskState::default();
+        assert_eq!(state.consecutive_inspection_turns, 0);
+
+        for _ in 0..4 {
+            state.consecutive_inspection_turns += 1;
+        }
+        assert_eq!(state.consecutive_inspection_turns, 4);
+
+        state.consecutive_inspection_turns += 1;
+        assert_eq!(state.consecutive_inspection_turns, 5);
+
+        state.consecutive_inspection_turns = 0;
+        assert_eq!(state.consecutive_inspection_turns, 0);
     }
 
     #[tokio::test]

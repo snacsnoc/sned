@@ -10,12 +10,14 @@
 //! - Handle errors gracefully
 
 use crate::core::agent_loop::TaskState;
+use crate::core::agent_types::ReadCoverage;
 use crate::core::file_editor::{AnchorStateManager, normalize_file_content, split_content_lines};
 use crate::core::hash_utils::{
     ANCHOR_GUIDANCE, anchor_guidance, content_hash, format_line_with_hash,
 };
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -68,6 +70,7 @@ const MAX_FILE_READ_SIZE: usize = 100 * 1024 * 1024;
 /// narrow-slice thrashing versus sequential scanning, while bounding memory
 /// growth across long sessions.
 const MAX_TRACKED_READ_WINDOWS: usize = 5;
+const MAX_TRACKED_COVERAGE_WINDOWS: usize = 32;
 
 fn max_file_read_size_from_value(value: Option<&str>) -> usize {
     value
@@ -99,6 +102,7 @@ struct FileReadResult {
     hash: String,
     success: bool,
     refreshes_edit_context: bool,
+    visible_range: Option<(usize, usize, usize)>,
     error: Option<String>,
 }
 
@@ -146,6 +150,7 @@ impl ReadFileHandler {
             hash: String::new(),
             success: false,
             refreshes_edit_context: false,
+            visible_range: None,
             error: Some(format!(
                 "Line-range read requires a file no larger than {max_kb}KB, but this file is {actual_kb}KB. Ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE. For a supported definition, get_function or get_file_skeleton can provide anchors only for the lines they return."
             )),
@@ -160,6 +165,7 @@ impl ReadFileHandler {
             hash: String::new(),
             success: false,
             refreshes_edit_context: false,
+            visible_range: None,
             error: Some(format!(
                 "Invalid line range: start_line ({start_line}) must be less than or equal to end_line ({end_line}). Re-issue read_file with start_line <= end_line."
             )),
@@ -168,6 +174,7 @@ impl ReadFileHandler {
 
     /// Read one or more files.
     ///
+    #[cfg(test)]
     async fn read_files(
         &self,
         paths: Vec<String>,
@@ -186,6 +193,7 @@ impl ReadFileHandler {
             anchor_mgr,
             task_id,
             output_writer,
+            None,
         )
         .await
     }
@@ -199,6 +207,7 @@ impl ReadFileHandler {
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
         output_writer: Option<&crate::cli::output::OutputWriterArc>,
+        coverage: Option<&HashMap<String, ReadCoverage>>,
     ) -> Vec<FileReadResult> {
         let read_futures: Vec<_> = paths
             .iter()
@@ -207,15 +216,38 @@ impl ReadFileHandler {
                 let display_path = display_paths
                     .get(index)
                     .map_or(path.as_str(), String::as_str);
-                self.read_file_with_display_path(
-                    path,
-                    display_path,
-                    start_line,
-                    end_line,
-                    anchor_mgr,
-                    task_id,
-                    output_writer,
-                )
+                async move {
+                    let canonical = if coverage.is_some() {
+                        tokio::fs::canonicalize(path).await.ok()
+                    } else {
+                        None
+                    };
+                    if let Some(canonical) = canonical.as_ref()
+                        && let Some(covered) = coverage.and_then(|coverage| {
+                            coverage.get(&canonical.to_string_lossy().to_string())
+                        })
+                        && let Some(result) = Self::already_read_result(
+                            &canonical.to_string_lossy(),
+                            display_path,
+                            start_line,
+                            end_line,
+                            covered,
+                        )
+                        .await
+                    {
+                        return result;
+                    }
+                    self.read_file_with_display_path(
+                        path,
+                        display_path,
+                        start_line,
+                        end_line,
+                        anchor_mgr,
+                        task_id,
+                        output_writer,
+                    )
+                    .await
+                }
             })
             .collect();
 
@@ -226,6 +258,66 @@ impl ReadFileHandler {
             .await;
 
         results
+    }
+
+    async fn already_read_result(
+        path: &str,
+        display_path: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        coverage: &ReadCoverage,
+    ) -> Option<FileReadResult> {
+        let start = start_line.unwrap_or(1).max(1);
+        if start > coverage.total_lines {
+            return None;
+        }
+        let end = end_line
+            .unwrap_or(coverage.total_lines)
+            .min(coverage.total_lines);
+        if start > end
+            || !coverage
+                .ranges
+                .iter()
+                .any(|&(covered_start, covered_end)| covered_start <= start && end <= covered_end)
+        {
+            return None;
+        }
+        if coverage
+            .last_already_read_range
+            .is_some_and(|(previous_start, previous_end)| {
+                previous_start <= end && start <= previous_end
+            })
+        {
+            return None;
+        }
+
+        let metadata = tokio::fs::metadata(path).await.ok()?;
+        if !metadata.is_file() || metadata.len() > max_file_read_size() as u64 {
+            return None;
+        }
+        let bytes = tokio::fs::read(path).await.ok()?;
+        if bytes.len() > max_file_read_size() {
+            return None;
+        }
+        let text = String::from_utf8(bytes).ok()?;
+        let (normalized, _) = normalize_file_content(&text);
+        if content_hash(&normalized) != coverage.revision {
+            return None;
+        }
+
+        Some(FileReadResult {
+            path: display_path.to_string(),
+            canonical_path: Some(path.to_string()),
+            content: format!(
+                "Already read: {display_path}\nHash: {}\nLines {start}–{end} are covered by an unchanged earlier read. Reuse its content and anchors. If you need fresh Word§ anchors to edit this range, call read_file with \"refresh\": true (do not use shell commands like sed/python, which lack anchors).",
+                coverage.revision
+            ),
+            hash: coverage.revision.clone(),
+            success: true,
+            refreshes_edit_context: false,
+            visible_range: None,
+            error: None,
+        })
     }
 
     /// Read a single file with optional line range.
@@ -279,6 +371,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(err.display()),
                 };
             }
@@ -296,6 +389,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(err.display()),
                 };
             }
@@ -313,6 +407,7 @@ impl ReadFileHandler {
                 hash: String::new(),
                 success: false,
                 refreshes_edit_context: false,
+                visible_range: None,
                 error: Some(err.display()),
             };
         }
@@ -430,6 +525,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(format!(
                         "Unable to persist editable anchor state for {display_path}: {error}"
                     )),
@@ -456,6 +552,7 @@ impl ReadFileHandler {
                 hash: String::new(),
                 success: false,
                 refreshes_edit_context: false,
+                visible_range: None,
                 error: Some(format!(
                     "Internal error: anchor/line length mismatch for {}: {} lines vs {} anchors",
                     display_path,
@@ -528,6 +625,27 @@ impl ReadFileHandler {
             hash,
             success: true,
             refreshes_edit_context,
+            visible_range: Some((
+                if has_line_range {
+                    if refreshes_edit_context {
+                        range_start + 1
+                    } else {
+                        line_number_offset + 1
+                    }
+                } else {
+                    1
+                },
+                if has_line_range {
+                    if refreshes_edit_context {
+                        range_end
+                    } else {
+                        line_number_offset + range_end
+                    }
+                } else {
+                    lines_for_reconcile.len()
+                },
+                lines_for_reconcile.len(),
+            )),
             error: None,
         }
     }
@@ -566,6 +684,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -584,6 +703,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -607,6 +727,7 @@ impl ReadFileHandler {
                         hash: String::new(),
                         success: false,
                         refreshes_edit_context: false,
+                        visible_range: None,
                         error: Some(err.display()),
                     });
                 }
@@ -716,6 +837,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -734,6 +856,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -772,6 +895,7 @@ impl ReadFileHandler {
                         hash: String::new(),
                         success: false,
                         refreshes_edit_context: false,
+                        visible_range: None,
                         error: Some(err.display()),
                     });
                 }
@@ -831,6 +955,7 @@ impl ReadFileHandler {
                             hash: String::new(),
                             success: false,
                             refreshes_edit_context: false,
+                            visible_range: None,
                             error: Some(err.display()),
                         }
                     })?;
@@ -898,6 +1023,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -929,6 +1055,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -945,6 +1072,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -961,6 +1089,7 @@ impl ReadFileHandler {
                     hash: String::new(),
                     success: false,
                     refreshes_edit_context: false,
+                    visible_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -987,6 +1116,7 @@ impl ReadFileHandler {
         anchor_mgr: &AnchorStateManager,
         task_id: Option<&str>,
         output_writer: Option<&crate::cli::output::OutputWriterArc>,
+        coverage: Option<&HashMap<String, ReadCoverage>>,
     ) -> Result<
         (
             Vec<String>,
@@ -997,14 +1127,17 @@ impl ReadFileHandler {
         ToolError,
     > {
         let (paths, start_line, end_line) = Self::parse_params(&params)?;
+        let display_paths = paths.clone();
         let results = self
-            .read_files(
+            .read_files_with_display_paths(
                 paths.clone(),
+                &display_paths,
                 start_line,
                 end_line,
                 anchor_mgr,
                 task_id,
                 output_writer,
+                coverage,
             )
             .await;
         Ok((paths, results, start_line, end_line))
@@ -1018,19 +1151,9 @@ impl ReadFileHandler {
         end_line: Option<usize>,
     ) {
         for (path_str, res) in paths.iter().zip(results.iter()) {
-            if res.success && res.refreshes_edit_context {
+            if res.success && res.refreshes_edit_context && res.visible_range.is_some() {
                 let canonical = res.canonical_path.as_deref().unwrap_or(path_str);
                 record_complete_file_read(state, Path::new(canonical));
-                // A direct handler call can bypass AgentLoop's tool boundary,
-                // so a different read path must also break the sequence here.
-                if state.consecutive_reads.len() != 1
-                    || !state.consecutive_reads.contains_key(canonical)
-                {
-                    state.consecutive_reads.clear();
-                    state.recent_read_windows.clear();
-                    state.last_read_turn.clear();
-                    state.read_file_snapshots.clear();
-                }
                 if let Ok(metadata) = std::fs::metadata(canonical) {
                     state.read_file_snapshots.insert(
                         canonical.to_string(),
@@ -1053,14 +1176,11 @@ impl ReadFileHandler {
                         .entry(canonical.to_string())
                         .or_insert(0);
                     *count += 1;
-                    // Record the window for this turn so the diagnostic warning
-                    // can surface thrashing vs. sequential scanning. The buffer
-                    // is capped at MAX_TRACKED_READ_WINDOWS to bound memory
-                    // growth across long sessions. Unbounded (EOF) reads are
-                    // stored with `usize::MAX` as the upper bound so the
-                    // overlap and cluster detectors can recognize them
-                    // instead of treating them as zero-span slices.
-                    let window = (start_line.unwrap_or(1), end_line.unwrap_or(usize::MAX));
+                    // Record only the lines actually returned to the model.
+                    let window = res.visible_range.map_or(
+                        (start_line.unwrap_or(1), end_line.unwrap_or(usize::MAX)),
+                        |(start, end, _)| (start, end),
+                    );
                     let ring = state
                         .recent_read_windows
                         .entry(canonical.to_string())
@@ -1074,6 +1194,202 @@ impl ReadFileHandler {
         }
     }
 
+    fn covered_range(result: &FileReadResult) -> Option<(usize, usize, usize)> {
+        (result.success && result.refreshes_edit_context)
+            .then_some(result.visible_range)
+            .flatten()
+    }
+
+    fn record_visible_reads(
+        state: &mut TaskState,
+        results: &[FileReadResult],
+        warnings: &[String],
+    ) {
+        let rendered_len = results
+            .iter()
+            .map(|result| {
+                if result.success {
+                    result.content.len()
+                } else {
+                    format!(
+                        "Error reading {}: {}",
+                        result.path,
+                        result.error.as_deref().unwrap_or_default()
+                    )
+                    .len()
+                }
+            })
+            .sum::<usize>()
+            .saturating_add(results.len().saturating_sub(1) * 5);
+        let warning_len = if warnings.is_empty() {
+            0
+        } else {
+            warnings
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+                .saturating_add(warnings.len() * 5)
+        };
+        if rendered_len.saturating_add(warning_len)
+            > crate::core::agent_loop::tool_result_history_limit()
+        {
+            return;
+        }
+        for result in results {
+            let Some((start, end, total)) = Self::covered_range(result) else {
+                continue;
+            };
+            let Some(path) = result.canonical_path.as_deref() else {
+                continue;
+            };
+            let coverage = state
+                .visible_read_coverage
+                .entry(path.to_string())
+                .or_insert_with(|| ReadCoverage {
+                    revision: result.hash.clone(),
+                    ranges: Vec::new(),
+                    total_lines: total,
+                    last_already_read_range: None,
+                });
+            if coverage.revision != result.hash || coverage.total_lines != total {
+                coverage.revision.clone_from(&result.hash);
+                coverage.ranges.clear();
+                coverage.total_lines = total;
+                coverage.last_already_read_range = None;
+            }
+
+            coverage.ranges.push((start, end));
+            coverage.ranges.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(coverage.ranges.len());
+            for (start, end) in coverage.ranges.drain(..) {
+                if let Some(last) = merged.last_mut()
+                    && start <= last.1.saturating_add(1)
+                {
+                    last.1 = last.1.max(end);
+                } else {
+                    merged.push((start, end));
+                }
+            }
+            if merged.len() > MAX_TRACKED_COVERAGE_WINDOWS {
+                merged.drain(..merged.len() - MAX_TRACKED_COVERAGE_WINDOWS);
+            }
+            coverage.ranges = merged;
+        }
+    }
+
+    fn warning_reserve(state: &TaskState, results: &[FileReadResult]) -> usize {
+        results
+            .iter()
+            .filter(|result| {
+                result.success
+                    && result.refreshes_edit_context
+                    && result.canonical_path.as_deref().is_some_and(|path| {
+                        state.consecutive_reads.get(path).copied().unwrap_or(0) >= 2
+                    })
+            })
+            .count()
+            .saturating_mul(512)
+            .min(2_048)
+    }
+
+    fn limit_visible_results(results: &mut [FileReadResult], warning_reserve: usize) {
+        let history_limit = crate::core::agent_loop::tool_result_history_limit();
+        let mut remaining = history_limit.saturating_sub(warning_reserve);
+        for index in 0..results.len() {
+            if index > 0 {
+                remaining = remaining.saturating_sub(5);
+            }
+            let budget = remaining / (results.len() - index);
+            let result = &mut results[index];
+            let rendered_len = if result.success {
+                result.content.len()
+            } else {
+                format!(
+                    "Error reading {}: {}",
+                    result.path,
+                    result.error.as_deref().unwrap_or_default()
+                )
+                .len()
+            };
+            if rendered_len <= budget {
+                remaining = remaining.saturating_sub(rendered_len);
+                continue;
+            }
+
+            if !result.success {
+                result.error = Some("Read failed; retry this path alone for details.".to_string());
+                remaining = remaining.saturating_sub(
+                    format!(
+                        "Error reading {}: {}",
+                        result.path,
+                        result.error.as_deref().unwrap()
+                    )
+                    .len(),
+                );
+                continue;
+            }
+
+            let Some((start, end, total)) = result.visible_range else {
+                result.content = format!("Already read: {}", result.path);
+                remaining = remaining.saturating_sub(result.content.len());
+                continue;
+            };
+            let source_line_count = end.saturating_sub(start).saturating_add(1);
+            let lines = result.content.lines().collect::<Vec<_>>();
+            if !result.success || source_line_count > lines.len() {
+                continue;
+            }
+            let prefix_count = lines.len() - source_line_count;
+            let prefix = lines[..prefix_count].join("\n");
+            let mut shown = String::new();
+            let mut shown_count = 0;
+            for line in &lines[prefix_count..] {
+                let next_line = start.saturating_add(shown_count).saturating_add(1);
+                let marker =
+                    format!("\n[Output limited. Lines {start}–{next_line} shown. Proceed with current context; request start_line={next_line} only if unseen lines are needed.]");
+                let added = line.len() + usize::from(shown_count > 0);
+                if prefix.len() + 1 + shown.len() + added + marker.len() + 64 > budget {
+                    break;
+                }
+                if shown_count > 0 {
+                    shown.push('\n');
+                }
+                shown.push_str(line);
+                shown_count += 1;
+            }
+
+            if shown_count == 0 {
+                let note = lines[..prefix_count]
+                    .iter()
+                    .find(|line| line.contains("File truncated to"))
+                    .map_or(String::new(), |line| format!("{line}\n"));
+                let line_count = if result.refreshes_edit_context {
+                    format!("{total} lines total")
+                } else {
+                    format!("{total} lines in file preview")
+                };
+                result.content = format!(
+                    "{note}[File: {}, Hash: {}] ({line_count})\n[Output limited. No source lines shown; request a narrower line range.]",
+                    result.path, result.hash
+                );
+                result.visible_range = None;
+                result.refreshes_edit_context = false;
+            } else {
+                let shown_end = start + shown_count - 1;
+                let prefix = prefix.replace(
+                    &format!("Lines {start}–{end}"),
+                    &format!("Lines {start}–{shown_end}"),
+                );
+                result.content = format!(
+                    "{prefix}\n{shown}\n[Output limited. Lines {start}–{shown_end} shown. Proceed with current context; request start_line={} only if unseen lines are needed.]",
+                    shown_end.saturating_add(1)
+                );
+                result.visible_range = Some((start, shown_end, total));
+            }
+            remaining = remaining.saturating_sub(result.content.len());
+        }
+    }
+
     pub async fn execute(
         &self,
         state: &mut TaskState,
@@ -1083,13 +1399,23 @@ impl ReadFileHandler {
         output_writer: Option<&crate::cli::output::OutputWriterArc>,
     ) -> Result<String, ToolError> {
         let (paths, results, start_line, end_line) = self
-            .execute_with_results(params, anchor_mgr, task_id, output_writer)
+            .execute_with_results(params, anchor_mgr, task_id, output_writer, None)
             .await?;
+        let mut results = results;
+        let warning_reserve = Self::warning_reserve(state, &results);
+        Self::limit_visible_results(&mut results, warning_reserve);
         Self::track_read_files(state, &paths, &results, start_line, end_line);
-        let warnings = Self::read_loop_warnings(state, &paths, &results);
+        let mut warnings = Self::read_loop_warnings(state, &paths, &results);
+        let output = Self::format_results(results.clone());
+        while Self::append_warnings(output.clone(), &warnings).len()
+            > crate::core::agent_loop::tool_result_history_limit()
+            && !warnings.is_empty()
+        {
+            warnings.pop();
+        }
+        Self::record_visible_reads(state, &results, &warnings);
 
-        // Read-loop detection: if a file was read 3+ times in a row with no
-        // intervening edit, surface a hint so the model doesn't loop forever.
+        // Read-loop detection follows each unchanged file across inspection turns.
         if let Some(writer) = output_writer {
             for warning in &warnings {
                 use crate::cli::output::OutputEvent;
@@ -1102,10 +1428,7 @@ impl ReadFileHandler {
             }
         }
 
-        Ok(Self::append_warnings(
-            Self::format_results(results),
-            &warnings,
-        ))
+        Ok(Self::append_warnings(output, &warnings))
     }
 
     fn parse_params(
@@ -1152,18 +1475,8 @@ impl ReadFileHandler {
                     .map(|ring| ring.iter().copied().collect())
                     .unwrap_or_default();
                 let overlap = detect_high_overlap(&recent);
-                let clustered = detect_center_clustering(&recent, 100);
                 let sequential = is_sequential_forward(&recent);
-                // Tier 1 — thrashing: overlapping slices OR centers
-                // clustered within a narrow region. The model is hunting
-                // inside a single region; push it back to a whole-file
-                // read. `detect_center_clustering` covers the case the
-                // 50%-overlap rule missed in the live logs (Qwen's
-                // 575-600 / 580-650 / 800-EOF pattern had only 25% overlap
-                // but centers within 50 lines of each other).
-                let thrashing = overlap || clustered;
-                // Tier 3 — silent suppression for legitimate pagination.
-                if !thrashing && sequential {
+                if !overlap || sequential {
                     return None;
                 }
                 let recent_str = if recent.is_empty() {
@@ -1171,15 +1484,9 @@ impl ReadFileHandler {
                 } else {
                     format_windows(&recent)
                 };
-                Some(if thrashing {
-                    format!(
-                        "Warning: {path_str} has been read {count} times consecutively in a narrow region (recent windows: {recent_str}). Stop reading narrow slices: call read_file with paths: [\"{path_str}\"] (omit start_line/end_line) to load the full file in one turn."
-                    )
-                } else {
-                    format!(
-                        "Warning: {path_str} has been read {count} times consecutively without edits (recent windows: {recent_str}). If you have the anchors you need, call edit_file now."
-                    )
-                })
+                Some(format!(
+                    "Warning: {path_str} has overlapping read ranges (recent windows: {recent_str}). Reuse lines already shown; request only an uncovered range if more context is needed."
+                ))
             })
             .collect()
     }
@@ -1271,36 +1578,6 @@ fn detect_high_overlap(windows: &[(usize, usize)]) -> bool {
     false
 }
 
-/// Detect window-center clustering: returns true when two non-EOF windows
-/// have their centers fewer than `gap` lines apart, indicating the
-/// model is hunting inside a narrow region of the file rather than scanning
-/// the whole file. Unbounded reads (e == usize::MAX) are excluded because
-/// their center is meaningless (it'd be `usize::MAX/2`). The check is
-/// order-independent — we sort by center first so out-of-order ring buffer
-/// entries don't fool us. This complements `detect_high_overlap`: a model
-/// that reads (550, 590) then (580, 650) has only 25% overlap of the
-/// smaller window, which `detect_high_overlap` rejects, but the centers
-/// are 45 lines apart and the model is clearly lost.
-fn detect_center_clustering(windows: &[(usize, usize)], gap: usize) -> bool {
-    let mut centers: Vec<usize> = windows
-        .iter()
-        .filter_map(|&(s, e)| {
-            if e == usize::MAX || e < s {
-                None
-            } else {
-                Some((s / 2) + (e / 2) + ((s % 2 + e % 2) / 2))
-            }
-        })
-        .collect();
-    if centers.len() < 2 {
-        return false;
-    }
-    centers.sort_unstable();
-    centers
-        .windows(2)
-        .any(|pair| pair[1].saturating_sub(pair[0]) < gap)
-}
-
 /// Detect the legitimate pagination pattern: each window's start is `>=`
 /// the previous window's end + 1, scanning forward through the file in
 /// order. Unbounded (EOF) reads must STILL satisfy the contiguity check —
@@ -1342,6 +1619,7 @@ impl ToolHandler for ReadFileHandler {
         let handler = self.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
+            let refresh = params.get("refresh").and_then(serde_json::Value::as_bool) == Some(true);
             let (paths, start_line, end_line) = Self::parse_params(&params)?;
             let display_paths: Vec<String> = paths
                 .iter()
@@ -1368,6 +1646,14 @@ impl ToolHandler for ReadFileHandler {
                 )
                 .await;
 
+            let coverage = {
+                let state = ctx.state.lock().await;
+                let mut coverage = state.visible_read_coverage.clone();
+                for path in &state.must_reread_before_edit {
+                    coverage.remove(path);
+                }
+                coverage
+            };
             let results = handler
                 .read_files_with_display_paths(
                     paths.clone(),
@@ -1377,15 +1663,44 @@ impl ToolHandler for ReadFileHandler {
                     &ctx.anchor_mgr,
                     Some(ctx.task_id.as_str()),
                     Some(&ctx.output_writer),
+                    (!refresh).then_some(&coverage),
                 )
                 .await;
             {
                 let mut state = ctx.state.lock().await;
+                let mut results = results;
+                for result in &results {
+                    if let Some(path) = result.canonical_path.as_deref()
+                        && let Some(coverage) = state.visible_read_coverage.get_mut(path)
+                        && coverage.revision == result.hash
+                    {
+                        if result.success
+                            && !result.refreshes_edit_context
+                            && result.visible_range.is_none()
+                        {
+                            coverage.last_already_read_range = Some((
+                                start_line.unwrap_or(1).max(1),
+                                end_line.unwrap_or(coverage.total_lines).min(coverage.total_lines),
+                            ));
+                        } else if result.visible_range.is_some() {
+                            coverage.last_already_read_range = None;
+                        }
+                    }
+                }
+                let warning_reserve = Self::warning_reserve(&state, &results);
+                Self::limit_visible_results(&mut results, warning_reserve);
                 Self::track_read_files(&mut state, &paths, &results, start_line, end_line);
-                let warnings = Self::read_loop_warnings(&state, &paths, &results);
+                let mut warnings = Self::read_loop_warnings(&state, &paths, &results);
+                let output = Self::format_results(results.clone());
+                while Self::append_warnings(output.clone(), &warnings).len()
+                    > crate::core::agent_loop::tool_result_history_limit()
+                    && !warnings.is_empty()
+                {
+                    warnings.pop();
+                }
+                Self::record_visible_reads(&mut state, &results, &warnings);
                 Ok(serde_json::Value::String(Self::append_warnings(
-                    Self::format_results(results),
-                    &warnings,
+                    output, &warnings,
                 )))
             }
         })
@@ -1409,6 +1724,318 @@ mod tests {
     use std::sync::Arc;
     use tempfile::NamedTempFile;
     use tokio::sync::mpsc;
+
+    fn coverage_context(directory: &tempfile::TempDir) -> ToolContext {
+        ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            directory.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "coverage-test".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn oversized_full_read_does_not_claim_hidden_lines_are_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let content = (1..=974)
+            .map(|line| format!("line {line:04} {}", "x".repeat(40)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(directory.path().join("WaterfallViewModel.swift"), content).unwrap();
+        let context = coverage_context(&directory);
+        let handler = ReadFileHandler::new();
+
+        let first = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["WaterfallViewModel.swift"]}),
+        )
+        .await
+        .unwrap();
+        assert!(first.as_str().unwrap().contains("974 lines total"));
+        let history_visible =
+            crate::core::agent_loop::truncate_tool_result(first.as_str().unwrap());
+        assert!(history_visible.contains("Output limited"));
+        assert!(!history_visible.contains("lines truncated"));
+
+        let second = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({
+                "paths": ["WaterfallViewModel.swift"],
+                "start_line": 730,
+                "end_line": 780
+            }),
+        )
+        .await
+        .unwrap();
+        let result = second.as_str().unwrap();
+        assert!(result.contains("§line 0730"), "{result}");
+        assert!(!result.starts_with("Already read:"));
+
+        let third = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({
+                "paths": ["WaterfallViewModel.swift"],
+                "start_line": 740,
+                "end_line": 750
+            }),
+        )
+        .await
+        .unwrap();
+        let result = third.as_str().unwrap();
+        assert!(
+            result.starts_with("Already read: WaterfallViewModel.swift"),
+            "{result}"
+        );
+        assert!(result.contains("Lines 740–750 are covered"), "{result}");
+        assert!(!result.contains("§line 0740"));
+        assert!(result.len() < 300);
+
+        let close_up = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({
+                "paths": ["WaterfallViewModel.swift"],
+                "start_line": 730,
+                "end_line": 780
+            }),
+        )
+        .await
+        .unwrap();
+        let result = close_up.as_str().unwrap();
+        assert!(result.contains("§line 0730"), "{result}");
+        assert!(!result.starts_with("Already read:"));
+    }
+
+    #[tokio::test]
+    async fn bulk_read_reports_visible_ranges_for_every_file() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            let content = (1..=500)
+                .map(|line| format!("{name} line {line:04} {}", "x".repeat(40)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(directory.path().join(name), content).unwrap();
+        }
+        let context = coverage_context(&directory);
+        let handler = ReadFileHandler::new();
+        let first = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["a.txt", "b.txt", "c.txt", "d.txt"]}),
+        )
+        .await
+        .unwrap();
+        let output = first.as_str().unwrap();
+        assert!(output.len() <= crate::core::agent_loop::tool_result_history_limit());
+        assert!(
+            output.len() > crate::core::agent_loop::tool_result_history_limit() - 2_048,
+            "first reads should not reserve unused warning space"
+        );
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            assert!(
+                output.contains(&format!("[File: {name}, Hash:")),
+                "{name} missing"
+            );
+        }
+        assert_eq!(output.matches("[Output limited.").count(), 4);
+
+        let unseen = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["d.txt"], "start_line": 450, "end_line": 470}),
+        )
+        .await
+        .unwrap();
+        assert!(unseen.as_str().unwrap().contains("§d.txt line 0450"));
+        let repeated = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["d.txt"], "start_line": 455, "end_line": 460}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            repeated
+                .as_str()
+                .unwrap()
+                .starts_with("Already read: d.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn interleaved_files_keep_independent_read_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+        std::fs::write(directory.path().join("b.txt"), "bravo\n").unwrap();
+        let context = coverage_context(&directory);
+        let handler = ReadFileHandler::new();
+
+        for path in ["a.txt", "b.txt"] {
+            ToolHandler::execute(&handler, &context, serde_json::json!({"paths": [path]}))
+                .await
+                .unwrap();
+        }
+        let repeated = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["a.txt"], "start_line": 2, "end_line": 2}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            repeated
+                .as_str()
+                .unwrap()
+                .starts_with("Already read: a.txt")
+        );
+        assert_eq!(context.state.lock().await.visible_read_coverage.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn covered_read_notice_only_unlocks_overlapping_close_up() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.txt"), "one\ntwo\nthree\nfour\nfive").unwrap();
+        let context = coverage_context(&directory);
+        let handler = ReadFileHandler::new();
+        ToolHandler::execute(&handler, &context, serde_json::json!({"paths": ["a.txt"]}))
+            .await
+            .unwrap();
+
+        for (start, end) in [(1, 2), (4, 5)] {
+            let notice = ToolHandler::execute(
+                &handler,
+                &context,
+                serde_json::json!({"paths": ["a.txt"], "start_line": start, "end_line": end}),
+            )
+            .await
+            .unwrap();
+            assert!(notice.as_str().unwrap().starts_with("Already read: a.txt"));
+        }
+
+        let close_up = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["a.txt"], "start_line": 4, "end_line": 5}),
+        )
+        .await
+        .unwrap();
+        assert!(close_up.as_str().unwrap().contains("§four"));
+
+        // After the close-up is served, requesting the same range again must
+        // return the "Already read:" notice rather than permanently disabling deduplication.
+        let third_read = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["a.txt"], "start_line": 4, "end_line": 5}),
+        )
+        .await
+        .unwrap();
+        assert!(third_read.as_str().unwrap().starts_with("Already read: a.txt"));
+    }
+
+    #[tokio::test]
+    async fn invalidating_one_file_preserves_other_file_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("a.txt");
+        let second_path = directory.path().join("b.txt");
+        std::fs::write(&first_path, "alpha").unwrap();
+        std::fs::write(&second_path, "bravo").unwrap();
+        let context = coverage_context(&directory);
+        let handler = ReadFileHandler::new();
+
+        for path in ["a.txt", "b.txt"] {
+            ToolHandler::execute(&handler, &context, serde_json::json!({"paths": [path]}))
+                .await
+                .unwrap();
+        }
+        context.invalidate_edit_context(&second_path).await;
+
+        let first =
+            ToolHandler::execute(&handler, &context, serde_json::json!({"paths": ["a.txt"]}))
+                .await
+                .unwrap();
+        assert!(first.as_str().unwrap().starts_with("Already read: a.txt"));
+
+        let second =
+            ToolHandler::execute(&handler, &context, serde_json::json!({"paths": ["b.txt"]}))
+                .await
+                .unwrap();
+        assert!(second.as_str().unwrap().contains("§bravo"));
+    }
+
+    #[tokio::test]
+    async fn uncovered_range_reads_source_and_merges_adjacent_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.txt"), "one\ntwo\nthree\nfour").unwrap();
+        let context = coverage_context(&directory);
+        let handler = ReadFileHandler::new();
+
+        for (start, end) in [(1, 2), (3, 4)] {
+            let result = ToolHandler::execute(
+                &handler,
+                &context,
+                serde_json::json!({"paths": ["a.txt"], "start_line": start, "end_line": end}),
+            )
+            .await
+            .unwrap();
+            assert!(result.as_str().unwrap().contains("§"));
+            assert!(!result.as_str().unwrap().starts_with("Already read:"));
+        }
+
+        let covered = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["a.txt"], "start_line": 2, "end_line": 3}),
+        )
+        .await
+        .unwrap();
+        assert!(covered.as_str().unwrap().starts_with("Already read: a.txt"));
+    }
+
+    #[tokio::test]
+    async fn changed_revision_and_refresh_return_source_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("a.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let context = coverage_context(&directory);
+        let handler = ReadFileHandler::new();
+        let params = serde_json::json!({"paths": ["a.txt"], "start_line": 2, "end_line": 2});
+
+        ToolHandler::execute(&handler, &context, params.clone())
+            .await
+            .unwrap();
+        let forced = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["a.txt"], "start_line": 2, "end_line": 2, "refresh": true}),
+        )
+        .await
+        .unwrap();
+        assert!(forced.as_str().unwrap().contains("§beta"));
+
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "alpha\nzeta\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        let changed = ToolHandler::execute(&handler, &context, params)
+            .await
+            .unwrap();
+        assert!(changed.as_str().unwrap().contains("§zeta"));
+        assert!(!changed.as_str().unwrap().starts_with("Already read:"));
+    }
 
     fn drain_rendered_output(
         rx: &mut tokio::sync::mpsc::Receiver<crate::cli::output::SequencedOutputEvent>,
@@ -2342,7 +2969,7 @@ mod tests {
             let _ = ToolHandler::execute(
                 &ReadFileHandler::new(),
                 &ctx,
-                serde_json::json!({"path": "loop.txt"}),
+                serde_json::json!({"path": "loop.txt", "refresh": true}),
             )
             .await
             .unwrap();
@@ -2350,17 +2977,14 @@ mod tests {
         let result = ToolHandler::execute(
             &ReadFileHandler::new(),
             &ctx,
-            serde_json::json!({"path": "loop.txt"}),
+            serde_json::json!({"path": "loop.txt", "refresh": true}),
         )
         .await
         .unwrap();
 
-        assert!(
-            result
-                .as_str()
-                .unwrap()
-                .contains("has been read 3 times consecutively without edits")
-        );
+        assert!(result.as_str().unwrap().contains("§content"));
+        assert!(!result.as_str().unwrap().starts_with("Already read:"));
+        assert!(result.as_str().unwrap().contains("has overlapping read ranges"));
     }
 
     #[tokio::test]
@@ -2520,15 +3144,15 @@ mod tests {
             )
             .await
             .expect("different file read should succeed");
-        assert_eq!(state.consecutive_reads.len(), 1);
+        assert_eq!(state.consecutive_reads.len(), 2);
         assert_eq!(
             state
                 .consecutive_reads
                 .get(&canonical_path_str)
                 .copied()
                 .unwrap_or(0),
-            0,
-            "reading another file must break the prior file's read sequence"
+            3,
+            "reading another file must preserve the prior file's read count"
         );
 
         state.turns_completed = 5;
@@ -2544,8 +3168,8 @@ mod tests {
             .expect("returning to the first file should succeed");
         assert_eq!(
             state.consecutive_reads.get(&canonical_path_str).copied(),
-            Some(1),
-            "a read after another file starts a new sequence"
+            Some(4),
+            "a read after another file continues tracking the unchanged file"
         );
     }
 
@@ -2606,12 +3230,12 @@ mod tests {
                 .expect("re-read should succeed");
             if round == 3 {
                 assert!(
-                    output.contains("has been read 3 times consecutively"),
+                    output.contains("overlapping read ranges"),
                     "warning should fire on the 3rd cross-turn read, got: {output}"
                 );
             } else {
                 assert!(
-                    !output.contains("has been read"),
+                    !output.contains("overlapping read ranges"),
                     "warning must not fire before the 3rd cross-turn read, got: {output}"
                 );
             }
@@ -2650,7 +3274,7 @@ mod tests {
                 .expect("thrash read should succeed");
             if turn == 3 {
                 assert!(
-                    output.contains("in a narrow region"),
+                    output.contains("overlapping read ranges"),
                     "third cross-turn overlapping read should fire the thrash warning, got: {output}"
                 );
                 assert!(
@@ -2680,7 +3304,7 @@ mod tests {
                 .await
                 .expect("sequential read should succeed");
             assert!(
-                !output.contains("in a narrow region"),
+                !output.contains("overlapping read ranges"),
                 "sequential forward scanning must not trigger the thrash warning, got: {output}"
             );
             assert!(
@@ -2820,13 +3444,9 @@ mod tests {
         }
     }
 
-    /// Audit (Gap A.2): narrow slices with centers within 100 lines of
-    /// each other but no ≥50% overlap should fire the circuit breaker
-    /// (Tier 1 — thrashing). Models in the live logs alternated between
-    /// (550–590) and (580–650) on the same file; overlap is only 25% but
-    /// the centers are clustered and the model is clearly hunting.
+    /// A later read in a new region must not suggest rereading the full file.
     #[tokio::test]
-    async fn test_circuit_breaker_fires_on_center_clustering_without_overlap() {
+    async fn test_new_region_does_not_trigger_full_file_guidance() {
         use crate::core::agent_types::TaskState;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -2860,16 +3480,8 @@ mod tests {
                 .expect("cluster read should succeed");
             if idx == 2 {
                 assert!(
-                    output.contains("in a narrow region"),
-                    "clustered slices must fire the circuit breaker, got: {output}"
-                );
-                assert!(
-                    output.contains("omit start_line/end_line"),
-                    "circuit breaker must direct the model at the whole-file read, got: {output}"
-                );
-                assert!(
-                    !output.contains("get_file_skeleton"),
-                    "warning must not steer the model at an unsupported tool, got: {output}"
+                    !output.contains("Warning:"),
+                    "a new read region must not trigger a read-loop warning, got: {output}"
                 );
             }
         }
@@ -2891,36 +3503,5 @@ mod tests {
         assert!(!is_sequential_forward(&[(500, 600), (550, usize::MAX)]));
         // EOF read that jumps forward — still pagination.
         assert!(is_sequential_forward(&[(1, 100), (200, usize::MAX)]));
-    }
-
-    /// Audit (Gap A.4): unit test on the center-clustering helper itself.
-    #[test]
-    fn detect_center_clustering_classifies_patterns() {
-        // Two windows with centers 50 lines apart — clustered.
-        assert!(detect_center_clustering(&[(550, 590), (580, 650)], 100));
-        // Three windows with centers 50, 50, 50 apart — clustered.
-        assert!(detect_center_clustering(
-            &[(550, 590), (580, 650), (700, 760)],
-            100
-        ));
-        // Centers 400 lines apart — not clustered.
-        assert!(!detect_center_clustering(&[(1, 50), (400, 450)], 100));
-        // Adjacent pagination whose centers are exactly at the threshold is
-        // not clustered; this keeps a 1–100, 101–200 scan out of the warning.
-        assert!(!detect_center_clustering(&[(1, 100), (101, 200)], 100));
-        // Centers 800 lines apart — not clustered.
-        assert!(!detect_center_clustering(
-            &[(1, 50), (400, 450), (1200, 1250)],
-            100
-        ));
-        // EOF read mixed in — center ignored, only bounded centers matter.
-        assert!(detect_center_clustering(
-            &[(550, 590), (580, 650), (800, usize::MAX)],
-            100
-        ));
-        // Single window — no clustering possible.
-        assert!(!detect_center_clustering(&[(1, 100)], 100));
-        // Empty — no clustering possible.
-        assert!(!detect_center_clustering(&[], 100));
     }
 }

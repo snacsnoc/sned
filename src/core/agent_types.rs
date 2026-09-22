@@ -159,9 +159,8 @@ pub struct TaskState {
     pub last_executed_command: Option<String>,
     /// Exact file paths that must be re-read before the next edit attempt.
     pub must_reread_before_edit: HashSet<String>,
-    /// Consecutive read_file calls per file path with no intervening tool action.
-    /// Used to detect the "read loop" pattern where the model reads the same
-    /// file repeatedly without taking action.
+    /// Read turns per file path since its last mutation, including reads
+    /// interleaved with inspection of other files.
     pub consecutive_reads: std::collections::HashMap<String, u32>,
     /// Last agent-turn index (`turns_completed`) at which each path was recorded
     /// by `track_read_files`. Reads of the same file within a single turn
@@ -180,6 +179,8 @@ pub struct TaskState {
     /// only for paths whose bytes may have changed externally.
     pub read_file_snapshots:
         std::collections::HashMap<String, (u64, Option<std::time::SystemTime>)>,
+    /// Model-visible read ranges for each unchanged file revision.
+    pub visible_read_coverage: std::collections::HashMap<String, ReadCoverage>,
     /// Number of consecutive successful edits per file with no intervening
     /// successful build/test run. When an execute_command result indicates
     /// a build failure and any value in this map is ≥3, the agent_loop
@@ -197,6 +198,11 @@ pub struct TaskState {
     /// re-read or rethink its anchor selection. Cleared on any successful
     /// edit or successful build/test for that file.
     pub consecutive_edit_failures: std::collections::HashMap<String, u32>,
+    /// Number of consecutive inspection-only turns (reading/searching files)
+    /// across the session without any mutating tool or command execution.
+    /// Used by the global inspection loop circuit breaker to stop passive
+    /// exploration thrashing and compel the model to take action.
+    pub consecutive_inspection_turns: u32,
     /// Number of tool calls executed in the current turn (for subagent result reporting).
     pub turn_tool_calls: u32,
     /// Cumulative total tool calls across all turns in the session (never
@@ -212,6 +218,15 @@ pub struct TaskState {
     /// Exact user-authored message of the most recent request that safely failed before any
     /// tool execution, and can therefore be retried verbatim.
     pub retryable_failed_request: Option<StorageMessage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadCoverage {
+    pub revision: String,
+    pub ranges: Vec<(usize, usize)>,
+    pub total_lines: usize,
+    /// A repeat of this covered range is an intentional close-up request.
+    pub last_already_read_range: Option<(usize, usize)>,
 }
 
 /// Stats for a single file's changes in a session.
@@ -280,8 +295,10 @@ impl Default for TaskState {
             last_read_turn: std::collections::HashMap::new(),
             recent_read_windows: std::collections::HashMap::new(),
             read_file_snapshots: std::collections::HashMap::new(),
+            visible_read_coverage: std::collections::HashMap::new(),
             consecutive_edits: std::collections::HashMap::new(),
             consecutive_edit_failures: std::collections::HashMap::new(),
+            consecutive_inspection_turns: 0,
             plan_state: None,
             last_injected_plan_state_hash: None,
             denied_tool_actions: Vec::new(),

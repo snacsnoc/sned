@@ -236,6 +236,7 @@ impl PromptBuilder {
         }
         prompt.push_str(
             "- Keep validation focused, but run the checks needed for code/workspace changes or required by project instructions.\n\
+             - When tasked with checking if code works or fixing bugs, run the project's build or test command via `execute_command` early to establish baseline status. Do not read the entire codebase or conduct endless exploratory searches; inspect only the specific files relevant to build/test failures or explicit user instructions.\n\
              - Avoid planning text, broad validation, and extra file reads unless they are necessary, cheap, or user-requested.\n\n\
              SAFETY AND REFUSAL\n\
              - Refuse unsafe or disallowed requests.\n\

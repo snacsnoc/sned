@@ -318,6 +318,7 @@ impl ToolContext {
         state.consecutive_reads.remove(&key);
         state.last_read_turn.remove(&key);
         state.recent_read_windows.remove(&key);
+        state.visible_read_coverage.remove(&key);
         // A write does not deliver fresh anchors. Keep the old dictionary so the
         // next read can retire old words, and require that read before editing.
         state.must_reread_before_edit.insert(key);

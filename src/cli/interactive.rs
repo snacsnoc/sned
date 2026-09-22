@@ -2953,6 +2953,7 @@ async fn invalidate_restored_file_context(
             // fresh read so reconciliation can bind anchors to the restored bytes.
             state.must_reread_before_edit.insert(key);
         }
+        state.consecutive_inspection_turns = 0;
     }
 }
 
