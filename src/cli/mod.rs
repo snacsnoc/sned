@@ -124,7 +124,24 @@ impl Drop for TuiTraceSessionGuard {
 fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
     match mode {
         TracingMode::JsonOnly => {
-            tracing_subscriber::registry().with(JsonOutputLayer).init();
+            let registry = tracing_subscriber::registry().with(JsonOutputLayer);
+
+            if debug {
+                let log_file = std::fs::File::create("/tmp/sned-debug.log")
+                    .expect("Failed to create debug log file");
+                let log_file = std::sync::Arc::new(log_file);
+                let file_layer = tracing_subscriber::fmt::layer()
+                    .with_writer(log_file)
+                    .with_thread_ids(true)
+                    .with_thread_names(true)
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_filter(EnvFilter::new("debug"));
+                registry.with(file_layer).init();
+            } else {
+                registry.init();
+            }
         }
         TracingMode::Human { verbose } => {
             let env_filter = EnvFilter::try_from_default_env()
