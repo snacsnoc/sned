@@ -77,7 +77,7 @@ impl GetFileSkeletonHandler {
                     .collect::<Vec<_>>(),
             )
             .map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}"))
+                ToolError::InvalidInput(format!("Failed to load language parsers: {e}. Use read_file or search_files for this file."))
             })?,
         );
 
@@ -350,5 +350,36 @@ mod tests {
             "get_file_skeleton bypassed the shared path lock"
         );
         drop(held);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "lang-swift")]
+    async fn test_get_file_skeleton_swift_support() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("View.swift");
+        std::fs::write(&file_path, "class ViewModel {\n    func update() {}\n}\n").unwrap();
+        let ctx = ToolContext::new(
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            None,
+            workspace.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            false,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        );
+
+        let result = ToolHandler::execute(
+            &GetFileSkeletonHandler,
+            &ctx,
+            serde_json::json!({"path": "View.swift"}),
+        )
+        .await
+        .unwrap();
+
+        let output = result.as_str().unwrap();
+        assert!(output.contains("class ViewModel"), "{output}");
     }
 }

@@ -1,6 +1,7 @@
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use crate::services::tree_sitter::{
-    MAX_STRUCTURAL_FILE_READ_SIZE, get_functions, load_required_language_parsers,
+    LanguageParserError, MAX_STRUCTURAL_FILE_READ_SIZE, get_functions,
+    load_required_language_parsers,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -60,10 +61,19 @@ impl GetFunctionHandler {
         }
 
         let abs_path_str = canonical_path.to_string_lossy().into_owned();
-        let language_parsers =
-            load_required_language_parsers(&[abs_path_str.as_str()]).map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}"))
-            })?;
+        let language_parsers = match load_required_language_parsers(&[abs_path_str.as_str()]) {
+            Ok(parsers) => parsers,
+            Err(LanguageParserError::UnsupportedExtension(extension)) => {
+                return Ok(format!(
+                    "get_function is unavailable for {path} in this Sned build ({extension}). Do not retry get_function for this file; use search_files to locate the symbol or reuse content already returned by read_file."
+                ));
+            }
+            Err(error) => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "Failed to load language parsers: {error}"
+                )));
+            }
+        };
 
         match tokio::fs::read_to_string(&canonical_path).await {
             Ok(content) => {
@@ -141,6 +151,33 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
             false,
         )
+    }
+
+    #[cfg(not(feature = "lang-swift"))]
+    #[tokio::test]
+    async fn test_unsupported_swift_get_function_directs_search_without_tool_failure() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("WaterfallViewModel.swift"),
+            "func startScanner() {}\n",
+        )
+        .unwrap();
+        let context = test_context(
+            workspace.path(),
+            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+        );
+
+        let result = GetFunctionHandler
+            .execute(
+                &context,
+                serde_json::json!({"path": "WaterfallViewModel.swift", "name": "startScanner"}),
+            )
+            .await
+            .unwrap();
+        let message = result.as_str().unwrap();
+        assert!(message.contains("get_function is unavailable"));
+        assert!(message.contains("search_files"));
+        assert!(message.contains("Do not retry"));
     }
 
     #[tokio::test]

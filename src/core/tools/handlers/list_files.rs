@@ -367,11 +367,15 @@ impl ListFilesHandler {
         files: &[FileInfo],
         hit_limit: bool,
         warning: Option<&str>,
+        workspace_root: &Path,
     ) -> String {
         if files.is_empty() {
             return "(empty directory)".to_string();
         }
 
+        let workspace_root = workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.to_path_buf());
         let mut lines = Vec::new();
 
         for file in files {
@@ -382,10 +386,11 @@ impl ListFilesHandler {
                 String::new()
             };
 
-            // Get just the filename for display
-            let name = Path::new(&file.path)
-                .file_name()
-                .map_or_else(|| file.path.clone(), |n| n.to_string_lossy().to_string());
+            let path = Path::new(&file.path);
+            let name = path
+                .strip_prefix(&workspace_root)
+                .unwrap_or(path)
+                .to_string_lossy();
 
             lines.push(format!("{prefix}{name}{line_info}"));
         }
@@ -446,7 +451,12 @@ impl ListFilesHandler {
             )
             .await;
         if result.success {
-            Ok(self.format_files_list(&result.files, result.hit_limit, result.warning.as_deref()))
+            Ok(self.format_files_list(
+                &result.files,
+                result.hit_limit,
+                result.warning.as_deref(),
+                workspace_root,
+            ))
         } else {
             Err(ToolError::ExecutionFailedWithMetadata(
                 result.error.unwrap_or_else(|| "Unknown error".to_string()),
@@ -742,7 +752,7 @@ mod tests {
             },
         ];
 
-        let formatted = handler.format_files_list(&files, false, None);
+        let formatted = handler.format_files_list(&files, false, None, Path::new("/test"));
         assert!(formatted.contains("📁 dir"));
         assert!(formatted.contains("📄 file.txt"));
         assert!(formatted.contains("(42 lines)"));
@@ -751,8 +761,28 @@ mod tests {
     #[test]
     fn test_format_files_list_empty() {
         let handler = ListFilesHandler::new();
-        let formatted = handler.format_files_list(&[], false, None);
+        let formatted = handler.format_files_list(&[], false, None, Path::new("/test"));
         assert_eq!(formatted, "(empty directory)");
+    }
+
+    #[tokio::test]
+    async fn recursive_listing_returns_paths_usable_by_read_file() {
+        let workspace = TempDir::new().unwrap();
+        let nested = workspace.path().join("SDRSkeleton/SDRSkeleton");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("WaterfallViewModel.swift"), "source").unwrap();
+
+        let result = ListFilesHandler::new()
+            .execute_without_state(
+                workspace.path(),
+                serde_json::json!({"path": "SDRSkeleton", "recursive": true}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.contains("📄 SDRSkeleton/SDRSkeleton/WaterfallViewModel.swift"),
+            "{result}"
+        );
     }
 
     #[test]

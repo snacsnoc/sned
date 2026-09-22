@@ -20,7 +20,7 @@ categories = ["command-line-utilities", "development-tools::code-assist"]
 ignored = ["tree-sitter-rust", "tree-sitter-javascript", "tree-sitter-python", "tree-sitter-typescript", "tree-sitter-go", "tree-sitter-c", "tree-sitter-cpp", "tree-sitter-c-sharp", "tree-sitter-ruby", "tree-sitter-java", "tree-sitter-php", "tree-sitter-swift"]
 
 [features]
-default = ["lang-rust", "lang-javascript", "lang-python", "lang-typescript", "lang-go"]
+default = ["lang-rust", "lang-javascript", "lang-python", "lang-typescript", "lang-go", "lang-swift", "lang-c", "lang-cpp"]
 dhat-heap = ["dep:dhat"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-javascript = ["dep:tree-sitter-javascript"]
