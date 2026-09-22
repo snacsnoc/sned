@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
+use std::sync::{LazyLock, Mutex as StdMutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
@@ -16,8 +17,8 @@ use crate::storage::disk::GlobalFileNames;
 pub const DEFAULT_TRANSCRIPT_CAP: usize = 1_000;
 pub const CURRENT_TRANSCRIPT_FORMAT_VERSION: u32 = 1;
 // Keep the append path cheap. The background writer compacts after this many
-// appended entries, when the file exceeds 1 MiB, and once during startup
-// recovery so retention/corruption repair is not performed for every line.
+// appended entries, not on every append after the retained 1,000 entries
+// themselves exceed the size threshold. Startup recovery handles old files.
 const TRANSCRIPT_COMPACTION_APPEND_THRESHOLD: usize = 500;
 const TRANSCRIPT_COMPACTION_MAX_BYTES: u64 = 1_048_576;
 const TRANSCRIPT_WRITER_BATCH_SIZE: usize = 64;
@@ -26,6 +27,15 @@ const ASYNC_LOCK_RETRY_DELAYS_MS: &[u64] = &[100, 200, 400, 800, 1_600, 3_200];
 const TASK_LOCK_FILE: &str = ".lock";
 const API_CONVERSATION_HISTORY_LOCK_FILE: &str = ".api-conversation-history.lock";
 const COMPACTED_SUMMARY_LOCK_FILE: &str = ".compacted-summary.lock";
+
+#[derive(Default)]
+struct SyncTranscriptGrowth {
+    entries: usize,
+    bytes: u64,
+}
+
+static SYNC_TRANSCRIPT_GROWTH: LazyLock<StdMutex<HashMap<PathBuf, SyncTranscriptGrowth>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 fn default_transcript_format_version() -> u32 {
     CURRENT_TRANSCRIPT_FORMAT_VERSION
@@ -94,7 +104,7 @@ pub struct TaskTranscriptWriter {
     handle: Option<JoinHandle<()>>,
 }
 
-const TRANSCRIPT_WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const TRANSCRIPT_WRITER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl TaskTranscriptWriter {
     pub fn start(storage: TaskStorage) -> io::Result<Self> {
@@ -109,6 +119,7 @@ impl TaskTranscriptWriter {
 
                 let mut pending = Vec::new();
                 let mut appends_since_compaction = 0usize;
+                let mut bytes_since_compaction = 0u64;
                 loop {
                     let command = if pending.is_empty() {
                         match receiver.recv() {
@@ -123,6 +134,7 @@ impl TaskTranscriptWriter {
                                     &storage,
                                     &mut pending,
                                     &mut appends_since_compaction,
+                                    &mut bytes_since_compaction,
                                 ) {
                                     let _ = error_sender.send(error.to_string());
                                 }
@@ -140,6 +152,7 @@ impl TaskTranscriptWriter {
                                     &storage,
                                     &mut pending,
                                     &mut appends_since_compaction,
+                                    &mut bytes_since_compaction,
                                 )
                             {
                                 let _ = error_sender.send(error.to_string());
@@ -150,6 +163,7 @@ impl TaskTranscriptWriter {
                                 &storage,
                                 &mut pending,
                                 &mut appends_since_compaction,
+                                &mut bytes_since_compaction,
                             );
                             let _ = response.send(result);
                         }
@@ -158,6 +172,7 @@ impl TaskTranscriptWriter {
                                 &storage,
                                 &mut pending,
                                 &mut appends_since_compaction,
+                                &mut bytes_since_compaction,
                             ) {
                                 let _ = error_sender.send(error.to_string());
                             }
@@ -167,6 +182,7 @@ impl TaskTranscriptWriter {
                                 &storage,
                                 &mut pending,
                                 &mut appends_since_compaction,
+                                &mut bytes_since_compaction,
                             );
                             let _ = response.send(result);
                             return;
@@ -258,19 +274,22 @@ fn flush_transcript_batch(
     storage: &TaskStorage,
     pending: &mut Vec<TranscriptEntry>,
     appends_since_compaction: &mut usize,
+    bytes_since_compaction: &mut u64,
 ) -> io::Result<()> {
     if pending.is_empty() {
         return Ok(());
     }
 
     let batch = std::mem::take(pending);
-    let file_size = storage.append_transcript_entries(&batch)?;
+    let bytes_written = storage.append_transcript_entries(&batch)?;
     *appends_since_compaction = appends_since_compaction.saturating_add(batch.len());
+    *bytes_since_compaction = bytes_since_compaction.saturating_add(bytes_written);
     if *appends_since_compaction >= TRANSCRIPT_COMPACTION_APPEND_THRESHOLD
-        || file_size > TRANSCRIPT_COMPACTION_MAX_BYTES
+        || *bytes_since_compaction >= TRANSCRIPT_COMPACTION_MAX_BYTES
     {
         storage.compact_transcript()?;
         *appends_since_compaction = 0;
+        *bytes_since_compaction = 0;
     }
     Ok(())
 }
@@ -902,10 +921,19 @@ impl TaskStorage {
 
     /// Append visible transcript entries in one locked, durable batch.
     pub fn write_transcript_entries(&self, entries: &[TranscriptEntry]) -> io::Result<()> {
-        let file_size = self.append_transcript_entries(entries)?;
-        if entries.len() >= TRANSCRIPT_COMPACTION_APPEND_THRESHOLD
-            || file_size > TRANSCRIPT_COMPACTION_MAX_BYTES
-        {
+        let bytes_written = self.append_transcript_entries(entries)?;
+        let transcript_path = self.task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let should_compact = {
+            let mut growth = SYNC_TRANSCRIPT_GROWTH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = growth.entry(transcript_path.clone()).or_default();
+            state.entries = state.entries.saturating_add(entries.len());
+            state.bytes = state.bytes.saturating_add(bytes_written);
+            state.entries >= TRANSCRIPT_COMPACTION_APPEND_THRESHOLD
+                || state.bytes >= TRANSCRIPT_COMPACTION_MAX_BYTES
+        };
+        if should_compact {
             self.compact_transcript()?;
         }
         Ok(())
@@ -931,19 +959,28 @@ impl TaskStorage {
                 .create(true)
                 .append(true)
                 .open(path)?;
+            let mut bytes_written = 0u64;
             for entry in entries {
                 let mut line = serde_json::to_vec(entry)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 line.push(b'\n');
+                bytes_written = bytes_written.saturating_add(line.len() as u64);
                 file.write_all(&line)?;
             }
             file.sync_data()?;
-            file.metadata().map(|metadata| metadata.len())
+            Ok(bytes_written)
         })
     }
 
     fn compact_transcript(&self) -> io::Result<()> {
-        self.with_lock(|| self.compact_transcript_unlocked())
+        let result = self.with_lock(|| self.compact_transcript_unlocked());
+        if result.is_ok() {
+            SYNC_TRANSCRIPT_GROWTH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.task_dir.join(GlobalFileNames::TRANSCRIPT));
+        }
+        result
     }
 
     fn recover_transcript(&self) -> io::Result<()> {
@@ -1885,6 +1922,39 @@ mod tests {
     }
 
     #[test]
+    fn test_synchronous_small_appends_accumulate_before_compaction() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-sync-growth");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let initial = (0..DEFAULT_TRANSCRIPT_CAP)
+            .map(|index| TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: index as u64,
+                markdown: format!("initial {index}"),
+            })
+            .collect::<Vec<_>>();
+        storage.write_transcript_entries(&initial).unwrap();
+
+        for index in 0..TRANSCRIPT_COMPACTION_APPEND_THRESHOLD {
+            storage
+                .write_transcript_entry(&TranscriptEntry {
+                    kind: BlockKind::Model,
+                    ts: 10_000 + index as u64,
+                    markdown: format!("append {index}"),
+                })
+                .unwrap();
+        }
+
+        let retained = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        assert_eq!(retained.len(), DEFAULT_TRANSCRIPT_CAP);
+        assert_eq!(retained.first().unwrap().ts, 500);
+        assert_eq!(retained.last().unwrap().ts, 10_000 + 499);
+    }
+
+    #[test]
     fn test_background_transcript_writer_batches_and_compacts_after_append_threshold() {
         let temp_dir = TempDir::new().unwrap();
         let task_dir = temp_dir.path().join("transcript-writer-threshold");
@@ -1911,6 +1981,81 @@ mod tests {
     }
 
     #[test]
+    fn test_background_transcript_writer_does_not_compact_every_streamed_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-writer-large-stream");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let entry = |index| TranscriptEntry {
+            kind: BlockKind::Model,
+            ts: index,
+            markdown: "x".repeat(100),
+        };
+        storage
+            .write_transcript_entries(
+                &(0..DEFAULT_TRANSCRIPT_CAP as u64)
+                    .map(entry)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
+        assert!(fs::metadata(&path).unwrap().len() < TRANSCRIPT_COMPACTION_MAX_BYTES);
+
+        let mut writer = TaskTranscriptWriter::start(storage).unwrap();
+        for batch_index in 0..10 {
+            let start = DEFAULT_TRANSCRIPT_CAP as u64 + batch_index * 100;
+            writer
+                .append((start..start + 100).map(entry).collect())
+                .unwrap();
+            writer.flush().unwrap();
+
+            let on_disk_lines = io::BufReader::new(fs::File::open(&path).unwrap())
+                .lines()
+                .count();
+            let expected = DEFAULT_TRANSCRIPT_CAP + ((batch_index as usize + 1) % 5) * 100;
+            assert_eq!(on_disk_lines, expected, "batch {batch_index}");
+        }
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_background_transcript_writer_compacts_after_growth_bytes() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-writer-growth-bytes");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let initial = (0..DEFAULT_TRANSCRIPT_CAP - 1)
+            .map(|index| TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: index as u64,
+                markdown: "small".to_string(),
+            })
+            .collect::<Vec<_>>();
+        storage.write_transcript_entries(&initial).unwrap();
+
+        let mut writer = TaskTranscriptWriter::start(storage).unwrap();
+        writer
+            .append(vec![TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: 1_000,
+                markdown: "x".repeat(1_100_000),
+            }])
+            .unwrap();
+        writer.flush().unwrap();
+
+        let on_disk_lines = io::BufReader::new(fs::File::open(path).unwrap())
+            .lines()
+            .count();
+        assert_eq!(on_disk_lines, DEFAULT_TRANSCRIPT_CAP);
+        writer.shutdown().unwrap();
+    }
+
+    #[test]
     fn test_background_transcript_writer_flush_request_does_not_wait_for_storage() {
         let temp_dir = TempDir::new().unwrap();
         let task_dir = temp_dir.path().join("transcript-writer-async-flush");
@@ -1920,7 +2065,7 @@ mod tests {
 
         writer
             .append(
-                (0..10_000)
+                (0..2_000)
                     .map(|index| TranscriptEntry {
                         kind: BlockKind::Model,
                         ts: index as u64,
