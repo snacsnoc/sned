@@ -50,6 +50,15 @@ pub struct FileEditBatch {
     pub edits: Vec<Edit>,
 }
 
+impl FileEditBatch {
+    /// Pure block batches match content against current bytes, so anchor
+    /// freshness (must_reread) never applies to them.
+    #[must_use]
+    pub fn is_pure_block(&self) -> bool {
+        !self.edits.is_empty() && self.edits.iter().all(|edit| edit.old_text.is_some())
+    }
+}
+
 /// Result of preparing edits for a file.
 #[derive(Debug, Clone)]
 pub struct PreparedEdits {
@@ -184,9 +193,9 @@ impl BatchProcessor {
         let has_end_anchor = edit.end_anchor.is_some();
         let is_replace = edit_type == "replace" || edit_type.is_empty();
 
-        if edit.anchor.is_empty() {
+        if edit.old_text.is_none() && edit.anchor.is_empty() {
             return Err(FileEditorError::ValidationError(
-                "Each edit must contain 'anchor'.".to_string(),
+                "Each edit must contain 'anchor' or 'old_text'.".to_string(),
             ));
         }
 
@@ -864,6 +873,7 @@ mod tests {
                     edit_type: "replace".to_string(),
                     text: "fn new_main()".to_string(),
                     content: None,
+                old_text: None,
                 }],
             ),
             (
@@ -874,6 +884,7 @@ mod tests {
                     edit_type: "insert_after".to_string(),
                     text: "pub fn sub()".to_string(),
                     content: None,
+                old_text: None,
                 }],
             ),
         ];
@@ -897,6 +908,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "new content".to_string(),
             content: None,
+                old_text: None,
         };
         assert!(processor.validate_edit(&valid).is_ok());
 
@@ -907,6 +919,7 @@ mod tests {
             edit_type: "".to_string(),
             text: "new".to_string(),
             content: None,
+                old_text: None,
         };
         assert!(processor.validate_edit(&default_replace).is_ok());
 
@@ -917,6 +930,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "new".to_string(),
             content: None,
+                old_text: None,
         };
         assert!(processor.validate_edit(&invalid).is_err());
 
@@ -927,6 +941,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "new".to_string(),
             content: None,
+                old_text: None,
         };
         assert!(processor.validate_edit(&valid).is_ok());
 
@@ -938,6 +953,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "new".to_string(),
             content: Some(vec!["middle".to_string()]),
+                old_text: None,
         };
         assert!(processor.validate_edit(&with_content_no_end).is_err());
 
@@ -947,6 +963,7 @@ mod tests {
             edit_type: "insert_after".to_string(),
             text: "new".to_string(),
             content: Some(vec!["middle".to_string()]),
+                old_text: None,
         };
         assert!(processor.validate_edit(&content_with_insert).is_err());
 
@@ -956,6 +973,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "new".to_string(),
             content: Some(vec!["middle".to_string()]),
+                old_text: None,
         };
         assert!(processor.validate_edit(&valid_fingerprint).is_ok());
 
@@ -968,6 +986,7 @@ mod tests {
                 "middle".to_string();
                 MAX_FINGERPRINT_CONTENT_LINES + 1
             ]),
+            old_text: None,
         };
         let error = processor
             .validate_edit(&oversized_fingerprint)
@@ -993,6 +1012,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "fn greeting() {\n    println!(\"hello\");".to_string(),
             content: None,
+                old_text: None,
         }];
 
         let prepared =
@@ -1033,6 +1053,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "replacement\n\n".to_string(),
             content: None,
+                old_text: None,
         }];
 
         let mut prepared = processor
@@ -1076,6 +1097,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: String::new(),
             content: None,
+                old_text: None,
         }];
 
         let mut prepared = processor
@@ -1112,6 +1134,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: String::new(),
             content: None,
+                old_text: None,
         }];
 
         let mut prepared = processor
@@ -1149,6 +1172,7 @@ mod tests {
                 edit_type: "replace".to_string(),
                 text: "alpha".to_string(),
                 content: None,
+                old_text: None,
             },
             Edit {
                 anchor: format!("{}§line2", hashes[1]),
@@ -1156,6 +1180,7 @@ mod tests {
                 edit_type: "replace".to_string(),
                 text: "beta".to_string(),
                 content: None,
+                old_text: None,
             },
             Edit {
                 anchor: "bogus§missing".to_string(),
@@ -1163,6 +1188,7 @@ mod tests {
                 edit_type: "replace".to_string(),
                 text: "gamma".to_string(),
                 content: None,
+                old_text: None,
             },
         ];
 
@@ -1196,6 +1222,7 @@ mod tests {
                 edit_type: "replace".to_string(),
                 text: "alpha".to_string(),
                 content: None,
+                old_text: None,
             },
             Edit {
                 anchor: format!("{}§line2", hashes[1]),
@@ -1203,6 +1230,7 @@ mod tests {
                 edit_type: "replace".to_string(),
                 text: "beta".to_string(),
                 content: None,
+                old_text: None,
             },
         ];
         let mut prepared = processor
@@ -1233,6 +1261,7 @@ mod tests {
             edit_type: "insert_after".to_string(),
             text: "new line".to_string(),
             content: Some(vec!["line".to_string()]),
+                old_text: None,
         };
 
         let error = processor
@@ -1274,6 +1303,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "new_line2".to_string(),
             content: None,
+                old_text: None,
         }];
 
         let mut prepared = processor
@@ -1319,6 +1349,7 @@ mod tests {
                 edit_type: "replace".into(),
                 text: replacement,
                 content: None,
+                old_text: None,
             }];
             let processor = BatchProcessor::new(DiffMode::Full);
             let mut prepared = processor
@@ -1359,6 +1390,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "same".to_string(),
             content: None,
+                old_text: None,
         };
         let prepared = PreparedEdits {
             provenance: SpliceProvenance::default(),
@@ -1415,6 +1447,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "new_line2".to_string(),
             content: None,
+                old_text: None,
         }];
 
         let mut prepared = processor
@@ -1456,6 +1489,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "new_line2".to_string(),
             content: None,
+                old_text: None,
         }];
 
         let mut prepared = processor
@@ -1504,6 +1538,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "new_line2\nnew_line2b".to_string(),
             content: None,
+                old_text: None,
         }];
 
         let mut prepared = processor
@@ -1565,6 +1600,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: format!("{}§new one\n{}§new two", hashes[0], hashes[1]),
             content: None,
+                old_text: None,
         }];
 
         let prepared = processor
@@ -1633,6 +1669,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "new_line2".to_string(),
             content: None,
+                old_text: None,
         }];
 
         let mut prepared = processor

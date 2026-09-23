@@ -296,53 +296,12 @@ fn is_secret_like(name: &str) -> bool {
         || upper.ends_with("_PRIVATE_KEY")
         || matches!(upper.as_str(), "KEY" | "SECRET" | "TOKEN" | "PASSWORD")
 }
-
-fn format_sandbox_env_note(report: &SandboxEnvReport) -> String {
-    // Use `Note:` prefix and a divider line so the model cannot parse
-    // the sandbox diagnostic as a tool failure. The bracketed
-    // `[Sandbox: ...]` framing historically tripped the model into
-    // treating the diagnostic as an error and rerunning the command.
-    let mut note = String::from("\n\n--- Note (informational, not a tool error) ---\n");
-    note.push_str(&format!(
-        "Sandbox withheld {} environment variables from this command.",
-        report.total()
-    ));
-    if !report.not_allowlisted.is_empty() {
-        note.push_str("\n  Not allowlisted: ");
-        note.push_str(&report.not_allowlisted.join(", "));
-    }
-    if !report.sensitive.is_empty() {
-        note.push_str("\n  Sensitive and always blocked: ");
-        note.push_str(&report.sensitive.join(", "));
-    }
-    note.push_str(
-        "\n  To pass non-sensitive variables, set SNED_ALLOW_ENV=VAR1,VAR2; sensitive variables remain blocked.",
-    );
-    note
-}
-
 fn command_output_limit() -> usize {
     std::env::var("SNED_COMMAND_OUTPUT_LIMIT")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v > 0 && v <= 1024 * 1024)
         .unwrap_or(10 * 1024)
-}
-
-fn format_bounded_sandbox_env_note(report: &SandboxEnvReport, limit_bytes: usize) -> String {
-    let note = format_sandbox_env_note(report);
-    if note.len() <= limit_bytes {
-        return note;
-    }
-
-    let compact_note = format!(
-        "\n\n--- Note (informational, not a tool error) ---\n\
-Sandbox: {} environment variables withheld; diagnostic truncated by output limit. \
-Increase SNED_COMMAND_OUTPUT_LIMIT to see all names.",
-        report.total()
-    );
-    let safe_end = compact_note.floor_char_boundary(limit_bytes);
-    compact_note[..safe_end].to_string()
 }
 
 fn truncate_command_output(output: String, limit_bytes: usize) -> String {
@@ -364,30 +323,15 @@ fn assemble_sandboxed_output(
     report: &SandboxEnvReport,
     limit_bytes: usize,
 ) -> String {
-    if report.is_empty() {
-        return truncate_command_output(output, limit_bytes);
+    // Withheld variable names go to tracing only. The model cannot act on
+    // them, and appending them steals budget from command output.
+    if !report.is_empty() {
+        tracing::debug!(
+            withheld = report.total(),
+            "sandbox withheld environment variables from command"
+        );
     }
-
-    let note = format_bounded_sandbox_env_note(report, limit_bytes);
-    if note.len() >= limit_bytes {
-        return note;
-    }
-
-    let output_budget = limit_bytes - note.len();
-    if output.len() <= output_budget {
-        let mut result = output;
-        result.push_str(&note);
-        return result;
-    }
-
-    let marker = "\n\n(Output truncated due to size limit.)";
-    let safe_end = output.floor_char_boundary(output_budget.saturating_sub(marker.len()));
-    let mut result = output[..safe_end].to_string();
-    if result.len() + marker.len() <= output_budget {
-        result.push_str(marker);
-    }
-    result.push_str(&note);
-    result
+    truncate_command_output(output, limit_bytes)
 }
 
 impl Default for ExecuteCommandHandler {
@@ -2998,36 +2942,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_env_note_lists_all_names_and_policy() {
-        let mut report = SandboxEnvReport {
-            not_allowlisted: vec![
-                "SSH_CONNECTION".to_string(),
-                "SHLVL".to_string(),
-                "SSH_CONNECTION".to_string(),
-            ],
-            sensitive: vec![
-                "SALAD_API_KEY".to_string(),
-                "MINI_MAX_TOKEN_API_KEY".to_string(),
-            ],
-        };
-        report.normalize();
-
-        let note = format_sandbox_env_note(&report);
-        assert!(
-            note.contains("informational, not a tool error"),
-            "sandbox note must be framed as informational so the model cannot parse it as a failure: {note}"
-        );
-        assert!(note.contains("Sandbox withheld 4 environment variables"));
-        assert!(note.contains("Not allowlisted: SHLVL, SSH_CONNECTION"));
-        assert!(
-            note.contains("Sensitive and always blocked: MINI_MAX_TOKEN_API_KEY, SALAD_API_KEY")
-        );
-        assert!(note.contains("SNED_ALLOW_ENV=VAR1,VAR2"));
-        assert!(!note.contains("e.g."));
-    }
-
-    #[test]
-    fn test_sandbox_output_limit_includes_metadata() {
+    fn test_sandbox_output_limit_excludes_metadata() {
         let report = SandboxEnvReport {
             not_allowlisted: vec!["WORKSPACE_ID".to_string()],
             sensitive: vec!["SERVICE_API_KEY".to_string()],
@@ -3035,8 +2950,8 @@ mod tests {
         let result = assemble_sandboxed_output("output".repeat(1024), &report, 512);
 
         assert!(result.len() <= 512);
-        assert!(result.contains("WORKSPACE_ID"));
-        assert!(result.contains("SERVICE_API_KEY"));
+        assert!(!result.contains("WORKSPACE_ID"));
+        assert!(!result.contains("SERVICE_API_KEY"));
         assert!(result.contains("(Output truncated due to size limit.)"));
     }
 
@@ -3088,20 +3003,18 @@ mod tests {
 
         let result = result.unwrap();
         assert!(
-            result.starts_with("Command executed successfully with no output.\n\n--- Note"),
-            "silent success should remain explicit before sandbox note, got: {result}"
+            result.starts_with("Command executed successfully with no output."),
+            "silent success should remain explicit, got: {result}"
         );
         assert!(
-            result.contains("informational, not a tool error"),
-            "sandbox note must be explicitly framed as informational so the model cannot parse it as a failure: {result}"
+            !result.contains("EXECUTE_COMMAND_TEST_SECRET"),
+            "withheld variable names must not leak into model output, got: {result}"
         );
-        assert!(result.contains("EXECUTE_COMMAND_TEST_SECRET"));
-        assert!(result.contains("Sensitive and always blocked"));
         assert!(!result.contains("filtered"));
     }
 
     #[tokio::test]
-    async fn test_sandbox_note_survives_command_output_truncation() {
+    async fn test_sandbox_output_excludes_withheld_names_when_truncated() {
         let _guard = crate::test_support::env_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -3168,8 +3081,8 @@ mod tests {
             }
         }
 
-        assert!(result.contains("EXECUTE_SCRIPT_TEST_SECRET"));
-        assert!(result.contains("Sensitive and always blocked"));
+        assert!(result.contains("script output"));
+        assert!(!result.contains("EXECUTE_SCRIPT_TEST_SECRET"));
         assert!(!result.contains("script-secret-value"));
     }
 

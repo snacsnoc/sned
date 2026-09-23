@@ -12,6 +12,7 @@ fn create_resolved_edit(line_idx: usize, edit_type: &str, text: &str) -> Resolve
             content: None,
             edit_type: edit_type.to_string(),
             text: text.to_string(),
+            old_text: None,
         },
     }
 }
@@ -93,6 +94,7 @@ fn bench_apply_delete_edit(c: &mut Criterion) {
             content: None,
             edit_type: "replace".to_string(),
             text: String::new(), // Empty = delete
+            old_text: None,
         },
     }];
 

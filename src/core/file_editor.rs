@@ -23,6 +23,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::core::hash_utils::{
     ANCHOR_DELIMITER, compute_hashes, find_glued_anchor_in_lines, split_anchor, strip_hashes,
+    strip_line_number_gutter,
 };
 
 /// Split file content into logical lines while preserving a trailing empty line
@@ -219,9 +220,6 @@ pub(crate) enum EditFailureReason {
     RangeOverlap,
     GluedAnchor,
     DuplicateInsertion,
-    /// Anchor resolved uniquely, but supplied content matches a different
-    /// line in the same file. The file was NOT modified — no re-read required.
-    MismatchedAnchorContent,
 }
 
 impl EditFailureReason {
@@ -289,16 +287,6 @@ impl EditFailureReason {
         if lower.contains("not found in the file") || lower.contains("anchor is stale") {
             add(Self::UnknownAnchor);
         }
-        // Anchor and supplied content resolve to different lines in the
-        // same file — file is not modified, so this is a misquote, not a
-        // stale anchor.
-        if (lower.contains("binds to line")
-            && lower.contains("supplied content")
-            && lower.contains("matches line"))
-            || (lower.contains("is ambiguous") && lower.contains("supplied content matches line"))
-        {
-            add(Self::MismatchedAnchorContent);
-        }
 
         if reasons.is_empty() {
             reasons.push(Self::from_diagnostic(diagnostic));
@@ -316,7 +304,6 @@ impl EditFailureReason {
             Self::RangeOverlap => "overlapping edit ranges",
             Self::GluedAnchor => "glued anchor fragments",
             Self::DuplicateInsertion => "duplicate insertion",
-            Self::MismatchedAnchorContent => "anchor and content refer to different lines",
         }
     }
 
@@ -1784,6 +1771,41 @@ pub struct Edit {
     /// list verbatim. Words pin the span authoritatively; `content`
     /// verifies the interior.
     pub content: Option<Vec<String>>,
+    /// Optional exact block mode: exact source lines to uniquely match and
+    /// replace without requiring Word§ anchors.
+    pub old_text: Option<String>,
+}
+
+impl Edit {
+    #[must_use]
+    pub fn anchored(
+        anchor: impl Into<String>,
+        end_anchor: Option<impl Into<String>>,
+        edit_type: impl Into<String>,
+        text: impl Into<String>,
+        content: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            anchor: anchor.into(),
+            end_anchor: end_anchor.map(Into::into),
+            edit_type: edit_type.into(),
+            text: text.into(),
+            content,
+            old_text: None,
+        }
+    }
+
+    #[must_use]
+    pub fn block(old_text: impl Into<String>, new_text: impl Into<String>) -> Self {
+        Self {
+            anchor: String::new(),
+            end_anchor: None,
+            edit_type: "replace".to_string(),
+            text: new_text.into(),
+            content: None,
+            old_text: Some(old_text.into()),
+        }
+    }
 }
 
 /// A file with multiple edits.
@@ -1893,6 +1915,109 @@ impl EditExecutor {
             line_hashes.iter().map(|h| h.trim().to_string()).collect();
 
         for edit in edits {
+            if let Some(old_text) = edit.old_text.as_deref() {
+                if edit.edit_type == "insert_before" || edit.edit_type == "insert_after" {
+                    failed_edits.push(FailedEdit {
+                        edit: edit.clone(),
+                        error: format!(
+                            "Old_text block matching replaces the matched block; it cannot position an '{}' insertion. Drop 'old_text' and use 'anchor' for insertions, or change 'edit_type' to 'replace'.",
+                            edit.edit_type
+                        ),
+                    });
+                    continue;
+                }
+                let clean_old = strip_hashes(old_text);
+                if clean_old.trim().is_empty() {
+                    failed_edits.push(FailedEdit {
+                        edit: edit.clone(),
+                        error: "Exact block replacement requires non-empty 'old_text'.".to_string(),
+                    });
+                    continue;
+                }
+                let clean_old_stripped = clean_old
+                    .strip_suffix("\r\n")
+                    .or_else(|| clean_old.strip_suffix('\n'))
+                    .unwrap_or(&clean_old);
+                let old_lines = split_content_lines(clean_old_stripped);
+                let find_block = |wanted: &[String]| -> Vec<usize> {
+                    if wanted.len() > lines.len() {
+                        return Vec::new();
+                    }
+                    (0..=lines.len() - wanted.len())
+                        .filter(|&i| lines[i..i + wanted.len()] == wanted[..])
+                        .collect()
+                };
+                let mut matches = find_block(&old_lines);
+                if matches.is_empty() {
+                    // Pasted read-output lines carry gutters (`NNN: `) and
+                    // anchors (`Word§`) that never match file lines, so
+                    // retry with both removed before reporting failure.
+                    let unguttered = old_lines
+                        .iter()
+                        .map(|line| strip_line_number_gutter(line).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let unguttered = split_content_lines(&strip_hashes(&unguttered));
+                    matches = find_block(&unguttered);
+                }
+                match matches.len() {
+                    0 => {
+                        let trimmed_matches: Vec<usize> = if old_lines.len() <= lines.len() {
+                            (0..=lines.len() - old_lines.len())
+                                .filter(|&i| {
+                                    lines[i..i + old_lines.len()]
+                                        .iter()
+                                        .zip(old_lines.iter())
+                                        .all(|(a, b)| a.trim() == b.trim())
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let error = if !trimmed_matches.is_empty() {
+                            let start = trimmed_matches[0];
+                            format!(
+                                "Exact block replacement failed: 'old_text' matches line {} only after trimming whitespace.\nFile has:\n{}\nSupplied 'old_text':\n{}\nIndentation and whitespace must match the file exactly.",
+                                start + 1,
+                                lines[start..start + old_lines.len()].join("\n"),
+                                old_lines.join("\n")
+                            )
+                        } else {
+                            "Exact block replacement failed: 'old_text' was not found in the file. Ensure the quoted lines match the current file contents exactly.".to_string()
+                        };
+                        failed_edits.push(FailedEdit {
+                            edit: edit.clone(),
+                            error,
+                        });
+                    }
+                    1 => {
+                        let line_idx = matches[0];
+                        let end_idx = matches[0] + old_lines.len() - 1;
+                        resolved_edits.push(ResolvedEdit {
+                            line_idx,
+                            end_idx,
+                            edit: edit.clone(),
+                        });
+                    }
+                    count => {
+                        let occurrences = matches
+                            .iter()
+                            .take(5)
+                            .map(|&idx| format!("  line {}: {:?}", idx + 1, lines[idx]))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        failed_edits.push(FailedEdit {
+                            edit: edit.clone(),
+                            error: format!(
+                                "Exact block replacement failed: 'old_text' matches {} occurrences in the file:\n{}\nProvide more surrounding context lines in 'old_text' to identify a unique block.",
+                                count, occurrences
+                            ),
+                        });
+                    }
+                }
+                continue;
+            }
+
             let end_is_multiline = edit
                 .end_anchor
                 .as_deref()
@@ -2102,33 +2227,97 @@ impl EditExecutor {
             if anchored_continuations {
                 let (word, content) = split_anchor(line);
                 if !line.contains(ANCHOR_DELIMITER) || !ANCHOR_NAME_REGEX.is_match(&word) {
-                    return Err("Every anchored continuation must be a complete Word§source line from read_file.".to_string());
+                    // A bare continuation among anchored lines is quoted
+                    // content, not a mistyped anchor; match it verbatim.
+                    expected_lines.push((None, line.to_string()));
+                } else {
+                    expected_lines.push((Some(word), content));
                 }
-                expected_lines.push((Some(word), content));
             } else {
                 expected_lines.push((None, line.to_string()));
             }
         }
 
-        let matches = line_hashes
-            .iter()
-            .enumerate()
-            .filter(|(start, word)| {
-                expected_lines.iter().enumerate().all(|(offset, (expected_word, expected_content))| {
-                    start
-                        .checked_add(offset)
-                        .is_some_and(|index| {
-                            expected_word.as_ref().is_none_or(|word| line_hashes.get(index) == Some(word))
-                                && lines.get(index) == Some(expected_content)
-                        })
-                }) && *word == &first_word
-            })
-            .map(|(start, _)| start)
-            .collect::<Vec<_>>();
+        let find_span = |expected: &[(Option<String>, String)]| -> Vec<usize> {
+            line_hashes
+                .iter()
+                .enumerate()
+                .filter(|(start, word)| {
+                    expected.iter().enumerate().all(|(offset, (expected_word, expected_content))| {
+                        start
+                            .checked_add(offset)
+                            .is_some_and(|index| {
+                                expected_word.as_ref().is_none_or(|word| line_hashes.get(index) == Some(word))
+                                    && lines.get(index) == Some(expected_content)
+                            })
+                    }) && *word == &first_word
+                })
+                .map(|(start, _)| start)
+                .collect::<Vec<_>>()
+        };
+        let mut matches = find_span(&expected_lines);
+        if matches.is_empty() {
+            // Bare interior lines pasted with gutters (`NNN: `) or anchors
+            // never match, so retry with both removed before failing.
+            let unguttered: Vec<(Option<String>, String)> = expected_lines
+                .iter()
+                .map(|(word, content)| {
+                    let content = if word.is_none() {
+                        let no_gutter = strip_line_number_gutter(content).to_string();
+                        strip_hashes(&no_gutter)
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string()
+                    } else {
+                        content.clone()
+                    };
+                    (word.clone(), content)
+                })
+                .collect();
+            matches = find_span(&unguttered);
+        }
 
         match matches.as_slice() {
             [start] => Ok((*start, start + expected_lines.len() - 1)),
-            [] if anchored_continuations => Err("The multiline anchored block does not match consecutive current Word§source lines. Read the changed range again before retrying; no edit was applied.".to_string()),
+            [] if anchored_continuations => {
+                // Quoted words may be mistranscribed or stale while the
+                // content itself is right; offer current anchors for an
+                // exact content-only match so the model can re-copy.
+                let contents: Vec<&str> = expected_lines
+                    .iter()
+                    .map(|(_, content)| content.as_str())
+                    .collect();
+                let mut starts = Vec::new();
+                if !contents.is_empty() && contents.len() <= lines.len() {
+                    for i in 0..=lines.len() - contents.len() {
+                        if lines[i..i + contents.len()]
+                            .iter()
+                            .zip(contents.iter())
+                            .all(|(actual, wanted)| actual.as_str() == *wanted)
+                        {
+                            starts.push(i);
+                        }
+                    }
+                }
+                if let [start] = starts.as_slice() {
+                    let suggested = expected_lines
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, (_, content))| {
+                            format!("{}§{}", line_hashes[start + offset], content)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(format!(
+                        "The multiline anchored block's words do not match current anchors, but its content matches lines {}–{} exactly. The quoted words were likely mistranscribed or stale; retry with these current anchors:\n{}",
+                        start + 1,
+                        start + contents.len(),
+                        suggested
+                    ));
+                }
+                Err("The multiline anchored block does not match consecutive current Word§source lines. Read the changed range again before retrying; no edit was applied.".to_string())
+            }
             [] => Err("The multiline anchored block does not match consecutive current source lines. Read the changed range again before retrying; no edit was applied.".to_string()),
             _ => Err("The multiline anchored block matches more than one range. Use a narrower unique range; no edit was applied.".to_string()),
         }
@@ -2259,26 +2448,16 @@ impl EditExecutor {
                     )),
                 );
             }
-            // File is not modified, so point at both lines and the correct
-            // anchor — the model can self-correct without a wasted read.
+            // Unique content wins over a rotated hash.
             if content_matches.len() == 1 {
                 let content_idx = content_matches[0];
-                let correct_anchor = normalized_line_hashes
-                    .get(content_idx)
-                    .map(String::as_str)
-                    .unwrap_or("?");
-                return (
-                    usize::MAX,
-                    Some(format!(
-                        "{anchor_type} \"{anchor_name}\" binds to line {} ({:?}), but the supplied content {:?} matches line {} (anchor \"{correct_anchor}\"). Use one of:\n  - \"{correct_anchor}{ANCHOR_DELIMITER}{provided_content}\" to edit line {}\n  - \"{anchor_name}{ANCHOR_DELIMITER}{bound_content}\" to edit line {}",
-                        bound + 1,
-                        bound_content,
-                        provided_content,
-                        content_idx + 1,
-                        content_idx + 1,
-                        bound + 1,
-                    )),
+                tracing::debug!(
+                    "Anchor resolved via content fallback: word={} bound line {}, content matches line {}",
+                    anchor_name,
+                    bound,
+                    content_idx
                 );
+                return (content_idx, None);
             }
             return (
                 usize::MAX,
@@ -2379,54 +2558,14 @@ impl EditExecutor {
         }
 
         let content_idx = content_matches[0];
-        let content_line = lines.get(content_idx).map(String::as_str).unwrap_or("");
-        let correct_anchor = normalized_line_hashes
-            .get(content_idx)
-            .map(String::as_str)
-            .unwrap_or("?");
-        let word_idx = word_bound_lines[0];
-        // The anchor's word resolves to multiple lines but the supplied
-        // content identifies exactly one. If that one line is the first
-        // word-bound line, the user unambiguously picked it; succeed.
-        if word_idx == content_idx {
-            tracing::debug!(
-                "Anchor resolved via content-disambiguation: word={} matched {} line(s), content matches line {}",
-                anchor_name,
-                word_bound_lines.len(),
-                content_idx
-            );
-            return (content_idx, None);
-        }
-        // Otherwise the user's content lives on a different word-bound
-        // line than word_bound_lines[0]. Surface the rebind instead of
-        // landing on the wrong line.
-        let word_bound_listing: Vec<String> = word_bound_lines
-            .iter()
-            .map(|&idx| {
-                format!(
-                    "line {}: {:?}",
-                    idx + 1,
-                    lines.get(idx).map(String::as_str).unwrap_or("")
-                )
-            })
-            .collect();
+        // Unique quoted text is unambiguous regardless of word-bound order.
         tracing::debug!(
-            "Anchor resolution: rebind detected (ambiguous word). quoted_word={} resolves to {} line(s) but supplied content matches line {}",
+            "Anchor resolved via content-disambiguation: word={} matched {} line(s), content matches line {}",
             anchor_name,
             word_bound_lines.len(),
             content_idx
         );
-        (
-            usize::MAX,
-            Some(format!(
-                "{anchor_type} \"{anchor_name}{ANCHOR_DELIMITER}{provided_content}\" is ambiguous — the quoted word resolves to {} line(s) [{}], but the supplied content matches line {} ({:?}, anchor \"{correct_anchor}\"). Use one of:\n  - \"{correct_anchor}{ANCHOR_DELIMITER}{provided_content}\" to edit line {}\n  - quote one of the word-bound lines verbatim with that line's anchor to edit a different line. Do NOT re-read; the file has not changed.",
-                word_bound_lines.len(),
-                word_bound_listing.join("; "),
-                content_idx + 1,
-                content_line,
-                content_idx + 1,
-            )),
-        )
+        (content_idx, None)
     }
 
     /// Resolves an anchor to a line index using ONLY the word identity
@@ -2520,6 +2659,12 @@ impl EditExecutor {
                 let clean_text = strip_hashes(&resolved.edit.text);
                 let replacement_lines = if clean_text.is_empty() {
                     Vec::new()
+                } else if resolved.edit.old_text.is_some() {
+                    let text = clean_text
+                        .strip_suffix("\r\n")
+                        .or_else(|| clean_text.strip_suffix('\n'))
+                        .unwrap_or(&clean_text);
+                    split_content_lines(text)
                 } else {
                     split_content_lines(&clean_text)
                 };
@@ -2584,6 +2729,18 @@ impl EditExecutor {
                             anchor_line, edit_type
                         ),
                     });
+                }
+
+                let is_pure_closing_delimiter = replacement_lines.len() <= 2
+                    && replacement_lines.iter().all(|line| {
+                        let trimmed = line.trim();
+                        !trimmed.is_empty()
+                            && trimmed
+                                .chars()
+                                .all(|c| matches!(c, '}' | ')' | ']' | ';' | ','))
+                    });
+                if is_pure_closing_delimiter {
+                    return None;
                 }
 
                 let adjacent_matches = if edit_type == "insert_before" {
@@ -2666,6 +2823,12 @@ impl EditExecutor {
             let clean_text = strip_hashes(&resolved.edit.text);
             let replacement_lines: Vec<String> = if clean_text.is_empty() {
                 Vec::new()
+            } else if resolved.edit.old_text.is_some() {
+                let text = clean_text
+                    .strip_suffix("\r\n")
+                    .or_else(|| clean_text.strip_suffix('\n'))
+                    .unwrap_or(&clean_text);
+                split_content_lines(text)
             } else {
                 split_content_lines(&clean_text)
             };
@@ -2772,16 +2935,21 @@ impl EditExecutor {
     /// Formats a failure message for an edit.
     #[must_use]
     pub fn format_failure_message(&self, edit: &Edit, error: Option<&str>) -> String {
+        let desc = if let Some(old_text) = &edit.old_text {
+            let preview: String = old_text.chars().take(80).collect();
+            format!("Block edit (old_text: {:?})", preview)
+        } else {
+            format!(
+                "Edit (anchor: \"{}\", end_anchor: \"{}\")",
+                edit.anchor,
+                edit.end_anchor.as_deref().unwrap_or("")
+            )
+        };
         let diagnostic = error.map_or_else(
-            || " This almost certainly is because the anchors used were incorrect or not in ascending order or the text supplied was incorrect. please check again edit again".to_string(),
+            || " Incorrect selector or unexpected file content.".to_string(),
             |e| format!(" Diagnostics: {e}"),
         );
-        format!(
-            "Edit (anchor: \"{}\", end_anchor: \"{}\") failed.{}",
-            edit.anchor,
-            edit.end_anchor.as_deref().unwrap_or(""),
-            diagnostic
-        )
+        format!("{desc} failed.{diagnostic}")
     }
 }
 
@@ -2938,6 +3106,7 @@ mod tests {
                     edit_type: kind.into(),
                     text: text.into(),
                     content: None,
+                    old_text: None,
                 },
             })
             .collect();
@@ -3759,18 +3928,16 @@ mod tests {
             error
         );
 
-        // Second occurrence: word "Hello" still resolves to line 0, but
-        // supplied content "def hello():  # duplicate" only matches
-        // line 2. Old behavior silently landed on whichever occurrence
-        // carried the word — that's the silent wrong-location bug.
-        // New behavior surfaces the rebind explicitly.
+        // Second occurrence: word "Hello" binds lines 0 and 2, but the
+        // supplied content only matches line 2. Unique quoted text wins
+        // over word order, so this resolves to line 2 instead of failing.
         let (idx, error) =
             executor.resolve_anchor("anchor", "Hello§def hello():  # duplicate", &hashes, &lines);
-        assert_eq!(idx, usize::MAX);
-        let err_msg = error.expect("rebind must surface an error");
+        assert_eq!(idx, 2);
         assert!(
-            err_msg.contains("is ambiguous") && err_msg.contains("supplied content matches line"),
-            "rebind must surface ambiguous-word diagnostic, got: {err_msg}"
+            error.is_none(),
+            "unique content must resolve despite multi-bound word: {:?}",
+            error
         );
 
         // Wrong content for the anchor should fail
@@ -3882,6 +4049,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "def greeting():\n    pass".to_string(),
             content: None,
+            old_text: None,
         }];
 
         let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
@@ -3909,6 +4077,7 @@ mod tests {
                 edit_type: "replace".to_string(),
                 text: "def greeting():\n    pass".to_string(),
                 content: None,
+                old_text: None,
             },
         }];
 
@@ -3940,6 +4109,7 @@ mod tests {
                 edit_type: "insert_after".to_string(),
                 text: "    print('world')".to_string(),
                 content: None,
+                old_text: None,
             },
         }];
 
@@ -3970,6 +4140,7 @@ mod tests {
             edit_type: "insert_before".to_string(),
             text: "#ifdef FLAG\n\n".to_string(),
             content: None,
+            old_text: None,
         }];
         let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
         assert!(failed.is_empty());
@@ -3987,6 +4158,43 @@ mod tests {
     }
 
     #[test]
+    fn test_edit_executor_closing_brace_insertion_is_not_rejected_as_duplicate() {
+        let executor = EditExecutor::new();
+        // Closing an inner closure right before the outer function's closing brace
+        let lines = split_content_lines("func test() {\n    lock.withLock {\n        work()\n}\n");
+        let hashes = vec!["Func", "Lock", "Work", "Brace", "End"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let edits = vec![Edit {
+            anchor: "Work§        work()".to_string(),
+            end_anchor: None,
+            edit_type: "insert_after".to_string(),
+            text: "    }".to_string(),
+            content: None,
+            old_text: None,
+        }];
+        let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
+        assert!(failed.is_empty());
+
+        let outcome = executor.apply_edits(&lines, &resolved);
+        let ApplyOutcome::Applied(final_lines, ..) = outcome else {
+            panic!("inserting closing brace adjacent to another closing brace must succeed");
+        };
+        assert_eq!(
+            final_lines,
+            vec![
+                "func test() {",
+                "    lock.withLock {",
+                "        work()",
+                "    }",
+                "}",
+                ""
+            ]
+        );
+    }
+
+    #[test]
     fn test_edit_executor_duplicate_detection_is_not_a_substring_match() {
         let executor = EditExecutor::new();
         let lines = split_content_lines("prefix with extra text\nfn target() {}\n");
@@ -4000,6 +4208,7 @@ mod tests {
             edit_type: "insert_before".to_string(),
             text: "prefix".to_string(),
             content: None,
+            old_text: None,
         }];
         let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
         assert!(failed.is_empty());
@@ -4024,6 +4233,7 @@ mod tests {
             edit_type: "insert_before".to_string(),
             text: "if should_retry {\n    return None;\n}".to_string(),
             content: None,
+            old_text: None,
         }];
         let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
         assert!(failed.is_empty());
@@ -4051,6 +4261,7 @@ mod tests {
             edit_type: "insert_after".to_string(),
             text: "// wrapper\nfn target() {}".to_string(),
             content: None,
+            old_text: None,
         }];
         let (resolved, failed) = executor.resolve_edits(&edits, &lines, &hashes);
         assert!(failed.is_empty());
@@ -4083,6 +4294,7 @@ mod tests {
             edit_type: "replace".to_string(),
             text: "def greeting():\n    pass".to_string(),
             content: None,
+            old_text: None,
         }];
 
         let result = editor.apply_edits(content, &edits, "/tmp/e2e.py", Some(task_id));
@@ -4189,13 +4401,235 @@ mod tests {
         let lines = vec!["def hello():".to_string()];
         let hashes = vec!["Apple".to_string()];
 
+        // Fabricated word with content matching nothing still fails.
         let (idx, error) =
-            executor.resolve_anchor("anchor", "FakeWord§def hello():", &hashes, &lines);
+            executor.resolve_anchor("anchor", "FakeWord§no such line", &hashes, &lines);
         assert_eq!(idx, usize::MAX);
         assert!(error.is_some());
         let err_msg = error.unwrap();
         assert!(err_msg.contains("not found in the file"));
         assert!(err_msg.contains("FakeWord"));
+    }
+
+    #[test]
+    fn test_resolve_anchor_stale_word_never_resolves_by_content() {
+        let executor = EditExecutor::new();
+        let lines = vec![
+            "def hello():".to_string(),
+            "    print('world')".to_string(),
+            "    return 42".to_string(),
+        ];
+        let hashes = vec![
+            "Apple".to_string(),
+            "Banana".to_string(),
+            "Cherry".to_string(),
+        ];
+
+        // A word from a retired generation must never land, even when the
+        // quoted line is still present exactly once. Otherwise an anchor
+        // copied before an external rewrite could edit the wrong line.
+        let (idx, error) =
+            executor.resolve_anchor("anchor", "Mango§    return 42", &hashes, &lines);
+        assert_eq!(idx, usize::MAX);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn test_resolve_anchor_current_word_unique_content_resolves() {
+        let executor = EditExecutor::new();
+        let lines = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
+        let hashes = vec![
+            "Alpha".to_string(),
+            "Beta".to_string(),
+            "Gamma".to_string(),
+        ];
+
+        // The word is current-generation but bound to line 0 while the
+        // quoted content uniquely matches line 2: resolve to the content.
+        let (idx, error) =
+            executor.resolve_anchor("anchor", "Alpha§third", &hashes, &lines);
+        assert_eq!(idx, 2);
+        assert!(error.is_none());
+    }
+
+        #[test]
+    fn test_block_mode_tolerates_pasted_line_number_gutters() {
+        let executor = EditExecutor::new();
+        let lines = vec![
+            "    lock.withLock {".to_string(),
+            "        sdr_core_skip(core)".to_string(),
+            "    }".to_string(),
+        ];
+        let hashes = vec![
+            "AxA".to_string(),
+            "AxB".to_string(),
+            "AxC".to_string(),
+        ];
+        let edit = Edit {
+            anchor: String::new(),
+            end_anchor: None,
+            edit_type: "replace".to_string(),
+            text: "    lock.withLock {\n        sdr_core_skip(core)\n    }\n}".to_string(),
+            content: None,
+            old_text: Some(
+                "979: AxA§    lock.withLock {\n980: AxB§        sdr_core_skip(core)\n981: AxC§    }"
+                    .to_string(),
+            ),
+        };
+        let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
+        assert!(failed.is_empty(), "guttered old_text must resolve: {failed:?}");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].line_idx, 0);
+    }
+
+    #[test]
+    fn test_block_delete_via_empty_replacement_resolves() {
+        let executor = EditExecutor::new();
+        let lines = vec![
+            ":root {".to_string(),
+            "  --muted: #6e747a;".to_string(),
+            "  --sand: #f6f5f2;".to_string(),
+            "}".to_string(),
+        ];
+        let hashes = vec![
+            "H0".to_string(),
+            "H1".to_string(),
+            "H2".to_string(),
+            "H3".to_string(),
+        ];
+        let edit = Edit {
+            anchor: String::new(),
+            end_anchor: None,
+            edit_type: "replace".to_string(),
+            text: String::new(),
+            content: None,
+            old_text: Some("  --muted: #6e747a;\n  --sand: #f6f5f2;".to_string()),
+        };
+        let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
+        assert!(failed.is_empty(), "block delete must resolve: {failed:?}");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!((resolved[0].line_idx, resolved[0].end_idx), (1, 2));
+    }
+
+    #[test]
+    fn test_insert_with_old_text_is_rejected_not_reinterpreted() {
+        let executor = EditExecutor::new();
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let hashes = vec!["H0".to_string(), "H1".to_string()];
+        let edit = Edit {
+            anchor: String::new(),
+            end_anchor: None,
+            edit_type: "insert_after".to_string(),
+            text: "c".to_string(),
+            content: None,
+            old_text: Some("a".to_string()),
+        };
+        let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
+        assert!(resolved.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].error.contains("cannot position"), "{:?}", failed[0].error);
+    }
+
+    #[test]
+    fn test_multiline_anchor_field_resolves_consecutive_span() {        let executor = EditExecutor::new();
+        let lines = vec![
+            "a".to_string(),
+            "            ))".to_string(),
+            "        }".to_string(),
+            "        #endif".to_string(),
+            "        }".to_string(),
+            "    }".to_string(),
+            "z".to_string(),
+        ];
+        let hashes = vec![
+            "H0".to_string(),
+            "H1".to_string(),
+            "H2".to_string(),
+            "H3".to_string(),
+            "H4".to_string(),
+            "H5".to_string(),
+            "H6".to_string(),
+        ];
+        let edit = Edit {
+            anchor: "H1§            ))\nH2§        }\nH3§        #endif\nH4§        }\nH5§    }"
+                .to_string(),
+            end_anchor: None,
+            edit_type: "replace".to_string(),
+            text: "            ))\n        }\n        #endif\n    }".to_string(),
+            content: None,
+            old_text: None,
+        };
+        let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
+        assert!(failed.is_empty(), "consecutive anchored span must resolve: {failed:?}");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].line_idx, 1);
+    }
+
+    #[test]
+    fn test_mixed_anchored_and_bare_continuations_resolve() {
+        let executor = EditExecutor::new();
+        let lines = vec![
+            "        #endif".to_string(),
+            "        }".to_string(),
+            "    }".to_string(),
+            "x".to_string(),
+        ];
+        let hashes = vec![
+            "H0".to_string(),
+            "H1".to_string(),
+            "H2".to_string(),
+            "H3".to_string(),
+        ];
+        // First line anchored, rest quoted bare: the bare lines match
+        // content verbatim instead of erroring.
+        let edit = Edit {
+            anchor: "H0§        #endif\n        }\n    }".to_string(),
+            end_anchor: None,
+            edit_type: "replace".to_string(),
+            text: "        #endif".to_string(),
+            content: None,
+            old_text: None,
+        };
+        let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
+        assert!(failed.is_empty(), "mixed continuations must resolve: {failed:?}");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].line_idx, 0);
+    }
+
+    #[test]
+    fn test_anchored_block_mistranscribed_words_suggest_current_anchors() {
+        let executor = EditExecutor::new();
+        let lines = vec![
+            "a".to_string(),
+            "            ))".to_string(),
+            "        }".to_string(),
+            "    }".to_string(),
+        ];
+        let hashes = vec![
+            "H0".to_string(),
+            "H1".to_string(),
+            "H2".to_string(),
+            "H3".to_string(),
+        ];
+        let edit = Edit {
+            anchor: "X1§            ))\nX2§        }\nX3§    }".to_string(),
+            end_anchor: None,
+            edit_type: "replace".to_string(),
+            text: "b".to_string(),
+            content: None,
+            old_text: None,
+        };
+        let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
+        assert_eq!(resolved.len(), 0);
+        assert_eq!(failed.len(), 1);
+        let message = &failed[0].error;
+        assert!(message.contains("lines 2–4"), "{message}");
+        assert!(message.contains("H1§            ))"), "{message}");
+        assert!(message.contains("H3§    }"), "{message}");
     }
 
     #[test]

@@ -201,8 +201,8 @@ impl PromptBuilder {
         }
         if self.has_tool(SnedTool::EditFile) {
             prompt.push_str(
-                "- For `edit_file`, use the current tracked state from a file read or successful edit result and copy one exact, complete `Word§line content` anchor from that tool output, including its prefix; never invent an anchor prefix or use a line number alone.\n\
-                 - Different prefixes distinguish identical-content occurrences in the current tracked state. Prefer batching independent edits from the same snapshot in one `edit_file` call, including in sequential tool mode, unless the task requires sequential edits. Explicit workflow requirements override batching defaults. Unchanged tracked occurrences retain their anchors across edits; a fresh read is not required for each edit. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; its Word§ snapshot anchors are inspection-only.\n\
+                "- For `edit_file`, you may use either exact block mode (`old_text` + `new_text`) to replace a unique block of source lines without anchors, or anchored mode (`anchor` + `text`) copying the exact anchor prefix and content from read_file (read lines show a 1-indexed line number first; omit the number when copying). Block mode (`old_text` + `new_text`) is recommended for structural edits and brace fixes.\n\
+                 - In exact block mode, include enough unique surrounding lines in `old_text` to match unambiguously. In anchored mode, different prefixes distinguish identical-content occurrences in the current tracked state. Prefer batching independent edits from the same snapshot in one `edit_file` call, including in sequential tool mode, unless the task requires sequential edits. Explicit workflow requirements override batching defaults. Unchanged tracked occurrences retain their anchors across edits; a fresh read is not required for each edit. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; its snapshot anchors are inspection-only.\n\
                  - In an `edit_file` edit, put replacement text in `text`; the optional `content` field is only an exact array of interior lines for duplicate-anchor disambiguation, never a replacement string.\n\
                  - After a stale or unknown anchor error, call `read_file` again before retrying. Correct malformed input, whitespace mismatches, overlaps, and duplicate insertions without rereading unless the returned recovery metadata explicitly requires it.\n",
             );
@@ -214,7 +214,7 @@ impl PromptBuilder {
         }
         if self.has_tool(SnedTool::ExecuteCommand) {
             prompt.push_str(
-                "- Use `execute_command` for inspection, builds, tests, and other execution; do not use shell redirection, heredocs, or ad-hoc Python/sed scripts as a substitute for workspace file tools.\n\
+                "- Use `execute_command` for inspection, builds, tests, and other execution; do not use shell redirection, heredocs, or ad-hoc Python/sed scripts as a substitute for workspace file tools. Sandboxed commands receive a filtered environment; to pass non-sensitive variables, set SNED_ALLOW_ENV=VAR1,VAR2.\n\
                  - For `execute_command`, send `commands` as a JSON array of strings, not a string containing an array; use `script` for complex run-only logic.\n\
                  - Each `commands[]` entry runs in a fresh shell, so variables, `cd`, and other shell state do not persist between entries or tool calls. Keep dependent statements in one multiline entry or use `script`. Preserve `\\n` escapes and quoted delimiters when a JSON command string contains multiline shell text such as a heredoc.\n",
             );
@@ -408,7 +408,7 @@ mod tests {
             prompt.contains("Absolute paths outside the workspace require explicit user approval")
         );
         assert!(prompt.contains("If no tools are needed or available, answer directly in text"));
-        assert!(prompt.contains("Word§line content"));
+        assert!(prompt.contains("copying the exact anchor prefix and content"));
         assert!(prompt.contains("Unchanged tracked occurrences retain their anchors"));
         assert!(!prompt.lines().any(|line| line.starts_with('\\')));
         assert!(prompt.contains("In ACT mode"));

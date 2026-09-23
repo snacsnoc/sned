@@ -3,6 +3,7 @@
 //! This module handles formatting of tool results, summaries, heat maps,
 //! and edit statistics for display to the user.
 
+use crate::core::hash_utils::strip_line_number_gutter;
 use crate::core::tools::{SnedTool, coerce_command_array};
 use std::collections::HashSet;
 
@@ -483,9 +484,11 @@ pub fn summarize_single_section(section: &str) -> String {
         .lines()
         .skip(1)
         .filter(|line| {
-            line.split_once('§').is_some_and(|(prefix, _)| {
-                !prefix.is_empty() && prefix.chars().all(char::is_alphanumeric)
-            })
+            strip_line_number_gutter(line)
+                .split_once('§')
+                .is_some_and(|(prefix, _)| {
+                    !prefix.is_empty() && prefix.chars().all(char::is_alphanumeric)
+                })
         })
         .take(MAX_PRESERVED_ANCHORS)
         .collect();

@@ -90,6 +90,7 @@ fn edit_executor_validation_messages_documents_deliberate_divergence() {
         edit_type: "replace".to_string(),
         text: "new line 2".to_string(),
         content: None,
+        old_text: None,
     };
     let bad_format = Edit {
         anchor: "bad§line 1".to_string(),
@@ -97,6 +98,7 @@ fn edit_executor_validation_messages_documents_deliberate_divergence() {
         edit_type: "replace".to_string(),
         text: "new line 1".to_string(),
         content: None,
+        old_text: None,
     };
     let missing = Edit {
         anchor: format!("{missing_anchor}§line 1"),
@@ -104,6 +106,7 @@ fn edit_executor_validation_messages_documents_deliberate_divergence() {
         edit_type: "replace".to_string(),
         text: "new line 1".to_string(),
         content: None,
+        old_text: None,
     };
     let wrong_content = Edit {
         anchor: format!("{}§wrong content", anchored[0].split('§').next().unwrap()),
@@ -114,6 +117,7 @@ fn edit_executor_validation_messages_documents_deliberate_divergence() {
         edit_type: "replace".to_string(),
         text: "wrong content".to_string(),
         content: None,
+        old_text: None,
     };
 
     let (resolved, failed) = executor.resolve_edits(
@@ -179,6 +183,7 @@ fn file_editor_documents_atomic_divergence_from_ts_partial_success() {
             edit_type: "replace".to_string(),
             text: "new line 2".to_string(),
             content: None,
+            old_text: None,
         },
         Edit {
             anchor: format!("{missing_anchor}§this should fail"),
@@ -186,6 +191,7 @@ fn file_editor_documents_atomic_divergence_from_ts_partial_success() {
             edit_type: "replace".to_string(),
             text: "this should fail".to_string(),
             content: None,
+            old_text: None,
         },
         Edit {
             anchor: anchored[3].clone(),
@@ -193,6 +199,7 @@ fn file_editor_documents_atomic_divergence_from_ts_partial_success() {
             edit_type: "replace".to_string(),
             text: "new line 4".to_string(),
             content: None,
+            old_text: None,
         },
     ];
 
@@ -242,6 +249,7 @@ fn file_editor_preserves_trailing_newline_semantics() {
         edit_type: "replace".to_string(),
         text: "new line 2".to_string(),
         content: None,
+        old_text: None,
     }];
 
     let processor = BatchProcessor::new(sned::core::edit_batch::DiffMode::Full);

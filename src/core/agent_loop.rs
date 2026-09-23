@@ -953,7 +953,6 @@ impl AgentLoop {
     }
 
     fn clear_history_dependent_read_state(state: &mut TaskState) {
-        state.visible_read_coverage.clear();
         state.consecutive_reads.clear();
         state.last_read_turn.clear();
         state.recent_read_windows.clear();
@@ -1620,6 +1619,116 @@ impl AgentLoop {
         }
     }
 
+    fn looks_like_mutating_command(tool_params: &serde_json::Value) -> bool {
+        let commands = coerce_command_array(tool_params);
+        let lines = commands
+            .iter()
+            .map(String::as_str)
+            .chain(tool_params.get("script").and_then(|value| value.as_str()));
+        lines
+            .flat_map(crate::core::approval::split_command_segments)
+            .any(Self::command_segment_looks_like_mutation)
+    }
+
+    /// Conservative mutation detector: only unambiguous filesystem
+    /// mutations and destructive git subcommands count. Read-only
+    /// lookalikes (`sed -n`, `git status/diff/log/show`, `2>/dev/null`)
+    /// stay inspection so the breaker keeps firing on shell-as-read loops.
+    fn command_segment_looks_like_mutation(segment: &str) -> bool {
+        const MUTATING_BINS: [&str; 13] = [
+            "rm", "rmdir", "mkdir", "touch", "cp", "mv", "ln", "chmod", "chown", "chgrp", "dd",
+            "truncate", "tee",
+        ];
+        const MUTATING_GIT_SUBCOMMANDS: [&str; 11] = [
+            "commit", "push", "checkout", "restore", "reset", "clean", "rm", "mv", "stash",
+            "apply", "am",
+        ];
+        let tokens = segment.split_whitespace().collect::<Vec<_>>();
+        let mut index = 0;
+        // Unwrap privilege wrappers and env prefixes so `sudo rm`,
+        // `env FOO=1 rm`, and `command rm` classify like bare `rm`.
+        // Mirrors the env handling in
+        // command_segment_looks_like_build_or_test.
+        while tokens
+            .get(index)
+            .is_some_and(|token| matches!(*token, "sudo" | "doas" | "command"))
+        {
+            index += 1;
+        }
+        if tokens.get(index).is_some_and(|token| *token == "env") {
+            index += 1;
+            while let Some(option) = tokens.get(index) {
+                match *option {
+                    "-u" | "--unset" | "-C" | "--chdir" => index += 2,
+                    "--" => {
+                        index += 1;
+                        break;
+                    }
+                    option if option.starts_with('-') => index += 1,
+                    _ => break,
+                }
+            }
+        }
+        while tokens
+            .get(index)
+            .is_some_and(|token| Self::is_shell_assignment(token))
+        {
+            index += 1;
+        }
+        // Shell write redirection targets a file (`>` / `>>`); descriptors
+        // (`2>&1`, `>&2`) and /dev/null do not mutate the workspace.
+        for (position, token) in tokens.iter().enumerate() {
+            if token.contains("->") || token.contains("=>") {
+                continue;
+            }
+            // A bare `>` / `>>` redirects into the following path token.
+            let target = if *token == ">" || *token == ">>" {
+                tokens.get(position + 1).copied().unwrap_or_default()
+            } else if let Some(pos) = token.find('>') {
+                token[pos..].trim_start_matches('>')
+            } else {
+                continue;
+            };
+            if !target.is_empty() && target != "/dev/null" && !target.starts_with('&') {
+                return true;
+            }
+        }
+        let Some(bin) = tokens.get(index).copied() else {
+            return false;
+        };
+        index += 1;
+        let basename = bin.rsplit(['/', '\\']).next().unwrap_or(bin);
+        if basename == "sed" {
+            return tokens.iter().any(|token| {
+                *token == "-i" || *token == "--in-place" || token.starts_with("-i")
+            });
+        }
+        if basename == "git" {
+            return tokens
+                .get(index)
+                .is_some_and(|sub| MUTATING_GIT_SUBCOMMANDS.contains(sub));
+        }
+        MUTATING_BINS.contains(&basename)
+    }
+
+    /// Read-only shell commands are inspection, not action, so a
+    /// read-via-shell loop still trips the breaker. Build/test commands
+    /// and unambiguous filesystem mutations reset the counter.
+    fn is_action_tool_call(
+        tool_name: &str,
+        parsed_args: &Result<serde_json::Value, String>,
+    ) -> bool {
+        match tool_name {
+            "edit_file" | "write_to_file" | "replace_symbol" | "rename_symbol"
+            | "attempt_completion" => true,
+            "execute_command" => parsed_args.as_ref().is_ok_and(|params| {
+                Self::looks_like_build_or_test_command(params)
+                    || Self::looks_like_mutating_command(params)
+            }),
+            _ => false,
+        }
+    }
+
     fn is_shell_assignment(token: &str) -> bool {
         let Some((name, _)) = token.split_once('=') else {
             return false;
@@ -1663,7 +1772,6 @@ impl AgentLoop {
             guard.last_read_turn.remove(&path);
             guard.recent_read_windows.remove(&path);
             guard.read_file_snapshots.remove(&path);
-            guard.visible_read_coverage.remove(&path);
         }
     }
 
@@ -4746,17 +4854,14 @@ impl AgentLoop {
                     self.config.output_writer.flush();
                 }
 
-                let has_action_tool = prepared_tool_calls.iter().any(|ptc| {
-                    matches!(
-                        ptc.tool_name.as_str(),
-                        "edit_file"
-                            | "write_to_file"
-                            | "replace_symbol"
-                            | "rename_symbol"
-                            | "execute_command"
-                            | "attempt_completion"
-                    )
-                });
+                // WHY: shell used as a reader (sed/tail/od/grep/python line
+                // printing) is inspection, not action. Counting every
+                // execute_command as action lets a read-via-shell loop run
+                // forever without tripping the circuit breaker below. Only
+                // build/test commands reset the inspection counter.
+                let has_action_tool = prepared_tool_calls
+                    .iter()
+                    .any(|ptc| Self::is_action_tool_call(&ptc.tool_name, &ptc.parsed_args));
 
                 {
                     let mut state = self.state.lock().await;
@@ -4767,7 +4872,7 @@ impl AgentLoop {
                             state.consecutive_inspection_turns.saturating_add(1);
                         if state.consecutive_inspection_turns >= 5 {
                             let guidance = format!(
-                                "\n\n--- Guidance (Inspection Loop Circuit Breaker) ---\nYou have performed {} consecutive inspection turns (reading/searching files) without making code edits or executing commands. You have gathered extensive context across the codebase. Stop passive searching; take direct action now: modify code using edit_file/write_to_file, or run a build/test command using execute_command to verify behavior.",
+                                "\n\n--- Guidance (Inspection Loop Circuit Breaker) ---\nYou have performed {} consecutive inspection turns (reading/searching files, including read-only shell commands like sed/tail/grep) without making code edits or running build/test commands. You have gathered extensive context across the codebase. Stop passive inspection; take direct action now: modify code using edit_file/write_to_file, or run a build/test command using execute_command to verify behavior.",
                                 state.consecutive_inspection_turns
                             );
                             if let Some(UserContentBlock::ToolResult(tr)) =
@@ -6882,6 +6987,11 @@ mod tests {
                 copied = text
                     .split('\n')
                     .find(|line| {
+                        // Models copy the full numbered line (`NNN: Word§…`);
+                        // split_anchor strips the gutter downstream.
+                        let line = line.trim_start_matches(|c: char| {
+                            c.is_ascii_digit() || c == ':' || c == ' '
+                        });
                         line.split_once('§')
                             .is_some_and(|(word, _)| word.chars().all(char::is_alphanumeric))
                     })
@@ -7833,15 +7943,6 @@ Irrespective of whether additional information or instructions are given, you ar
             state
                 .consecutive_edit_failures
                 .insert("/tmp/foo.c".to_string(), 2);
-            state.visible_read_coverage.insert(
-                "/tmp/untouched.c".to_string(),
-                crate::core::agent_types::ReadCoverage {
-                    revision: "unchanged".to_string(),
-                    ranges: vec![(1, 2)],
-                    total_lines: 2,
-                    last_already_read_range: None,
-                },
-            );
             AgentLoop::decay_read_loop_state(&mut state, tool);
             assert!(
                 state.consecutive_reads.is_empty(),
@@ -7858,7 +7959,6 @@ Irrespective of whether additional information or instructions are given, you ar
                 "{tool} must clear recent_read_windows, got: {:?}",
                 state.recent_read_windows
             );
-            assert!(state.visible_read_coverage.contains_key("/tmp/untouched.c"));
             assert_eq!(
                 state
                     .consecutive_edit_failures
@@ -8132,6 +8232,95 @@ Irrespective of whether additional information or instructions are given, you ar
         }
     }
 
+
+    #[test]
+    fn test_is_action_tool_call_shell_as_read_is_inspection() {
+        // WHY: live log showed 36 turns of read_file + sed/tail/od/grep with
+        // zero edits. Every shell-as-read call reset the inspection counter,
+        // so the circuit breaker never fired.
+        let ok = |params: serde_json::Value| -> Result<serde_json::Value, String> { Ok(params) };
+        // Mutating tools are always action.
+        for tool in [
+            "edit_file",
+            "write_to_file",
+            "replace_symbol",
+            "rename_symbol",
+            "attempt_completion",
+        ] {
+            assert!(
+                AgentLoop::is_action_tool_call(tool, &ok(serde_json::json!({}))),
+                "{tool} must classify as action"
+            );
+        }
+        // Pure inspection tools are never action.
+        for tool in ["read_file", "list_files", "search_files", "get_function"] {
+            assert!(
+                !AgentLoop::is_action_tool_call(tool, &ok(serde_json::json!({}))),
+                "{tool} must classify as inspection"
+            );
+        }
+        // Build/test shell commands are action.
+        assert!(AgentLoop::is_action_tool_call(
+            "execute_command",
+            &ok(serde_json::json!({"commands": ["xcodebuild -scheme App build 2>&1 | grep error"]})),
+        ));
+        // Read-only shell commands are inspection, even though they run
+        // through execute_command.
+        for params in [
+            serde_json::json!({"commands": ["sed -n '445,460p' WaterfallViewModel.swift"]}),
+            serde_json::json!({"commands": ["tail -n 20 WaterfallViewModel.swift"]}),
+            serde_json::json!({"commands": ["sed -n '452,455p' WaterfallViewModel.swift | od -c"]}),
+            serde_json::json!({"commands": ["grep -n 'private func updateRtlTcpFrame' WaterfallViewModel.swift"]}),
+            serde_json::json!({"commands": ["wc -l WaterfallViewModel.swift"]}),
+            serde_json::json!({"commands": ["git show HEAD:WaterfallViewModel.swift | tail -n 50"]}),
+        ] {
+            assert!(
+                !AgentLoop::is_action_tool_call("execute_command", &ok(params.clone())),
+                "shell-as-read must classify as inspection, got: {params}"
+            );
+        }
+        // Unparseable args fail closed to inspection.
+        assert!(!AgentLoop::is_action_tool_call(
+            "execute_command",
+            &Err("parse error".to_string()),
+        ));
+    }
+
+    #[test]
+    fn test_mutating_shell_counts_as_action() {
+        let ok = |params: serde_json::Value| -> Result<serde_json::Value, String> { Ok(params) };
+        // Unambiguous filesystem mutations reset the counter.
+        for params in [
+            serde_json::json!({"commands": ["rm -rf target/debug"]}),
+            serde_json::json!({"commands": ["mkdir -p out"]}),
+            serde_json::json!({"commands": ["git checkout HEAD -- file.swift"]}),
+            serde_json::json!({"commands": ["git commit -m fix"]}),
+            serde_json::json!({"commands": ["echo x > out.txt"]}),
+            serde_json::json!({"commands": ["sed -i '' 's/a/b/' file"]}),
+            serde_json::json!({"commands": ["sudo rm -rf target/debug"]}),
+            serde_json::json!({"commands": ["env FOO=1 rm -f out.txt"]}),
+            serde_json::json!({"commands": ["command mkdir -p out"]}),
+        ] {
+            assert!(
+                AgentLoop::is_action_tool_call("execute_command", &ok(params.clone())),
+                "mutating shell must classify as action, got: {params}"
+            );
+        }
+        // Read-only lookalikes stay inspection.
+        for params in [
+            serde_json::json!({"commands": ["sed -n '1,10p' file"]}),
+            serde_json::json!({"commands": ["git status"]}),
+            serde_json::json!({"commands": ["git diff HEAD -- file"]}),
+            serde_json::json!({"commands": ["grep foo file 2>/dev/null"]}),
+        ] {
+            assert!(
+                !AgentLoop::is_action_tool_call("execute_command", &ok(params.clone())),
+                "read-only shell must classify as inspection, got: {params}"
+            );
+        }
+    }
+
+
     #[tokio::test]
     async fn invalidate_changed_read_state_preserves_unchanged_paths() {
         let directory = tempfile::tempdir().unwrap();
@@ -8152,15 +8341,6 @@ Irrespective of whether additional information or instructions are given, you ar
                 guard
                     .recent_read_windows
                     .insert(key.clone(), std::collections::VecDeque::from([(1, 10)]));
-                guard.visible_read_coverage.insert(
-                    key.clone(),
-                    crate::core::agent_types::ReadCoverage {
-                        revision: "hash".to_string(),
-                        ranges: vec![(1, 10)],
-                        total_lines: 10,
-                        last_already_read_range: None,
-                    },
-                );
             }
             guard.read_file_snapshots.insert(
                 unchanged_key.clone(),
@@ -8180,8 +8360,6 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(!guard.consecutive_reads.contains_key(&changed_key));
         assert!(guard.read_file_snapshots.contains_key(&unchanged_key));
         assert!(!guard.read_file_snapshots.contains_key(&changed_key));
-        assert!(guard.visible_read_coverage.contains_key(&unchanged_key));
-        assert!(!guard.visible_read_coverage.contains_key(&changed_key));
     }
 
     #[test]
@@ -9731,15 +9909,6 @@ Irrespective of whether additional information or instructions are given, you ar
     fn context_reduction_clears_read_warnings_with_coverage() {
         let mut state = TaskState::default();
         let path = "/tmp/covered.swift".to_string();
-        state.visible_read_coverage.insert(
-            path.clone(),
-            crate::core::agent_types::ReadCoverage {
-                revision: "hash".to_string(),
-                ranges: vec![(1, 100)],
-                total_lines: 100,
-                last_already_read_range: Some((1, 100)),
-            },
-        );
         state.consecutive_reads.insert(path.clone(), 3);
         state.last_read_turn.insert(path.clone(), 4);
         state
@@ -9749,7 +9918,6 @@ Irrespective of whether additional information or instructions are given, you ar
 
         AgentLoop::clear_history_dependent_read_state(&mut state);
 
-        assert!(state.visible_read_coverage.is_empty());
         assert!(state.consecutive_reads.is_empty());
         assert!(state.last_read_turn.is_empty());
         assert!(state.recent_read_windows.is_empty());

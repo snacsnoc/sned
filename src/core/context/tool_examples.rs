@@ -12,15 +12,16 @@ EXAMPLE TOOL CALLS
 - File workflow: inspect first with read_file, then make the smallest file change with the matching file tool, then re-read or run a focused check.
 - inspect/read: tool=read_file args={\"paths\": [\"src/main.rs\"]}
 - search/find: tool=search_files args={\"regex\": \"fn handle_error\", \"path\": \"src\"}
-- edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (each files[] item contains path and edits; anchor/edit_type/text belong inside edits[], never alongside path; copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
+- edit block (preferred): tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"old_text\": \"use std::io;\\n\\nfn main() {\", \"new_text\": \"use std::io;\\nuse std::fs;\\n\\nfn main() {\"}]}]} (each files[] item contains path and edits; copy 2-4 lines of source exactly; omit the NNN: line numbers and anchor prefixes; old_text must match exactly one block in the file)
+- edit anchored (fallback for single-line targeting): tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (anchor/edit_type/text belong inside edits[], never alongside path; copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
 - run/test: tool=execute_command args={\"commands\": [\"cargo test --no-fail-fast\"]} (commands is a literal JSON array, not a string containing an array)
 - complex run-only logic: tool=execute_command args={\"script\": \"...\", \"language\": \"python\"}
 - dependent shell statements: tool=execute_command args={\"commands\": [\"value='ready'\\nprintf '%s\\\\n' \\\"$value\\\"\"]} (each commands[] entry starts a fresh shell; keep assignment and use in one entry)
 - quoted multiline shell text: tool=execute_command args={\"commands\": [\"cat <<'EOF'\\nquoted \\\"value\\\"\\nEOF\"]} (preserve the `\\n` escapes and quoted heredoc delimiter)
-- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; Word§ snapshot anchors are inspection-only.
+- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; snapshot anchors are inspection-only.
 - Delete a range: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"anchor\": \"First§// obsolete\", \"end_anchor\": \"Last§old_call();\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read; each selector is one line, never a pasted block).
-- edit_file uses text for replacement source without Word§ prefixes. Its optional content field is only an array of plain interior source lines for a duplicate-anchor fingerprint; ordinary range deletion does not need it.
+- edit_file uses text for replacement source without anchor prefixes; ordinary range deletion does not need the optional content field.
 - Use file tools for workspace changes. Use execute_command for inspection, builds, tests, and other execution; do not replace a file edit with shell redirection, a heredoc, or an ad-hoc Python/sed rewrite.
 - retry after tool failure: read the complete error, correct the named argument, and call the same tool again. Only stale or unknown anchor recovery requires read_file; malformed input, whitespace mismatch, overlap, and duplicate insertion do not.
 ";
@@ -36,11 +37,12 @@ EXAMPLE TOOL CALLS
 - File workflow: inspect first with read_file, then make the smallest file change with the matching file tool, then re-read or run a focused check.
 - inspect/read: tool=read_file args={\"paths\": [\"src/main.rs\"]}
 - search/find: tool=search_files args={\"regex\": \"fn handle_error\", \"path\": \"src\"}
-- edit existing: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (each files[] item contains path and edits; anchor/edit_type/text belong inside edits[], never alongside path; copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
+- edit block (preferred): tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"old_text\": \"use std::io;\\n\\nfn main() {\", \"new_text\": \"use std::io;\\nuse std::fs;\\n\\nfn main() {\"}]}]} (each files[] item contains path and edits; copy 2-4 lines of source exactly; omit the NNN: line numbers and anchor prefixes; old_text must match exactly one block in the file)
+- edit anchored (fallback for single-line targeting): tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (anchor/edit_type/text belong inside edits[], never alongside path; copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
-- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; Word§ snapshot anchors are inspection-only.
+- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; snapshot anchors are inspection-only.
 - Delete a range: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"anchor\": \"First§// obsolete\", \"end_anchor\": \"Last§old_call();\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read; each selector is one line, never a pasted block).
-- edit_file uses text for replacement source without Word§ prefixes. Its optional content field is only an array of plain interior source lines for a duplicate-anchor fingerprint; ordinary range deletion does not need it.
+- edit_file uses text for replacement source without anchor prefixes; ordinary range deletion does not need the optional content field.
 - retry after a stale or unknown edit anchor: call read_file again before retrying. Correct validation-only failures without rereading.
 ";
 
@@ -108,7 +110,8 @@ mod tests {
             assert!(examples.contains("anchor/edit_type/text belong inside edits[]"));
             assert!(examples.contains("same snapshot in one edit_file call"));
             assert!(examples.contains("ranged read's complete sha256 revision"));
-            assert!(examples.contains("Word§ snapshot anchors are inspection-only"));
+            assert!(examples.contains("snapshot anchors are inspection-only"));
+            assert!(!examples.contains("Word§"));
             assert!(!examples.contains("immediately preceding"));
         }
     }

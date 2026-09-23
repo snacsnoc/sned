@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 use sned::core::agent_loop::TaskState;
 use sned::core::file_editor::AnchorStateManager;
+use sned::core::hash_utils::strip_line_number_gutter;
 use sned::core::tools::handlers::{edit_file::EditFileHandler, read_file::ReadFileHandler};
 use sned::core::tools::{
     ToolContext, ToolError, ToolFailureClass, ToolHandler, ToolRequiredNextStep,
@@ -262,12 +263,12 @@ async fn native_workflow_known_edit_manager_matches_copied_duplicate_identity() 
         .unwrap();
     assert_eq!(
         managed[1],
-        copied[1].split_once('§').unwrap().0,
+        strip_line_number_gutter(&copied[1]).split_once('§').unwrap().0,
         "original above retains identity"
     );
     assert_eq!(
         managed[5],
-        copied[3].split_once('§').unwrap().0,
+        strip_line_number_gutter(&copied[3]).split_once('§').unwrap().0,
         "original below retains identity"
     );
     assert_ne!(
@@ -871,9 +872,11 @@ impl Workflow {
             .unwrap()
             .split('\n')
             .filter(|line| {
-                line.split_once('§').is_some_and(|(word, _)| {
-                    !word.is_empty() && word.chars().all(char::is_alphanumeric)
-                })
+                strip_line_number_gutter(line)
+                    .split_once('§')
+                    .is_some_and(|(word, _)| {
+                        !word.is_empty() && word.chars().all(char::is_alphanumeric)
+                    })
             })
             .map(str::to_owned)
             .collect()

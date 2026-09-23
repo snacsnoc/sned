@@ -179,8 +179,6 @@ pub struct TaskState {
     /// only for paths whose bytes may have changed externally.
     pub read_file_snapshots:
         std::collections::HashMap<String, (u64, Option<std::time::SystemTime>)>,
-    /// Model-visible read ranges for each unchanged file revision.
-    pub visible_read_coverage: std::collections::HashMap<String, ReadCoverage>,
     /// Number of consecutive successful edits per file with no intervening
     /// successful build/test run. When an execute_command result indicates
     /// a build failure and any value in this map is ≥3, the agent_loop
@@ -218,15 +216,6 @@ pub struct TaskState {
     /// Exact user-authored message of the most recent request that safely failed before any
     /// tool execution, and can therefore be retried verbatim.
     pub retryable_failed_request: Option<StorageMessage>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ReadCoverage {
-    pub revision: String,
-    pub ranges: Vec<(usize, usize)>,
-    pub total_lines: usize,
-    /// A repeat of this covered range is an intentional close-up request.
-    pub last_already_read_range: Option<(usize, usize)>,
 }
 
 /// Stats for a single file's changes in a session.
@@ -295,7 +284,6 @@ impl Default for TaskState {
             last_read_turn: std::collections::HashMap::new(),
             recent_read_windows: std::collections::HashMap::new(),
             read_file_snapshots: std::collections::HashMap::new(),
-            visible_read_coverage: std::collections::HashMap::new(),
             consecutive_edits: std::collections::HashMap::new(),
             consecutive_edit_failures: std::collections::HashMap::new(),
             consecutive_inspection_turns: 0,

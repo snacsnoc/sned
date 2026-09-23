@@ -90,7 +90,7 @@ pub(crate) fn edit_failure(reason: EditFailureReason, consecutive_failures: u32)
             "Correct the edit parameters described in the validation error and retry. This is not a stale-anchor failure; re-reading is not required for this validation error."
         }
         EditFailureReason::MissingAnchor => {
-            "The edit anchor is missing or malformed. Use a complete single-line `Word§line content` anchor copied from the latest read_file output."
+            "The edit anchor is missing or malformed. Use a complete single-line anchor copied from the latest read_file output (form `<id>§<source>`)."
         }
         EditFailureReason::UnknownAnchor => {
             "The anchor is unknown or stale. Re-read the target file and copy fresh anchors; do not reuse the failed anchor."
@@ -109,9 +109,6 @@ pub(crate) fn edit_failure(reason: EditFailureReason, consecutive_failures: u32)
         }
         EditFailureReason::DuplicateInsertion => {
             "The insertion would duplicate content already beside its anchor or repeat the anchored line. Do not re-read or retry the same insertion; use replace with anchor and end_anchor when wrapping existing code."
-        }
-        EditFailureReason::MismatchedAnchorContent => {
-            "The anchor and the supplied content refer to different lines in the same file. Switch to the correct anchor (or content) for the intended line — do not re-read; the file has not changed."
         }
     };
 

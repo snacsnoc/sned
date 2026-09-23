@@ -556,7 +556,7 @@ impl EditFileHandler {
         if let Some(raw) = params.get("files").and_then(serde_json::Value::as_str) {
             let files = Self::parse_stringified_files_array(raw).map_err(|error| {
                 format!(
-                    "Failed to parse 'files' as an array of {{path, edits}} objects: {}. Re-issue the tool call with a literal JSON array.",
+                    "Failed to parse 'files' as an array of {{path, edits}} objects. Parse error: {}. Re-issue the tool call with a literal JSON array.",
                     Self::json_error_context(raw, &error)
                 )
             })?;
@@ -566,6 +566,48 @@ impl EditFileHandler {
 
         if params.get("files").is_some() {
             return Ok(false);
+        }
+        if params.get("path").is_some()
+            && (params.get("old_text").is_some()
+                || params.get("old_str").is_some()
+                || params.get("search").is_some())
+        {
+            if params.get("paths").is_some() {
+                return Err("Ambiguous edit_file arguments: use either 'paths' or top-level 'path' with 'old_text'.".to_string());
+            }
+            let path = params
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|path| !path.is_empty())
+                .ok_or("Invalid 'path': expected a nonempty file path")?
+                .to_string();
+            let old_text = params
+                .get("old_text")
+                .or_else(|| params.get("old_str"))
+                .or_else(|| params.get("search"))
+                .cloned()
+                .unwrap();
+            let new_text = params
+                .get("new_text")
+                .or_else(|| params.get("new_str"))
+                .or_else(|| params.get("text"))
+                .or_else(|| params.get("replace"))
+                .cloned()
+                .unwrap_or(serde_json::json!(""));
+            let object = params.as_object_mut().ok_or("edit_file arguments must be a JSON object")?;
+            object.remove("path");
+            object.remove("old_text");
+            object.remove("old_str");
+            object.remove("search");
+            object.remove("new_text");
+            object.remove("new_str");
+            object.remove("text");
+            object.remove("replace");
+            object.insert(
+                "files".to_string(),
+                serde_json::json!([{"path": path, "edits": [{"old_text": old_text, "new_text": new_text}]}]),
+            );
+            return Ok(true);
         }
         if params.get("path").is_some() && params.get("edits").is_some() {
             if params.get("paths").is_some() {
@@ -683,48 +725,101 @@ impl EditFileHandler {
         for file in files {
             let path = Self::file_entry_path(file).map_err(ToolError::InvalidInput)?;
 
-            let edits_raw = match file.get("edits") {
-                Some(serde_json::Value::Array(edits)) => edits.clone(),
-                Some(serde_json::Value::String(raw)) => Self::parse_stringified_edits_array(raw)
-                    .map_err(|error| {
-                        ToolError::InvalidInput(format!(
-                            "Failed to parse 'edits' for file '{path}': {error}. Use a literal JSON array of edit objects."
-                        ))
-                    })?,
-                _ => return Err({
-                    // Lenient: models sometimes put anchor/edit_type/text as
-                    // siblings at the file-entry level instead of inside an
-                    // edits array. Detect this and give a targeted error.
-                    let has_anchor = file.get("anchor").and_then(|a| a.as_str()).is_some();
-                    let has_edit_type = file.get("edit_type").and_then(|t| t.as_str()).is_some();
-                    let has_text = file.get("text").and_then(|t| t.as_str()).is_some();
-                    if has_anchor || has_edit_type || has_text {
-                        ToolError::InvalidInput(format!(
-                            "The 'anchor', 'edit_type', and 'text' fields must be inside an 'edits' array, not at the file-entry level.\n\n\
-                             Correct: {{ \"path\": \"{path}\", \"edits\": [{{ \"anchor\": \"...\", \"text\": \"...\" }}] }}\n\
-                             Wrong:   {{ \"path\": \"{path}\", \"anchor\": \"...\", \"text\": \"...\" }}"
-                        ))
-                    } else {
-                        ToolError::InvalidInput(format!(
-                            "Missing 'edits' for file '{}'. {}",
-                            path,
-                            error_guidance::missing_parameter("edits", 0)
-                        ))
-                    }
-                }),
+            let file_old_text = file
+                .get("old_text")
+                .or_else(|| file.get("old_str"))
+                .or_else(|| file.get("search"))
+                .and_then(|v| v.as_str());
+
+            let edits_raw = if let Some(old_text) = file_old_text {
+                let new_text = file
+                    .get("new_text")
+                    .or_else(|| file.get("new_str"))
+                    .or_else(|| file.get("text"))
+                    .or_else(|| file.get("replace"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                vec![serde_json::json!({
+                    "old_text": old_text,
+                    "new_text": new_text
+                })]
+            } else {
+                match file.get("edits") {
+                    Some(serde_json::Value::Array(edits)) => edits.clone(),
+                    Some(serde_json::Value::String(raw)) => Self::parse_stringified_edits_array(raw)
+                        .map_err(|error| {
+                            ToolError::InvalidInput(format!(
+                                "Failed to parse 'edits' for file '{path}': {error}. Use a literal JSON array of edit objects."
+                            ))
+                        })?,
+                    _ => return Err({
+                        // Lenient: models sometimes put anchor/edit_type/text as
+                        // siblings at the file-entry level instead of inside an
+                        // edits array. Detect this and give a targeted error.
+                        let has_anchor = file.get("anchor").and_then(|a| a.as_str()).is_some();
+                        let has_edit_type = file.get("edit_type").and_then(|t| t.as_str()).is_some();
+                        let has_text = file.get("text").and_then(|t| t.as_str()).is_some();
+                        if has_anchor || has_edit_type || has_text {
+                            ToolError::InvalidInput(format!(
+                                "The 'anchor', 'edit_type', and 'text' fields must be inside an 'edits' array, not at the file-entry level.\n\n\
+                                 Correct: {{ \"path\": \"{path}\", \"edits\": [{{ \"anchor\": \"...\", \"text\": \"...\" }}] }}\n\
+                                 Wrong:   {{ \"path\": \"{path}\", \"anchor\": \"...\", \"text\": \"...\" }}"
+                            ))
+                        } else {
+                            ToolError::InvalidInput(format!(
+                                "Missing 'edits' for file '{}'. {}",
+                                path,
+                                error_guidance::missing_parameter("edits", 0)
+                            ))
+                        }
+                    }),
+                }
             };
 
             let mut edits = Vec::new();
-            for edit_raw in &edits_raw {
+            for (edit_index, edit_raw) in edits_raw.iter().enumerate() {
+                let old_text_raw = edit_raw
+                    .get("old_text")
+                    .or_else(|| edit_raw.get("old_str"))
+                    .or_else(|| edit_raw.get("search"))
+                    .and_then(|v| v.as_str());
+
+                if let Some(old_text) = old_text_raw {
+                    let text_raw = edit_raw
+                        .get("new_text")
+                        .or_else(|| edit_raw.get("new_str"))
+                        .or_else(|| edit_raw.get("text"))
+                        .or_else(|| edit_raw.get("replace"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            ToolError::InvalidInput(format!(
+                                "Edit #{} for file '{path}': 'new_text' is required when using 'old_text' (use \"new_text\": \"\" to delete the block).",
+                                edit_index + 1
+                            ))
+                        })?;
+
+                    let clean_old = strip_hashes(old_text);
+                    let clean_text = strip_hashes(text_raw);
+
+                    edits.push(Edit {
+                        anchor: String::new(),
+                        end_anchor: None,
+                        edit_type: "replace".to_string(),
+                        text: clean_text,
+                        content: None,
+                        old_text: Some(clean_old),
+                    });
+                    continue;
+                }
+
                 let anchor_raw =
                     edit_raw
                         .get("anchor")
                         .and_then(|a| a.as_str())
                         .ok_or_else(|| {
                             ToolError::InvalidInput(format!(
-                                "Missing 'anchor' in edit for file '{}'. {}",
-                                path,
-                                error_guidance::missing_parameter("anchor", 0)
+                                "Missing 'anchor' in edit #{} for file '{path}'. Specify either 'anchor' or 'old_text' for block replacement.",
+                                edit_index + 1
                             ))
                         })?;
                 let anchor_block = Self::normalized_selector_block("anchor", path, anchor_raw)
@@ -836,6 +931,7 @@ impl EditFileHandler {
                     edit_type: edit_type.to_string(),
                     text,
                     content,
+                    old_text: None,
                 });
             }
 
@@ -901,12 +997,25 @@ impl EditFileHandler {
                 affected_paths.push(resolved.clone());
             }
 
+            if file.get("old_text").is_some()
+                || file.get("old_str").is_some()
+                || file.get("search").is_some()
+            {
+                continue;
+            }
+
             let edits: &[serde_json::Value] = file
                 .get("edits")
                 .and_then(|e| e.as_array())
                 .map_or(&[], std::vec::Vec::as_slice);
 
             for edit in edits {
+                if edit.get("old_text").is_some()
+                    || edit.get("old_str").is_some()
+                    || edit.get("search").is_some()
+                {
+                    continue;
+                }
                 let anchor_raw = edit
                     .get("anchor")
                     .and_then(|a: &serde_json::Value| a.as_str())
@@ -1075,7 +1184,6 @@ impl EditFileHandler {
         state.last_read_turn.remove(&key);
         state.recent_read_windows.remove(&key);
         state.read_file_snapshots.remove(&key);
-        state.visible_read_coverage.remove(&key);
     }
 
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
@@ -1602,6 +1710,9 @@ impl EditFileHandler {
         output_writer: &crate::cli::output::OutputWriterArc,
         consecutive_failures: u32,
     ) -> Result<String, ToolError> {
+        let mut params = params;
+        Self::normalize_stringified_files_param(&mut params).map_err(ToolError::InvalidInput)?;
+
         let files_value = params.get("files");
         let top_level_path = params.get("path").and_then(|p| p.as_str());
         let parsed_stringified_files = files_value
@@ -2175,7 +2286,7 @@ impl EditFileHandler {
                     continue;
                 }
             };
-            if must_reread {
+            if must_reread && !batch.is_pure_block() {
                 rejected_paths.insert(batch.absolute_path.clone());
                 reread_paths.insert(batch.absolute_path.clone());
                 total_failed += batch.edits.len();
@@ -2368,6 +2479,7 @@ impl EditFileHandler {
             unchanged_sites: Vec<crate::core::file_editor::UnchangedSite>,
             glued_anchor_lines: Vec<usize>,
             duplicate_insertions: Vec<crate::core::file_editor::FailedEdit>,
+            is_pure_block: bool,
         }
         let mut file_results: Vec<FileResult> = Vec::new();
         let mut transitions = HashMap::new();
@@ -2486,6 +2598,7 @@ impl EditFileHandler {
                 unchanged_sites: result.unchanged_sites,
                 glued_anchor_lines: result.glued_anchor_lines,
                 duplicate_insertions: result.duplicate_insertions,
+                is_pure_block: batch.is_pure_block(),
             });
         }
 
@@ -2758,6 +2871,14 @@ impl EditFileHandler {
 
             if file_result.had_success && file_result.applied_count > 0 {
                 let mut state = state.lock().await;
+                if file_result.is_pure_block {
+                    // Block edits match current bytes, so a prior
+                    // anchor-freshness demand no longer applies.
+                    let key = crate::core::tools::canonical_path_key(Path::new(
+                        &file_result.batch_absolute_path,
+                    ));
+                    state.must_reread_before_edit.remove(&key);
+                }
                 let entry = state
                     .session_file_changes
                     .entry(file_result.batch_absolute_path.clone())
@@ -2795,7 +2916,6 @@ impl EditFileHandler {
                 state.last_read_turn.remove(&key);
                 state.recent_read_windows.remove(&key);
                 state.read_file_snapshots.remove(&key);
-                state.visible_read_coverage.remove(&key);
                 if write_failed_paths.contains(&item.absolute_path) {
                     continue;
                 }
@@ -3196,7 +3316,11 @@ impl ToolHandler for EditFileHandler {
             let mut params = params;
             if params.get("files").is_none()
                 && (params.get("paths").is_some()
-                    || params.get("path").is_some() && params.get("edits").is_some())
+                    || params.get("path").is_some()
+                        && (params.get("edits").is_some()
+                            || params.get("old_text").is_some()
+                            || params.get("old_str").is_some()
+                            || params.get("search").is_some()))
             {
                 Self::normalize_stringified_files_param(&mut params)
                     .map_err(ToolError::InvalidInput)?;
@@ -3706,6 +3830,102 @@ mod tests {
         assert_eq!(
             result.unwrap_err().to_string(),
             "Invalid input: No files specified. The 'files' array is empty; provide at least one object with 'path' and 'edits' fields."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pure_block_batch_bypasses_and_clears_must_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("block.txt");
+        std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let canonical = std::fs::canonicalize(&file_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // Simulate a stale anchor latch left by an earlier failed edit.
+        state
+            .lock()
+            .await
+            .must_reread_before_edit
+            .insert(canonical.clone());
+        let ctx = ToolContext::new(
+            state.clone(),
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        );
+        // Pure block edits match current bytes, so the anchor-freshness
+        // latch must not block them.
+        let output = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({"files": [{"path": "block.txt", "edits": [{
+                "old_text": "beta\n", "new_text": "gamma\n"
+            }]}]}),
+        )
+        .await
+        .unwrap();
+        assert!(output.as_str().unwrap().contains("1 edit(s) applied"));
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "alpha\ngamma\n");
+        // Success clears the latch for subsequent edits.
+        assert!(!state
+            .lock()
+            .await
+            .must_reread_before_edit
+            .contains(&canonical));
+    }
+
+    #[tokio::test]
+    async fn test_anchor_batch_still_blocked_by_must_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("anchored.txt");
+        std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
+
+        let handler = EditFileHandler::new();
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let canonical = std::fs::canonicalize(&file_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        state
+            .lock()
+            .await
+            .must_reread_before_edit
+            .insert(canonical);
+        let ctx = ToolContext::new(
+            state,
+            None,
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "test-task".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        );
+        let error = ToolHandler::execute(
+            &handler,
+            &ctx,
+            serde_json::json!({"files": [{"path": "anchored.txt", "edits": [{
+                "anchor": "Bogus§alpha", "text": "changed"
+            }]}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("re-read"));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "alpha\nbeta\n"
         );
     }
 
@@ -4286,6 +4506,192 @@ mod tests {
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(std::fs::read_to_string(file_path).unwrap(), "replacement\nafter\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_exact_block_mode_replaces_multiline_braces() {
+        let _guard = TEST_MUTEX.lock().await;
+        let content = "func test() {\n    lock.withLock {\n        work()\n}\n";
+        let (dir, file_path, _) = setup_test_file(content, "exact-block-braces").await;
+        let ctx = ctx_for_dir(&dir, "exact-block-braces");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "old_text": "        work()\n}",
+                    "new_text": "        work()\n    }\n}"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "func test() {\n    lock.withLock {\n        work()\n    }\n}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_exact_block_mode_at_file_level() {
+        let _guard = TEST_MUTEX.lock().await;
+        let content = "let a = 1\nlet b = 2\n";
+        let (dir, file_path, _) = setup_test_file(content, "exact-block-file-level").await;
+        let ctx = ctx_for_dir(&dir, "exact-block-file-level");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "old_text": "let a = 1",
+                "new_text": "let a = 10"
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "let a = 10\nlet b = 2\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_exact_block_mode_top_level_normalized() {
+        let _guard = TEST_MUTEX.lock().await;
+        let content = "first\nsecond\n";
+        let (dir, file_path, _) = setup_test_file(content, "exact-block-top-level").await;
+        let ctx = ctx_for_dir(&dir, "exact-block-top-level");
+
+        let params = serde_json::json!({
+            "path": "test.txt",
+            "old_text": "first",
+            "new_text": "replaced"
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "replaced\nsecond\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_exact_block_mode_rejects_ambiguous_occurrences() {
+        let _guard = TEST_MUTEX.lock().await;
+        let content = "    }\n    }\n";
+        let (dir, file_path, _) = setup_test_file(content, "exact-block-ambiguous").await;
+        let ctx = ctx_for_dir(&dir, "exact-block-ambiguous");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "old_text": "    }",
+                    "new_text": "    }\n    }"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let err = result.expect_err("ambiguous old_text must be rejected");
+        assert!(err.to_string().contains("matches 2 occurrences"), "{err}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_exact_block_mode_reports_whitespace_trimmed_match() {
+        let _guard = TEST_MUTEX.lock().await;
+        let content = "        work()\n";
+        let (dir, file_path, _) = setup_test_file(content, "exact-block-whitespace").await;
+        let ctx = ctx_for_dir(&dir, "exact-block-whitespace");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "old_text": "    work()",
+                    "new_text": "    done()"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let err = result.expect_err("whitespace mismatch must be rejected with helpful error");
+        assert!(err.to_string().contains("trimming whitespace"), "{err}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_exact_block_mode_handles_trailing_newlines_in_old_and_new_text() {
+        let _guard = TEST_MUTEX.lock().await;
+        let content = "header\nline 1\nline 2\nfooter\n";
+        let (dir, file_path, _) = setup_test_file(content, "exact-block-newlines").await;
+        let ctx = ctx_for_dir(&dir, "exact-block-newlines");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "old_text": "line 1\nline 2\n",
+                    "new_text": "new 1\nnew 2\n"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "header\nnew 1\nnew 2\nfooter\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_exact_block_mode_old_text_longer_than_file_does_not_panic() {
+        let _guard = TEST_MUTEX.lock().await;
+        let content = "only one line\n";
+        let (dir, file_path, _) = setup_test_file(content, "exact-block-longer").await;
+        let ctx = ctx_for_dir(&dir, "exact-block-longer");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "old_text": "line 1\nline 2\nline 3\nline 4\n",
+                    "new_text": "new line\n"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let err = result.expect_err("old_text longer than file must fail without panicking");
+        assert!(err.to_string().contains("not found in the file"), "{err}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_exact_block_mode_rejects_empty_old_text() {
+        let _guard = TEST_MUTEX.lock().await;
+        let content = "some content\n";
+        let (dir, file_path, _) = setup_test_file(content, "exact-block-empty").await;
+        let ctx = ctx_for_dir(&dir, "exact-block-empty");
+
+        let params = serde_json::json!({
+            "files": [{
+                "path": "test.txt",
+                "edits": [{
+                    "old_text": "   \n  ",
+                    "new_text": "new line\n"
+                }]
+            }]
+        });
+
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let err = result.expect_err("blank old_text must be rejected");
+        assert!(err.to_string().contains("non-empty 'old_text'"), "{err}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), content);
     }
 
     #[tokio::test]
@@ -7854,9 +8260,16 @@ edition = "2021"
             .await
             .expect_err("concatenated anchor must be rejected");
         let msg = err.to_string();
+        // Content matches lines 1–3 exactly but two quoted words are
+        // fabricated, so the error offers the current anchors instead of
+        // applying anything.
         assert!(
-            msg.contains("does not match consecutive current Word§source lines"),
-            "error must reject stale or fabricated words, got: {msg}"
+            msg.contains("lines 1–3 exactly"),
+            "error must pinpoint the content match, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{}§static int", anchors[0])),
+            "error must suggest the current anchor, got: {msg}"
         );
         let updated = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(
@@ -9556,6 +9969,7 @@ edition = "2021"
             edit_type: "insert_after".into(),
             text: "INSERTED".into(),
             content: None,
+            old_text: None,
         };
         let (_resolved, failed) = executor.resolve_edits(&[edit], &lines, &line_hashes);
         assert_eq!(failed.len(), 1);
@@ -9601,6 +10015,7 @@ edition = "2021"
             edit_type: "replace".into(),
             text: "x".into(),
             content: None,
+            old_text: None,
         };
         let (_resolved, failed) = executor.resolve_edits(&[edit], &lines, &line_hashes);
         assert_eq!(failed.len(), 1);

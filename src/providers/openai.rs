@@ -19,7 +19,11 @@ use std::time::{Duration, Instant};
 
 const OPENAI_CLIENT_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 const OPENAI_NON_STREAM_PREOUTPUT_GRACE: Duration = Duration::from_secs(5);
-const OPENAI_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+// Reasoning models hold response headers for minutes while thinking
+// server-side (kimi-k3 at high effort took 30-60s in live logs); curl has
+// no timeout, which is why the same requests succeed outside sned.
+// Override with SNED_RESPONSE_HEADERS_TIMEOUT_SECS.
+const OPENAI_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(300);
 const SNED_REASONING_HISTORY_KEY: &str = "sned_reasoning_history";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

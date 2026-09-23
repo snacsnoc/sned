@@ -19,7 +19,7 @@ pub const ANCHOR_DELIMITER: &str = "§";
 
 static ANCHOR_STRIP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?m)^[ \t]*(?:[A-Z][a-zA-Z0-9]*|[0-9a-f]{{8,16}})\s*{}",
+        r"(?m)^[ \t]*(?:\d+:\s+)?(?:[A-Z][a-zA-Z0-9]*|[0-9a-f]{{8,16}})\s*{}",
         regex::escape(ANCHOR_DELIMITER)
     ))
     .unwrap()
@@ -33,7 +33,7 @@ static DUPLICATE_ANCHOR_SUFFIX_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Shared explanation kept outside source lines so anchors can be copied verbatim.
-pub const ANCHOR_GUIDANCE: &str = "[Anchors: Copy the complete prefix§source line. Different prefixes distinguish identical-content occurrences in the current tracked state. Batch independent edits from the same snapshot in one edit_file call.]";
+pub const ANCHOR_GUIDANCE: &str = "[Anchors: Each line is shown as `NNN: <id>§source` where NNN is the 1-indexed file line number. Copy the complete anchor line (e.g. `AxD6h8§    lock.withLock {`), omitting the `NNN: ` prefix. Different ids distinguish identical-content occurrences in the current tracked state. Batch independent edits from the same snapshot in one edit_file call.]";
 
 /// Reader guidance follows the same full-source threshold as anchor reconciliation.
 #[must_use]
@@ -108,6 +108,29 @@ pub fn format_line_with_hash(content: &str, anchor: &str, _identical_at: &[usize
     format!("{anchor}{ANCHOR_DELIMITER}{content}")
 }
 
+/// Line-numbered read output: `NNN: Word§source`. The number lets models map
+/// compiler errors to lines without shell workarounds; parsers strip it.
+#[must_use]
+pub fn format_numbered_line_with_hash(
+    line_no: usize,
+    content: &str,
+    anchor: &str,
+) -> String {
+    format!("{line_no}: {anchor}{ANCHOR_DELIMITER}{content}")
+}
+
+static LINE_NUMBER_GUTTER_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d+:(\s+|$)").unwrap());
+
+/// Strips a read-output line-number gutter (`NNN: `) so pasted lines match
+/// file content. Only the gutter goes; anything else stays verbatim.
+#[must_use]
+pub fn strip_line_number_gutter(line: &str) -> &str {
+    LINE_NUMBER_GUTTER_REGEX
+        .find(line)
+        .map_or(line, |m| &line[m.end()..])
+}
+
 /// Compatibility wrapper; line offsets do not affect occurrence prefixes.
 #[must_use]
 pub fn format_line_with_hash_with_offset(
@@ -121,8 +144,11 @@ pub fn format_line_with_hash_with_offset(
 
 /// Splits a raw anchor string into anchor word and content.
 ///
+/// A read-output line-number gutter (`NNN: `) is stripped first so anchors
+/// copied verbatim from read output still resolve.
 #[must_use]
 pub fn split_anchor(raw_anchor: &str) -> (String, String) {
+    let raw_anchor = strip_line_number_gutter(raw_anchor.trim_start());
     match raw_anchor.find(ANCHOR_DELIMITER) {
         Some(idx) => (
             raw_anchor[..idx].trim().to_string(),
@@ -296,6 +322,22 @@ mod tests {
         let limit = crate::core::file_editor::MAX_TRACKED_LINES;
         assert_eq!(anchor_guidance(limit), ANCHOR_GUIDANCE);
         assert!(anchor_guidance(limit + 1).contains("including anchors for unchanged lines"));
+    }
+
+    #[test]
+    fn test_numbered_lines_round_trip_through_parsers() {
+        assert_eq!(
+            format_numbered_line_with_hash(979, "    lock.withLock {", "AxD6"),
+            "979: AxD6§    lock.withLock {"
+        );
+        assert_eq!(strip_line_number_gutter("979: AxD6§x"), "AxD6§x");
+        assert_eq!(strip_line_number_gutter("AxD6§x"), "AxD6§x");
+        assert_eq!(strip_line_number_gutter("2024 was a year"), "2024 was a year");
+        let (word, content) = split_anchor("979: AxD6§    lock.withLock {");
+        assert_eq!(word, "AxD6");
+        assert_eq!(content, "    lock.withLock {");
+        let (word, content) = split_anchor("AxD6§x");
+        assert_eq!((word.as_str(), content.as_str()), ("AxD6", "x"));
     }
 
     #[test]

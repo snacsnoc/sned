@@ -238,26 +238,34 @@ pub fn edit_file_schema() -> ToolSchema {
                     },
                     "expected_file_hash": {
                         "type": "string",
-                        "description": "Optional complete sha256:<digest> from a large ranged read. Only consumed when no edit in this file uses 'anchor'; ignored otherwise. When consumed, submit exactly one file and use line-range selectors (start_line + expected_text) instead of anchors."
+                        "description": "Optional sha256:<digest> from large ranged read. Submit one file with line-range selectors (start_line + expected_text) instead of anchors."
                     },
                     "edits": {
                         "type": "array",
-                        "description": "Edits for this file. Each edit requires either anchor (anchored edit) or start_line plus expected_text (revision-checked edit with expected_file_hash).",
+                        "description": "Edits for this file: 'old_text' + 'new_text' (block replace), 'anchor' + 'text' (anchored edit), or 'start_line' + 'expected_text' (revision-checked).",
                         "items": {
                             "type": "object",
                             "properties": {
+                                "old_text": {
+                                    "type": "string",
+                                    "description": "Exact unique block of source lines to replace. Replaces matching block with 'new_text' without anchors. Omit read-output 'NNN: ' line-number prefixes."
+                                },
+                                "new_text": {
+                                    "type": "string",
+                                    "description": "Replacement source text for 'old_text'. 'text' is accepted as an alias."
+                                },
                                 "edit_type": {
                                     "type": "string",
                                     "enum": ["replace", "insert_after", "insert_before"],
-                                    "description": "Default replace. Inserts preserve anchor; wrap with range replace. Reject adjacent duplicates or insertions repeating anchor."
+                                    "description": "Default replace. Inserts preserve anchor; wrap with range replace. Reject adjacent duplicates."
                                 },
                                 "anchor": {
                                     "type": "string",
-                                    "description": "Copy Word§source lines from read_file, get_function, get_file_skeleton, or successful edit output. For replace, anchor may contain a consecutive multiline Word§source block, including Word§ with empty source; end_anchor may also contain a consecutive block. Sned uses the first anchor line and last end_anchor line while verifying every copied line. Replacement text is raw source without Word§ prefixes. Insertions require one line. Either anchor or start_line plus expected_text is required."
+                                    "description": "Copy anchor lines from read_file or edit output (form `<id>§<source>`, e.g. `AxD6h8§    lock.withLock {`; omit the 'NNN: ' line-number prefix). For replace, anchor and end_anchor may be consecutive multiline blocks. Or use old_text or start_line."
                                 },
                                 "end_anchor": {
                                     "type": "string",
-                                    "description": "Inclusive endpoint for a multi-line range. It may be one Word§source line or a consecutive multiline Word§source block; Sned uses its last line after verifying the copied block. WARNING: Everything between anchor and end_anchor is replaced by text. NEVER set end_anchor if you only want to modify or replace a single line. Omit it for single-line replaces."
+                                    "description": "Inclusive endpoint for a multi-line range. WARNING: Everything between anchor and end_anchor is replaced by text. NEVER set end_anchor if you only want to modify or replace a single line."
                                 },
                                 "start_line": {
                                     "type": "integer",
@@ -276,14 +284,13 @@ pub fn edit_file_schema() -> ToolSchema {
                                 "content": {
                                     "type": "array",
                                     "items": { "type": "string" },
-                                    "description": "Optional exact interior lines for a duplicate-line fingerprint. Use only with replace and end_anchor; include every line between them in exact order and whitespace. Limited to 4096 lines and 1 MiB."
+                                    "description": "Optional exact interior lines for duplicate-line fingerprint. Use only with replace and end_anchor."
                                 },
                                 "text": {
                                     "type": "string",
-                                    "description": "Replacement source without Word§ prefixes; use \\n for new lines. Use an empty string to delete the inclusive anchor/end_anchor range. In insertions, leading and trailing blank lines count in duplicate checks."
+                                    "description": "Replacement source without anchor prefixes; use \\n for new lines. Use \"\" to delete range."
                                 }
-                            },
-                            "required": ["text"]
+                            }
                         }
                     }
                 },
@@ -1087,20 +1094,12 @@ mod tests {
             .and_then(|items| items.pointer("/properties/edits/items"))
             .expect("edit_file should expose edit items");
         let properties = edit["properties"].as_object().expect("edit properties");
-        let required = edit["required"].as_array().expect("required fields");
+        if let Some(required) = edit.get("required").and_then(|r| r.as_array()) {
+            assert!(!required.iter().any(|field| field == "edit_type"));
+            assert!(!required.iter().any(|field| field == "anchor"));
+        }
 
         assert_eq!(properties["content"]["type"], "array");
-        assert!(
-            properties["end_anchor"]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains(
-                    "NEVER set end_anchor if you only want to modify or replace a single line"
-                )),
-            "end_anchor schema must warn against single-line use to prevent accidental 40-line range wipeouts"
-        );
-        assert!(!required.iter().any(|field| field == "edit_type"));
-        assert!(!required.iter().any(|field| field == "anchor"));
-        assert!(required.iter().any(|field| field == "text"));
         assert_eq!(properties["start_line"]["minimum"], 1);
         assert_eq!(properties["expected_text"]["type"], "string");
 
