@@ -2448,17 +2448,6 @@ impl EditExecutor {
                     )),
                 );
             }
-            // Unique content wins over a rotated hash.
-            if content_matches.len() == 1 {
-                let content_idx = content_matches[0];
-                tracing::debug!(
-                    "Anchor resolved via content fallback: word={} bound line {}, content matches line {}",
-                    anchor_name,
-                    bound,
-                    content_idx
-                );
-                return (content_idx, None);
-            }
             return (
                 usize::MAX,
                 Some(format!(
@@ -2558,7 +2547,20 @@ impl EditExecutor {
         }
 
         let content_idx = content_matches[0];
-        // Unique quoted text is unambiguous regardless of word-bound order.
+        if !word_bound_lines.contains(&content_idx) {
+            let rebound = word_bound_lines
+                .iter()
+                .map(|&idx| format!("line {}: {:?}", idx + 1, lines[idx]))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return (
+                usize::MAX,
+                Some(format!(
+                    "{anchor_type} \"{anchor_name}\" exists, but the supplied content does not match a line it currently binds to (word-bound: {rebound}). The anchor is stale: the quoted word resolved to different lines after a prior edit. Please re-read the file with read_file to get fresh anchors before retrying."
+                )),
+            );
+        }
+        // Unique quoted text disambiguates between the word-bound lines.
         tracing::debug!(
             "Anchor resolved via content-disambiguation: word={} matched {} line(s), content matches line {}",
             anchor_name,
@@ -2619,6 +2621,20 @@ impl EditExecutor {
                 usize::MAX,
                 Some(format!(
                     "{anchor_type} \"{anchor_name}\" not found in the file. Please ensure you are using the latest anchors from the most recent read_file output."
+                )),
+            );
+        }
+
+        if word_bound_lines.len() != 1 {
+            let listing = word_bound_lines
+                .iter()
+                .map(|&idx| format!("line {}", idx + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return (
+                usize::MAX,
+                Some(format!(
+                    "{anchor_type} \"{anchor_name}\" matches multiple lines ({listing}). Anchor a unique neighboring line instead, or rewrite the file with write_to_file."
                 )),
             );
         }
@@ -2729,18 +2745,6 @@ impl EditExecutor {
                             anchor_line, edit_type
                         ),
                     });
-                }
-
-                let is_pure_closing_delimiter = replacement_lines.len() <= 2
-                    && replacement_lines.iter().all(|line| {
-                        let trimmed = line.trim();
-                        !trimmed.is_empty()
-                            && trimmed
-                                .chars()
-                                .all(|c| matches!(c, '}' | ')' | ']' | ';' | ','))
-                    });
-                if is_pure_closing_delimiter {
-                    return None;
                 }
 
                 let adjacent_matches = if edit_type == "insert_before" {
@@ -4448,12 +4452,12 @@ mod tests {
             "Gamma".to_string(),
         ];
 
-        // The word is current-generation but bound to line 0 while the
-        // quoted content uniquely matches line 2: resolve to the content.
+        // The word binds line 0 but the quoted content is line 2: a
+        // miscopied prefix must not silently edit the wrong line.
         let (idx, error) =
             executor.resolve_anchor("anchor", "Alpha§third", &hashes, &lines);
-        assert_eq!(idx, 2);
-        assert!(error.is_none());
+        assert_eq!(idx, usize::MAX);
+        assert!(error.is_some());
     }
 
         #[test]
