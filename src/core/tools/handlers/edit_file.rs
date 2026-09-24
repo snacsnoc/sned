@@ -575,6 +575,9 @@ impl EditFileHandler {
             if params.get("paths").is_some() {
                 return Err("Ambiguous edit_file arguments: use either 'paths' or top-level 'path' with 'old_text'.".to_string());
             }
+            if params.get("edits").is_some() || params.get("files").is_some() {
+                return Err("Ambiguous edit_file arguments: use either top-level 'path' with 'old_text' or 'files'/'edits', not both.".to_string());
+            }
             let path = params
                 .get("path")
                 .and_then(serde_json::Value::as_str)
@@ -732,6 +735,11 @@ impl EditFileHandler {
                 .and_then(|v| v.as_str());
 
             let edits_raw = if let Some(old_text) = file_old_text {
+                if file.get("edits").is_some() {
+                    return Err(ToolError::InvalidInput(format!(
+                        "File '{path}': use either file-level 'old_text' or an 'edits' array, not both. Put block edits in 'edits' or anchored edits in 'edits', not mixed at the file level."
+                    )));
+                }
                 let new_text = file
                     .get("new_text")
                     .or_else(|| file.get("new_str"))
@@ -785,6 +793,16 @@ impl EditFileHandler {
                     .and_then(|v| v.as_str());
 
                 if let Some(old_text) = old_text_raw {
+                    if edit_raw.get("anchor").is_some()
+                        || edit_raw.get("end_anchor").is_some()
+                        || edit_raw.get("edit_type").is_some()
+                        || edit_raw.get("content").is_some()
+                    {
+                        return Err(ToolError::InvalidInput(format!(
+                            "Edit #{} for file '{path}': 'old_text' block mode cannot be combined with 'anchor', 'end_anchor', 'edit_type', or 'content'. Use block mode ('old_text' + 'new_text') or anchored mode, not both in one edit.",
+                            edit_index + 1
+                        )));
+                    }
                     let text_raw = edit_raw
                         .get("new_text")
                         .or_else(|| edit_raw.get("new_str"))
