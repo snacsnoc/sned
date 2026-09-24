@@ -2189,7 +2189,7 @@ impl AgentLoop {
             // Pass history by reference to context_manager — saves a full deep clone
             // of every message/tool-result per turn.
             let mut conversation_guard = self.conversation_history.lock().await;
-            compact_old_read_results(&mut conversation_guard);
+            compact_old_tool_results(&mut conversation_guard);
             let original_history_len = conversation_guard.len();
             let result = context_manager::get_new_context_messages_and_metadata(
                 &conversation_guard,
@@ -3541,10 +3541,8 @@ impl AgentLoop {
                 }));
             }
 
-            // Truncate thinking blocks and compact older read_file results before adding new message.
-            // This prevents token bloat and keeps context bounded across long multi-file turns.
+            // Pre-request compaction already collapsed aged results this turn.
             truncate_old_thinking_blocks(&mut history);
-            compact_old_read_results(&mut history);
 
             history.push(StorageMessage {
                 id: Some(Self::next_message_id(&self.message_counter)),
@@ -6016,16 +6014,35 @@ fn truncate_thinking_text(thinking: &mut String, token_limit: usize) {
     }
 }
 
-/// Compacts older `read_file` results in the conversation history, preserving
-/// the most recent `RECENT_READS_TO_PRESERVE` reads in full with all anchors.
-/// Earlier reads are collapsed to their header and a brief placeholder note,
-/// preventing multi-file exploration loops from ballooning context size past
-/// provider limits (e.g. 100KB+ in 15 turns).
-fn compact_old_read_results(history: &mut [StorageMessage]) {
-    const RECENT_READS_TO_PRESERVE: usize = 2;
+/// Compacts older tool results in the conversation history, preserving
+/// the most recent `RECENT_TO_PRESERVE` reads and shell outputs in full.
+/// Stale bulk output costs tokens on every later turn without adding new
+/// information, so earlier large results collapse to a placeholder.
+fn compact_old_tool_results(history: &mut [StorageMessage]) {
+    const RECENT_TO_PRESERVE: usize = 2;
     const MIN_BYTES_TO_COMPACT: usize = 1000;
 
+    let bytes_before = tool_result_text_bytes(history);
+
+    let mut tool_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for message in history.iter() {
+        if message.role != MessageRole::Assistant {
+            continue;
+        }
+        let MessageContent::AssistantBlocks(blocks) = &message.content else {
+            continue;
+        };
+        for block in blocks {
+            if let AssistantContentBlock::ToolUse(tool_use) = block {
+                tool_names.insert(tool_use.id.clone(), tool_use.name.clone());
+            }
+        }
+    }
+
     let mut read_result_count = 0;
+    let mut shell_result_count = 0;
+    let mut search_result_count = 0;
 
     for message in history.iter_mut().rev() {
         if message.role != MessageRole::User {
@@ -6051,30 +6068,110 @@ fn compact_old_read_results(history: &mut [StorageMessage]) {
                     _ => false,
                 }),
             };
+            let tool_name = tool_names.get(tr.tool_use_id.as_str());
+            let is_shell_result =
+                !is_read_result && tool_name.is_some_and(|name| *name == "execute_command");
+            let is_search_result = !is_read_result
+                && !is_shell_result
+                && tool_name.is_some_and(|name| *name == "search_files" || *name == "list_files");
 
-            if !is_read_result {
+            // Edit results and other tools are never collapsed here.
+            let counter = if is_read_result {
+                &mut read_result_count
+            } else if is_shell_result {
+                &mut shell_result_count
+            } else if is_search_result {
+                &mut search_result_count
+            } else {
                 continue;
-            }
+            };
 
-            read_result_count += 1;
-            if read_result_count <= RECENT_READS_TO_PRESERVE {
+            *counter += 1;
+            if *counter <= RECENT_TO_PRESERVE {
                 continue;
             }
 
             match &mut tr.content {
                 ToolResultContent::Text(text) => {
-                    compact_single_read_text(text, MIN_BYTES_TO_COMPACT);
+                    if is_read_result {
+                        compact_single_read_text(text, MIN_BYTES_TO_COMPACT);
+                    } else if is_search_result {
+                        compact_single_search_text(text, MIN_BYTES_TO_COMPACT);
+                    } else {
+                        compact_single_shell_text(text, MIN_BYTES_TO_COMPACT);
+                    }
                 }
                 ToolResultContent::Blocks(b) => {
                     for cb in b.iter_mut() {
                         if let ToolResultContentBlock::Text { text } = cb {
-                            compact_single_read_text(text, MIN_BYTES_TO_COMPACT);
+                            if is_read_result {
+                                compact_single_read_text(text, MIN_BYTES_TO_COMPACT);
+                            } else if is_search_result {
+                                compact_single_search_text(text, MIN_BYTES_TO_COMPACT);
+                            } else {
+                                compact_single_shell_text(text, MIN_BYTES_TO_COMPACT);
+                            }
                         }
                     }
                 }
             }
         }
     }
+
+    // One line per turn keeps every debug log a running record of what
+    // compaction actually saved, so future sessions measure themselves.
+    let bytes_after = tool_result_text_bytes(history);
+    tracing::debug!(
+        bytes_before,
+        bytes_after,
+        saved = bytes_before.saturating_sub(bytes_after),
+        "history compaction collapsed stale tool results"
+    );
+}
+
+fn tool_result_text_bytes(history: &[StorageMessage]) -> usize {
+    history
+        .iter()
+        .filter(|msg| msg.role == MessageRole::User)
+        .filter_map(|msg| match &msg.content {
+            MessageContent::UserBlocks(blocks) => Some(blocks),
+            _ => None,
+        })
+        .flat_map(|blocks| blocks.iter())
+        .filter_map(|block| match block {
+            UserContentBlock::ToolResult(tr) => Some(&tr.content),
+            _ => None,
+        })
+        .map(|content| match content {
+            ToolResultContent::Text(text) => text.len(),
+            ToolResultContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|cb| match cb {
+                    ToolResultContentBlock::Text { text } => Some(text.len()),
+                    _ => None,
+                })
+                .sum(),
+        })
+        .sum()
+}
+
+fn compact_single_shell_text(text: &mut String, min_bytes: usize) {
+    if text.len() <= min_bytes {
+        return;
+    }
+
+    let header_end = text.find('\n').unwrap_or(text.len());
+    let header = &text[..header_end.min(text.len())];
+
+    let total_bytes = text.len();
+    let total_lines = text.lines().count();
+
+    *text = format!(
+        "{}\n[... Earlier shell output ({} lines, {} bytes) collapsed to save context space. Re-run the command for fresh output.]",
+        header.trim_end(),
+        total_lines,
+        total_bytes
+    );
 }
 
 fn compact_single_read_text(text: &mut String, min_bytes: usize) {
@@ -6092,36 +6189,33 @@ fn compact_single_read_text(text: &mut String, min_bytes: usize) {
     let total_bytes = text.len();
     let total_lines = text.lines().count();
 
-    // Preserve up to 80 anchored lines so failure diagnostics and
-    // later summarization still have usable anchors; collapse only bulk.
-    let preserved: Vec<&str> = text
-        .lines()
-        .skip(1)
-        .filter(|line| {
-            crate::core::hash_utils::strip_line_number_gutter(line)
-                .split_once('§')
-                .is_some_and(|(prefix, _)| {
-                    !prefix.is_empty() && prefix.chars().all(char::is_alphanumeric)
-                })
-        })
-        .take(80)
-        .collect();
-    if preserved.is_empty() {
-        *text = format!(
-            "{}\n[... Earlier read content ({} lines, {} bytes) collapsed to save context space. Call read_file again if fresh anchors are needed.]",
-            header.trim_end(),
-            total_lines,
-            total_bytes
-        );
-    } else {
-        *text = format!(
-            "{}\n[... Earlier read content ({} lines, {} bytes) collapsed to save context space. Preserved anchors (copy EXACTLY):\n{}\nCall read_file again if fresh anchors are needed.]",
-            header.trim_end(),
-            total_lines,
-            total_bytes,
-            preserved.join("\n")
-        );
+    // Retaining anchored lines kept most reads at full size on every later
+    // turn, while one fresh read_file restores citable anchors on demand.
+    *text = format!(
+        "{}\n[... Earlier read content ({} lines, {} bytes) collapsed to save context space. Call read_file again if fresh anchors are needed.]",
+        header.trim_end(),
+        total_lines,
+        total_bytes
+    );
+}
+
+fn compact_single_search_text(text: &mut String, min_bytes: usize) {
+    if text.len() <= min_bytes {
+        return;
     }
+
+    let header_end = text.find('\n').unwrap_or(text.len());
+    let header = &text[..header_end.min(text.len())];
+
+    let total_bytes = text.len();
+    let total_lines = text.lines().count();
+
+    *text = format!(
+        "{}\n[... Earlier search results ({} lines, {} bytes) collapsed to save context space. Re-run search_files or list_files for fresh results.]",
+        header.trim_end(),
+        total_lines,
+        total_bytes
+    );
 }
 
 #[cfg(test)]
@@ -11904,7 +11998,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[test]
-    fn test_compact_old_read_results_preserves_recent_reads() {
+    fn test_compact_old_tool_results_preserves_recent_reads() {
         let make_read_msg = |file: &str, size: usize| StorageMessage {
             id: None,
             role: MessageRole::User,
@@ -11932,7 +12026,7 @@ Irrespective of whether additional information or instructions are given, you ar
             make_read_msg("file3.rs", 5000),
         ];
 
-        compact_old_read_results(&mut history);
+        compact_old_tool_results(&mut history);
 
         // Most recent two reads (file2 and file3) must be preserved in full
         let get_text = |msg: &StorageMessage| match &msg.content {
@@ -11962,6 +12056,252 @@ Irrespective of whether additional information or instructions are given, you ar
         );
         assert!(file1_text.starts_with("[File: file1.rs, Hash: abc12345] (100 lines total)"));
         assert!(file1_text.contains("Earlier read content"));
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_drops_aged_anchors() {
+        let anchored_body: String = (1..=80)
+            .map(|n| format!("{n}: ABC{n:04}X§line content number {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let make_old_read = |file: &str| StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                crate::providers::ToolResultBlock {
+                    tool_use_id: format!("call_{file}"),
+                    content: crate::providers::ToolResultContent::Text(format!(
+                        "[File: {file}, Hash: abc12345] (85 lines total)\n[Anchors: ...]\n{anchored_body}"
+                    )),
+                    shared: crate::providers::SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+
+        let mut history = vec![
+            make_old_read("old1.rs"),
+            make_old_read("old2.rs"),
+            make_old_read("old3.rs"),
+        ];
+
+        compact_old_tool_results(&mut history);
+
+        let get_text = |msg: &StorageMessage| match &msg.content {
+            MessageContent::UserBlocks(blocks) => match &blocks[0] {
+                UserContentBlock::ToolResult(tr) => match &tr.content {
+                    ToolResultContent::Text(t) => t.clone(),
+                    _ => panic!("Expected text"),
+                },
+                _ => panic!("Expected ToolResult"),
+            },
+            _ => panic!("Expected UserBlocks"),
+        };
+
+        let aged = get_text(&history[0]);
+        assert!(aged.contains("Earlier read content"));
+        assert!(
+            aged.len() < 1000,
+            "aged read must collapse near header size, got {} bytes",
+            aged.len()
+        );
+        assert!(
+            get_text(&history[2]).contains("line content number 80"),
+            "most recent read must keep full content"
+        );
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_collapses_stale_search_results() {
+        let make_search_pair = |n: usize, size: usize| -> Vec<StorageMessage> {
+            let id = format!("call_search_{n}");
+            vec![
+                StorageMessage {
+                    id: None,
+                    role: MessageRole::Assistant,
+                    content: MessageContent::AssistantBlocks(vec![
+                        AssistantContentBlock::ToolUse(ToolUseBlock {
+                            id: id.clone(),
+                            name: "search_files".to_string(),
+                            input: serde_json::json!({}),
+                            shared: SharedContentFields {
+                                call_id: None,
+                                signature: None,
+                            },
+                            reasoning_details: None,
+                        }),
+                    ]),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+                StorageMessage {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                        crate::providers::ToolResultBlock {
+                            tool_use_id: id,
+                            content: ToolResultContent::Text(format!(
+                                "matches\n{}",
+                                "z".repeat(size)
+                            )),
+                            shared: SharedContentFields {
+                                call_id: None,
+                                signature: None,
+                            },
+                        },
+                    )]),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+            ]
+        };
+
+        let mut history = Vec::new();
+        for n in 1..=3 {
+            history.extend(make_search_pair(n, 5000));
+        }
+
+        compact_old_tool_results(&mut history);
+
+        let get_result_text = |idx: usize| match &history[idx].content {
+            MessageContent::UserBlocks(blocks) => match &blocks[0] {
+                UserContentBlock::ToolResult(tr) => match &tr.content {
+                    ToolResultContent::Text(t) => t.clone(),
+                    _ => panic!("Expected text"),
+                },
+                _ => panic!("Expected ToolResult"),
+            },
+            _ => panic!("Expected UserBlocks"),
+        };
+
+        let stale = get_result_text(1);
+        assert!(stale.contains("Earlier search results"));
+        assert!(
+            !stale.contains(&"z".repeat(5000)),
+            "stale search results should be compacted"
+        );
+        assert!(
+            get_result_text(5).contains(&"z".repeat(5000)),
+            "most recent search results must not be compacted"
+        );
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_collapses_stale_shell_output() {
+        let make_shell_pair = |n: usize, tool: &str, size: usize| -> Vec<StorageMessage> {
+            let id = format!("call_{tool}_{n}");
+            vec![
+                StorageMessage {
+                    id: None,
+                    role: MessageRole::Assistant,
+                    content: MessageContent::AssistantBlocks(vec![
+                        AssistantContentBlock::ToolUse(ToolUseBlock {
+                            id: id.clone(),
+                            name: tool.to_string(),
+                            input: serde_json::json!({}),
+                            shared: SharedContentFields {
+                                call_id: None,
+                                signature: None,
+                            },
+                            reasoning_details: None,
+                        }),
+                    ]),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+                StorageMessage {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                        crate::providers::ToolResultBlock {
+                            tool_use_id: id,
+                            content: ToolResultContent::Text(format!(
+                                "first line\n{}",
+                                "y".repeat(size)
+                            )),
+                            shared: SharedContentFields {
+                                call_id: None,
+                                signature: None,
+                            },
+                        },
+                    )]),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+            ]
+        };
+
+        let mut history = Vec::new();
+        for pair in make_shell_pair(1, "execute_command", 5000) {
+            history.push(pair);
+        }
+        for pair in make_shell_pair(2, "execute_command", 5000) {
+            history.push(pair);
+        }
+        for pair in make_shell_pair(3, "execute_command", 5000) {
+            history.push(pair);
+        }
+        for pair in make_shell_pair(0, "execute_command", 100) {
+            history.insert(0, pair);
+        }
+        for pair in make_shell_pair(9, "edit_file", 5000) {
+            history.push(pair);
+        }
+
+        let bytes_before = tool_result_text_bytes(&history);
+        compact_old_tool_results(&mut history);
+        let bytes_after = tool_result_text_bytes(&history);
+        assert!(
+            bytes_before - bytes_after >= 4000,
+            "collapsing one 5KB shell output must save bulk bytes, before={bytes_before} after={bytes_after}"
+        );
+
+        let texts: Vec<String> = history
+            .iter()
+            .filter(|msg| msg.role == MessageRole::User)
+            .map(|msg| match &msg.content {
+                MessageContent::UserBlocks(blocks) => match &blocks[0] {
+                    UserContentBlock::ToolResult(tr) => match &tr.content {
+                        ToolResultContent::Text(t) => t.clone(),
+                        _ => panic!("Expected text"),
+                    },
+                    _ => panic!("Expected ToolResult"),
+                },
+                _ => panic!("Expected UserBlocks"),
+            })
+            .collect();
+        assert_eq!(texts.len(), 5);
+        assert!(
+            texts[2].contains(&"y".repeat(5000)),
+            "Second most recent shell output must not be compacted"
+        );
+        assert!(
+            texts[3].contains(&"y".repeat(5000)),
+            "Most recent shell output must not be compacted"
+        );
+        assert!(
+            !texts[1].contains(&"y".repeat(5000))
+                && texts[1].contains("Earlier shell output"),
+            "Oldest large shell output must be collapsed, got: {}",
+            &texts[1][..texts[1].len().min(200)]
+        );
+        assert!(
+            texts[0].contains(&"y".repeat(100)),
+            "Small shell output must not be compacted"
+        );
+        assert!(
+            texts[4].contains(&"y".repeat(5000)),
+            "Edit results must never be collapsed here"
+        );
     }
 
     #[tokio::test]
