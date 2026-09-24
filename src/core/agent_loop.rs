@@ -6505,12 +6505,36 @@ fn compact_single_read_text(text: &mut String, min_bytes: usize) {
     let total_bytes = text.len();
     let total_lines = text.lines().count();
 
-    *text = format!(
-        "{}\n[... Earlier read content ({} lines, {} bytes) collapsed to save context space. Call read_file again if fresh anchors are needed.]",
-        header.trim_end(),
-        total_lines,
-        total_bytes
-    );
+    // Preserve up to 80 anchored lines so failure diagnostics and
+    // later summarization still have usable anchors; collapse only bulk.
+    let preserved: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .filter(|line| {
+            crate::core::hash_utils::strip_line_number_gutter(line)
+                .split_once('§')
+                .is_some_and(|(prefix, _)| {
+                    !prefix.is_empty() && prefix.chars().all(char::is_alphanumeric)
+                })
+        })
+        .take(80)
+        .collect();
+    if preserved.is_empty() {
+        *text = format!(
+            "{}\n[... Earlier read content ({} lines, {} bytes) collapsed to save context space. Call read_file again if fresh anchors are needed.]",
+            header.trim_end(),
+            total_lines,
+            total_bytes
+        );
+    } else {
+        *text = format!(
+            "{}\n[... Earlier read content ({} lines, {} bytes) collapsed to save context space. Preserved anchors (copy EXACTLY):\n{}\nCall read_file again if fresh anchors are needed.]",
+            header.trim_end(),
+            total_lines,
+            total_bytes,
+            preserved.join("\n")
+        );
+    }
 }
 
 #[cfg(test)]
