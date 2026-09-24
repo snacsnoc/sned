@@ -139,7 +139,7 @@ pub enum FileEditorError {
     ValidationError(String),
 
     #[error(
-        "File edit batch rejected: {message} {failed_count} edit(s) failed; {withheld_count} otherwise-valid edit(s) were withheld. No edits were applied to this file."
+        "File edit batch rejected: {message} {failed_count} edit(s) failed. No edits were applied to this file."
     )]
     AtomicBatchRejected {
         message: String,
@@ -3007,7 +3007,7 @@ impl FileEditor {
 
         let (resolved_edits, failed_edits) = self.executor.resolve_edits(edits, lines, line_hashes);
 
-        if !failed_edits.is_empty() {
+        if !failed_edits.is_empty() && resolved_edits.is_empty() {
             let failure_messages: Vec<String> = failed_edits
                 .iter()
                 .map(|f| {
@@ -3018,7 +3018,7 @@ impl FileEditor {
             return Err(FileEditorError::atomic_batch_rejected(
                 failure_messages.join("\n\n"),
                 failed_edits.len(),
-                resolved_edits.len(),
+                0,
             ));
         }
 

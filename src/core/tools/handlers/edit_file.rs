@@ -2518,6 +2518,17 @@ impl EditFileHandler {
             let result =
                 processor.apply_batch(&mut prepared, &batch.absolute_path, &batch.display_path);
 
+            // Latch a re-read only when a failure impugns the file's
+            // remaining anchors; other failures resolve against untouched
+            // lines, where a forced re-read would be a wasted turn.
+            let anchors_suspect = prepared.failed_edits.iter().any(|failed| {
+                EditFailureReason::from_diagnostic(&failed.error).requires_reread()
+            });
+            if anchors_suspect {
+                Self::mark_must_reread(state, &batch.absolute_path).await;
+                reread_paths.insert(batch.absolute_path.clone());
+            }
+
             if result.success {
                 #[cfg(test)]
                 if self.invalid_provenance {
@@ -7254,7 +7265,7 @@ edition = "2021"
     }
 
     #[tokio::test]
-    async fn test_same_file_mixed_valid_and_stale_edits_apply_nothing() {
+    async fn test_same_file_mixed_valid_and_stale_edits_applies_valid() {
         let _guard = TEST_MUTEX.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("atomic.txt");
@@ -7264,15 +7275,16 @@ edition = "2021"
         let anchors = anchor_mgr.reconcile(
             file_path.to_str().unwrap(),
             &split_content_lines(original),
-            Some("same-file-atomic"),
+            Some("same-file-partial"),
         );
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
-            Arc::new(tokio::sync::Mutex::new(TaskState::default())),
+            Arc::clone(&state),
             None,
             dir.path().to_path_buf(),
             anchor_mgr,
             false,
-            "same-file-atomic".to_string(),
+            "same-file-partial".to_string(),
             None,
             true,
             Arc::new(crate::cli::output::StderrOutputWriter),
@@ -7288,13 +7300,84 @@ edition = "2021"
 
         let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
             .await
-            .expect_err("one stale anchor must reject its whole file batch");
+            .expect_err("a stale anchor must still fail the overall request");
+        let output = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("otherwise-valid edit(s) were withheld")
+            output.contains("1 edit(s) applied"),
+            "valid edit must apply, got: {output}"
         );
-        assert_eq!(std::fs::read_to_string(file_path).unwrap(), original);
+        assert!(
+            output.contains("1 edit(s) failed"),
+            "stale edit must be reported, got: {output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "changed\nsecond\n"
+        );
+        assert!(
+            state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&crate::core::tools::canonical_path_key(&file_path)),
+            "a resolution failure must latch must_reread even when siblings applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_same_file_whitespace_failure_does_not_latch_reread() {
+        let _guard = TEST_MUTEX.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("ws.txt");
+        let original = "first\n  second\n";
+        std::fs::write(&file_path, original).unwrap();
+        let anchor_mgr = AnchorStateManager::new();
+        let anchors = anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &split_content_lines(original),
+            Some("same-file-whitespace"),
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let ctx = ToolContext::new(
+            Arc::clone(&state),
+            None,
+            dir.path().to_path_buf(),
+            anchor_mgr,
+            false,
+            "same-file-whitespace".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        );
+        let params = serde_json::json!({"files": [{
+            "path": "ws.txt",
+            "edits": [
+                {"anchor": format!("{}§first", anchors[0]), "text": "changed"},
+                {"old_text": "second", "new_text": "SECOND"}
+            ]
+        }]});
+
+        let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
+            .await
+            .expect_err("a failed edit must still fail the overall request");
+        let output = error.to_string();
+        assert!(
+            output.contains("1 edit(s) applied"),
+            "valid edit must apply, got: {output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "changed\n  second\n"
+        );
+        assert!(
+            !state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&crate::core::tools::canonical_path_key(&file_path)),
+            "whitespace failures resolve against untouched lines; a forced re-read would be a wasted turn, got: {output}"
+        );
     }
 
     #[tokio::test]

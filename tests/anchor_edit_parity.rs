@@ -1,6 +1,6 @@
 use sned::core::edit_batch::BatchProcessor;
 use sned::core::file_editor::{
-    AnchorStateManager, ApplyOutcome, Edit, EditExecutor, FileEditorError, split_content_lines,
+    AnchorStateManager, ApplyOutcome, Edit, EditExecutor, split_content_lines,
 };
 
 fn lines(content: &str) -> Vec<String> {
@@ -152,7 +152,7 @@ fn edit_executor_validation_messages_documents_deliberate_divergence() {
 }
 
 #[test]
-fn file_editor_documents_atomic_divergence_from_ts_partial_success() {
+fn file_editor_applies_resolved_edits_despite_one_unresolved() {
     let task_id = "parity-file-editor";
     let path = "/tmp/sned-file-editor-parity.txt";
     let content = "line 1\nline 2\nline 3\nline 4\nline 5";
@@ -204,7 +204,7 @@ fn file_editor_documents_atomic_divergence_from_ts_partial_success() {
     ];
 
     let processor = BatchProcessor::new(sned::core::edit_batch::DiffMode::Full);
-    let error = processor
+    let mut prepared = processor
         .prepare_edits(
             path,
             "sned-file-editor-parity.txt",
@@ -212,20 +212,20 @@ fn file_editor_documents_atomic_divergence_from_ts_partial_success() {
             &edits,
             &anchor_mgr.reconcile(path, &lines(content), Some(task_id)),
         )
-        .expect_err("one unresolved edit must reject the entire file batch");
+        .expect("one unresolved edit must not withhold resolved siblings");
+    assert_eq!(prepared.resolved_edits.len(), 2);
+    assert_eq!(prepared.failed_edits.len(), 1);
 
-    let FileEditorError::AtomicBatchRejected {
-        message,
-        failed_count,
-        withheld_count,
-        ..
-    } = error
-    else {
-        panic!("expected an atomic batch rejection, got: {error}");
-    };
-    assert_eq!(failed_count, 1);
-    assert_eq!(withheld_count, 2);
-    assert!(message.contains("not found in the file"));
+    let result = processor.apply_batch(&mut prepared, path, "sned-file-editor-parity.txt");
+    assert!(result.success);
+    assert_eq!(result.resolved_count, 2);
+    assert_eq!(result.failed_count, 1);
+    let final_content = result
+        .final_content
+        .expect("partial batch must produce content");
+    assert!(final_content.contains("new line 2"));
+    assert!(final_content.contains("new line 4"));
+    assert!(final_content.contains("line 3"));
 }
 
 #[test]

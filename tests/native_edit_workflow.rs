@@ -992,7 +992,7 @@ async fn native_workflow_duplicate_occurrences_outside_range() {
 }
 
 #[tokio::test]
-async fn native_workflow_atomic_rejection_reread_and_retry() {
+async fn native_workflow_partial_success_applies_valid_and_latches_reread() {
     let w = Workflow::new(b"alpha\nbeta\n");
     let anchors = w.read(None).await;
     w.edit(json!([{"anchor": anchors[0], "text": "A"}]))
@@ -1011,12 +1011,20 @@ async fn native_workflow_atomic_rejection_reread_and_retry() {
         metadata.required_next_step,
         Some(ToolRequiredNextStep::ReadFile)
     );
-    assert!(error.to_string().contains("read_file"));
-    w.assert_bytes(b"A\nbeta\n");
+    let output = error.to_string();
+    assert!(
+        output.contains("1 edit(s) applied"),
+        "valid sibling must apply, got: {output}"
+    );
+    assert!(
+        output.contains("1 edit(s) failed"),
+        "stale sibling must be reported, got: {output}"
+    );
+    w.assert_bytes(b"A\nB\n");
     w.assert_reread(true).await;
     let fresh = w.read(None).await;
     w.assert_reread(false).await;
-    w.edit(json!([{"anchor": fresh[0], "text": "final"}, {"anchor": fresh[1], "text": "B"}]))
+    w.edit(json!([{"anchor": fresh[0], "text": "final"}]))
         .await
         .unwrap();
     w.assert_bytes(b"final\nB\n");

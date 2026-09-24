@@ -270,10 +270,14 @@ impl BatchProcessor {
             ));
         }
 
+        // Withhold only when nothing resolved: siblings resolve
+        // independently against the original snapshot, and anchor-trust
+        // failures latch must_reread downstream. Overlap and assembly
+        // failures still reject at apply time.
         let (resolved_edits, failed_edits) =
             self.executor.resolve_edits(edits, &lines, line_hashes);
 
-        if !failed_edits.is_empty() {
+        if !failed_edits.is_empty() && resolved_edits.is_empty() {
             let failure_messages: Vec<String> = failed_edits
                 .iter()
                 .map(|f| {
@@ -284,7 +288,7 @@ impl BatchProcessor {
             return Err(FileEditorError::atomic_batch_rejected(
                 failure_messages.join("\n\n"),
                 failed_edits.len(),
-                resolved_edits.len(),
+                0,
             ));
         }
 
@@ -1154,37 +1158,37 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_processor_rejects_mixed_resolved_and_failed_edits_before_apply() {
-        let task_id = "overlap_count_test";
+    fn test_batch_processor_applies_resolved_edits_despite_failed_ones() {
+        let task_id = "partial_apply_test";
         let anchor_mgr = AnchorStateManager::new();
         anchor_mgr.reset(Some(task_id));
 
         let processor = BatchProcessor::new(DiffMode::Full);
 
-        let content = "line1\nline2\nline3";
+        let content = "line1\nline2\nline3\nline4";
         let lines = split_content_lines(content);
-        let hashes = anchor_mgr.reconcile("/tmp/overlap.rs", &lines, Some(task_id));
+        let hashes = anchor_mgr.reconcile("/tmp/partial.rs", &lines, Some(task_id));
 
         let edits = vec![
             Edit {
                 anchor: format!("{}§line1", hashes[0]),
-                end_anchor: Some(format!("{}§line2", hashes[1])),
+                end_anchor: None,
                 edit_type: "replace".to_string(),
                 text: "alpha".to_string(),
                 content: None,
                 old_text: None,
             },
             Edit {
-                anchor: format!("{}§line2", hashes[1]),
-                end_anchor: Some(format!("{}§line3", hashes[2])),
+                anchor: format!("{}§line4", hashes[3]),
+                end_anchor: None,
                 edit_type: "replace".to_string(),
-                text: "beta".to_string(),
+                text: "delta".to_string(),
                 content: None,
                 old_text: None,
             },
             Edit {
                 anchor: "bogus§missing".to_string(),
-                end_anchor: Some("bogus§missing".to_string()),
+                end_anchor: None,
                 edit_type: "replace".to_string(),
                 text: "gamma".to_string(),
                 content: None,
@@ -1192,18 +1196,20 @@ mod tests {
             },
         ];
 
-        let error = processor
-            .prepare_edits("/tmp/overlap.rs", "overlap.rs", content, &edits, &hashes)
-            .expect_err("one unresolved anchor must reject the entire file batch");
+        let mut prepared = processor
+            .prepare_edits("/tmp/partial.rs", "partial.rs", content, &edits, &hashes)
+            .expect("one bad anchor must not withhold resolved edits");
+        assert_eq!(prepared.resolved_edits.len(), 2);
+        assert_eq!(prepared.failed_edits.len(), 1);
 
-        assert!(matches!(
-            error,
-            FileEditorError::AtomicBatchRejected {
-                failed_count: 1,
-                withheld_count: 2,
-                ..
-            }
-        ));
+        let result = processor.apply_batch(&mut prepared, "/tmp/partial.rs", "partial.rs");
+        assert!(result.success);
+        assert_eq!(result.resolved_count, 2);
+        assert_eq!(result.failed_count, 1);
+        let final_content = result.final_content.expect("partial batch must produce content");
+        assert!(final_content.contains("alpha"));
+        assert!(final_content.contains("delta"));
+        assert!(final_content.contains("line2"));
     }
 
     #[test]
