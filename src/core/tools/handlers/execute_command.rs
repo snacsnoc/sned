@@ -288,13 +288,28 @@ impl SandboxEnvReport {
 fn is_secret_like(name: &str) -> bool {
     let upper = name.to_uppercase();
     upper.ends_with("_KEY")
+        || upper.ends_with("_KEYS")
+        || upper.ends_with("_KEY_ID")
+        || upper.contains("_KEY_")
         || upper.ends_with("_SECRET")
+        || upper.ends_with("_SECRETS")
         || upper.ends_with("_TOKEN")
+        || upper.ends_with("_TOKENS")
         || upper.ends_with("_PASSWORD")
         || upper.ends_with("_PASSWD")
+        || upper.ends_with("_PASS")
+        || upper.contains("_PASS_")
         || upper.ends_with("_CREDENTIAL")
+        || upper.ends_with("_CREDENTIALS")
         || upper.ends_with("_PRIVATE_KEY")
-        || matches!(upper.as_str(), "KEY" | "SECRET" | "TOKEN" | "PASSWORD")
+        || upper.ends_with("_PAT")
+        || upper.ends_with("_AUTH")
+        || upper.ends_with("_COOKIE")
+        || upper.ends_with("_COOKIES")
+        || matches!(
+            upper.as_str(),
+            "KEY" | "SECRET" | "TOKEN" | "PASSWORD" | "PASS" | "PAT" | "AUTH"
+        )
 }
 fn command_output_limit() -> usize {
     std::env::var("SNED_COMMAND_OUTPUT_LIMIT")
@@ -1568,24 +1583,21 @@ impl ExecuteCommandHandler {
             "HOSTNAME",
         ];
 
-        static SNED_ALLOW_ENV: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-        let extra = SNED_ALLOW_ENV.get_or_init(|| {
-            std::env::var("SNED_ALLOW_ENV")
-                .unwrap_or_default()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| {
-                    if s.is_empty() || s.starts_with("SNED_") {
-                        return false;
-                    }
-                    if is_secret_like(s) {
-                        tracing::warn!(var = %s, "SNED_ALLOW_ENV entry blocked (secret-like name ending)");
-                        return false;
-                    }
-                    true
-                })
-                .collect::<Vec<_>>()
-        });
+        let extra: Vec<String> = std::env::var("SNED_ALLOW_ENV")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| {
+                if s.is_empty() || s.starts_with("SNED_") {
+                    return false;
+                }
+                if is_secret_like(s) {
+                    tracing::warn!(var = %s, "SNED_ALLOW_ENV entry blocked (secret-like name ending)");
+                    return false;
+                }
+                true
+            })
+            .collect();
 
         let allow_set: HashMap<&str, bool> = BASE_ALLOWLIST
             .iter()
