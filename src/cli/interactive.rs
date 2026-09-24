@@ -2935,25 +2935,10 @@ async fn invalidate_restored_file_context(
             state.consecutive_reads.remove(&key);
             state.last_read_turn.remove(&key);
             state.recent_read_windows.remove(&key);
-            // A restored checkpoint wipes out the cumulative edit history
-            // too — the edit counts were tracked against the bytes the
-            // model just threw away. Without this, the next execute_command
-            // failure would surface an edit-thrashing diagnostic for
-            // edits that no longer exist on disk.
-            state.consecutive_edits.remove(&key);
-            // Mirror the edit-success counter: a restored checkpoint
-            // discards the bytes the model was trying to edit, so the
-            // failure-loop counter against those (now-reverted) bytes is
-            // also stale. Without clearing, the next rejected edit attempt
-            // would resume from a high baseline and trigger the retry
-            // diagnostic too early on a file the model hasn't actually
-            // failed against since the restore.
-            state.consecutive_edit_failures.remove(&key);
             // A restored checkpoint invalidates the model's file snapshot. Require a
             // fresh read so reconciliation can bind anchors to the restored bytes.
             state.must_reread_before_edit.insert(key);
         }
-        state.consecutive_inspection_turns = 0;
     }
 }
 
@@ -13592,21 +13577,15 @@ mod tests {
         );
     }
 
-    /// Bug 1 (Audit): restoring a checkpoint must wipe `consecutive_edits`
-    /// alongside the three read-tracking maps. Otherwise the next
-    /// build failure after a restore would surface the thrashing
-    /// diagnostic for edits that no longer exist on disk — a false
-    /// positive that would push the model to act on stale context.
+    /// Restoring a checkpoint must wipe the three read-tracking maps so a
+    /// post-restore verification read in the same turn is not skipped and
+    /// the detector does not see pre-restore windows after the bytes changed.
     #[tokio::test]
-    async fn test_invalidate_restored_file_context_clears_consecutive_edits() {
+    async fn test_invalidate_restored_file_context_clears_read_tracking() {
         use crate::core::agent_types::TaskState;
         let inner_state = Arc::new(Mutex::new(TaskState::default()));
         {
             let mut guard = inner_state.lock().await;
-            // Simulate three successful edits to a file plus four reads.
-            guard
-                .consecutive_edits
-                .insert("/tmp/restored.c".to_string(), 3);
             guard
                 .consecutive_reads
                 .insert("/tmp/restored.c".to_string(), 4);
@@ -13627,11 +13606,6 @@ mod tests {
         )
         .await;
         let guard = inner_state.lock().await;
-        assert!(
-            guard.consecutive_edits.is_empty(),
-            "restored checkpoint must clear consecutive_edits, got: {:?}",
-            guard.consecutive_edits
-        );
         assert!(guard.consecutive_reads.is_empty());
         assert!(guard.last_read_turn.is_empty());
         assert!(guard.recent_read_windows.is_empty());

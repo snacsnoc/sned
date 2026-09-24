@@ -179,28 +179,6 @@ pub struct TaskState {
     /// only for paths whose bytes may have changed externally.
     pub read_file_snapshots:
         std::collections::HashMap<String, (u64, Option<std::time::SystemTime>)>,
-    /// Number of consecutive successful edits per file with no intervening
-    /// successful build/test run. When an execute_command result indicates
-    /// a build failure and any value in this map is ≥3, the agent_loop
-    /// surfaces an edit-compile thrashing diagnostic instructing the model
-    /// to step back and review the full diff instead of making localized
-    /// line edits in a loop. Cleared on any successful build/test result.
-    pub consecutive_edits: std::collections::HashMap<String, u32>,
-    /// Number of consecutive failed edits per file with no intervening
-    /// successful edit. When the model retries the same broken edit batch
-    /// (off-by-one anchors, multi-line `anchor` fields, stale content, etc.)
-    /// without ever writing to disk, `consecutive_edits` never grows and
-    /// the build-failure circuit breaker stays silent. This map tracks the
-    /// complementary failure loop: any file with N consecutive rejected
-    /// edits fires a diagnostic that tells the model to stop retrying and
-    /// re-read or rethink its anchor selection. Cleared on any successful
-    /// edit or successful build/test for that file.
-    pub consecutive_edit_failures: std::collections::HashMap<String, u32>,
-    /// Number of consecutive inspection-only turns (reading/searching files)
-    /// across the session without any mutating tool or command execution.
-    /// Used by the global inspection loop circuit breaker to stop passive
-    /// exploration thrashing and compel the model to take action.
-    pub consecutive_inspection_turns: u32,
     /// Number of tool calls executed in the current turn (for subagent result reporting).
     pub turn_tool_calls: u32,
     /// Cumulative total tool calls across all turns in the session (never
@@ -284,9 +262,6 @@ impl Default for TaskState {
             last_read_turn: std::collections::HashMap::new(),
             recent_read_windows: std::collections::HashMap::new(),
             read_file_snapshots: std::collections::HashMap::new(),
-            consecutive_edits: std::collections::HashMap::new(),
-            consecutive_edit_failures: std::collections::HashMap::new(),
-            consecutive_inspection_turns: 0,
             plan_state: None,
             last_injected_plan_state_hash: None,
             denied_tool_actions: Vec::new(),

@@ -409,11 +409,11 @@ impl ToolHandler for WriteToFileHandler {
                     };
                     {
                         // Phase 4b cleanup: mirror edit_file's per-file state
-                        // reset so the read-loop and edit-thrash detectors
-                        // see a coherent file. Without this, write_to_file
-                        // creates an asymmetry where full-rewrites leave
-                        // stale read windows + edit counts pointing at
-                        // pre-rewrite bytes. edit_file already does this in
+                        // reset so the read-loop detector sees a coherent
+                        // file. Without this, write_to_file creates an
+                        // asymmetry where full-rewrites leave stale read
+                        // windows pointing at pre-rewrite bytes.
+                        // edit_file already does this in
                         // its own Phase 4b; write_to_file must do the same
                         // because it overwrites the file in one shot rather
                         // than applying incremental edits.
@@ -423,13 +423,6 @@ impl ToolHandler for WriteToFileHandler {
                         state.last_read_turn.remove(&key);
                         state.recent_read_windows.remove(&key);
                         state.read_file_snapshots.remove(&key);
-                        // Increment consecutive_edits so a subsequent build
-                        // failure can surface the thrashing diagnostic.
-                        // Cleared by agent_loop when build/test succeeds, or
-                        // by invalidate_restored_file_context on checkpoint
-                        // restore.
-                        let count = state.consecutive_edits.entry(key).or_insert(0);
-                        *count += 1;
                     }
                     let task_id = ctx.task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
@@ -1289,22 +1282,19 @@ mod tests {
         assert_eq!(on_disk, "# Doc\n```rust\nfn inner() {}\n```\n");
     }
 
-    /// Bug 3 (Audit): write_to_file must mirror edit_file's Phase 4b
-    /// cleanup. After a successful write, the three read-tracking maps
+    /// write_to_file must mirror edit_file's Phase 4b cleanup. After a
+    /// successful write, the three read-tracking maps
     /// (consecutive_reads, last_read_turn, recent_read_windows) must be
-    /// cleared for the written file, AND consecutive_edits must be
-    /// incremented so a subsequent build failure can surface the
-    /// thrashing diagnostic. Without this, full-rewrites leave stale
-    /// state pointing at pre-rewrite bytes.
+    /// cleared for the written file. Without this, full-rewrites leave
+    /// stale state pointing at pre-rewrite bytes.
     #[tokio::test]
-    async fn test_write_to_file_phase_4b_clears_read_state_and_increments_consecutive_edits() {
+    async fn test_write_to_file_phase_4b_clears_read_state() {
         let workspace_root = TempDir::new().unwrap();
         let file_path = workspace_root.path().join("target.c");
         std::fs::write(&file_path, "int original(void) { return 0; }\n").unwrap();
 
         let handler = WriteToFileHandler::new();
         let state = std::sync::Arc::new(tokio::sync::Mutex::new(TaskState::default()));
-        // Seed stale read/edit state for this file.
         {
             let mut guard = state.lock().await;
             let key = crate::core::tools::canonical_path_key(&file_path);
@@ -1314,8 +1304,6 @@ mod tests {
             ring.push_back((1, 50));
             ring.push_back((60, 100));
             guard.recent_read_windows.insert(key.clone(), ring);
-            // Pre-existing edits so we can verify increment (not just set).
-            guard.consecutive_edits.insert(key, 2);
         }
         let anchor_mgr = AnchorStateManager::new();
         let ctx = ToolContext::new(
@@ -1354,13 +1342,6 @@ mod tests {
         assert!(
             !guard.recent_read_windows.contains_key(&key),
             "recent_read_windows must be cleared after a successful write"
-        );
-        // consecutive_edits must have been incremented from 2 to 3.
-        assert_eq!(
-            guard.consecutive_edits.get(&key).copied(),
-            Some(3),
-            "consecutive_edits must be incremented after a successful write, got: {:?}",
-            guard.consecutive_edits
         );
     }
 }
