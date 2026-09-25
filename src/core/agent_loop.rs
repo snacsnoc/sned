@@ -6043,6 +6043,7 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
     let mut read_result_count = 0;
     let mut shell_result_count = 0;
     let mut search_result_count = 0;
+    let mut edit_result_count = 0;
 
     for message in history.iter_mut().rev() {
         if message.role != MessageRole::User {
@@ -6075,13 +6076,20 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
                         || *name == "get_file_skeleton"
                 });
 
-            // Edit results and other tools are never collapsed here.
+            let is_edit_result = !is_read_result
+                && !is_shell_result
+                && !is_search_result
+                && tool_name.is_some_and(|name| *name == "edit_file");
+
+            // Other tools are never collapsed here.
             let counter = if is_read_result {
                 &mut read_result_count
             } else if is_shell_result {
                 &mut shell_result_count
             } else if is_search_result {
                 &mut search_result_count
+            } else if is_edit_result {
+                &mut edit_result_count
             } else {
                 continue;
             };
@@ -6097,6 +6105,8 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
                         compact_single_read_text(text, MIN_BYTES_TO_COMPACT);
                     } else if is_search_result {
                         compact_single_search_text(text, MIN_BYTES_TO_COMPACT);
+                    } else if is_edit_result {
+                        compact_single_edit_text(text, MIN_BYTES_TO_COMPACT);
                     } else {
                         compact_single_shell_text(text, MIN_BYTES_TO_COMPACT);
                     }
@@ -6108,6 +6118,8 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
                                 compact_single_read_text(text, MIN_BYTES_TO_COMPACT);
                             } else if is_search_result {
                                 compact_single_search_text(text, MIN_BYTES_TO_COMPACT);
+                            } else if is_edit_result {
+                                compact_single_edit_text(text, MIN_BYTES_TO_COMPACT);
                             } else {
                                 compact_single_shell_text(text, MIN_BYTES_TO_COMPACT);
                             }
@@ -6201,6 +6213,27 @@ fn compact_single_read_text(text: &mut String, min_bytes: usize) {
     // turn, while one fresh read_file restores citable anchors on demand.
     *text = format!(
         "{}\n[... Earlier read content ({} lines, {} bytes) collapsed to save context space. Call read_file again if fresh anchors are needed.]",
+        header.trim_end(),
+        total_lines,
+        total_bytes
+    );
+}
+
+fn compact_single_edit_text(text: &mut String, min_bytes: usize) {
+    if text.len() <= min_bytes {
+        return;
+    }
+
+    let header_end = text.find('\n').unwrap_or(text.len());
+    let header = &text[..header_end.min(text.len())];
+
+    let total_bytes = text.len();
+    let total_lines = text.lines().count();
+
+    // Aged edit anchors are unusable once later edits land, and the newest
+    // results stay intact for follow-up edits; the header keeps the outcome.
+    *text = format!(
+        "{}\n[... Earlier edit result ({} lines, {} bytes) collapsed to save context space. Re-read the file for fresh anchors.]",
         header.trim_end(),
         total_lines,
         total_bytes
@@ -12334,6 +12367,84 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(
             get_result_text(5).contains(&"y".repeat(5000)),
             "most recent skeleton results must not be compacted"
+        );
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_collapses_stale_edits() {
+        let make_edit_pair = |n: usize, size: usize| -> Vec<StorageMessage> {
+            let id = format!("call_edit_{n}");
+            vec![
+                StorageMessage {
+                    id: None,
+                    role: MessageRole::Assistant,
+                    content: MessageContent::AssistantBlocks(vec![
+                        AssistantContentBlock::ToolUse(ToolUseBlock {
+                            id: id.clone(),
+                            name: "edit_file".to_string(),
+                            input: serde_json::json!({}),
+                            shared: SharedContentFields {
+                                call_id: None,
+                                signature: None,
+                            },
+                            reasoning_details: None,
+                        }),
+                    ]),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+                StorageMessage {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                        crate::providers::ToolResultBlock {
+                            tool_use_id: id,
+                            content: ToolResultContent::Text(format!(
+                                "Edited 1 file(s): 1 edit(s) applied.\n\nApplied 1 edit(s) successfully (+1, -1 lines). New anchors shown below.\n{}",
+                                "w".repeat(size)
+                            )),
+                            shared: SharedContentFields {
+                                call_id: None,
+                                signature: None,
+                            },
+                        },
+                    )]),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+            ]
+        };
+
+        let mut history = Vec::new();
+        for n in 1..=3 {
+            history.extend(make_edit_pair(n, 5000));
+        }
+
+        compact_old_tool_results(&mut history);
+
+        let get_result_text = |idx: usize| match &history[idx].content {
+            MessageContent::UserBlocks(blocks) => match &blocks[0] {
+                UserContentBlock::ToolResult(tr) => match &tr.content {
+                    ToolResultContent::Text(t) => t.clone(),
+                    _ => panic!("Expected text"),
+                },
+                _ => panic!("Expected ToolResult"),
+            },
+            _ => panic!("Expected UserBlocks"),
+        };
+
+        let stale = get_result_text(1);
+        assert!(stale.starts_with("Edited 1 file(s): 1 edit(s) applied."));
+        assert!(stale.contains("Earlier edit result"));
+        assert!(
+            !stale.contains(&"w".repeat(5000)),
+            "stale edit results should be compacted"
+        );
+        assert!(
+            get_result_text(5).contains(&"w".repeat(5000)),
+            "most recent edit results must not be compacted"
         );
     }
 
