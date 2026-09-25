@@ -1895,6 +1895,23 @@ pub enum ApplyOutcome {
 #[derive(Debug, Clone, Default)]
 pub struct EditExecutor;
 
+/// Names a submitted edit by anchor (or old_text preview for block edits)
+/// so applied diffs and failure diagnostics share one vocabulary the model
+/// can match back to its batch.
+#[must_use]
+pub fn describe_edit(edit: &Edit) -> String {
+    if let Some(old_text) = &edit.old_text {
+        let preview: String = old_text.chars().take(80).collect();
+        format!("Block edit (old_text: {preview:?})")
+    } else {
+        format!(
+            "Edit (anchor: \"{}\", end_anchor: \"{}\")",
+            edit.anchor,
+            edit.end_anchor.as_deref().unwrap_or("")
+        )
+    }
+}
+
 impl EditExecutor {
     #[must_use]
     pub fn new() -> Self {
@@ -2939,21 +2956,11 @@ impl EditExecutor {
     /// Formats a failure message for an edit.
     #[must_use]
     pub fn format_failure_message(&self, edit: &Edit, error: Option<&str>) -> String {
-        let desc = if let Some(old_text) = &edit.old_text {
-            let preview: String = old_text.chars().take(80).collect();
-            format!("Block edit (old_text: {:?})", preview)
-        } else {
-            format!(
-                "Edit (anchor: \"{}\", end_anchor: \"{}\")",
-                edit.anchor,
-                edit.end_anchor.as_deref().unwrap_or("")
-            )
-        };
         let diagnostic = error.map_or_else(
             || " Incorrect selector or unexpected file content.".to_string(),
             |e| format!(" Diagnostics: {e}"),
         );
-        format!("{desc} failed.{diagnostic}")
+        format!("{} failed.{diagnostic}", describe_edit(edit))
     }
 }
 

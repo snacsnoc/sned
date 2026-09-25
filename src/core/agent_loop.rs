@@ -75,6 +75,22 @@ use crate::core::tool_output::{
 };
 
 const MAX_EDIT_RESULT_DISPLAY_LINES: usize = 10;
+/// Cap for full failed-tool params/results in the debug log, so a
+/// post-mortem stays possible without one call flooding the file.
+const DEBUG_ERROR_CONTEXT_CAP: usize = 64 * 1024;
+
+fn truncated_debug_text(text: &str) -> String {
+    let end = text.floor_char_boundary(text.len().min(DEBUG_ERROR_CONTEXT_CAP));
+    if end < text.len() {
+        format!(
+            "{}...[{} more chars truncated]",
+            &text[..end],
+            text.len() - end
+        )
+    } else {
+        text.to_string()
+    }
+}
 /// Default concurrency limit for parallel non-grouped tool execution.
 /// Prevents I/O contention when many tools run simultaneously.
 const DEFAULT_TOOL_CONCURRENCY: usize = 12;
@@ -4473,6 +4489,15 @@ impl AgentLoop {
                     result_preview = %&result_output.text[..result_output.text.floor_char_boundary(result_output.text.len().min(80))],
                     "tool result paired with ID"
                 );
+                if result_output.is_error {
+                    tracing::debug!(
+                        tool_id = %tool_id,
+                        tool_name = %tool_name,
+                        params = %truncated_debug_text(&tool_params.to_string()),
+                        result = %truncated_debug_text(&result_output.text),
+                        "tool error full context"
+                    );
+                }
 
                 if tool_name == "attempt_completion" && !result_output.is_error {
                     completion_result = Some(result_output.text.clone());
@@ -6269,6 +6294,16 @@ fn compact_single_search_text(text: &mut String, min_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_debug_text_passes_short_text_through() {
+        assert_eq!(truncated_debug_text("short"), "short");
+        let capped = "x".repeat(DEBUG_ERROR_CONTEXT_CAP + 10);
+        let out = truncated_debug_text(&capped);
+        assert!(out.starts_with(&"x".repeat(100)));
+        assert!(out.ends_with("more chars truncated]"));
+        assert!(out.len() < DEBUG_ERROR_CONTEXT_CAP + 100);
+    }
 
     fn filter_thinking_chunks(chunks: &[&str]) -> String {
         let mut filter = ThinkingTagStreamFilter::new();

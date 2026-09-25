@@ -590,7 +590,11 @@ impl BatchProcessor {
                     colored,
                 )
             };
-            applied_diffs.push(diff_block);
+            applied_diffs.push(format!(
+                "{} applied:\n{}",
+                crate::core::file_editor::describe_edit(&applied.edit),
+                diff_block
+            ));
         }
 
         let total_diff_lines: usize = applied_diffs.iter().map(|d| d.lines().count()).sum();
@@ -1433,6 +1437,54 @@ mod tests {
         );
 
         assert!(formatted.contains("(+0, -1 lines)"));
+    }
+
+    #[test]
+    fn test_format_result_labels_applied_diff_with_source_anchor() {
+        let edit = Edit {
+            anchor: "Eleventh§h11".to_string(),
+            end_anchor: Some("Eleventh§h11".to_string()),
+            edit_type: "replace".to_string(),
+            text: "new5".to_string(),
+            content: None,
+            old_text: None,
+        };
+        let lines: Vec<String> = (1..=20).map(|n| format!("line{n}")).collect();
+        let hashes: Vec<String> = (1..=20).map(|n| format!("h{n}")).collect();
+        let mut final_lines = lines.clone();
+        final_lines[10] = "new11".to_string();
+        let mut final_hashes = hashes.clone();
+        final_hashes[10] = "hnew".to_string();
+        let prepared = PreparedEdits {
+            provenance: SpliceProvenance::default(),
+            content: lines.join("\n"),
+            final_content: final_lines.join("\n"),
+            diff: String::new(),
+            resolved_edits: Vec::new(),
+            failed_edits: Vec::new(),
+            applied_edits: vec![AppliedEdit {
+                start_idx: 10,
+                end_idx: 10,
+                original_start_idx: 10,
+                original_end_idx: 10,
+                edit,
+                lines_added: 1,
+                lines_deleted: 1,
+            }],
+            lines,
+            line_hashes: hashes,
+            final_lines: final_lines.clone(),
+            initial_mtime: None,
+        };
+        let processor = BatchProcessor::new(DiffMode::Full);
+        let formatted =
+            processor.format_result("labeled.rs", &prepared, &final_lines, &final_hashes, None);
+
+        assert!(formatted.contains("Applied 1 edit(s) successfully"));
+        assert!(
+            formatted
+                .contains("Edit (anchor: \"Eleventh§h11\", end_anchor: \"Eleventh§h11\") applied:")
+        );
     }
 
     #[test]
