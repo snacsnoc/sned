@@ -691,7 +691,7 @@ pub struct AnthropicToolCallState {
     last_was_text: bool,
 }
 
-fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
+pub(crate) fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
     // Model-specific defaults based on Anthropic's pricing and specs
     if model_id.contains("claude-fable-5") {
         ModelInfo {

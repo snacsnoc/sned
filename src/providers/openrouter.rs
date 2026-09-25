@@ -578,9 +578,9 @@ mod tests {
     }
 
     #[test]
-    fn test_openrouter_unknown_qwen_keeps_generic_limits() {
+    fn test_openrouter_pattern_qwen_uses_sourced_context() {
         let info = get_openrouter_model_info("qwen/qwen3.6-35b-a3b");
-        assert_eq!(info.base.context_window, Some(32_768));
+        assert_eq!(info.base.context_window, Some(262_144));
         assert_eq!(info.base.max_tokens, Some(8192));
     }
 

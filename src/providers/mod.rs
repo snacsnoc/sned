@@ -492,11 +492,13 @@ pub struct ModelInfo {
 }
 
 #[derive(Clone, Copy)]
+/// Sourced per-model capabilities. Fields left as None preserve the
+/// caller-provided values instead of overwriting them with guesses.
 struct QwenModelProfile {
-    context_window: u64,
-    max_tokens: u32,
-    supports_images: bool,
-    supports_reasoning: bool,
+    context_window: Option<u64>,
+    max_tokens: Option<u32>,
+    supports_images: Option<bool>,
+    supports_reasoning: Option<bool>,
 }
 
 fn qwen_profile_id(model_id: &str) -> &str {
@@ -518,49 +520,90 @@ fn exact_qwen_model_profile(model_id: &str) -> Option<QwenModelProfile> {
         return None;
     }
 
-    let profile = match qwen_profile_id(model_id).to_ascii_lowercase().as_str() {
-        // qwen-code's Alibaba provider presets are the source for these exact context
-        // and modality capabilities; its tokenLimits table supplies output ceilings.
+    // Sourced from qwen-code's Alibaba provider table and tokenLimits.
+    let exact = match qwen_profile_id(model_id).to_ascii_lowercase().as_str() {
         "qwen3.5-plus" | "qwen3.6-plus" => QwenModelProfile {
-            context_window: 1_000_000,
-            max_tokens: 65_536,
-            supports_images: true,
-            supports_reasoning: true,
+            context_window: Some(1_000_000),
+            max_tokens: Some(65_536),
+            supports_images: Some(true),
+            supports_reasoning: Some(true),
         },
         "qwen3.7-plus" => QwenModelProfile {
-            context_window: 1_000_000,
-            max_tokens: 65_536,
-            supports_images: true,
-            supports_reasoning: true,
+            context_window: Some(1_000_000),
+            max_tokens: Some(65_536),
+            supports_images: Some(true),
+            supports_reasoning: Some(true),
         },
         "qwen3.7-max" | "qwen3.6-flash" => QwenModelProfile {
-            context_window: 1_000_000,
-            max_tokens: 32_768,
-            supports_images: false,
-            supports_reasoning: true,
+            context_window: Some(1_000_000),
+            max_tokens: Some(32_768),
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
         },
         "qwen3-coder-plus" => QwenModelProfile {
-            context_window: 1_000_000,
-            max_tokens: 32_768,
-            supports_images: false,
-            supports_reasoning: false,
+            context_window: Some(1_000_000),
+            max_tokens: Some(32_768),
+            supports_images: Some(false),
+            supports_reasoning: Some(false),
         },
         "qwen3-coder-next" => QwenModelProfile {
-            context_window: 262_144,
-            max_tokens: 32_768,
-            supports_images: false,
-            supports_reasoning: false,
+            context_window: Some(262_144),
+            max_tokens: Some(32_768),
+            supports_images: Some(false),
+            supports_reasoning: Some(false),
         },
         "qwen3-max-2026-01-23" => QwenModelProfile {
-            context_window: 262_144,
-            max_tokens: 32_768,
-            supports_images: false,
-            supports_reasoning: true,
+            context_window: Some(262_144),
+            max_tokens: Some(32_768),
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
         },
-        _ => return None,
+        _ => return pattern_qwen_model_profile(model_id),
     };
 
-    Some(profile)
+    Some(exact)
+}
+
+/// Pattern fallback for versioned weight ids the exact table does not list
+/// (e.g. `qwen3.6-27b`, `qwen3.8-27b`, `qwen3.6-fp8-noreason`): `qwen<major>.<minor>-*`.
+/// Only claims what is sourced. The 262,144 native context is documented for
+/// the 3.6 weights (official FP8 model card) and the 3.8 weights (same
+/// architecture class); older generations fall through to generic defaults.
+/// Output ceilings, image support, and (absent a `-noreason` suffix) reasoning
+/// support are left for the caller defaults rather than guessed.
+fn pattern_qwen_model_profile(model_id: &str) -> Option<QwenModelProfile> {
+    if !crate::core::context::is_qwen_model(model_id) {
+        return None;
+    }
+
+    let stripped = qwen_profile_id(model_id).to_ascii_lowercase();
+    let rest = stripped.strip_prefix("qwen")?;
+    let (major, rest) = parse_qwen_version_part(rest)?;
+    let rest = rest.strip_prefix('.')?;
+    let (minor, _) = parse_qwen_version_part(rest)?;
+    if !matches!((major, minor), (3, 6) | (3, 8)) {
+        return None;
+    }
+
+    Some(QwenModelProfile {
+        context_window: Some(262_144),
+        max_tokens: None,
+        supports_images: None,
+        supports_reasoning: if stripped.ends_with("-noreason") {
+            Some(false)
+        } else {
+            None
+        },
+    })
+}
+
+/// Split leading ASCII digits off `text`, returning the value and remainder.
+fn parse_qwen_version_part(text: &str) -> Option<(u32, &str)> {
+    let end = text.bytes().take_while(u8::is_ascii_digit).count();
+    if end == 0 {
+        return None;
+    }
+    text[..end].parse::<u32>().ok().map(|n| (n, &text[end..]))
 }
 
 pub(crate) fn apply_qwen_model_profile(model_id: &str, info: &mut ModelInfo) -> bool {
@@ -570,11 +613,19 @@ pub(crate) fn apply_qwen_model_profile(model_id: &str, info: &mut ModelInfo) -> 
         return false;
     };
 
-    info.max_tokens = Some(profile.max_tokens);
-    info.context_window = Some(profile.context_window);
-    info.supports_images = Some(profile.supports_images);
+    if profile.max_tokens.is_some() {
+        info.max_tokens = profile.max_tokens;
+    }
+    if profile.context_window.is_some() {
+        info.context_window = profile.context_window;
+    }
+    if profile.supports_images.is_some() {
+        info.supports_images = profile.supports_images;
+    }
     info.supports_prompt_cache = false;
-    info.supports_reasoning = Some(profile.supports_reasoning);
+    if profile.supports_reasoning.is_some() {
+        info.supports_reasoning = profile.supports_reasoning;
+    }
     info.supports_tools = Some(true);
     true
 }
@@ -1530,13 +1581,14 @@ mod tests {
     #[test]
     fn unknown_qwen_models_keep_generic_defaults() {
         for model_id in [
-            "qwen3.6-27b",
-            "Qwen/Qwen3.6-27B",
             "vendor/qwen3-coder",
             "hosted-qwen3-coder-custom",
             "qwen2.5-coder-7b",
+            "qwen2-7b-instruct",
+            "qwen3.5-9b",
             "qwen-vl-max",
             "qwq-preview",
+            "qwen-max",
         ] {
             let mut info = ModelInfo {
                 max_tokens: None,
@@ -1549,6 +1601,49 @@ mod tests {
 
             assert!(!apply_qwen_model_profile(model_id, &mut info), "{model_id}");
             assert_eq!(info, original, "{model_id}");
+        }
+    }
+
+    #[test]
+    fn pattern_qwen_models_get_sourced_context_only() {
+        for model_id in [
+            "qwen3.6-27b",
+            "Qwen/Qwen3.6-27B",
+            "qwen3.8-27b",
+            "qwen/qwen3.6-35b-a3b",
+            "qwen3.6-fp8",
+            "openrouter/qwen/qwen3.8-27b",
+        ] {
+            let mut info = ModelInfo {
+                max_tokens: None,
+                context_window: Some(128_000),
+                supports_images: Some(true),
+                supports_reasoning: Some(true),
+                ..ModelInfo::default()
+            };
+
+            assert!(apply_qwen_model_profile(model_id, &mut info), "{model_id}");
+            assert_eq!(info.context_window, Some(262_144), "{model_id}");
+            // No sourced output ceiling or modality claims: caller defaults stand.
+            assert_eq!(info.max_tokens, None, "{model_id}");
+            assert_eq!(info.supports_images, Some(true), "{model_id}");
+            assert_eq!(info.supports_reasoning, Some(true), "{model_id}");
+            assert_eq!(info.supports_tools, Some(true), "{model_id}");
+            assert!(!info.supports_prompt_cache, "{model_id}");
+        }
+    }
+
+    #[test]
+    fn pattern_qwen_noreason_ids_disable_reasoning() {
+        for model_id in ["qwen3.6-fp8-noreason", "qwen/qwen3.6-fp8-noreason"] {
+            let mut info = ModelInfo {
+                supports_reasoning: Some(true),
+                ..ModelInfo::default()
+            };
+
+            assert!(apply_qwen_model_profile(model_id, &mut info), "{model_id}");
+            assert_eq!(info.context_window, Some(262_144), "{model_id}");
+            assert_eq!(info.supports_reasoning, Some(false), "{model_id}");
         }
     }
 

@@ -3586,9 +3586,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_openai_model_info_unknown_qwen_uses_generic_limits() {
+    fn test_get_openai_model_info_pattern_qwen_uses_sourced_context() {
         let info = get_openai_model_info("qwen3.6-35b-a3b");
-        assert_eq!(info.base.context_window, Some(128_000));
+        assert_eq!(info.base.context_window, Some(262_144));
         assert_eq!(info.base.max_tokens, None);
     }
 
