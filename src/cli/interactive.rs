@@ -155,6 +155,12 @@ pub struct InteractiveSession {
     provider_api_keys: HashMap<String, String>,
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,
+    tool_registry: Arc<crate::core::tools::ToolRegistry>,
+    context_loader: crate::core::context::ContextLoader,
+    system_prompt_context: crate::core::context::SystemPromptContext,
+    // Signal-listener tasks bound to this session's task state. Aborted on
+    // /new so stale listeners don't fan signals out to dead state.
+    ctrl_c_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl InteractiveSession {
@@ -196,6 +202,9 @@ impl InteractiveSession {
                 .await?;
         components.config.interactive_mode = interactive_mode;
         let task_storage = components.task_storage.clone();
+        let tool_registry = Arc::clone(&components.registry);
+        let context_loader = components.context_loader.clone();
+        let system_prompt_context = components.system_prompt_context.clone();
 
         let agent_loop = crate::core::agent_loop::AgentLoop::new(components.config)
             .with_system_prompt_context(components.system_prompt_context)
@@ -221,8 +230,9 @@ impl InteractiveSession {
             .collect();
 
         let agent_loop = Arc::new(tokio::sync::Mutex::new(agent_loop));
-        crate::core::cancellation::setup_ctrl_c_handler(agent_loop.lock().await.state_handle())
-            .await;
+        let ctrl_c_handles =
+            crate::core::cancellation::setup_ctrl_c_handler(agent_loop.lock().await.state_handle())
+                .await;
 
         Ok(Self {
             agent_loop,
@@ -233,6 +243,76 @@ impl InteractiveSession {
             provider_api_keys,
             task_opts,
             root_opts,
+            tool_registry,
+            context_loader,
+            system_prompt_context,
+            ctrl_c_handles,
+        })
+    }
+
+    /// Start a new task reusing the workspace-scoped components of this
+    /// session (tool registry, context loader, approval/hooks managers).
+    /// The old task's files stay on disk and remain resumable.
+    pub async fn start_fresh_task(
+        &self,
+        output_writer: crate::cli::output::OutputWriterArc,
+    ) -> anyhow::Result<Self> {
+        let new_task_id = ulid::Ulid::new().to_string();
+        let workspace_root = self.system_prompt_context.cwd.clone().unwrap_or_default();
+        let task_storage = TaskStorage::new(&new_task_id)?;
+        // A metadata-less dir would break later --session-id resume, so log
+        // instead of silently swallowing the failure.
+        if let Err(error) =
+            task_storage.create_initial_metadata(&workspace_root, self.task_opts.model.as_deref())
+        {
+            tracing::warn!(error = %error, "Failed to write initial metadata for fresh task");
+        }
+        // Retire this session's signal listeners before the new ones start so
+        // Ctrl+C/SIGTERM route only to the live task state.
+        for handle in &self.ctrl_c_handles {
+            handle.abort();
+        }
+
+        let old_agent = self.agent_loop().await;
+        let enable_checkpoints = old_agent.checkpoint_manager().is_some();
+        let mut agent_config = old_agent.config_snapshot();
+        drop(old_agent);
+        agent_config.task_id = new_task_id.clone();
+        agent_config.output_writer = output_writer;
+        agent_config.interactive_mode = true;
+
+        let checkpoint_mgr = crate::core::checkpoints::TaskCheckpointManager::new(
+            new_task_id,
+            enable_checkpoints,
+            &workspace_root,
+        );
+
+        let agent_loop = crate::core::agent_loop::AgentLoop::new(agent_config)
+            .with_system_prompt_context(self.system_prompt_context.clone())
+            .with_tools(Arc::clone(&self.tool_registry))
+            .with_task_storage(task_storage.clone())
+            .with_context_loader(self.context_loader.clone())
+            .with_approval_manager(Arc::clone(&self.approval_manager))
+            .with_hooks(Arc::clone(&self.hook_manager))
+            .with_checkpoint_manager(checkpoint_mgr)
+            .with_yolo(self.task_opts.yolo);
+
+        let ctrl_c_handles =
+            crate::core::cancellation::setup_ctrl_c_handler(agent_loop.state_handle()).await;
+
+        Ok(Self {
+            agent_loop: Arc::new(tokio::sync::Mutex::new(agent_loop)),
+            approval_manager: Arc::clone(&self.approval_manager),
+            hook_manager: Arc::clone(&self.hook_manager),
+            state_manager: Arc::clone(&self.state_manager),
+            task_storage,
+            provider_api_keys: self.provider_api_keys.clone(),
+            task_opts: self.task_opts.clone(),
+            root_opts: self.root_opts.clone(),
+            tool_registry: Arc::clone(&self.tool_registry),
+            context_loader: self.context_loader.clone(),
+            system_prompt_context: self.system_prompt_context.clone(),
+            ctrl_c_handles,
         })
     }
 
@@ -2960,8 +3040,169 @@ async fn invalidate_restored_file_context(
     }
 }
 
-/// Handle CLI-only slash commands, routing output to the App buffer.
-/// Returns `true` if the caller should exit the main loop (for /exit, /quit).
+/// Re-point the loop's cached queue/state handles and slash-command entries at
+/// the current session. Needed after /new because the session object (and its
+/// task state) is replaced while the loop's locals still point at the old one.
+async fn refresh_session_handles(
+    app: &mut App,
+    session: &Arc<Mutex<InteractiveSession>>,
+    queue_handle: &Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>>,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    task_opts: &TaskOptions,
+) {
+    let sess = session.lock().await;
+    let mut qh = queue_handle.lock().await;
+    *qh = Some(sess.queue_handle().await);
+    let mut sh = state_handle.lock().await;
+    *sh = Some(sess.state_handle().await);
+
+    let agent_loop = sess.agent_loop().await.state_handle();
+    let (skills, availability) = {
+        let state = agent_loop.lock().await;
+        (
+            state.available_skills.clone(),
+            crate::cli::slash_commands::SlashCommandAvailability::from_task_state(
+                &state,
+                task_opts.track_changes,
+                app.mode == "PLAN",
+            ),
+        )
+    };
+    let entries =
+        crate::cli::slash_commands::build_available_slash_command_entries(&skills, availability);
+    app.slash_command_all_entries = entries;
+}
+
+/// Drop stale render events from the old task so they can't bleed into the new
+/// conversation's output. Bounded so a flooding producer can't stall the switch.
+fn discard_pending_output(
+    approval_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    priority_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    output_rx: &mut mpsc::Receiver<SequencedOutputEvent>,
+) {
+    for _ in 0..4096 {
+        let mut drained = false;
+        while approval_rx.try_recv().is_ok() {
+            drained = true;
+        }
+        while priority_rx.try_recv().is_ok() {
+            drained = true;
+        }
+        while output_rx.try_recv().is_ok() {
+            drained = true;
+        }
+        if !drained {
+            break;
+        }
+    }
+}
+
+/// Swap the live session for a fresh task, keeping workspace-scoped state.
+/// Refuses while the agent is busy, has queued follow-ups, or (via the caller's
+/// dispatch gate) a completion is pending, so no in-flight work is discarded.
+async fn switch_to_fresh_task(
+    app: &mut App,
+    output_writer: &OutputWriterArc,
+    session: &Arc<Mutex<InteractiveSession>>,
+    task_id: &mut String,
+    task_storage: &mut TaskStorage,
+    agent_busy: &Arc<AtomicBool>,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    queue_handle: &Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>>,
+    approval_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    priority_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    output_rx: &mut mpsc::Receiver<SequencedOutputEvent>,
+    task_opts: &TaskOptions,
+) -> anyhow::Result<()> {
+    if agent_busy.load(Ordering::Relaxed) {
+        app.push_styled(
+            "Agent is busy. Wait for it to finish before starting a new conversation.",
+            Style::default().fg(theme::WARNING_FG),
+        );
+        return Ok(());
+    }
+    if session
+        .lock()
+        .await
+        .agent_loop()
+        .await
+        .has_queued_messages()
+        .await
+    {
+        app.push_styled(
+            "There are queued follow-ups for this conversation. Let them run before starting a new one.",
+            Style::default().fg(theme::WARNING_FG),
+        );
+        return Ok(());
+    }
+    if app.has_pending_approval() {
+        app.resolve_pending_approval(crate::core::approval::ApprovalResult::Denied);
+        app.push_styled(
+            "Pending approval denied for the new conversation.",
+            Style::default().fg(theme::WARNING_FG),
+        );
+    }
+
+    let old_task_id = task_id.clone();
+    discard_pending_output(approval_rx, priority_rx, output_rx);
+    if let Err(error) = app.shutdown_task_transcript_writer() {
+        tracing::warn!(error = %error, "Failed to shut down task transcript writer");
+    }
+    let fresh = match session
+        .lock()
+        .await
+        .start_fresh_task(output_writer.clone())
+        .await
+    {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            app.push_styled(
+                format!("Could not start a new conversation: {error}"),
+                Style::default().fg(theme::WARNING_FG),
+            );
+            app.start_task_transcript_writer(task_storage)?;
+            return Ok(());
+        }
+    };
+    *session.lock().await = fresh;
+    *task_id = session
+        .lock()
+        .await
+        .agent_loop()
+        .await
+        .task_id()
+        .to_string();
+    *task_storage = session.lock().await.task_storage();
+    refresh_session_handles(app, session, queue_handle, state_handle, task_opts).await;
+    app.task_id = task_id.clone();
+    app.start_task_transcript_writer(task_storage)?;
+    app.clear_output()?;
+    app.set_input_text("");
+    app.slash_command_active = false;
+    app.picker_active = false;
+    app.pending_clear = None;
+    // A requested-but-unapplied /model switch targets the old task's provider
+    // setup, so it can't carry over; say so instead of dropping it silently.
+    if let Some(pending) = app.pending_model_switch.take() {
+        app.push_styled(
+            format!(
+                "Dropped unapplied model switch to {} {}.",
+                pending.provider, pending.model_id
+            ),
+            Style::default().fg(theme::WARNING_FG),
+        );
+    }
+    app.mention_search_active = false;
+    app.plan_state_cache = None;
+    app.plan_state_cache_ptr = None;
+    app.start_time = Some(Instant::now());
+    app.force_bottom();
+    app.push_plain(format!(
+        "Started new conversation {task_id} (previous {old_task_id} resumable via --session-id)."
+    ));
+    Ok(())
+}
+
 async fn handle_cli_only_command(
     cli_cmd: crate::cli::slash_commands::CliOnlyCommand,
     text: &str,
@@ -3019,6 +3260,16 @@ async fn handle_cli_only_command(
             app.pending_clear = Some("slash".to_string());
             app.push_styled(
                 "Clear display? (y to confirm, any other key to cancel): ",
+                Style::default().fg(theme::WARNING_FG),
+            );
+        }
+        CliOnlyCommand::New => {
+            // Live loop callers intercept New before reaching this dispatch
+            // because the task switch needs the loop-owned queues and task
+            // bindings. Reaching here means a direct caller bypassed that
+            // interception, so refuse rather than half-switch.
+            app.push_styled(
+                "Cannot start a new conversation from here.",
                 Style::default().fg(theme::WARNING_FG),
             );
         }
@@ -4490,8 +4741,8 @@ async fn run_main_loop(
     turn_render_worker: &TurnRenderWorker,
     output_writer: OutputWriterArc,
     session: Arc<Mutex<InteractiveSession>>,
-    task_id: String,
-    task_storage: TaskStorage,
+    mut task_id: String,
+    mut task_storage: TaskStorage,
     agent_busy: Arc<AtomicBool>,
     agent_done: Arc<tokio::sync::Notify>,
     agent_start_time: Arc<Mutex<Option<Instant>>>,
@@ -5434,6 +5685,27 @@ async fn run_main_loop(
 
                                     // Local commands execute immediately even when agent is busy
                                     if cli_cmd.is_local_command() {
+                                        if matches!(
+                                            &cli_cmd,
+                                            crate::cli::slash_commands::CliOnlyCommand::New
+                                        ) {
+                                            switch_to_fresh_task(
+                                                app,
+                                                &output_writer,
+                                                &session,
+                                                &mut task_id,
+                                                &mut task_storage,
+                                                &agent_busy,
+                                                &state_handle,
+                                                &queue_handle,
+                                                approval_output_rx,
+                                                priority_output_rx,
+                                                output_rx,
+                                                task_opts,
+                                            )
+                                            .await?;
+                                            continue;
+                                        }
                                         let should_exit = handle_cli_only_command(
                                             cli_cmd,
                                             &text,
@@ -5895,31 +6167,7 @@ pub async fn run_interactive_shell_inner(
     app.history.reload();
     app.slash_command_track_changes = task_opts.track_changes;
 
-    {
-        let sess = session.lock().await;
-        let mut qh = queue_handle.lock().await;
-        *qh = Some(sess.queue_handle().await);
-        let mut sh = state_handle.lock().await;
-        *sh = Some(sess.state_handle().await);
-
-        let agent_loop = sess.agent_loop().await.state_handle();
-        let (skills, availability) = {
-            let state = agent_loop.lock().await;
-            (
-                state.available_skills.clone(),
-                crate::cli::slash_commands::SlashCommandAvailability::from_task_state(
-                    &state,
-                    task_opts.track_changes,
-                    app.mode == "PLAN",
-                ),
-            )
-        };
-        let entries = crate::cli::slash_commands::build_available_slash_command_entries(
-            &skills,
-            availability,
-        );
-        app.slash_command_all_entries = entries;
-    }
+    refresh_session_handles(&mut app, &session, &queue_handle, &state_handle, &task_opts).await;
 
     // 6. Main loop
     let auto_approve = task_opts.yolo || task_opts.auto_approve_all;
@@ -11544,6 +11792,7 @@ mod tests {
             no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
+            context_window: None,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -11614,6 +11863,157 @@ mod tests {
         assert_eq!(
             session.provider_api_key("gemini").as_deref(),
             Some("gemini-key")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_new_command_switches_to_fresh_task() -> anyhow::Result<()> {
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let old_task_id = session
+            .lock()
+            .await
+            .agent_loop()
+            .await
+            .task_id()
+            .to_string();
+        let old_task_dir = session.lock().await.task_storage().task_dir().to_path_buf();
+
+        let (tx, mut output_rx) = mpsc::channel(8);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let state_handle = Arc::new(Mutex::new(None));
+        let queue_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.push_plain("old conversation line");
+        let mut task_id = old_task_id.clone();
+        let mut task_storage = session.lock().await.task_storage();
+
+        switch_to_fresh_task(
+            &mut app,
+            &output_writer,
+            &session,
+            &mut task_id,
+            &mut task_storage,
+            &agent_busy,
+            &state_handle,
+            &queue_handle,
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut output_rx,
+            &task_opts,
+        )
+        .await?;
+
+        assert_ne!(task_id, old_task_id);
+        assert_eq!(
+            session.lock().await.agent_loop().await.task_id(),
+            task_id.as_str()
+        );
+        assert!(old_task_dir.exists());
+        assert!(task_storage.task_dir().exists());
+        assert!(queue_handle.lock().await.is_some());
+        assert!(state_handle.lock().await.is_some());
+        assert_eq!(app.task_id, task_id);
+        let visible: String = app.output_lines.iter().map(App::line_to_string).collect();
+        assert!(visible.contains(&task_id));
+        assert!(visible.contains(&old_task_id));
+        assert!(!visible.contains("old conversation line"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fresh_task_retires_old_signal_listeners() -> anyhow::Result<()> {
+        let task_opts = retry_test_task_opts();
+        let session = InteractiveSession::build_with_writer(
+            task_opts,
+            RootOnlyOptions {
+                session_id: None,
+                continue_session: false,
+            },
+            None,
+        )
+        .await?;
+        assert!(!session.ctrl_c_handles.is_empty());
+
+        let (tx, _rx) = mpsc::channel(8);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let fresh = session.start_fresh_task(output_writer).await?;
+
+        // Aborted listeners terminate once the runtime settles them.
+        tokio::task::yield_now().await;
+        assert!(session.ctrl_c_handles.iter().all(|h| h.is_finished()));
+        assert!(!fresh.ctrl_c_handles.is_empty());
+        assert!(fresh.ctrl_c_handles.iter().all(|h| !h.is_finished()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_new_command_refuses_while_busy() -> anyhow::Result<()> {
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let old_task_id = session
+            .lock()
+            .await
+            .agent_loop()
+            .await
+            .task_id()
+            .to_string();
+
+        let (tx, mut output_rx) = mpsc::channel(8);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let state_handle = Arc::new(Mutex::new(None));
+        let queue_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        let mut task_id = old_task_id.clone();
+        let mut task_storage = session.lock().await.task_storage();
+
+        switch_to_fresh_task(
+            &mut app,
+            &output_writer,
+            &session,
+            &mut task_id,
+            &mut task_storage,
+            &agent_busy,
+            &state_handle,
+            &queue_handle,
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut output_rx,
+            &task_opts,
+        )
+        .await?;
+
+        assert_eq!(task_id, old_task_id);
+        assert_eq!(
+            session.lock().await.agent_loop().await.task_id(),
+            old_task_id.as_str()
         );
         Ok(())
     }
@@ -11929,6 +12329,7 @@ mod tests {
             no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
+            context_window: None,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -12590,6 +12991,7 @@ mod tests {
             no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
+            context_window: None,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -12727,6 +13129,7 @@ mod tests {
             no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
+            context_window: None,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -12856,6 +13259,7 @@ mod tests {
             no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
+            context_window: None,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -12995,6 +13399,7 @@ mod tests {
             no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
+            context_window: None,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -13119,6 +13524,7 @@ mod tests {
             no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
+            context_window: None,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -13246,6 +13652,7 @@ mod tests {
             no_checkpoints: false,
             max_context_turns: None,
             max_tokens: None,
+            context_window: None,
             debug: false,
             prompt_file: None,
             result_file: None,

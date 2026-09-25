@@ -290,14 +290,21 @@ async fn handle_shutdown_signal(
 ///
 /// First SIGINT/Ctrl+C or SIGTERM requests cooperative cancellation. A repeated
 /// signal within two seconds waits briefly for active atomic writes, then exits.
+///
+/// Returns the listener tasks so session switches can abort the stale set;
+/// otherwise every switch leaks listeners that keep fanning signals out to
+/// dead task state.
 #[allow(clippy::unused_async)]
-pub async fn setup_ctrl_c_handler(state: Arc<Mutex<TaskState>>) {
+pub async fn setup_ctrl_c_handler(
+    state: Arc<Mutex<TaskState>>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let last_signal = Arc::new(Mutex::new(None));
+    let mut handles = Vec::with_capacity(2);
 
     {
         let state = state.clone();
         let last_signal = last_signal.clone();
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             loop {
                 match tokio::signal::ctrl_c().await {
                     Ok(()) => {
@@ -309,14 +316,14 @@ pub async fn setup_ctrl_c_handler(state: Arc<Mutex<TaskState>>) {
                     }
                 }
             }
-        });
+        }));
     }
 
     #[cfg(unix)]
     {
         let state = state;
         let last_signal = last_signal;
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
 
             let mut sigterm = match signal(SignalKind::terminate()) {
@@ -330,8 +337,9 @@ pub async fn setup_ctrl_c_handler(state: Arc<Mutex<TaskState>>) {
             while sigterm.recv().await.is_some() {
                 handle_shutdown_signal(&state, &last_signal, "SIGTERM", 143).await;
             }
-        });
+        }));
     }
+    handles
 }
 
 #[cfg(test)]

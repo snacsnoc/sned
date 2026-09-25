@@ -12,6 +12,7 @@ enum SlashCommandId {
     Compact,
     Exit,
     Clear,
+    New,
     Copy,
     Full,
     History,
@@ -135,6 +136,17 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         description: "Clear the visible display",
         usage: "/clear",
         detail: "Clears the transcript shown in this terminal. Model context and saved conversation history are unchanged.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::New,
+        name: "new",
+        aliases: &[],
+        description: "Start a fresh conversation",
+        usage: "/new",
+        detail: "Starts a new conversation with empty context. The previous session is kept on disk and stays resumable via --session-id.",
         category: SlashCommandCategory::Local,
         requires_args: false,
         requirement: CommandRequirement::Always,
@@ -576,6 +588,7 @@ pub enum CliOnlyCommand {
     Exit,
     Quit,
     Clear,
+    New,
     Copy,
     Full,
     History,
@@ -739,6 +752,7 @@ impl CliOnlyCommand {
             Self::Exit
                 | Self::Quit
                 | Self::Clear
+                | Self::New
                 | Self::Copy
                 | Self::Full
                 | Self::History
@@ -860,6 +874,7 @@ fn cli_command_from_match(matched: &StaticCommandMatch<'_>) -> Option<CliOnlyCom
             }
         }
         SlashCommandId::Clear => Some(CliOnlyCommand::Clear),
+        SlashCommandId::New => Some(CliOnlyCommand::New),
         SlashCommandId::Copy => Some(CliOnlyCommand::Copy),
         SlashCommandId::Full => Some(CliOnlyCommand::Full),
         SlashCommandId::History => Some(CliOnlyCommand::History),
@@ -1907,6 +1922,12 @@ mod tests {
     fn test_parse_cli_only_clear() {
         let result = get_cli_only_command("/clear");
         assert_eq!(result, Some(CliOnlyCommand::Clear));
+    }
+
+    #[test]
+    fn test_parse_cli_only_new() {
+        let result = get_cli_only_command("/new");
+        assert_eq!(result, Some(CliOnlyCommand::New));
     }
 
     #[test]

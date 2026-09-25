@@ -1334,6 +1334,11 @@ impl AgentLoop {
         &self.config.task_id
     }
 
+    /// Snapshot the agent config so a fresh task can inherit it.
+    pub fn config_snapshot(&self) -> crate::core::agent_types::AgentConfig {
+        self.config.clone()
+    }
+
     /// Get a reference to the checkpoint manager, if configured.
     pub fn checkpoint_manager(&self) -> Option<&crate::core::checkpoints::TaskCheckpointManager> {
         self.deps.checkpoint_manager.as_ref()
