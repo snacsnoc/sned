@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,9 @@ use std::time::{Duration, SystemTime};
 use crate::cli::tui::BlockKind;
 use crate::core::context::context_manager::PersistedApiReqInfo;
 use crate::providers::StorageMessage;
+use crate::providers::{
+    AssistantContentBlock, MessageContent, MessageRole, TextContentBlock, UserContentBlock,
+};
 use crate::storage::disk::GlobalFileNames;
 
 pub const DEFAULT_TRANSCRIPT_CAP: usize = 1_000;
@@ -425,28 +428,286 @@ impl TaskStorage {
             .task_dir
             .join(GlobalFileNames::API_CONVERSATION_HISTORY);
         match fs::read_to_string(&file_path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(data) => data,
-                Err(e) => {
-                    // Create backup of corrupted file before discarding
-                    if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path) {
-                        tracing::warn!(
-                            file_path = %file_path.display(),
-                            backup_path = %backup_path.display(),
-                            error = %e,
-                            "Created backup of corrupted API conversation history JSON"
-                        );
-                    } else {
-                        tracing::warn!(
-                            file_path = %file_path.display(),
-                            error = %e,
-                            "Failed to parse API conversation history JSON and backup failed"
-                        );
+            Ok(contents) => match serde_json::from_str::<Vec<StorageMessage>>(&contents) {
+                Ok(data) => {
+                    let indexed = data
+                        .into_iter()
+                        .enumerate()
+                        .collect::<Vec<(usize, StorageMessage)>>();
+                    Self::repair_conversation_history(indexed)
+                }
+                Err(bulk_error) => {
+                    match Self::recover_history_elements(&contents) {
+                        Some((recovered, dropped, first_error)) if !recovered.is_empty() => {
+                            // Nothing lost: bulk parsing rejects files our own
+                            // writer produces, so a clean recovery is routine,
+                            // not corruption. No backup, no warn.
+                            if dropped.is_empty() {
+                                tracing::info!(
+                                    file_path = %file_path.display(),
+                                    recovered = recovered.len(),
+                                    bulk_error = %bulk_error,
+                                    "Bulk parse rejected API conversation history but all records recovered per-element"
+                                );
+                            } else if let Ok(backup_path) =
+                                crate::storage::disk::create_backup(&file_path)
+                            {
+                                // Create backup of partially corrupted file
+                                // before resuming on the surviving records
+                                tracing::warn!(
+                                    file_path = %file_path.display(),
+                                    backup_path = %backup_path.display(),
+                                    recovered = recovered.len(),
+                                    dropped = dropped.len(),
+                                    dropped_sample = ?&dropped[..dropped.len().min(10)],
+                                    first_error = ?first_error,
+                                    bulk_error = %bulk_error,
+                                    "Recovered valid API conversation history around corrupted records"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    file_path = %file_path.display(),
+                                    recovered = recovered.len(),
+                                    dropped = dropped.len(),
+                                    "Recovered valid API conversation history around corrupted records and backup failed"
+                                );
+                            }
+                            Self::repair_conversation_history(recovered)
+                        }
+                        Some((_, dropped, first_error)) => {
+                            // Create backup of corrupted file before discarding
+                            if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path)
+                            {
+                                tracing::warn!(
+                                    file_path = %file_path.display(),
+                                    backup_path = %backup_path.display(),
+                                    error = %bulk_error,
+                                    unusable = dropped.len(),
+                                    dropped_sample = ?&dropped[..dropped.len().min(10)],
+                                    first_error = ?first_error,
+                                    "Created backup of corrupted API conversation history JSON"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    file_path = %file_path.display(),
+                                    error = %bulk_error,
+                                    "Failed to parse API conversation history JSON and backup failed"
+                                );
+                            }
+                            Vec::new()
+                        }
+                        None => {
+                            // Create backup of corrupted file before discarding
+                            if let Ok(backup_path) = crate::storage::disk::create_backup(&file_path)
+                            {
+                                tracing::warn!(
+                                    file_path = %file_path.display(),
+                                    backup_path = %backup_path.display(),
+                                    error = %bulk_error,
+                                    "Created backup of corrupted API conversation history JSON"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    file_path = %file_path.display(),
+                                    error = %bulk_error,
+                                    "Failed to parse API conversation history JSON and backup failed"
+                                );
+                            }
+                            Vec::new()
+                        }
                     }
-                    Vec::new()
                 }
             },
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// Parse history message-by-message, collecting the indices that fail
+    /// plus the first failure's error. Returns None when the file is not a
+    /// JSON array at all. Bulk parsing rejects files our own writer
+    /// produces (thinking blocks serialize duplicate `signature` keys, which
+    /// derived struct deserialization refuses), while per-element conversion
+    /// through Value accepts them, so one unreadable record no longer
+    /// discards the whole session.
+    fn recover_history_elements(
+        contents: &str,
+    ) -> Option<(Vec<(usize, StorageMessage)>, Vec<usize>, Option<String>)> {
+        let values: Vec<serde_json::Value> = serde_json::from_str(contents).ok()?;
+        let mut recovered = Vec::with_capacity(values.len());
+        let mut dropped = Vec::new();
+        let mut first_error = None;
+        for (index, value) in values.into_iter().enumerate() {
+            match serde_json::from_value(value) {
+                Ok(message) => recovered.push((index, message)),
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e.to_string());
+                    }
+                    dropped.push(index);
+                }
+            }
+        }
+        Some((recovered, dropped, first_error))
+    }
+
+    /// Drop tool blocks left dangling by removed messages and merge
+    /// same-role neighbors only where a removal opened the gap, so resumed
+    /// history stays provider-valid. Runs on every load: pre-existing
+    /// adjacency went through the live send path and is preserved, while
+    /// crash-torn tails the bulk parse accepts still get repaired.
+    fn repair_conversation_history(history: Vec<(usize, StorageMessage)>) -> Vec<StorageMessage> {
+        let mut offered = HashSet::new();
+        let mut answered = HashSet::new();
+        for (_, message) in &history {
+            match &message.content {
+                MessageContent::AssistantBlocks(blocks) => {
+                    for block in blocks {
+                        if let AssistantContentBlock::ToolUse(tool_use) = block {
+                            offered.insert(tool_use.id.clone());
+                        }
+                    }
+                }
+                MessageContent::UserBlocks(blocks) => {
+                    for block in blocks {
+                        if let UserContentBlock::ToolResult(result) = block {
+                            answered.insert(result.tool_use_id.clone());
+                        }
+                    }
+                }
+                MessageContent::Text(_) => {}
+            }
+        }
+
+        // Survivors carry their recovery index so the merge below can tell
+        // removal-opened gaps apart from pre-existing adjacency.
+        let mut pruned: Vec<(usize, StorageMessage)> = Vec::with_capacity(history.len());
+        for (index, mut message) in history.into_iter() {
+            let keep = match &mut message.content {
+                MessageContent::AssistantBlocks(blocks) => {
+                    blocks.retain(|block| {
+                        !matches!(block, AssistantContentBlock::ToolUse(tool_use) if !answered.contains(&tool_use.id))
+                    });
+                    !blocks.is_empty()
+                }
+                MessageContent::UserBlocks(blocks) => {
+                    blocks.retain(|block| {
+                        !matches!(block, UserContentBlock::ToolResult(result) if !offered.contains(&result.tool_use_id))
+                    });
+                    !blocks.is_empty()
+                }
+                MessageContent::Text(_) => true,
+            };
+            if keep {
+                pruned.push((index, message));
+            }
+        }
+
+        // Fold same-role neighbors only where a removal opened the gap;
+        // strict providers reject the new adjacency, while pre-existing
+        // adjacency went through the live send path untouched and stays.
+        let mut merged: Vec<(usize, usize, StorageMessage)> = Vec::with_capacity(pruned.len());
+        for (index, message) in pruned {
+            let gap_merge = merged.last().is_some_and(|(_, last_index, last)| {
+                last.role == message.role && index > *last_index + 1
+            });
+            if gap_merge {
+                let (first_index, last_index, last) = merged.pop().unwrap();
+                if let Some(content) =
+                    Self::merge_message_content(&last.content, &message.content, message.role)
+                {
+                    merged.push((first_index, index, StorageMessage { content, ..last }));
+                    continue;
+                }
+                merged.push((first_index, last_index, last));
+            }
+            merged.push((index, index, message));
+        }
+        merged.into_iter().map(|(_, _, message)| message).collect()
+    }
+
+    /// Combine two same-role message contents. Returns None for
+    /// role/content mismatches the writer never produces; callers keep
+    /// both messages in that case rather than fabricate content.
+    fn merge_message_content(
+        first: &MessageContent,
+        second: &MessageContent,
+        role: MessageRole,
+    ) -> Option<MessageContent> {
+        match (first, second) {
+            (MessageContent::Text(x), MessageContent::Text(y)) => {
+                if x.is_empty() {
+                    return Some(MessageContent::Text(y.clone()));
+                }
+                if y.is_empty() {
+                    return Some(MessageContent::Text(x.clone()));
+                }
+                Some(MessageContent::Text(format!("{x}\n{y}")))
+            }
+            (MessageContent::UserBlocks(x), MessageContent::UserBlocks(y)) => {
+                let mut blocks = x.clone();
+                blocks.extend(y.iter().cloned());
+                Some(MessageContent::UserBlocks(blocks))
+            }
+            (MessageContent::AssistantBlocks(x), MessageContent::AssistantBlocks(y)) => {
+                let mut blocks = x.clone();
+                blocks.extend(y.iter().cloned());
+                Some(MessageContent::AssistantBlocks(blocks))
+            }
+            (MessageContent::Text(text), MessageContent::UserBlocks(blocks))
+                if role == MessageRole::User =>
+            {
+                let mut merged = Vec::with_capacity(blocks.len() + 1);
+                if !text.is_empty() {
+                    merged.push(UserContentBlock::Text(TextContentBlock {
+                        text: text.clone(),
+                        shared: Default::default(),
+                        reasoning_details: None,
+                    }));
+                }
+                merged.extend(blocks.iter().cloned());
+                Some(MessageContent::UserBlocks(merged))
+            }
+            (MessageContent::UserBlocks(blocks), MessageContent::Text(text))
+                if role == MessageRole::User =>
+            {
+                let mut merged = blocks.clone();
+                if !text.is_empty() {
+                    merged.push(UserContentBlock::Text(TextContentBlock {
+                        text: text.clone(),
+                        shared: Default::default(),
+                        reasoning_details: None,
+                    }));
+                }
+                Some(MessageContent::UserBlocks(merged))
+            }
+            (MessageContent::Text(text), MessageContent::AssistantBlocks(blocks))
+                if role == MessageRole::Assistant =>
+            {
+                let mut merged = Vec::with_capacity(blocks.len() + 1);
+                if !text.is_empty() {
+                    merged.push(AssistantContentBlock::Text(TextContentBlock {
+                        text: text.clone(),
+                        shared: Default::default(),
+                        reasoning_details: None,
+                    }));
+                }
+                merged.extend(blocks.iter().cloned());
+                Some(MessageContent::AssistantBlocks(merged))
+            }
+            (MessageContent::AssistantBlocks(blocks), MessageContent::Text(text))
+                if role == MessageRole::Assistant =>
+            {
+                let mut merged = blocks.clone();
+                if !text.is_empty() {
+                    merged.push(AssistantContentBlock::Text(TextContentBlock {
+                        text: text.clone(),
+                        shared: Default::default(),
+                        reasoning_details: None,
+                    }));
+                }
+                Some(MessageContent::AssistantBlocks(merged))
+            }
+            _ => None,
         }
     }
 
@@ -1833,6 +2094,483 @@ mod tests {
         assert_eq!(
             backup_content, corrupted_content,
             "Backup should contain original corrupted content"
+        );
+    }
+
+    #[test]
+    fn test_api_conversation_history_large_scale_round_trip() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, TextContentBlock, ToolResultBlock,
+            ToolResultContent, ToolUseBlock, UserContentBlock,
+        };
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // Build a long tool-heavy history at the scale of the reported
+        // incident (~3000 messages) to pin bulk-parse behavior.
+        let mut history = Vec::with_capacity(3000);
+        for i in 0..1500 {
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    AssistantContentBlock::Text(TextContentBlock {
+                        text: format!("thinking {i}"),
+                        shared: Default::default(),
+                        reasoning_details: None,
+                    }),
+                    AssistantContentBlock::ToolUse(ToolUseBlock {
+                        id: format!("tool-{i}"),
+                        name: "read".to_string(),
+                        input: serde_json::json!({"path": "/tmp/x.rs"}),
+                        shared: Default::default(),
+                        reasoning_details: None,
+                    }),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                    ToolResultBlock {
+                        tool_use_id: format!("tool-{i}"),
+                        content: ToolResultContent::Text(format!("result {i}")),
+                        shared: Default::default(),
+                    },
+                )]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+        }
+
+        storage.write_api_conversation_history(&history).unwrap();
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read.len(), history.len());
+        assert_eq!(read, history);
+    }
+
+    #[test]
+    fn test_api_conversation_history_thinking_block_round_trip() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields, ThinkingBlock,
+        };
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // Thinking blocks serialize duplicate `signature` keys (direct field
+        // plus flattened shared fields), which bulk parsing rejects while
+        // per-element conversion accepts. The collapsed key feeds the direct
+        // field, so the shared copy reads back empty; the fix guarantees the
+        // record survives, not that the writer's duplicate keys round-trip.
+        let history = vec![StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Thinking(
+                ThinkingBlock {
+                    thinking: "hmm".to_string(),
+                    signature: Some("sig".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: Some("sig".to_string()),
+                    },
+                    summary: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }];
+
+        storage.write_api_conversation_history(&history).unwrap();
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].role, MessageRole::Assistant);
+        match &read[0].content {
+            MessageContent::AssistantBlocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0] {
+                    AssistantContentBlock::Thinking(thinking) => {
+                        assert_eq!(thinking.thinking, "hmm");
+                        assert_eq!(thinking.signature, Some("sig".to_string()));
+                    }
+                    other => panic!("expected thinking block, got {other:?}"),
+                }
+            }
+            other => panic!("expected assistant blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_api_conversation_history_recovers_around_poisoned_record() {
+        use crate::providers::{MessageContent, MessageRole};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let before = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("before".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        let after = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("after".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        // Matches no MessageContent variant, so bulk parsing fails and
+        // per-element recovery must drop exactly this record.
+        let poison = serde_json::json!({"role": "user", "content": [{"type": "bogus_block"}]});
+        let contents = format!(
+            "[{},{},{}]",
+            serde_json::to_string(&before).unwrap(),
+            poison,
+            serde_json::to_string(&after).unwrap()
+        );
+
+        let history_path = storage
+            .task_dir
+            .join(GlobalFileNames::API_CONVERSATION_HISTORY);
+        fs::write(&history_path, &contents).unwrap();
+
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read, vec![before, after]);
+
+        let backup_path = history_path.with_extension("json.bak");
+        assert!(backup_path.exists());
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), contents);
+    }
+
+    #[test]
+    fn test_api_conversation_history_prunes_dangling_tool_result() {
+        use crate::providers::{
+            MessageContent, MessageRole, ToolResultBlock, ToolResultContent, UserContentBlock,
+        };
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // Fully parseable, so this exercises the bulk path: repair still
+        // prunes the result nobody offered, and the emptied message goes.
+        let history = vec![
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("done".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                    ToolResultBlock {
+                        tool_use_id: "tool-ghost".to_string(),
+                        content: ToolResultContent::Text("orphan".to_string()),
+                        shared: Default::default(),
+                    },
+                )]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ];
+
+        storage.write_api_conversation_history(&history).unwrap();
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read, history[..1].to_vec());
+    }
+
+    #[test]
+    fn test_api_conversation_history_prunes_unanswered_tool_use() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, TextContentBlock, ToolUseBlock,
+        };
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let history = vec![
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![
+                    AssistantContentBlock::Text(TextContentBlock {
+                        text: "working".to_string(),
+                        shared: Default::default(),
+                        reasoning_details: None,
+                    }),
+                    AssistantContentBlock::ToolUse(ToolUseBlock {
+                        id: "tool-ghost".to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({}),
+                        shared: Default::default(),
+                        reasoning_details: None,
+                    }),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("ok".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ];
+
+        storage.write_api_conversation_history(&history).unwrap();
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read.len(), 2);
+        assert_eq!(
+            read[0].content,
+            MessageContent::AssistantBlocks(vec![AssistantContentBlock::Text(TextContentBlock {
+                text: "working".to_string(),
+                shared: Default::default(),
+                reasoning_details: None,
+            })])
+        );
+        assert_eq!(read[1], history[1]);
+    }
+
+    #[test]
+    fn test_api_conversation_history_preserves_preexisting_adjacency() {
+        use crate::providers::{MessageContent, MessageRole};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // Adjacent same-role messages the live loop wrote went through the
+        // send path that way; the loader preserves them byte-for-byte.
+        let history = vec![
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("first".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("second".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ];
+
+        storage.write_api_conversation_history(&history).unwrap();
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read, history);
+    }
+
+    #[test]
+    fn test_api_conversation_history_clean_recovery_skips_backup() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields, ThinkingBlock,
+        };
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // Bulk rejects the duplicate `signature` keys but every record
+        // parses, so recovery is total: no backup, no warn-level damage.
+        let history = vec![StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Thinking(
+                ThinkingBlock {
+                    thinking: "hmm".to_string(),
+                    signature: Some("sig".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: Some("sig".to_string()),
+                    },
+                    summary: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }];
+
+        storage.write_api_conversation_history(&history).unwrap();
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read.len(), 1);
+
+        let history_path = storage
+            .task_dir
+            .join(GlobalFileNames::API_CONVERSATION_HISTORY);
+        assert!(
+            !history_path.with_extension("json.bak").exists(),
+            "clean recovery must not back up a healthy file"
+        );
+    }
+
+    #[test]
+    fn test_api_conversation_history_gap_merge_spares_preexisting_neighbor() {
+        use crate::providers::{MessageContent, MessageRole};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // B and C were already adjacent; only the A,B pair meets across the
+        // removal gap, so only it merges.
+        let message = |text: &str| {
+            serde_json::to_string(&StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(text.to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            })
+            .unwrap()
+        };
+        let poison = serde_json::json!({"role": "user", "content": [{"type": "bogus_block"}]});
+        let contents = format!(
+            "[{},{},{},{}]",
+            message("a"),
+            poison,
+            message("b"),
+            message("c")
+        );
+
+        let history_path = storage
+            .task_dir
+            .join(GlobalFileNames::API_CONVERSATION_HISTORY);
+        fs::write(&history_path, &contents).unwrap();
+
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].content, MessageContent::Text("a\nb".to_string()));
+        assert_eq!(read[1].content, MessageContent::Text("c".to_string()));
+    }
+
+    #[test]
+    fn test_api_conversation_history_merges_same_role_neighbors() {
+        use crate::providers::{MessageContent, MessageRole};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // Dropping the middle user message leaves two assistant messages in
+        // a row, which providers reject; repair folds them into one.
+        let poison = serde_json::json!({"role": "user", "content": [{"type": "bogus_block"}]});
+        let contents = format!(
+            "[{},{},{}]",
+            serde_json::to_string(&StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("first".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            })
+            .unwrap(),
+            poison,
+            serde_json::to_string(&StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("second".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            })
+            .unwrap()
+        );
+
+        let history_path = storage
+            .task_dir
+            .join(GlobalFileNames::API_CONVERSATION_HISTORY);
+        fs::write(&history_path, &contents).unwrap();
+
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].role, MessageRole::Assistant);
+        assert_eq!(
+            read[0].content,
+            MessageContent::Text("first\nsecond".to_string())
         );
     }
 
