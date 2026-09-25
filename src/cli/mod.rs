@@ -383,6 +383,10 @@ pub struct TaskOptions {
     #[arg(long, value_name = "tokens", hide_short_help = true)]
     pub max_tokens: Option<u32>,
 
+    /// Override the model's context window for this session (deployment cap)
+    #[arg(long, value_name = "tokens", hide_short_help = true)]
+    pub context_window: Option<u64>,
+
     /// Enable debug logging to /tmp/sned-debug.log. Default disabled
     #[arg(long, hide_short_help = true)]
     pub debug: bool,
@@ -817,6 +821,30 @@ fn openai_endpoint_kind(
     }
 }
 
+/// Explicit --context-window wins over profile and generic defaults.
+/// Zero is ignored like --max-tokens handling downstream.
+fn apply_context_window_override(
+    info: &mut crate::providers::ModelInfo,
+    context_window: Option<u64>,
+) {
+    if let Some(window) = context_window.filter(|window| *window > 0) {
+        info.context_window = Some(window);
+    }
+}
+
+/// Build an explicit model profile only when --context-window is set,
+/// so providers that resolve limits internally keep doing so otherwise.
+fn overridden_model_info(
+    base: crate::providers::ModelInfo,
+    context_window: Option<u64>,
+) -> Option<crate::providers::ModelInfo> {
+    context_window.filter(|window| *window > 0).map(|window| {
+        let mut info = base;
+        info.context_window = Some(window);
+        info
+    })
+}
+
 fn parse_extra_body(
     extra_body: Option<&str>,
 ) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
@@ -1072,6 +1100,10 @@ pub(crate) fn create_provider(
             let default_model = model_id
                 .or_else(|| stored_state.act_mode_api_model_id.clone())
                 .unwrap_or_else(|| "claude-sonnet-5".to_string());
+            let anthropic_model_info = overridden_model_info(
+                crate::providers::anthropic::get_anthropic_model_info(&default_model),
+                task_opts.context_window,
+            );
             let base_url = stored_state
                 .anthropic_base_url
                 .clone()
@@ -1082,7 +1114,7 @@ pub(crate) fn create_provider(
                         api_key,
                         base_url,
                         model_id: default_model,
-                        model_info: None,
+                        model_info: anthropic_model_info,
                         thinking_budget_tokens: thinking_budget,
                     },
                 )?,
@@ -1124,7 +1156,10 @@ pub(crate) fn create_provider(
                         api_key,
                         api_line,
                         model_id: default_model,
-                        model_info: None,
+                        model_info: overridden_model_info(
+                            crate::providers::ModelInfo::default(),
+                            task_opts.context_window,
+                        ),
                     },
                 )?,
             ))
@@ -1178,9 +1213,10 @@ pub(crate) fn create_provider(
             let default_model = model_id
                 .or_else(|| stored_state.act_mode_api_model_id.clone())
                 .unwrap_or_else(|| "gpt-5.6".to_string());
-            let model_info = Some(crate::providers::openai::get_openai_model_info(
-                &default_model,
-            ));
+            let mut openai_model_info =
+                crate::providers::openai::get_openai_model_info(&default_model);
+            apply_context_window_override(&mut openai_model_info.base, task_opts.context_window);
+            let model_info = Some(openai_model_info);
             Arc::new(crate::providers::Providers::OpenAi(
                 crate::providers::openai::OpenAiProvider::new(
                     crate::providers::openai::OpenAiConfig {
@@ -1231,7 +1267,9 @@ pub(crate) fn create_provider(
             let default_model = model_id
                 .or_else(|| stored_state.act_mode_api_model_id.clone())
                 .unwrap_or_else(|| "gemini-3.6-flash".to_string());
-            let gemini_model_info = crate::providers::gemini::get_gemini_model_info(&default_model);
+            let mut gemini_model_info =
+                crate::providers::gemini::get_gemini_model_info(&default_model);
+            apply_context_window_override(&mut gemini_model_info, task_opts.context_window);
             // Reject flags that the selected Gemini generation cannot honour.
             if task_opts.thinking.is_some()
                 && gemini_model_info
@@ -1293,14 +1331,15 @@ pub(crate) fn create_provider(
                 )
             })?;
             let model_id_str = model_id.unwrap_or_else(|| "deepseek-chat".to_string());
+            let mut deepseek_model_info =
+                crate::providers::deepseek::get_deepseek_model_info(&model_id_str);
+            apply_context_window_override(&mut deepseek_model_info.base, task_opts.context_window);
             Arc::new(crate::providers::Providers::DeepSeek(
                 crate::providers::deepseek::DeepSeekProvider::new(
                     crate::providers::deepseek::DeepSeekConfig {
                         api_key,
                         model_id: model_id_str.clone(),
-                        model_info: Some(crate::providers::deepseek::get_deepseek_model_info(
-                            &model_id_str,
-                        )),
+                        model_info: Some(deepseek_model_info),
                         extra_body,
                     },
                 )?,
@@ -1326,14 +1365,18 @@ pub(crate) fn create_provider(
                 )
             })?;
             let model_id_str = model_id.unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string());
+            let mut openrouter_model_info =
+                crate::providers::openrouter::get_openrouter_model_info(&model_id_str);
+            apply_context_window_override(
+                &mut openrouter_model_info.base,
+                task_opts.context_window,
+            );
             Arc::new(crate::providers::Providers::OpenRouter(
                 crate::providers::openrouter::OpenRouterProvider::new(
                     crate::providers::openrouter::OpenRouterConfig {
                         api_key,
                         model_id: model_id_str.clone(),
-                        model_info: Some(crate::providers::openrouter::get_openrouter_model_info(
-                            &model_id_str,
-                        )),
+                        model_info: Some(openrouter_model_info),
                         provider_sort: None,
                         reasoning_effort: reasoning_effort_str,
                         extra_body,
@@ -2350,6 +2393,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_context_window_flag() {
+        let cli = Cli::try_parse_from(["sned", "--context-window", "46000", "test"]).unwrap();
+        assert_eq!(cli.task_opts.context_window, Some(46_000));
+    }
+
+    #[test]
+    fn context_window_override_wins_over_profile() {
+        use crate::providers::ModelInfo;
+
+        let mut info = ModelInfo {
+            context_window: Some(262_144),
+            ..ModelInfo::default()
+        };
+        apply_context_window_override(&mut info, Some(46_000));
+        assert_eq!(info.context_window, Some(46_000));
+
+        let mut info = ModelInfo {
+            context_window: Some(262_144),
+            ..ModelInfo::default()
+        };
+        apply_context_window_override(&mut info, None);
+        assert_eq!(info.context_window, Some(262_144));
+
+        let mut info = ModelInfo {
+            context_window: Some(262_144),
+            ..ModelInfo::default()
+        };
+        apply_context_window_override(&mut info, Some(0));
+        assert_eq!(info.context_window, Some(262_144));
+    }
+
+    #[test]
+    fn overridden_model_info_stays_absent_without_flag() {
+        use crate::providers::ModelInfo;
+
+        let base = ModelInfo {
+            context_window: Some(200_000),
+            ..ModelInfo::default()
+        };
+        assert!(overridden_model_info(base.clone(), None).is_none());
+        assert!(overridden_model_info(base.clone(), Some(0)).is_none());
+
+        let info = overridden_model_info(base, Some(46_000)).unwrap();
+        assert_eq!(info.context_window, Some(46_000));
+    }
+
+    #[test]
     fn interactive_shell_requires_real_terminal_and_non_json_mode() {
         assert!(should_start_interactive_shell(false, true, true, false));
         assert!(!should_start_interactive_shell(true, true, true, false));
@@ -2890,6 +2980,7 @@ mod tests {
                 no_checkpoints: false,
                 max_context_turns: None,
                 max_tokens: None,
+                context_window: None,
                 debug: false,
                 prompt_file: None,
                 result_file: None,
@@ -2964,6 +3055,7 @@ mod tests {
                 no_checkpoints: false,
                 max_context_turns: None,
                 max_tokens: None,
+                context_window: None,
                 debug: false,
                 prompt_file: None,
                 result_file: None,
@@ -3090,6 +3182,7 @@ mod tests {
                 no_checkpoints: false,
                 max_context_turns: None,
                 max_tokens: None,
+                context_window: None,
                 debug: false,
                 prompt_file: None,
                 result_file: None,

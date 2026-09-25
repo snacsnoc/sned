@@ -214,7 +214,7 @@ impl MinimaxProvider {
     fn get_model_info(&self) -> ModelInfo {
         let model_id = self.canonical_model_id();
 
-        match model_id.as_str() {
+        let mut info = match model_id.as_str() {
             "MiniMax-M3" => ModelInfo {
                 name: Some("MiniMax-M3".to_string()),
                 max_tokens: Some(128_000),
@@ -493,7 +493,17 @@ impl MinimaxProvider {
                 supports_tools: Some(true),
                 api_format: None,
             },
+        };
+        if let Some(window) = self
+            .config
+            .model_info
+            .as_ref()
+            .and_then(|info| info.context_window)
+            .filter(|window| *window > 0)
+        {
+            info.context_window = Some(window);
         }
+        info
     }
 }
 
@@ -1562,6 +1572,24 @@ mod tests {
         assert_eq!(model.info.input_price, Some(0.3));
         assert_eq!(model.info.output_price, Some(1.2));
         assert_eq!(model.info.tiers.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn test_minimax_config_context_window_override() {
+        let provider = MinimaxProvider::new(MinimaxConfig {
+            api_key: "test-key".to_string(),
+            api_line: None,
+            model_id: "MiniMax-M2.7".to_string(),
+            model_info: Some(ModelInfo {
+                context_window: Some(46_000),
+                ..ModelInfo::default()
+            }),
+        })
+        .unwrap();
+
+        let model = provider.get_model();
+        assert_eq!(model.info.context_window, Some(46_000));
+        assert_eq!(model.info.max_tokens, Some(128_000));
     }
 
     #[test]
