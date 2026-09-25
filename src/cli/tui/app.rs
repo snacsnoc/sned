@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
@@ -3543,7 +3543,23 @@ impl App {
             return;
         }
 
-        let max_offset = Self::max_scroll_offset_for(total_rows, self.last_content_height);
+        let mut max_offset = Self::max_scroll_offset_for(total_rows, self.last_content_height);
+        // Scrolling past the top loads evicted history so the wheel alone
+        // reaches older lines; scrolling home from the history view exits.
+        if delta < 0
+            && !self.in_scrollback
+            && self.scrollback_count > 0
+            && max_offset > 0
+            && self.scroll_offset == 0
+            && self.enter_scrollback().is_ok()
+        {
+            let old_max = max_offset;
+            let grown_rows = self.output_visual_rows(wrap_width);
+            max_offset =
+                Self::max_scroll_offset_for(grown_rows, self.last_content_height);
+            self.scroll_mode = ScrollMode::Manual;
+            self.scroll_offset = max_offset.saturating_sub(old_max);
+        }
         self.scroll_offset = if delta.is_negative() {
             self.scroll_offset.saturating_sub(delta.unsigned_abs())
         } else {
@@ -3552,6 +3568,9 @@ impl App {
                 .min(max_offset)
         };
         self.clamp_to_content();
+        if self.in_scrollback && self.scroll_mode == ScrollMode::Auto {
+            let _ = self.exit_scrollback();
+        }
     }
 
     fn total_visual_rows_for_width(&self, wrap_width: usize) -> usize {
@@ -4706,6 +4725,9 @@ impl App {
         if self.scroll_mode == ScrollMode::Manual && self.unseen_output_count > 0 {
             right_segments.push(format!("↑ {} new", self.unseen_output_count));
         }
+        if !self.in_scrollback && self.scrollback_count > 0 {
+            right_segments.push(format!("↑{} scrollback", self.scrollback_count));
+        }
 
         let mut right = String::new();
         for segment in right_segments {
@@ -4812,12 +4834,6 @@ impl App {
                 )
             })
             .unwrap_or_default();
-        if !self.in_scrollback
-            && self.scrollback_count > 0
-            && let Some(source) = self.transcript_selection_row_sources.last_mut()
-        {
-            *source = None;
-        }
         {
             frame.render_widget(Clear, output_area);
             let visible_lines =
@@ -4834,23 +4850,6 @@ impl App {
                     theme::border_block(title).padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
                 );
             frame.render_widget(output, output_area);
-        }
-
-        if !self.in_scrollback && self.scrollback_count > 0 && output_area.height > 0 {
-            let indicator = Paragraph::new(Line::from(format!(
-                "↓ {} lines of scrollback — press Shift+S to view",
-                self.scrollback_count,
-            )))
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(theme::ACCENT).italic());
-            let indicator_area = Rect {
-                x: output_area.x,
-                y: output_area.y + output_area.height - 1,
-                width: output_area.width,
-                height: 1,
-            };
-            frame.render_widget(Clear, indicator_area);
-            frame.render_widget(indicator, indicator_area);
         }
 
         if output_rows > content_height {
@@ -7471,7 +7470,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scrollback_indicator_remains_visible_while_manually_scrolled() {
+    fn test_scrollback_count_renders_in_status_bar_without_overlay_row() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         let mut app = App::new();
@@ -7490,7 +7489,176 @@ mod tests {
 
         let rendered = rendered_rows(terminal.backend().buffer()).join("\n");
         assert_eq!(app.scroll_mode, ScrollMode::Manual);
-        assert!(rendered.contains("42 lines of scrollback"));
+        assert!(
+            rendered.contains("↑42 scrollback"),
+            "status bar must carry the scrollback count, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("lines of scrollback"),
+            "no dedicated indicator row may remain, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_status_bar_hides_scrollback_segment_while_viewing_history() {
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.scrollback_count = 42;
+        app.in_scrollback = true;
+        let status_area = ratatui::layout::Rect::new(0, 0, 80, 1);
+        terminal
+            .draw(|frame| app.render_status_bar(frame, status_area))
+            .expect("status bar should render");
+        let rendered = rendered_rows(terminal.backend().buffer()).join("\n");
+        assert!(
+            !rendered.contains("scrollback"),
+            "segment must hide while viewing history, got:\n{rendered}"
+        );
+    }
+
+    fn scrollback_journey_app() -> (tempfile::TempDir, App) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lines");
+        let content = (0..5)
+            .map(|index| format!("history {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, content).unwrap();
+        let mut app = App::new();
+        app.scrollback_file = Some(file_path);
+        app.set_content_width(80);
+        app.set_content_height(5);
+        for index in 0..30 {
+            app.push_plain(format!("line {index}"));
+        }
+        app.scrollback_count = 5;
+        (temp_dir, app)
+    }
+
+    #[test]
+    fn test_scroll_past_top_loads_scrollback_without_jumping() {
+        let (_temp_dir, mut app) = scrollback_journey_app();
+        app.scroll_lines(-isize::MAX);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(!app.in_scrollback);
+
+        app.scroll_lines(-3);
+
+        assert!(app.in_scrollback, "scrolling past the top must enter history");
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.output_lines[0].to_string(), "history 0");
+        assert_eq!(app.output_lines[6].to_string(), "line 0");
+        assert_eq!(
+            app.scroll_offset, 3,
+            "viewport must hold its position then move into history"
+        );
+    }
+
+    #[test]
+    fn test_scroll_home_in_scrollback_returns_to_live() {
+        let (_temp_dir, mut app) = scrollback_journey_app();
+        app.scroll_lines(-isize::MAX);
+        app.scroll_lines(-3);
+        assert!(app.in_scrollback);
+
+        app.scroll_lines(isize::MAX);
+
+        assert!(!app.in_scrollback, "scrolling home must exit history");
+        assert_eq!(app.scrollback_count, 0);
+        assert_eq!(app.scroll_mode, ScrollMode::Auto);
+    }
+
+    #[test]
+    fn test_scroll_without_scrollback_stays_put_at_top() {
+        let (_temp_dir, mut app) = scrollback_journey_app();
+        app.scrollback_count = 0;
+        app.scroll_lines(-isize::MAX);
+        app.scroll_lines(-3);
+
+        assert!(!app.in_scrollback);
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_render_long_wrapped_content_keeps_border_columns_clean() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.push_plain(
+            "nothing added to commit but untracked files present (use \"git add\" to track) \
+             and here is more trailing prose to force several wrapped rows of plain output text \
+             with \"quoted\" segments and {braces} scattered throughout the line for good measure",
+        );
+        for index in 0..40 {
+            app.push_plain(format!(
+                "result line {index}: \"Done. Both files were already committed in the previous \
+                 turn as `bd08951 description here` and `git status` shows no remaining modified \
+                 files (only an unrelated untracked `xcsomedir/` directory). Stopping.\" \
+                 trailing filler words to extend the row well past the wrap width {{done}}"
+            ));
+        }
+        app.push_plain("code line: if (idx < ringRequired && nextIdx < ringRequired) { ringData[idx] = dataSource[i * 2]; }");
+        app.push_plain("emoji markers ✓ 📝 done and more trailing text to push this row over the wrap boundary again");
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("long content should render");
+        let width = terminal.backend().buffer().area.width as usize;
+        let rows = rendered_rows(terminal.backend().buffer());
+        let allowed = [
+            '│', '╭', '╮', '╰', '╯', '─', '↑', '↓', '█', '║', ' ',
+        ];
+        for (row_idx, row) in rows.iter().enumerate() {
+            let chars: Vec<char> = row.chars().collect();
+            for (label, cell) in [("left", chars[0]), ("right", chars[width - 1])] {
+                assert!(
+                    allowed.contains(&cell),
+                    "{label} edge of row {row_idx} must be border, scrollbar, or blank, got \
+                     {cell:?} in {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_render_tab_indented_code_keeps_border_columns_clean() {
+        for width in [40u16, 120u16] {
+            let backend = TestBackend::new(width, 24);
+            let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+            let mut app = App::new();
+            for index in 0..30 {
+                app.push_plain(format!(
+                    "\t\tcode line {index} with tab indentation and enough trailing words \
+                     to wrap several times at narrow widths {{x}}"
+                ));
+            }
+            for offset in [0, 3, 17] {
+                app.scroll_lines(-(offset as isize));
+                terminal
+                    .draw(|frame| app.render(frame))
+                    .expect("tabbed content should render");
+                let area_width =
+                    terminal.backend().buffer().area.width as usize;
+                let rows = rendered_rows(terminal.backend().buffer());
+                let allowed = [
+                    '│', '╭', '╮', '╰', '╯', '─', '↑', '↓', '█', '║', ' ',
+                ];
+                for (row_idx, row) in rows.iter().enumerate() {
+                    let chars: Vec<char> = row.chars().collect();
+                    for (label, cell) in
+                        [("left", chars[0]), ("right", chars[area_width - 1])]
+                    {
+                        assert!(
+                            allowed.contains(&cell),
+                            "width {width} offset {offset}: {label} edge of row {row_idx} \
+                             must be border, scrollbar, or blank, got {cell:?} in {row:?}"
+                        );
+                    }
+                }
+                app.force_bottom();
+            }
+        }
     }
 
     #[test]
