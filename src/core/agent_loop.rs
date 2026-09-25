@@ -4115,9 +4115,11 @@ impl AgentLoop {
                                     None,
                                     Some(
                                         async move {
+                                            let params_text = tool_params.to_string();
                                             tracing::debug!(
                                                 tool = %tool_name,
-                                                params = %tool_params.to_string(),
+                                                params_len = params_text.len(),
+                                                params_preview = %&params_text[..params_text.floor_char_boundary(params_text.len().min(1024))],
                                                 "executing tool"
                                             );
                                             let result = Self::execute_tool_with_hooks_internal(
