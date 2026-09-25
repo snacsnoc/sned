@@ -16,7 +16,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::warn;
 
 /// A checkpoint is a safety feature, never a reason to leave the agent stuck
@@ -253,12 +253,7 @@ impl CheckpointTracker {
             return Err(CheckpointError::Cancelled);
         }
         // Stage all changes (including deletions and files outside cwd)
-        let add_result = Self::run_git_cmd_with_worktree_cancellable(
-            &self.shadow_git_path,
-            &self.cwd,
-            &["add", "--all"],
-            cancelled,
-        );
+        let add_result = self.run_commit_git_op(&["add", "--all"], cancelled);
 
         if let Err(e) = add_result {
             warn!("[checkpoints] Warning: failed to stage files: {}", e);
@@ -269,9 +264,7 @@ impl CheckpointTracker {
         if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return Err(CheckpointError::Cancelled);
         }
-        let commit_result = Self::run_git_cmd_with_worktree_cancellable(
-            &self.shadow_git_path,
-            &self.cwd,
+        let commit_result = self.run_commit_git_op(
             &[
                 "commit",
                 "-m",
@@ -560,6 +553,59 @@ impl CheckpointTracker {
         Self::run_git_cmd_with_worktree_cancellable(git_dir, work_tree, args, None)
     }
 
+    /// A lock created inside our own op window belongs to the child we
+    /// just killed, so no live holder can own it.
+    fn remove_lock_created_since(git_dir: &Path, op_start: SystemTime) -> bool {
+        let lock_path = git_dir.join("index.lock");
+        let is_ours = std::fs::metadata(&lock_path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified >= op_start);
+        if !is_ours {
+            return false;
+        }
+        if std::fs::remove_file(&lock_path).is_err() {
+            return false;
+        }
+        warn!(
+            "[checkpoints] Removed index.lock created during a killed git op in {}",
+            git_dir.display()
+        );
+        true
+    }
+
+    fn is_index_lock_conflict(message: &str) -> bool {
+        message.contains("index.lock")
+    }
+
+    /// Run a commit-path git op, surviving a transient lock held by a live
+    /// holder finishing mid-save; a stale lock falls back to the age gate.
+    fn run_commit_git_op(
+        &self,
+        args: &[&str],
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(), CheckpointError> {
+        let run =
+            || Self::run_git_cmd_with_worktree_cancellable(&self.shadow_git_path, &self.cwd, args, cancelled);
+        let first = run();
+        if !matches!(&first, Err(error) if Self::is_index_lock_conflict(&error.to_string())) {
+            return first;
+        }
+        let lock_path = self.shadow_git_path.join("index.lock");
+        let waited = Instant::now();
+        while lock_path.exists()
+            && waited.elapsed() < Duration::from_secs(5)
+            && !cancelled.is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let second = run();
+        if !matches!(&second, Err(error) if Self::is_index_lock_conflict(&error.to_string())) {
+            return second;
+        }
+        let _ = self.remove_stale_index_lock();
+        run()
+    }
+
     fn run_git_cmd_with_worktree_cancellable(
         git_dir: &Path,
         work_tree: &Path,
@@ -573,6 +619,7 @@ impl CheckpointTracker {
         cmd_args.push(work_tree.to_str().unwrap_or("."));
         cmd_args.extend_from_slice(args);
 
+        let op_start = SystemTime::now();
         let mut command = Command::new("git");
         command.current_dir(git_dir).args(cmd_args.iter().copied());
         let output = Self::run_command_with_timeout_and_cancellation(
@@ -580,7 +627,15 @@ impl CheckpointTracker {
             CHECKPOINT_GIT_TIMEOUT,
             cancelled,
         )
-        .map_err(|error| CheckpointError::CommandFailed(format!("git command failed: {error}")))?;
+        .map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+            ) {
+                Self::remove_lock_created_since(git_dir, op_start);
+            }
+            CheckpointError::CommandFailed(format!("git command failed: {error}"))
+        })?;
         if !output.status.success() {
             return Err(CheckpointError::CommandFailed(format!(
                 "git {} failed: {}",
@@ -881,6 +936,84 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn test_index_lock_conflict_detection() {
+        assert!(CheckpointTracker::is_index_lock_conflict(
+            "fatal: Unable to create '/x/.git/index.lock': File exists."
+        ));
+        assert!(!CheckpointTracker::is_index_lock_conflict(
+            "nothing to commit, working tree clean"
+        ));
+    }
+
+    #[test]
+    fn test_op_lock_cleanup_keeps_preexisting_lock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("index.lock");
+        std::fs::write(&lock_path, b"live-holder").unwrap();
+        assert!(
+            !CheckpointTracker::remove_lock_created_since(
+                temp_dir.path(),
+                SystemTime::now() + Duration::from_secs(60)
+            ),
+            "a lock predating the op window must be kept"
+        );
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn test_op_lock_cleanup_removes_op_window_lock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("index.lock");
+        std::fs::write(&lock_path, b"killed-child").unwrap();
+        assert!(
+            CheckpointTracker::remove_lock_created_since(
+                temp_dir.path(),
+                SystemTime::now() - Duration::from_secs(60)
+            ),
+            "a lock created inside the op window must go"
+        );
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn test_commit_git_op_retries_after_transient_lock() {
+        if !git_available() {
+            eprintln!("Skipping test: git not available");
+            return;
+        }
+        ensure_test_checkpoint_base_dir();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("f.txt"), b"content").unwrap();
+
+        let tracker = CheckpointTracker::new(
+            "lock-retry-test".to_string(),
+            true,
+            workspace.to_str().unwrap(),
+        )
+        .expect("tracker init")
+        .expect("checkpoints enabled");
+
+        let lock_path = tracker.shadow_git_path.join("index.lock");
+        std::fs::write(&lock_path, b"transient-holder").unwrap();
+        let remover = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = std::fs::remove_file(&lock_path);
+        });
+
+        tracker
+            .run_commit_git_op(&["add", "--all"], None)
+            .expect("retry after a transient lock must succeed");
+        let _ = remover.join();
+        assert!(
+            !tracker.shadow_git_path.join("index.lock").exists(),
+            "no lock may be left behind"
+        );
     }
 
     #[cfg(unix)]
