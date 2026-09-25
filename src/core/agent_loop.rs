@@ -6058,13 +6058,9 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
             };
 
             let is_read_result = match &tr.content {
-                ToolResultContent::Text(text) => {
-                    text.starts_with("[File: ") || text.contains("\n[File: ")
-                }
+                ToolResultContent::Text(text) => is_read_result_text(text),
                 ToolResultContent::Blocks(b) => b.iter().any(|cb| match cb {
-                    ToolResultContentBlock::Text { text } => {
-                        text.starts_with("[File: ") || text.contains("\n[File: ")
-                    }
+                    ToolResultContentBlock::Text { text } => is_read_result_text(text),
                     _ => false,
                 }),
             };
@@ -6172,6 +6168,14 @@ fn compact_single_shell_text(text: &mut String, min_bytes: usize) {
         total_lines,
         total_bytes
     );
+}
+
+fn is_read_result_text(text: &str) -> bool {
+    // Re-reads of edited files come back section-summarized without a
+    // file header; without this they would never collapse.
+    text.starts_with("[File: ")
+        || text.contains("\n[File: ")
+        || text.starts_with("[Context pruned:")
 }
 
 fn compact_single_read_text(text: &mut String, min_bytes: usize) {
@@ -12113,6 +12117,65 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(
             get_text(&history[2]).contains("line content number 80"),
             "most recent read must keep full content"
+        );
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_collapses_pruned_rereads() {
+        let anchored_body: String = (1..=80)
+            .map(|n| format!("{n}: ABC{n:04}X§line content number {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let make_pruned_read = |hash: &str| StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                crate::providers::ToolResultBlock {
+                    tool_use_id: format!("call_{hash}"),
+                    content: crate::providers::ToolResultContent::Text(format!(
+                        "[Context pruned: 83 lines, ~5KB. Hash: {hash}]\nPreserved anchors (copy EXACTLY):\n{anchored_body}"
+                    )),
+                    shared: crate::providers::SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+
+        let mut history = vec![
+            make_pruned_read("aaaa1111"),
+            make_pruned_read("bbbb2222"),
+            make_pruned_read("cccc3333"),
+        ];
+
+        compact_old_tool_results(&mut history);
+
+        let get_text = |msg: &StorageMessage| match &msg.content {
+            MessageContent::UserBlocks(blocks) => match &blocks[0] {
+                UserContentBlock::ToolResult(tr) => match &tr.content {
+                    ToolResultContent::Text(t) => t.clone(),
+                    _ => panic!("Expected text"),
+                },
+                _ => panic!("Expected ToolResult"),
+            },
+            _ => panic!("Expected UserBlocks"),
+        };
+
+        let aged = get_text(&history[0]);
+        assert!(aged.starts_with("[Context pruned: 83 lines"));
+        assert!(aged.contains("Earlier read content"));
+        assert!(
+            aged.len() < 1000,
+            "aged pruned re-read must collapse near header size, got {} bytes",
+            aged.len()
+        );
+        assert!(
+            get_text(&history[2]).contains("line content number 80"),
+            "most recent pruned re-read must keep full content"
         );
     }
 
