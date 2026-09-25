@@ -653,8 +653,17 @@ impl BatchProcessor {
             } else {
                 "Untouched lines retain their anchors; inserted or replaced lines have new anchors. Deleted or replaced anchors are retired. Use the shown anchors for changed lines."
             };
+            // The write phase verifies these bytes landed on disk, so this
+            // hash matches read_file's [Revision:] for the same content. A
+            // retry can compare it against the revision its anchors came
+            // from to detect the file moved underneath it.
+            use sha2::Digest;
+            let revision = format!(
+                "{:x}",
+                sha2::Sha256::digest(prepared.final_content.as_bytes())
+            );
             format!(
-                "Applied {} edit(s) successfully (+{total_added}, -{total_removed} lines). {anchor_note}{unchanged_note}{failure_note}",
+                "Applied {} edit(s) successfully (+{total_added}, -{total_removed} lines). [Revision: sha256:{revision}] {anchor_note}{unchanged_note}{failure_note}",
                 prepared.applied_edits.len()
             )
         };
@@ -1485,6 +1494,66 @@ mod tests {
             formatted
                 .contains("Edit (anchor: \"Eleventh§h11\", end_anchor: \"Eleventh§h11\") applied:")
         );
+    }
+
+    #[test]
+    fn test_format_result_reports_output_revision_token() {
+        use sha2::Digest;
+        let lines: Vec<String> = (1..=5).map(|n| format!("line{n}")).collect();
+        let hashes: Vec<String> = (1..=5).map(|n| format!("h{n}")).collect();
+        let mut final_lines = lines.clone();
+        final_lines[1] = "changed".to_string();
+        let final_hashes = hashes.clone();
+        let final_content = final_lines.join("\n");
+        let expected = format!(
+            "{:x}",
+            sha2::Sha256::digest("line1\nchanged\nline3\nline4\nline5".as_bytes())
+        );
+        assert_eq!(final_content, "line1\nchanged\nline3\nline4\nline5");
+        let applied_edit = AppliedEdit {
+            start_idx: 1,
+            end_idx: 1,
+            original_start_idx: 1,
+            original_end_idx: 1,
+            edit: Edit {
+                anchor: "Second§h2".to_string(),
+                end_anchor: None,
+                edit_type: "replace".to_string(),
+                text: "changed".to_string(),
+                content: None,
+                old_text: None,
+            },
+            lines_added: 1,
+            lines_deleted: 1,
+        };
+        let prepared = PreparedEdits {
+            provenance: SpliceProvenance::default(),
+            content: lines.join("\n"),
+            final_content,
+            diff: String::new(),
+            resolved_edits: Vec::new(),
+            failed_edits: Vec::new(),
+            applied_edits: vec![applied_edit],
+            lines,
+            line_hashes: hashes,
+            final_lines: final_lines.clone(),
+            initial_mtime: None,
+        };
+        let processor = BatchProcessor::new(DiffMode::Full);
+        let formatted =
+            processor.format_result("revised.rs", &prepared, &final_lines, &final_hashes, None);
+
+        // The token must match read_file's revision for the same bytes so a
+        // retry can tell the file moved underneath its anchors.
+        assert!(formatted.contains(&format!("[Revision: sha256:{expected}]")));
+
+        let empty = PreparedEdits {
+            applied_edits: Vec::new(),
+            ..prepared
+        };
+        let formatted =
+            processor.format_result("revised.rs", &empty, &final_lines, &final_hashes, None);
+        assert!(!formatted.contains("[Revision:"));
     }
 
     #[test]
