@@ -1070,6 +1070,8 @@ pub struct App {
     /// Reasoning blocks awaiting a non-reasoning event or TurnEnd. Keeping
     /// the rendered blocks together preserves chunk coalescing on replay.
     pending_transcript_reasoning_lines: Option<Vec<Line<'static>>>,
+    reasoning_stream_generation: u64,
+    last_persisted_reasoning_generation: u64,
     pub(crate) deferred_priority_events: VecDeque<crate::cli::output::SequencedOutputEvent>,
     /// Whether the model picker is active.
     pub model_picker_active: bool,
@@ -1105,6 +1107,15 @@ impl App {
             out.push_str(&span.content);
         }
         out
+    }
+
+    fn line_trimmed_starts_with(line: &Line<'static>, prefix: &str) -> bool {
+        let mut chars = line
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .skip_while(|ch| ch.is_whitespace());
+        prefix.chars().all(|next| chars.next().is_some_and(|cell| cell == next))
     }
 
     fn allocate_output_line_id(&mut self) -> OutputLineId {
@@ -1457,6 +1468,8 @@ impl App {
             last_turn_render_generation: None,
             pending_transcript_model_line: None,
             pending_transcript_reasoning_lines: None,
+            reasoning_stream_generation: 0,
+            last_persisted_reasoning_generation: 0,
             deferred_priority_events: VecDeque::new(),
             model_picker_active: false,
             model_picker_results: Vec::new(),
@@ -1541,6 +1554,14 @@ impl App {
         self.pending_transcript_reasoning_lines = Some(lines);
     }
 
+    pub(crate) fn reasoning_stream_changed_since_persisted(&self) -> bool {
+        self.reasoning_stream_generation != self.last_persisted_reasoning_generation
+    }
+
+    pub(crate) fn mark_reasoning_stream_persisted(&mut self) {
+        self.last_persisted_reasoning_generation = self.reasoning_stream_generation;
+    }
+
     pub(crate) fn reasoning_stream_lines(&self) -> Vec<Line<'static>> {
         self.turn_stream_entries
             .iter()
@@ -1574,6 +1595,8 @@ impl App {
         self.output_line_ids.push_back(line_id);
         self.output_line_kinds.push_back(kind);
         self.cached_visible_window = None;
+        let new_line_rows =
+            Self::output_row_visual_rows(self.output_lines.back(), kind, wrap_width);
         if self.output_lines.len() > 10_000 {
             let evicted_kind = *self
                 .output_line_kinds
@@ -1671,12 +1694,8 @@ impl App {
         } else if self.cached_wrap_width == Some(wrap_width) {
             // Hot path: keep the cached row count in sync for simple appends
             // so the next render does not need to rescan the whole transcript.
-            let added_rows = Self::output_row_visual_rows(
-                Some(self.output_lines.back().unwrap()),
-                kind,
-                wrap_width,
-            )
-            .saturating_add(usize::from(separator_before_line));
+            let added_rows =
+                new_line_rows.saturating_add(usize::from(separator_before_line));
             self.cached_visual_rows = self.cached_visual_rows.saturating_add(added_rows);
         }
         if can_extend_layout && self.visual_layout_index.is_valid_for(wrap_width) {
@@ -1693,7 +1712,7 @@ impl App {
                         + self.output_lines.len().saturating_sub(1),
                 ),
                 kind,
-                rows: Self::output_row_visual_rows(self.output_lines.back(), kind, wrap_width),
+                rows: new_line_rows,
             });
             self.cached_visual_rows = self.visual_layout_index.total_rows();
         } else if !self.visual_layout_index.is_valid_for(wrap_width) {
@@ -2992,6 +3011,9 @@ impl App {
     }
 
     fn normalize_hyperlink_markers(&self, buffer: &mut Buffer) {
+        if self.rendered_hyperlink_targets.is_empty() {
+            return;
+        }
         for cell in &mut buffer.content {
             if Self::hyperlink_marker_index(cell.underline_color)
                 .is_some_and(|index| index < self.rendered_hyperlink_targets.len())
@@ -3084,6 +3106,9 @@ impl App {
         };
         let mut pushed = 0usize;
 
+        if kind == StreamKind::Reasoning {
+            self.reasoning_stream_generation = self.reasoning_stream_generation.wrapping_add(1);
+        }
         for line in lines_to_push {
             self.push_output_with_kind(line, block_kind);
             let idx = self.output_lines.len() - 1;
@@ -3990,7 +4015,13 @@ impl App {
     ) -> Line<'static> {
         let mut line = line.map_or_else(
             || Line::from(""),
-            |line| Self::parse_osc8_line(line, hyperlink_targets),
+            |line| {
+                if Self::line_contains_osc8(line) {
+                    Self::parse_osc8_line(line, hyperlink_targets)
+                } else {
+                    line.clone()
+                }
+            },
         );
         if kind != BlockKind::Separator {
             line.spans
@@ -4328,13 +4359,10 @@ impl App {
             && matches!(prev_kind, BlockKind::ToolHeader | BlockKind::CommandHeader)
         {
             let next_is_call_start = match next_kind {
-                BlockKind::ToolHeader => Self::line_to_string(next_line)
-                    .trim_start()
-                    .starts_with("▶ "),
+                BlockKind::ToolHeader => Self::line_trimmed_starts_with(next_line, "▶ "),
                 BlockKind::CommandHeader => {
-                    let text = Self::line_to_string(next_line);
-                    text.trim_start().starts_with("Running: ")
-                        || text.trim_start().starts_with("$ ")
+                    Self::line_trimmed_starts_with(next_line, "Running: ")
+                        || Self::line_trimmed_starts_with(next_line, "$ ")
                 }
                 _ => false,
             };

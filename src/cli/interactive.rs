@@ -819,7 +819,7 @@ fn persist_transcript_line(
     storage: Option<&TaskStorage>,
     kind: crate::cli::tui::BlockKind,
     line: &Line<'static>,
-) {
+) -> bool {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -836,12 +836,15 @@ fn persist_transcript_line(
     if app.task_transcript_writer_is_started() {
         if let Err(error) = app.enqueue_task_transcript(entries) {
             tracing::warn!(error = %error, "Failed to queue transcript entries");
+            return false;
         }
     } else if let Some(storage) = storage
         && let Err(error) = storage.write_transcript_entries(&entries)
     {
         tracing::warn!(error = %error, "Failed to persist transcript entries");
+        return false;
     }
+    true
 }
 
 fn replay_transcript(app: &mut App, storage: &TaskStorage) {
@@ -871,10 +874,15 @@ fn flush_pending_reasoning_lines(
     pending: &mut Option<Vec<Line<'static>>>,
     storage: Option<&TaskStorage>,
 ) {
+    let mut persisted = true;
     if let Some(lines) = pending.take() {
         for line in lines {
-            persist_transcript_line(app, storage, crate::cli::tui::BlockKind::Reasoning, &line);
+            persisted &=
+                persist_transcript_line(app, storage, crate::cli::tui::BlockKind::Reasoning, &line);
         }
+    }
+    if persisted {
+        app.mark_reasoning_stream_persisted();
     }
 }
 
@@ -961,11 +969,13 @@ fn apply_output_event(
     turn_render_worker: Option<&TurnRenderWorker>,
 ) {
     if !matches!(&event, OutputEvent::ReasoningChunk(_)) {
-        let reasoning_lines = app.reasoning_stream_lines();
-        if !reasoning_lines.is_empty() {
-            *pending_reasoning_lines = Some(reasoning_lines);
+        if pending_reasoning_lines.is_some() || app.reasoning_stream_changed_since_persisted() {
+            let reasoning_lines = app.reasoning_stream_lines();
+            if !reasoning_lines.is_empty() {
+                *pending_reasoning_lines = Some(reasoning_lines);
+            }
+            flush_pending_reasoning_lines(app, pending_reasoning_lines, storage);
         }
-        flush_pending_reasoning_lines(app, pending_reasoning_lines, storage);
         app.finish_reasoning_stream();
     }
 
@@ -982,7 +992,7 @@ fn apply_output_event(
         }
         OutputEvent::ToolOutputLine(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
-            if line.to_string().contains("📋 Plan Generated") {
+            if line_spans_contain(&line, "📋 Plan Generated") {
                 app.discard_current_turn_model_stream();
             }
             for line in split_output_line_on_newlines(line) {
@@ -1154,6 +1164,25 @@ fn apply_output_event(
             app.push_turn_indicator(line);
         }
     }
+}
+
+fn line_spans_contain(line: &Line<'static>, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let tail = needle.chars().count().saturating_sub(1);
+    let mut window = String::new();
+    for span in &line.spans {
+        window.push_str(&span.content);
+        if window.contains(needle) {
+            return true;
+        }
+        let excess = window.chars().count().saturating_sub(tail);
+        if excess > 0 {
+            window = window.chars().skip(excess).collect();
+        }
+    }
+    false
 }
 
 /// Convert embedded newlines into actual transcript rows before storing them.
@@ -4660,6 +4689,7 @@ async fn run_main_loop(
     let mut draw_retry_delay = BUSY_REDRAW_INTERVAL;
     let mut draw_retry_at: Option<std::time::Instant> = None;
     let mut terminal_desynced = false;
+    let mut pending_export_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut timing = TimingSummary {
         enabled: timing_enabled,
         session_start_time: app.start_time,
@@ -5651,9 +5681,21 @@ async fn run_main_loop(
         }
 
         // Export conversation after each completed turn when --export is set.
+        // Serialization and the file write run off the event loop so a
+        // large transcript cannot stall input handling between turns. A
+        // still-running export is superseded: only the latest turn's bytes
+        // may land last.
         if agent_completed && let Some(export_path) = task_opts.export.clone() {
-            let export_result = export_conversation(&session, &export_path).await;
-            report_conversation_export(&output_writer, task_opts.json, &export_result, false);
+            if let Some(previous) = pending_export_task.take() {
+                previous.abort();
+            }
+            let session = Arc::clone(&session);
+            let output_writer = output_writer.clone();
+            let json_output = task_opts.json;
+            pending_export_task = Some(tokio::spawn(async move {
+                let export_result = export_conversation(&session, &export_path).await;
+                report_conversation_export(&output_writer, json_output, &export_result, false);
+            }));
         }
 
         // 5. Update elapsed time for status bar
@@ -7965,6 +8007,75 @@ mod tests {
         );
         assert!(entries[0].markdown.contains("Ɵ"));
         assert_eq!(entries[3].markdown, "answer");
+    }
+
+    #[test]
+    fn test_transcript_does_not_repersist_reasoning_on_later_events() {
+        use crate::cli::output::OutputEvent;
+        use crate::storage::task_storage::DEFAULT_TRANSCRIPT_CAP;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("reasoning-transcript-no-dupe");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(OutputEvent::reasoning_chunk("first").into())
+            .unwrap();
+        tx.try_send(OutputEvent::reasoning_chunk(" thought\n\nnext").into())
+            .unwrap();
+        tx.try_send(OutputEvent::reasoning_chunk(" step").into())
+            .unwrap();
+
+        let mut app = App::new();
+        app.set_content_width(80);
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+
+        tx.try_send(OutputEvent::Line(Line::from("answer one")).into())
+            .unwrap();
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+        tx.try_send(OutputEvent::Line(Line::from("answer two")).into())
+            .unwrap();
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+
+        let entries = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        let kinds: Vec<_> = entries.iter().map(|entry| entry.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::Reasoning,
+                BlockKind::Reasoning,
+                BlockKind::Reasoning,
+                BlockKind::Model,
+                BlockKind::Model,
+            ]
+        );
+        assert_eq!(entries[3].markdown, "answer one");
+        assert_eq!(entries[4].markdown, "answer two");
+    }
+
+    #[test]
+    fn test_transcript_retry_preserved_when_reasoning_persist_fails() {
+        use crate::cli::output::OutputEvent;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("reasoning-transcript-broken");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
+        std::fs::remove_dir_all(&task_dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(OutputEvent::reasoning_chunk("first thought\n").into())
+            .unwrap();
+
+        let mut app = App::new();
+        app.set_content_width(80);
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+        tx.try_send(OutputEvent::Line(Line::from("answer")).into())
+            .unwrap();
+        drain_output_for_test_with_storage(&mut rx, &mut app, &storage);
+
+        assert!(app.reasoning_stream_changed_since_persisted());
     }
 
     #[test]
