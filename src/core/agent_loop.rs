@@ -6069,7 +6069,11 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
                 !is_read_result && tool_name.is_some_and(|name| *name == "execute_command");
             let is_search_result = !is_read_result
                 && !is_shell_result
-                && tool_name.is_some_and(|name| *name == "search_files" || *name == "list_files");
+                && tool_name.is_some_and(|name| {
+                    *name == "search_files"
+                        || *name == "list_files"
+                        || *name == "get_file_skeleton"
+                });
 
             // Edit results and other tools are never collapsed here.
             let counter = if is_read_result {
@@ -6215,7 +6219,7 @@ fn compact_single_search_text(text: &mut String, min_bytes: usize) {
     let total_lines = text.lines().count();
 
     *text = format!(
-        "{}\n[... Earlier search results ({} lines, {} bytes) collapsed to save context space. Re-run search_files or list_files for fresh results.]",
+        "{}\n[... Earlier search results ({} lines, {} bytes) collapsed to save context space. Re-run the discovery tool for fresh results.]",
         header.trim_end(),
         total_lines,
         total_bytes
@@ -12253,6 +12257,83 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(
             get_result_text(5).contains(&"z".repeat(5000)),
             "most recent search results must not be compacted"
+        );
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_collapses_stale_skeletons() {
+        let make_skeleton_pair = |n: usize, size: usize| -> Vec<StorageMessage> {
+            let id = format!("call_skeleton_{n}");
+            vec![
+                StorageMessage {
+                    id: None,
+                    role: MessageRole::Assistant,
+                    content: MessageContent::AssistantBlocks(vec![
+                        AssistantContentBlock::ToolUse(ToolUseBlock {
+                            id: id.clone(),
+                            name: "get_file_skeleton".to_string(),
+                            input: serde_json::json!({}),
+                            shared: SharedContentFields {
+                                call_id: None,
+                                signature: None,
+                            },
+                            reasoning_details: None,
+                        }),
+                    ]),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+                StorageMessage {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                        crate::providers::ToolResultBlock {
+                            tool_use_id: id,
+                            content: ToolResultContent::Text(format!(
+                                "symbols\n{}",
+                                "y".repeat(size)
+                            )),
+                            shared: SharedContentFields {
+                                call_id: None,
+                                signature: None,
+                            },
+                        },
+                    )]),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+            ]
+        };
+
+        let mut history = Vec::new();
+        for n in 1..=3 {
+            history.extend(make_skeleton_pair(n, 5000));
+        }
+
+        compact_old_tool_results(&mut history);
+
+        let get_result_text = |idx: usize| match &history[idx].content {
+            MessageContent::UserBlocks(blocks) => match &blocks[0] {
+                UserContentBlock::ToolResult(tr) => match &tr.content {
+                    ToolResultContent::Text(t) => t.clone(),
+                    _ => panic!("Expected text"),
+                },
+                _ => panic!("Expected ToolResult"),
+            },
+            _ => panic!("Expected UserBlocks"),
+        };
+
+        let stale = get_result_text(1);
+        assert!(stale.contains("Earlier search results"));
+        assert!(
+            !stale.contains(&"y".repeat(5000)),
+            "stale skeleton results should be compacted"
+        );
+        assert!(
+            get_result_text(5).contains(&"y".repeat(5000)),
+            "most recent skeleton results must not be compacted"
         );
     }
 
