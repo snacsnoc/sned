@@ -30,6 +30,10 @@ const APPROVAL_PANEL_MAX_DETAIL_ROWS: usize = 10;
 const SCROLLBACK_FLUSH_LINE_BATCH: usize = 128;
 const MAX_SCROLLBACK_LOAD_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SCROLLBACK_LOAD_LINES: usize = 10_000;
+// Trim below the caps so steady-state batches append without re-rotating.
+const SCROLLBACK_ROTATE_LINE_TARGET: usize = 9_000;
+const SCROLLBACK_ROTATE_BYTE_TARGET: u64 = 3_670_016;
+const SCROLLBACK_ROTATE_KEEP_FLOOR: usize = 100;
 const MAX_PASTED_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FOLDED_PASTE_CHUNKS: usize = 256;
 const ASYNC_LAYOUT_REFLOW_THRESHOLD: usize = 512;
@@ -760,22 +764,48 @@ impl ScrollbackWriter {
     }
 }
 
+#[derive(Default)]
+struct ScrollbackFileState {
+    bytes: u64,
+    lines: u64,
+    known: bool,
+}
+
+impl ScrollbackFileState {
+    fn reset(&mut self) {
+        self.bytes = 0;
+        self.lines = 0;
+        self.known = false;
+    }
+}
+
+fn should_rotate_scrollback(
+    cached_bytes: u64,
+    cached_lines: u64,
+    batch_bytes: u64,
+    batch_lines: u64,
+) -> bool {
+    cached_bytes.saturating_add(batch_bytes) > MAX_SCROLLBACK_LOAD_BYTES
+        || cached_lines.saturating_add(batch_lines) > MAX_SCROLLBACK_LOAD_LINES as u64
+}
+
 fn scrollback_writer_loop(
     path: &Path,
     receiver: &std_mpsc::Receiver<ScrollbackCommand>,
     error_sender: &std_mpsc::Sender<String>,
 ) {
     let mut pending = Vec::new();
+    let mut state = ScrollbackFileState::default();
     while let Ok(command) = receiver.recv() {
         match command {
             ScrollbackCommand::Append(batch) => {
                 pending.extend_from_slice(batch.as_bytes());
-                if let Err(error) = write_scrollback_pending(path, &mut pending) {
+                if let Err(error) = write_scrollback_pending(path, &mut pending, &mut state) {
                     let _ = error_sender.send(error.to_string());
                 }
             }
             ScrollbackCommand::Flush(sender) => {
-                let _ = sender.send(write_scrollback_pending(path, &mut pending));
+                let _ = sender.send(write_scrollback_pending(path, &mut pending, &mut state));
             }
             ScrollbackCommand::Clear(sender) => {
                 pending.clear();
@@ -784,18 +814,26 @@ fn scrollback_writer_loop(
                     Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                     Err(error) => Err(error),
                 };
+                state.reset();
+                if result.is_ok() {
+                    state.known = true;
+                }
                 let _ = sender.send(result);
             }
             ScrollbackCommand::Shutdown(sender) => {
-                let _ = sender.send(write_scrollback_pending(path, &mut pending));
+                let _ = sender.send(write_scrollback_pending(path, &mut pending, &mut state));
                 return;
             }
         }
     }
-    let _ = write_scrollback_pending(path, &mut pending);
+    let _ = write_scrollback_pending(path, &mut pending, &mut state);
 }
 
-fn write_scrollback_pending(path: &Path, pending: &mut Vec<u8>) -> io::Result<()> {
+fn write_scrollback_pending(
+    path: &Path,
+    pending: &mut Vec<u8>,
+    state: &mut ScrollbackFileState,
+) -> io::Result<()> {
     if pending.is_empty() {
         return Ok(());
     }
@@ -811,6 +849,7 @@ fn write_scrollback_pending(path: &Path, pending: &mut Vec<u8>) -> io::Result<()
         match file.write(&pending[written..]) {
             Ok(0) => {
                 pending.drain(..written);
+                state.reset();
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "failed to write scrollback batch",
@@ -819,34 +858,69 @@ fn write_scrollback_pending(path: &Path, pending: &mut Vec<u8>) -> io::Result<()
             Ok(count) => written = written.saturating_add(count),
             Err(error) => {
                 pending.drain(..written);
+                state.reset();
                 return Err(error);
             }
         }
     }
+    let batch_bytes = pending.len() as u64;
+    let batch_lines = String::from_utf8_lossy(pending).lines().count() as u64;
     pending.clear();
-    rotate_scrollback_file(path)
+    if state.known
+        && !should_rotate_scrollback(state.bytes, state.lines, batch_bytes, batch_lines)
+    {
+        state.bytes = state.bytes.saturating_add(batch_bytes);
+        state.lines = state.lines.saturating_add(batch_lines);
+        return Ok(());
+    }
+    reconcile_scrollback_state(path, state)
 }
 
-fn rotate_scrollback_file(path: &Path) -> io::Result<()> {
+fn reconcile_scrollback_state(path: &Path, state: &mut ScrollbackFileState) -> io::Result<()> {
+    match rotate_scrollback_file(path) {
+        Ok((bytes, lines)) => {
+            state.bytes = bytes;
+            state.lines = lines;
+            state.known = true;
+            Ok(())
+        }
+        Err(error) => {
+            state.reset();
+            Err(error)
+        }
+    }
+}
+
+fn rotate_scrollback_file(path: &Path) -> io::Result<(u64, u64)> {
     let file_len = path.metadata()?.len();
     let Some(content) = read_scrollback_tail(path)? else {
-        return Ok(());
+        return Ok((0, 0));
     };
     let line_count = content.lines().count();
     if file_len <= MAX_SCROLLBACK_LOAD_BYTES && line_count <= MAX_SCROLLBACK_LOAD_LINES {
-        return Ok(());
+        return Ok((file_len, line_count as u64));
     }
 
-    let first_retained_line = line_count.saturating_sub(MAX_SCROLLBACK_LOAD_LINES);
-    let mut retained = content
-        .lines()
-        .skip(first_retained_line)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let lines: Vec<&str> = content.lines().collect();
+    let mut start = lines.len().saturating_sub(SCROLLBACK_ROTATE_LINE_TARGET);
+    let mut retained_bytes: u64 = lines[start..]
+        .iter()
+        .map(|line| line.len() as u64 + 1)
+        .sum();
+    while lines.len().saturating_sub(start) > SCROLLBACK_ROTATE_KEEP_FLOOR
+        && (lines.len().saturating_sub(start) > SCROLLBACK_ROTATE_LINE_TARGET
+            || retained_bytes > SCROLLBACK_ROTATE_BYTE_TARGET)
+    {
+        retained_bytes = retained_bytes.saturating_sub(lines[start].len() as u64 + 1);
+        start += 1;
+    }
+    let kept = lines.len().saturating_sub(start);
+    let mut retained = lines[start..].join("\n");
     if !retained.is_empty() {
         retained.push('\n');
     }
-    std::fs::write(path, retained)
+    std::fs::write(path, retained)?;
+    Ok((retained_bytes.min(file_len), kept as u64))
 }
 
 fn read_scrollback_tail(path: &Path) -> io::Result<Option<String>> {
@@ -9259,6 +9333,16 @@ mod tests {
     }
 
     #[test]
+    fn test_turn_render_without_streamed_lines_keeps_empty_model_fallback() {
+        let mut app = App::new();
+        app.set_content_width(80);
+        assert!(app
+            .begin_async_turn_render("unstreamed result".to_string())
+            .is_none());
+        assert_eq!(app.model_text_for_completion(), "");
+    }
+
+    #[test]
     fn test_layout_rebuild_timing_records_full_rebuilds() {
         let mut app = App::new();
         app.set_content_width(80);
@@ -9762,12 +9846,14 @@ mod tests {
             .map(|line| format!("line {line}\n"))
             .collect::<String>()
             .into_bytes();
+        let mut state = ScrollbackFileState::default();
 
-        write_scrollback_pending(&file_path, &mut pending).unwrap();
+        write_scrollback_pending(&file_path, &mut pending, &mut state).unwrap();
 
         let content = std::fs::read_to_string(file_path).unwrap();
-        assert_eq!(content.lines().count(), MAX_SCROLLBACK_LOAD_LINES);
-        assert_eq!(content.lines().next(), Some("line 3"));
+        assert_eq!(content.lines().count(), SCROLLBACK_ROTATE_LINE_TARGET);
+        let first_line = format!("line {}", MAX_SCROLLBACK_LOAD_LINES + 3 - SCROLLBACK_ROTATE_LINE_TARGET);
+        assert_eq!(content.lines().next(), Some(first_line.as_str()));
         let last_line = format!("line {}", MAX_SCROLLBACK_LOAD_LINES + 2);
         assert_eq!(content.lines().last(), Some(last_line.as_str()));
     }
@@ -9779,10 +9865,70 @@ mod tests {
         let oversized = "x".repeat(MAX_SCROLLBACK_LOAD_BYTES as usize + 1);
         std::fs::write(&file_path, format!("{oversized}\n")).unwrap();
         let mut pending = b"retained\n".to_vec();
+        let mut state = ScrollbackFileState::default();
 
-        write_scrollback_pending(&file_path, &mut pending).unwrap();
+        write_scrollback_pending(&file_path, &mut pending, &mut state).unwrap();
 
         assert_eq!(std::fs::read_to_string(file_path).unwrap(), "retained\n");
+    }
+
+    #[test]
+    fn test_should_rotate_scrollback_decision_table() {
+        assert!(!should_rotate_scrollback(0, 0, 128, 128));
+        assert!(!should_rotate_scrollback(
+            SCROLLBACK_ROTATE_LINE_TARGET as u64,
+            SCROLLBACK_ROTATE_LINE_TARGET as u64,
+            128,
+            128
+        ));
+        assert!(!should_rotate_scrollback(
+            MAX_SCROLLBACK_LOAD_BYTES,
+            MAX_SCROLLBACK_LOAD_LINES as u64,
+            0,
+            0
+        ));
+        assert!(should_rotate_scrollback(
+            0,
+            MAX_SCROLLBACK_LOAD_LINES as u64 + 1,
+            0,
+            0
+        ));
+        assert!(should_rotate_scrollback(
+            MAX_SCROLLBACK_LOAD_BYTES + 1,
+            0,
+            0,
+            0
+        ));
+        assert!(should_rotate_scrollback(0, 0, MAX_SCROLLBACK_LOAD_BYTES + 1, 1));
+        assert!(should_rotate_scrollback(
+            0,
+            0,
+            1,
+            MAX_SCROLLBACK_LOAD_LINES as u64 + 1
+        ));
+    }
+
+    #[test]
+    fn test_scrollback_steady_state_batch_skips_rotation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("lines");
+        let mut state = ScrollbackFileState::default();
+        let mut pending = (0..MAX_SCROLLBACK_LOAD_LINES + 3)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>()
+            .into_bytes();
+        write_scrollback_pending(&file_path, &mut pending, &mut state).unwrap();
+        assert!(state.known);
+
+        let mut steady = "steady\n".repeat(SCROLLBACK_FLUSH_LINE_BATCH).into_bytes();
+        write_scrollback_pending(&file_path, &mut steady, &mut state).unwrap();
+
+        let content = std::fs::read_to_string(file_path).unwrap();
+        assert_eq!(
+            content.lines().count(),
+            SCROLLBACK_ROTATE_LINE_TARGET + SCROLLBACK_FLUSH_LINE_BATCH
+        );
+        assert_eq!(content.lines().last(), Some("steady"));
     }
 
     #[test]
