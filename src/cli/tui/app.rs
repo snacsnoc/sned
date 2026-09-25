@@ -3388,15 +3388,6 @@ impl App {
         result
     }
 
-    /// Toggle between normal and scrollback modes.
-    pub fn toggle_scrollback(&mut self) -> io::Result<()> {
-        if self.in_scrollback {
-            self.exit_scrollback()
-        } else {
-            self.enter_scrollback()
-        }
-    }
-
     /// Clear all output and reset the visual-row cache.
     pub fn clear_output(&mut self) -> io::Result<()> {
         let result = self.clear_scrollback_storage();
@@ -10003,36 +9994,6 @@ mod tests {
     }
 
     /// Toggle switches between normal and scrollback modes.
-    #[test]
-    fn test_scrollback_toggle() {
-        let mut app = App::new();
-        app.set_content_width(80);
-
-        let tmp_dir = std::env::temp_dir().join("sned_scrollback_test4");
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-        let file_path = tmp_dir.join("lines");
-        std::fs::write(&file_path, "s0\ns1\n").unwrap();
-        app.scrollback_file = Some(file_path.clone());
-        app.scrollback_count = 2;
-
-        app.push_plain("session");
-
-        assert!(!app.in_scrollback);
-        app.toggle_scrollback().unwrap();
-        assert!(app.in_scrollback, "first toggle should enter scrollback");
-        assert!(
-            app.output_lines.len() >= 2,
-            "buffer should contain scrollback lines"
-        );
-
-        app.toggle_scrollback().unwrap();
-        assert!(!app.in_scrollback, "second toggle should exit scrollback");
-        assert_eq!(app.scrollback_count, 0, "count should be reset");
-
-        let _ = std::fs::remove_file(&file_path);
-        let _ = std::fs::remove_dir(&tmp_dir);
-    }
-
     /// Closes the "tests ≠ reality" gap for autoscroll.
     ///
     /// Existing scroll tests (e.g. `test_scroll_lines_switches_to_manual_mode`)
