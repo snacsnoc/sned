@@ -315,7 +315,7 @@ fn render_markdown_with_code_limit_timed(
                 0,
                 Span::styled(
                     p.to_string(),
-                    Style::default().fg(crate::cli::tui::theme::PROMPT_FG),
+                    Style::default().fg(crate::cli::tui::theme::prompt_fg()),
                 ),
             );
         }
@@ -378,9 +378,9 @@ fn render_markdown_with_code_limit_timed(
                     out.push(Line::from(Span::styled(
                         label,
                         Style::default()
-                            .fg(crate::cli::tui::theme::PROMPT_FG)
+                            .fg(crate::cli::tui::theme::prompt_fg())
                             .add_modifier(Modifier::BOLD)
-                            .bg(crate::cli::tui::theme::BORDER_FG),
+                            .bg(crate::cli::tui::theme::border_fg()),
                     )));
                 }
                 Tag::Item => {
@@ -401,7 +401,7 @@ fn render_markdown_with_code_limit_timed(
                         // (e.g., "🚀 ") to the first line by inserting it now.
                         current_spans.push(Span::styled(
                             p.to_string(),
-                            Style::default().fg(crate::cli::tui::theme::PROMPT_FG),
+                            Style::default().fg(crate::cli::tui::theme::prompt_fg()),
                         ));
                     }
                     *is_first_line = false;
@@ -583,7 +583,7 @@ fn render_markdown_with_code_limit_timed(
                 if in_code_block {
                     // Already handled by Text path
                 } else {
-                    let style = Style::default().fg(crate::cli::tui::theme::PROMPT_FG);
+                    let style = Style::default().fg(crate::cli::tui::theme::prompt_fg());
                     current_spans.push(Span::styled(format!("`{}`", c.into_string()), style));
                 }
             }
@@ -643,7 +643,7 @@ fn render_markdown_with_code_limit_timed(
         if let Some(p) = prefix {
             out.push(Line::from(Span::styled(
                 p.to_string(),
-                Style::default().fg(crate::cli::tui::theme::PROMPT_FG),
+                Style::default().fg(crate::cli::tui::theme::prompt_fg()),
             )));
         } else {
             out.push(Line::from(""));
@@ -722,12 +722,12 @@ mod tests {
         let lines = render_completion_markdown("🚀 ", "Use `ls` to list files");
         let found = lines.iter().any(|l| {
             l.spans.iter().any(|s| {
-                s.content.contains("`ls`") && s.style.fg == Some(crate::cli::tui::theme::PROMPT_FG)
+                s.content.contains("`ls`") && s.style.fg == Some(crate::cli::tui::theme::prompt_fg())
             })
         });
         assert!(
             found,
-            "expected inline code with PROMPT_FG, got: {:?}",
+            "expected inline code with prompt_fg(), got: {:?}",
             lines
         );
     }

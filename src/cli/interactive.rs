@@ -900,17 +900,55 @@ fn persist_transcript_line(
     kind: crate::cli::tui::BlockKind,
     line: &Line<'static>,
 ) -> bool {
+    use crate::storage::task_storage::TranscriptSpan;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let entries = line
-        .to_string()
-        .split('\n')
-        .map(|markdown| TranscriptEntry {
-            kind,
-            ts,
-            markdown: markdown.to_string(),
+    // Flatten styled spans into per-line runs so `--continue` restores the
+    // colors instead of replaying everything in the terminal default.
+    let mut lines: Vec<Vec<(String, Style)>> = vec![Vec::new()];
+    for span in &line.spans {
+        let mut parts = span.content.split('\n');
+        if let Some(first) = parts.next() {
+            lines
+                .last_mut()
+                .expect("lines always holds a current row")
+                .push((first.to_string(), span.style));
+            for part in parts {
+                lines.push(vec![(part.to_string(), span.style)]);
+            }
+        }
+    }
+    let entries = lines
+        .into_iter()
+        .map(|runs| {
+            let markdown = runs
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("");
+            let spans = runs
+                .into_iter()
+                .map(|(text, style)| TranscriptSpan {
+                    text,
+                    fg: style
+                        .fg
+                        .as_ref()
+                        .and_then(crate::storage::task_storage::encode_transcript_color),
+                    bg: style
+                        .bg
+                        .as_ref()
+                        .and_then(crate::storage::task_storage::encode_transcript_color),
+                    modifier_bits: (style.add_modifier & !style.sub_modifier).bits(),
+                })
+                .collect();
+            TranscriptEntry {
+                kind,
+                ts,
+                markdown,
+                spans,
+            }
         })
         .collect::<Vec<_>>();
     if app.task_transcript_writer_is_started() {
@@ -931,10 +969,72 @@ fn replay_transcript(app: &mut App, storage: &TaskStorage) {
     match storage.read_transcript(DEFAULT_TRANSCRIPT_CAP) {
         Ok(entries) => {
             for entry in entries {
-                app.push_output_with_kind(Line::from(entry.markdown), entry.kind);
+                app.push_output_with_kind(restore_transcript_line(&entry), entry.kind);
             }
         }
         Err(error) => tracing::warn!(error = %error, "Failed to read task transcript"),
+    }
+}
+
+/// Rebuild a persisted line with its colors. Entries written before styles
+/// were stored fall back to kind styling below; corrupt runs replay
+/// unstyled rather than dropping the line.
+fn restore_transcript_line(entry: &TranscriptEntry) -> Line<'static> {
+    use crate::storage::task_storage::decode_transcript_color;
+    use ratatui::style::Modifier;
+    if !entry.spans.is_empty() {
+        let mut spans = Vec::with_capacity(entry.spans.len());
+        let mut text = String::new();
+        for run in &entry.spans {
+            let fg = run.fg.as_deref().and_then(decode_transcript_color);
+            let bg = run.bg.as_deref().and_then(decode_transcript_color);
+            if run.fg.is_some() && fg.is_none() || run.bg.is_some() && bg.is_none() {
+                break;
+            }
+            let mut style = Style::default();
+            if let Some(fg) = fg {
+                style = style.fg(fg);
+            }
+            if let Some(bg) = bg {
+                style = style.bg(bg);
+            }
+            style = style.add_modifier(Modifier::from_bits_truncate(run.modifier_bits));
+            text.push_str(&run.text);
+            spans.push(Span::styled(run.text.clone(), style));
+        }
+        if text == entry.markdown {
+            return Line::from(spans);
+        }
+    }
+    let fallback = replay_fallback_style(entry.kind, &entry.markdown);
+    Line::from(Span::styled(entry.markdown.clone(), fallback))
+}
+
+/// Style old-format transcript lines the way they render live. Only kinds
+/// that render uniformly take a color; mixed lines (model body, tool
+/// output, completion banners) replay in the default the live body uses.
+fn replay_fallback_style(kind: crate::cli::tui::BlockKind, markdown: &str) -> Style {
+    use crate::cli::tui::theme;
+    use crate::cli::tui::BlockKind;
+    use ratatui::style::Modifier;
+    match kind {
+        BlockKind::ToolHeader => Style::default().fg(theme::tool_call_fg()),
+        BlockKind::UserPrompt => Style::default()
+            .fg(theme::echo_fg())
+            .add_modifier(Modifier::BOLD),
+        BlockKind::ToolOutput => {
+            let trimmed = markdown.trim_start();
+            // Per-tool result markers (`  ✓ name result`) render green,
+            // failures red; all other tool output renders dim gray.
+            if trimmed.starts_with("✓ ") && trimmed.ends_with(" result") {
+                Style::default().fg(theme::prompt_fg())
+            } else if trimmed.starts_with("✗ ") && trimmed.ends_with(" result") {
+                Style::default().fg(theme::error_fg())
+            } else {
+                Style::default().fg(theme::status_fg())
+            }
+        }
+        _ => Style::default(),
     }
 }
 
@@ -1427,7 +1527,7 @@ fn handle_text_selection_mouse_event(
             {
                 app.push_styled(
                     format!("Failed to copy selection: {error}"),
-                    Style::default().fg(theme::ERROR_FG),
+                    Style::default().fg(theme::error_fg()),
                 );
             }
             true
@@ -1444,7 +1544,7 @@ fn handle_copy_command(app: &mut App, copy: impl FnOnce(&str) -> std::io::Result
     let Some(text) = app.last_completion_text().map(str::to_owned) else {
         app.push_styled(
             "No completion to copy yet.",
-            Style::default().fg(theme::WARNING_FG),
+            Style::default().fg(theme::warning_fg()),
         );
         return;
     };
@@ -1453,11 +1553,11 @@ fn handle_copy_command(app: &mut App, copy: impl FnOnce(&str) -> std::io::Result
     match copy(&text) {
         Ok(()) => app.push_styled(
             format!("Copied latest completion ({char_count} characters)."),
-            Style::default().fg(theme::ACCENT),
+            Style::default().fg(theme::accent()),
         ),
         Err(err) => app.push_styled(
             format!("Failed to copy completion: {err}"),
-            Style::default().fg(theme::ERROR_FG),
+            Style::default().fg(theme::error_fg()),
         ),
     }
 }
@@ -2565,7 +2665,7 @@ fn handle_idle_ctrl_c(app: &mut App) {
     clear_input_overlays(app);
     app.push_styled(
         "Press Ctrl+C again to quit.",
-        Style::default().fg(theme::WARNING_FG),
+        Style::default().fg(theme::warning_fg()),
     );
 
     if !app.input.lines().join("\n").is_empty() {
@@ -2610,7 +2710,7 @@ async fn handle_key_event_inner(
                 if api_key.is_empty() {
                     app.push_styled(
                         "API key cannot be empty. Enter a key or press Esc to cancel.",
-                        Style::default().fg(theme::WARNING_FG),
+                        Style::default().fg(theme::warning_fg()),
                     );
                     return Ok(None);
                 }
@@ -2771,7 +2871,7 @@ async fn handle_key_event_inner(
                 if sender.send(text).is_err() {
                     app.push_styled(
                         "Response discarded - prompt closed.",
-                        Style::default().fg(theme::WARNING_FG),
+                        Style::default().fg(theme::warning_fg()),
                     );
                 }
                 app.input = App::new_textarea(Vec::new());
@@ -2786,7 +2886,7 @@ async fn handle_key_event_inner(
             if app.has_pending_approval() {
                 app.push_styled(
                     "Approval pending. Type y, n, or a first.",
-                    Style::default().fg(theme::WARNING_FG),
+                    Style::default().fg(theme::warning_fg()),
                 );
                 close_slash_command_mode(app);
                 return Ok(None);
@@ -2857,7 +2957,7 @@ async fn handle_key_event_inner(
             if let Some(err) = clear_error {
                 app.push_styled(
                     format!("Failed to clear persisted scrollback: {err}"),
-                    Style::default().fg(theme::WARNING_FG),
+                    Style::default().fg(theme::warning_fg()),
                 );
             }
         } else {
@@ -2994,7 +3094,7 @@ async fn handle_key_event_inner(
         app.pending_clear = Some("ctrl_l".to_string());
         app.push_styled(
             "Clear display? (y to confirm, any other key to cancel): ",
-            Style::default().fg(theme::WARNING_FG),
+            Style::default().fg(theme::warning_fg()),
         );
         return Ok(None);
     }
@@ -3122,7 +3222,7 @@ async fn switch_to_fresh_task(
     if agent_busy.load(Ordering::Relaxed) {
         app.push_styled(
             "Agent is busy. Wait for it to finish before starting a new conversation.",
-            Style::default().fg(theme::WARNING_FG),
+            Style::default().fg(theme::warning_fg()),
         );
         return Ok(());
     }
@@ -3136,7 +3236,7 @@ async fn switch_to_fresh_task(
     {
         app.push_styled(
             "There are queued follow-ups for this conversation. Let them run before starting a new one.",
-            Style::default().fg(theme::WARNING_FG),
+            Style::default().fg(theme::warning_fg()),
         );
         return Ok(());
     }
@@ -3144,7 +3244,7 @@ async fn switch_to_fresh_task(
         app.resolve_pending_approval(crate::core::approval::ApprovalResult::Denied);
         app.push_styled(
             "Pending approval denied for the new conversation.",
-            Style::default().fg(theme::WARNING_FG),
+            Style::default().fg(theme::warning_fg()),
         );
     }
 
@@ -3163,7 +3263,7 @@ async fn switch_to_fresh_task(
         Err(error) => {
             app.push_styled(
                 format!("Could not start a new conversation: {error}"),
-                Style::default().fg(theme::WARNING_FG),
+                Style::default().fg(theme::warning_fg()),
             );
             app.start_task_transcript_writer(task_storage)?;
             return Ok(());
@@ -3194,7 +3294,7 @@ async fn switch_to_fresh_task(
                 "Dropped unapplied model switch to {} {}.",
                 pending.provider, pending.model_id
             ),
-            Style::default().fg(theme::WARNING_FG),
+            Style::default().fg(theme::warning_fg()),
         );
     }
     app.mention_search_active = false;
@@ -3232,7 +3332,7 @@ async fn handle_cli_only_command(
     if agent_busy.load(Ordering::Relaxed) && !cli_cmd.is_local_command() {
         app.push_styled(
             "Agent is busy. Wait for it to finish before running this command.",
-            Style::default().fg(theme::WARNING_FG),
+            Style::default().fg(theme::warning_fg()),
         );
         return Ok(false);
     }
@@ -3265,7 +3365,7 @@ async fn handle_cli_only_command(
             app.pending_clear = Some("slash".to_string());
             app.push_styled(
                 "Clear display? (y to confirm, any other key to cancel): ",
-                Style::default().fg(theme::WARNING_FG),
+                Style::default().fg(theme::warning_fg()),
             );
         }
         CliOnlyCommand::New => {
@@ -3275,7 +3375,7 @@ async fn handle_cli_only_command(
             // interception, so refuse rather than half-switch.
             app.push_styled(
                 "Cannot start a new conversation from here.",
-                Style::default().fg(theme::WARNING_FG),
+                Style::default().fg(theme::warning_fg()),
             );
         }
         CliOnlyCommand::Copy => {
@@ -3292,14 +3392,14 @@ async fn handle_cli_only_command(
             let Some(response) = response else {
                 app.push_styled(
                     "No full model response is available yet.",
-                    Style::default().fg(theme::WARNING_FG),
+                    Style::default().fg(theme::warning_fg()),
                 );
                 return Ok(false);
             };
 
             app.push_styled(
                 "──── Full model response ────",
-                Style::default().fg(theme::ACCENT),
+                Style::default().fg(theme::accent()),
             );
             for line in crate::cli::markdown::render_markdown(None, &response) {
                 app.push_output_with_kind(line, crate::cli::tui::BlockKind::Model);
@@ -3546,7 +3646,7 @@ async fn handle_cli_only_command(
                 Err(e) => {
                     app.push_styled(
                         format!("Could not determine files affected by undo: {e}. Undo cancelled."),
-                        Style::default().fg(theme::WARNING_FG),
+                        Style::default().fg(theme::warning_fg()),
                     );
                     return Ok(false);
                 }
@@ -3555,7 +3655,7 @@ async fn handle_cli_only_command(
             if !changed_files.is_empty() {
                 app.push_styled(
                     "/undo will revert the following files to the previous checkpoint:",
-                    Style::default().fg(theme::WARNING_FG),
+                    Style::default().fg(theme::warning_fg()),
                 );
                 for f in &changed_files {
                     app.push_plain(format!("  - {f}"));
@@ -3583,13 +3683,13 @@ async fn handle_cli_only_command(
                 if confirm.trim().is_empty() {
                     app.push_styled(
                         "Confirmation timeout — cancelled.",
-                        Style::default().fg(theme::WARNING_FG),
+                        Style::default().fg(theme::warning_fg()),
                     );
                     return Ok(false);
                 }
 
                 if !confirmation_is_approved(&confirm) {
-                    app.push_styled("Undo cancelled.", Style::default().fg(theme::WARNING_FG));
+                    app.push_styled("Undo cancelled.", Style::default().fg(theme::warning_fg()));
                     return Ok(false);
                 }
             }
@@ -3625,7 +3725,7 @@ async fn handle_cli_only_command(
                 Err(e) => {
                     app.push_styled(
                         format!("Undo failed: {e}"),
-                        Style::default().fg(theme::ERROR_FG),
+                        Style::default().fg(theme::error_fg()),
                     );
                 }
             }
@@ -3646,7 +3746,7 @@ async fn handle_cli_only_command(
                         Err(e) => {
                             app.push_styled(
                                 format!("Failed to get diff: {e}"),
-                                Style::default().fg(theme::ERROR_FG),
+                                Style::default().fg(theme::error_fg()),
                             );
                         }
                     }
@@ -3671,7 +3771,7 @@ async fn handle_cli_only_command(
                         Err(e) => {
                             app.push_styled(
                                 format!("Failed to get log: {e}"),
-                                Style::default().fg(theme::ERROR_FG),
+                                Style::default().fg(theme::error_fg()),
                             );
                         }
                     }
@@ -3698,7 +3798,7 @@ async fn handle_cli_only_command(
                                 } else {
                                     app.push_styled(
                                         "Changes to commit:",
-                                        Style::default().fg(theme::ACCENT),
+                                        Style::default().fg(theme::accent()),
                                     );
                                     for line in ansi_to_ratatui_lines(&diff) {
                                         app.push_output(line);
@@ -3730,7 +3830,7 @@ async fn handle_cli_only_command(
                                     if confirm.trim().is_empty() {
                                         app.push_styled(
                                             "Confirmation timeout — cancelled.",
-                                            Style::default().fg(theme::WARNING_FG),
+                                            Style::default().fg(theme::warning_fg()),
                                         );
                                     } else if confirm.trim().to_lowercase() == "y" {
                                         match crate::core::shadow_git::commit_to_real_git(
@@ -3746,14 +3846,14 @@ async fn handle_cli_only_command(
                                             Err(e) => {
                                                 app.push_styled(
                                                     format!("Commit failed: {e}"),
-                                                    Style::default().fg(theme::ERROR_FG),
+                                                    Style::default().fg(theme::error_fg()),
                                                 );
                                             }
                                         }
                                     } else {
                                         app.push_styled(
                                             "Commit cancelled.",
-                                            Style::default().fg(theme::WARNING_FG),
+                                            Style::default().fg(theme::warning_fg()),
                                         );
                                     }
                                 }
@@ -3761,7 +3861,7 @@ async fn handle_cli_only_command(
                             Err(e) => {
                                 app.push_styled(
                                     format!("Failed to get diff: {e}"),
-                                    Style::default().fg(theme::ERROR_FG),
+                                    Style::default().fg(theme::error_fg()),
                                 );
                             }
                         }
@@ -3865,7 +3965,7 @@ async fn handle_cli_only_command(
                         if !changed_files.is_empty() {
                             app.push_styled(
                                 "Files that will be restored:",
-                                Style::default().fg(theme::WARNING_FG),
+                                Style::default().fg(theme::warning_fg()),
                             );
                             for file in &changed_files {
                                 app.push_plain(format!("  - {file}"));
@@ -3893,7 +3993,7 @@ async fn handle_cli_only_command(
                             if confirm.trim().is_empty() {
                                 app.push_styled(
                                     "Confirmation timeout — cancelled.",
-                                    Style::default().fg(theme::WARNING_FG),
+                                    Style::default().fg(theme::warning_fg()),
                                 );
                                 return Ok(false);
                             }
@@ -3901,7 +4001,7 @@ async fn handle_cli_only_command(
                             if !confirmation_is_approved(&confirm) {
                                 app.push_styled(
                                     "Restore cancelled.",
-                                    Style::default().fg(theme::WARNING_FG),
+                                    Style::default().fg(theme::warning_fg()),
                                 );
                                 return Ok(false);
                             }
@@ -3911,7 +4011,7 @@ async fn handle_cli_only_command(
                     Err(e) => {
                         app.push_styled(
                             format!("Could not determine files affected by restore: {e}. Restore cancelled."),
-                            Style::default().fg(theme::WARNING_FG),
+                            Style::default().fg(theme::warning_fg()),
                         );
                         return Ok(false);
                     }
@@ -3960,7 +4060,7 @@ async fn handle_cli_only_command(
             if agent_busy.load(Ordering::Relaxed) && !paused_plan {
                 app.push_styled(
                     "Agent is busy. Cancel it before aborting the plan.",
-                    Style::default().fg(theme::WARNING_FG),
+                    Style::default().fg(theme::warning_fg()),
                 );
                 return Ok(false);
             }
@@ -3968,7 +4068,7 @@ async fn handle_cli_only_command(
             let Some(sh) = state_handle.lock().await.clone() else {
                 app.push_styled(
                     "Plan state is unavailable. Try again.",
-                    Style::default().fg(theme::WARNING_FG),
+                    Style::default().fg(theme::warning_fg()),
                 );
                 return Ok(false);
             };
@@ -4016,7 +4116,7 @@ async fn handle_cli_only_command(
             {
                 app.push_styled(
                     "Agent is busy. Wait for it to finish before approving the plan.",
-                    Style::default().fg(theme::WARNING_FG),
+                    Style::default().fg(theme::warning_fg()),
                 );
                 return Ok(false);
             }
@@ -4034,7 +4134,7 @@ async fn handle_cli_only_command(
             {
                 app.push_styled(
                     "Agent is busy. Wait for it to finish or cancel it before changing the plan.",
-                    Style::default().fg(theme::WARNING_FG),
+                    Style::default().fg(theme::warning_fg()),
                 );
                 return Ok(false);
             }
@@ -4042,7 +4142,7 @@ async fn handle_cli_only_command(
             let Some(sh) = state_handle.lock().await.clone() else {
                 app.push_styled(
                     "Plan state is unavailable. Try again.",
-                    Style::default().fg(theme::WARNING_FG),
+                    Style::default().fg(theme::warning_fg()),
                 );
                 return Ok(false);
             };
@@ -5434,12 +5534,12 @@ async fn run_main_loop(
                                         }
                                     }
                                 ),
-                                Style::default().fg(theme::ACCENT),
+                                Style::default().fg(theme::accent()),
                             );
                             if !delivered {
                                 app.push_styled(
                                     "Approval expired before the decision was delivered.",
-                                    Style::default().fg(theme::WARNING_FG),
+                                    Style::default().fg(theme::warning_fg()),
                                 );
                             }
 
@@ -5513,7 +5613,7 @@ async fn run_main_loop(
                             app.agent_busy = false;
                             app.push_styled(
                                 "Press Ctrl+C again to quit.",
-                                Style::default().fg(theme::WARNING_FG),
+                                Style::default().fg(theme::warning_fg()),
                             );
                             continue;
                         }
@@ -5572,7 +5672,7 @@ async fn run_main_loop(
                                             format!(
                                                 "Failed to save API key: {error}. It will only be used for this switch."
                                             ),
-                                            Style::default().fg(theme::WARNING_FG),
+                                            Style::default().fg(theme::warning_fg()),
                                         );
                                     }
                                 }
@@ -5635,7 +5735,7 @@ async fn run_main_loop(
                                         if agent_busy.load(Ordering::Relaxed) {
                                             app.push_styled(
                                                 "Agent is busy. Wait for it to finish before starting a new plan.",
-                                                Style::default().fg(theme::WARNING_FG),
+                                                Style::default().fg(theme::warning_fg()),
                                             );
                                             continue;
                                         }
@@ -5793,7 +5893,7 @@ async fn run_main_loop(
                                             format!(
                                                 "Unknown command /{command}. Type /help to list commands."
                                             ),
-                                            Style::default().fg(theme::WARNING_FG),
+                                            Style::default().fg(theme::warning_fg()),
                                         );
                                         continue;
                                     }
@@ -5867,7 +5967,7 @@ async fn run_main_loop(
                                     "Paste rejected: input would exceed the {} MiB paste limit.",
                                     max_bytes / (1024 * 1024)
                                 ),
-                                Style::default().fg(theme::WARNING_FG),
+                                Style::default().fg(theme::warning_fg()),
                             );
                         }
                         Some(PasteOutcome::RejectedTooManyChunks { max_chunks }) => {
@@ -5875,7 +5975,7 @@ async fn run_main_loop(
                                 format!(
                                     "Paste rejected: input already contains {max_chunks} folded pastes."
                                 ),
-                                Style::default().fg(theme::WARNING_FG),
+                                Style::default().fg(theme::warning_fg()),
                             );
                         }
                         Some(PasteOutcome::Inserted) | None => {}
@@ -8399,6 +8499,7 @@ mod tests {
                     kind: *kind,
                     ts: index as u64,
                     markdown: (*markdown).to_string(),
+                    spans: Vec::new(),
                 })
                 .unwrap();
         }
@@ -8419,6 +8520,88 @@ mod tests {
                 .map(|(_, markdown)| (*markdown).to_string())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_transcript_round_trip_preserves_span_styles() {
+        use crate::storage::task_storage::DEFAULT_TRANSCRIPT_CAP;
+        use ratatui::style::{Color, Modifier, Style};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("interactive-replay-styled");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage::from_task_dir(&task_dir).unwrap();
+
+        let line = Line::from(vec![
+            Span::styled(
+                "code",
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" plain"),
+        ]);
+        let mut app = App::new();
+        assert!(persist_transcript_line(
+            &mut app,
+            Some(&storage),
+            BlockKind::Model,
+            &line
+        ));
+
+        let mut resumed = App::new();
+        replay_transcript(&mut resumed, &storage);
+        assert_eq!(resumed.output_lines.len(), 1);
+        let spans: Vec<_> = resumed.output_lines[0].spans.iter().collect();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].style.fg, Some(Color::LightGreen));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[1].style, Style::default());
+
+        let stored = storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].markdown, "code plain");
+    }
+
+    #[test]
+    fn test_replay_fallback_styles_old_entries_by_kind() {
+        use crate::cli::tui::theme;
+        use crate::storage::task_storage::TranscriptEntry;
+        use ratatui::style::Modifier;
+
+        let plain = |kind, markdown: &str| {
+            restore_transcript_line(&TranscriptEntry {
+                kind,
+                ts: 0,
+                markdown: markdown.to_string(),
+                spans: Vec::new(),
+            })
+        };
+
+        let line = plain(BlockKind::ToolHeader, "▶ read_file");
+        assert_eq!(line.spans[0].style.fg, Some(theme::tool_call_fg()));
+
+        let line = plain(BlockKind::UserPrompt, "❯ hi");
+        assert_eq!(line.spans[0].style.fg, Some(theme::echo_fg()));
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+
+        let line = plain(BlockKind::ToolOutput, "  ✓ read_file result");
+        assert_eq!(line.spans[0].style.fg, Some(theme::prompt_fg()));
+
+        let line = plain(BlockKind::ToolOutput, "  ✗ read_file result");
+        assert_eq!(line.spans[0].style.fg, Some(theme::error_fg()));
+
+        let line = plain(BlockKind::ToolOutput, "some stdout");
+        assert_eq!(line.spans[0].style.fg, Some(theme::status_fg()));
+
+        let line = plain(BlockKind::Model, "body text");
+        assert_eq!(line.spans[0].style, Style::default());
+
+        // A ✓ shape outside ToolOutput keeps the default; the marker only
+        // has meaning on tool result lines.
+        let line = plain(BlockKind::Model, "✓ done");
+        assert_eq!(line.spans[0].style, Style::default());
     }
 
     #[test]
@@ -11797,6 +11980,7 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             context_window: None,
+            high_contrast: false,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -12334,6 +12518,7 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             context_window: None,
+            high_contrast: false,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -12996,6 +13181,7 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             context_window: None,
+            high_contrast: false,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -13134,6 +13320,7 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             context_window: None,
+            high_contrast: false,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -13264,6 +13451,7 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             context_window: None,
+            high_contrast: false,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -13404,6 +13592,7 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             context_window: None,
+            high_contrast: false,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -13529,6 +13718,7 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             context_window: None,
+            high_contrast: false,
             debug: false,
             prompt_file: None,
             result_file: None,
@@ -13657,6 +13847,7 @@ mod tests {
             max_context_turns: None,
             max_tokens: None,
             context_window: None,
+            high_contrast: false,
             debug: false,
             prompt_file: None,
             result_file: None,

@@ -484,11 +484,11 @@ impl UseSubagentsHandler {
         let emit_progress = progress_writer.is_some();
         if let Some(ref writer) = progress_writer {
             use crate::cli::output::OutputEvent;
-            use crate::cli::tui::theme::INFO_FG;
+            use crate::cli::tui::theme::info_fg;
             use ratatui::style::{Modifier, Style};
             writer.emit(OutputEvent::tool_output_line(
                 format!("Subagent {} started", subagent_index + 1),
-                Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+                Style::default().fg(info_fg()).add_modifier(Modifier::DIM),
             ));
         }
 
@@ -497,11 +497,11 @@ impl UseSubagentsHandler {
             Err(e) => {
                 if let Some(ref writer) = progress_writer {
                     use crate::cli::output::OutputEvent;
-                    use crate::cli::tui::theme::ERROR_FG;
+                    use crate::cli::tui::theme::error_fg;
                     use ratatui::style::Style;
                     writer.emit(OutputEvent::tool_output_line(
                         format!("Subagent {} failed to start: {}", subagent_index + 1, e),
-                        Style::default().fg(ERROR_FG),
+                        Style::default().fg(error_fg()),
                     ));
                 }
                 return SubagentResult {
@@ -594,11 +594,11 @@ impl UseSubagentsHandler {
                 if status.success() {
                     if let Some(ref writer) = progress_writer {
                         use crate::cli::output::OutputEvent;
-                        use crate::cli::tui::theme::INFO_FG;
+                        use crate::cli::tui::theme::info_fg;
                         use ratatui::style::{Modifier, Style};
                         writer.emit(OutputEvent::tool_output_line(
                             format!("Subagent {} completed", subagent_index + 1),
-                            Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+                            Style::default().fg(info_fg()).add_modifier(Modifier::DIM),
                         ));
                     }
                     if let Some(parsed) = Self::read_result_file(&result_path) {
@@ -622,11 +622,11 @@ impl UseSubagentsHandler {
                 } else {
                     if let Some(ref writer) = progress_writer {
                         use crate::cli::output::OutputEvent;
-                        use crate::cli::tui::theme::WARNING_FG;
+                        use crate::cli::tui::theme::warning_fg;
                         use ratatui::style::Style;
                         writer.emit(OutputEvent::tool_output_line(
                             format!("Subagent {} failed", subagent_index + 1),
-                            Style::default().fg(WARNING_FG),
+                            Style::default().fg(warning_fg()),
                         ));
                     }
                     // Try to recover token/cost metrics from the result file the
@@ -661,11 +661,11 @@ impl UseSubagentsHandler {
                 Self::stop_subagent(&mut child, child_pid).await;
                 if let Some(ref writer) = progress_writer {
                     use crate::cli::output::OutputEvent;
-                    use crate::cli::tui::theme::ERROR_FG;
+                    use crate::cli::tui::theme::error_fg;
                     use ratatui::style::Style;
                     writer.emit(OutputEvent::tool_output_line(
                         format!("Subagent {} wait failed: {}", subagent_index + 1, e),
-                        Style::default().fg(ERROR_FG),
+                        Style::default().fg(error_fg()),
                     ));
                 }
                 SubagentResult {
@@ -677,7 +677,7 @@ impl UseSubagentsHandler {
             SubagentWaitOutcome::TimedOut => {
                 if let Some(ref writer) = progress_writer {
                     use crate::cli::output::OutputEvent;
-                    use crate::cli::tui::theme::WARNING_FG;
+                    use crate::cli::tui::theme::warning_fg;
                     use ratatui::style::Style;
                     writer.emit(OutputEvent::tool_output_line(
                         format!(
@@ -685,7 +685,7 @@ impl UseSubagentsHandler {
                             subagent_index + 1,
                             timeout_secs
                         ),
-                        Style::default().fg(WARNING_FG),
+                        Style::default().fg(warning_fg()),
                     ));
                 }
                 SubagentResult {
@@ -896,11 +896,11 @@ impl UseSubagentsHandler {
 
         if !json_output {
             use crate::cli::output::OutputEvent;
-            use crate::cli::tui::theme::INFO_FG;
+            use crate::cli::tui::theme::info_fg;
             use ratatui::style::{Modifier, Style};
             output_writer.emit(OutputEvent::tool_output_line(
                 format!("Running {} subagent(s) in parallel...", prompts.len()),
-                Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+                Style::default().fg(info_fg()).add_modifier(Modifier::DIM),
             ));
         }
 
@@ -1028,11 +1028,11 @@ impl UseSubagentsHandler {
 
         if !json_output {
             use crate::cli::output::OutputEvent;
-            use crate::cli::tui::theme::INFO_FG;
+            use crate::cli::tui::theme::info_fg;
             use ratatui::style::{Modifier, Style};
             output_writer.emit(OutputEvent::tool_output_line(
                 summary.clone(),
-                Style::default().fg(INFO_FG).add_modifier(Modifier::DIM),
+                Style::default().fg(info_fg()).add_modifier(Modifier::DIM),
             ));
         }
 

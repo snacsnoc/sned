@@ -91,6 +91,94 @@ pub struct TranscriptEntry {
     pub kind: BlockKind,
     pub ts: u64,
     pub markdown: String,
+    /// Styled runs covering `markdown`. Absent on entries written before
+    /// styles were persisted; replay falls back to unstyled text then.
+    #[serde(default)]
+    pub spans: Vec<TranscriptSpan>,
+}
+
+/// One styled run inside a transcript line. Colors ride as names so the
+/// JSONL stays readable; `None` means the terminal default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptSpan {
+    pub text: String,
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+    pub modifier_bits: u16,
+}
+
+/// Name a terminal color for transcript storage. `Reset` maps to `None`
+/// since it renders as the default anyway.
+pub fn encode_transcript_color(color: &ratatui::style::Color) -> Option<String> {
+    use ratatui::style::Color::*;
+    Some(
+        match color {
+            Reset => return None,
+            Black => "black",
+            Red => "red",
+            Green => "green",
+            Yellow => "yellow",
+            Blue => "blue",
+            Magenta => "magenta",
+            Cyan => "cyan",
+            Gray => "gray",
+            DarkGray => "darkgray",
+            LightRed => "lightred",
+            LightGreen => "lightgreen",
+            LightYellow => "lightyellow",
+            LightBlue => "lightblue",
+            LightMagenta => "lightmagenta",
+            LightCyan => "lightcyan",
+            White => "white",
+            Rgb(r, g, b) => return Some(format!("rgb({r},{g},{b})")),
+            Indexed(i) => return Some(format!("indexed({i})")),
+        }
+        .to_string(),
+    )
+}
+
+/// Inverse of [`encode_transcript_color`]. Unknown names yield `None` so a
+/// corrupt style degrades to the default instead of dropping the line.
+pub fn decode_transcript_color(name: &str) -> Option<ratatui::style::Color> {
+    use ratatui::style::Color::*;
+    match name {
+        "black" => Some(Black),
+        "red" => Some(Red),
+        "green" => Some(Green),
+        "yellow" => Some(Yellow),
+        "blue" => Some(Blue),
+        "magenta" => Some(Magenta),
+        "cyan" => Some(Cyan),
+        "gray" => Some(Gray),
+        "darkgray" => Some(DarkGray),
+        "lightred" => Some(LightRed),
+        "lightgreen" => Some(LightGreen),
+        "lightyellow" => Some(LightYellow),
+        "lightblue" => Some(LightBlue),
+        "lightmagenta" => Some(LightMagenta),
+        "lightcyan" => Some(LightCyan),
+        "white" => Some(White),
+        _ => name
+            .strip_prefix("rgb(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .and_then(|triple| {
+                let mut parts = triple.split(',');
+                let r = parts.next()?.parse().ok()?;
+                let g = parts.next()?.parse().ok()?;
+                let b = parts.next()?.parse().ok()?;
+                if parts.next().is_none() {
+                    Some(Rgb(r, g, b))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                name.strip_prefix("indexed(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .and_then(|i| i.parse().ok())
+                    .map(Indexed)
+            }),
+    }
 }
 
 enum TranscriptWriterCommand {
@@ -2586,16 +2674,19 @@ mod tests {
                 kind: BlockKind::Model,
                 ts: 1,
                 markdown: "model".to_string(),
+                spans: Vec::new(),
             },
             TranscriptEntry {
                 kind: BlockKind::ToolHeader,
                 ts: 2,
                 markdown: "▶ read_file".to_string(),
+                spans: Vec::new(),
             },
             TranscriptEntry {
                 kind: BlockKind::ToolOutput,
                 ts: 3,
                 markdown: "file contents".to_string(),
+                spans: Vec::new(),
             },
         ];
 
@@ -2621,6 +2712,7 @@ mod tests {
                     kind: BlockKind::Model,
                     ts: index,
                     markdown: format!("line {index}"),
+                    spans: Vec::new(),
                 })
                 .unwrap();
         }
@@ -2645,6 +2737,7 @@ mod tests {
                 kind: BlockKind::Model,
                 ts: index as u64,
                 markdown: format!("line {index}"),
+                spans: Vec::new(),
             })
             .collect::<Vec<_>>();
 
@@ -2661,6 +2754,30 @@ mod tests {
     }
 
     #[test]
+    fn test_transcript_span_colors_round_trip() {
+        use ratatui::style::Color::*;
+        for color in [
+            Black, Red, Green, Yellow, Blue, Magenta, Cyan, Gray, DarkGray, LightRed,
+            LightGreen, LightYellow, LightBlue, LightMagenta, LightCyan, White, Rgb(1, 2, 3),
+            Indexed(7),
+        ] {
+            let name = encode_transcript_color(&color).expect("named color encodes");
+            assert_eq!(decode_transcript_color(&name), Some(color));
+        }
+        assert_eq!(encode_transcript_color(&Reset), None);
+        assert_eq!(decode_transcript_color("nope"), None);
+        assert_eq!(decode_transcript_color("rgb(1,2)"), None);
+    }
+
+    #[test]
+    fn test_transcript_entries_without_spans_still_parse() {
+        let entry: TranscriptEntry =
+            serde_json::from_str(r#"{"kind":"model","ts":7,"markdown":"hi"}"#).unwrap();
+        assert!(entry.spans.is_empty());
+        assert_eq!(entry.markdown, "hi");
+    }
+
+    #[test]
     fn test_synchronous_small_appends_accumulate_before_compaction() {
         let temp_dir = TempDir::new().unwrap();
         let task_dir = temp_dir.path().join("transcript-sync-growth");
@@ -2673,6 +2790,7 @@ mod tests {
                 kind: BlockKind::Model,
                 ts: index as u64,
                 markdown: format!("initial {index}"),
+                spans: Vec::new(),
             })
             .collect::<Vec<_>>();
         storage.write_transcript_entries(&initial).unwrap();
@@ -2683,6 +2801,7 @@ mod tests {
                     kind: BlockKind::Model,
                     ts: 10_000 + index as u64,
                     markdown: format!("append {index}"),
+                    spans: Vec::new(),
                 })
                 .unwrap();
         }
@@ -2707,6 +2826,7 @@ mod tests {
                     kind: BlockKind::Model,
                     ts: index as u64,
                     markdown: format!("line {index}"),
+                    spans: Vec::new(),
                 }])
                 .unwrap();
         }
@@ -2731,6 +2851,7 @@ mod tests {
             kind: BlockKind::Model,
             ts: index,
             markdown: "x".repeat(100),
+            spans: Vec::new(),
         };
         storage
             .write_transcript_entries(
@@ -2773,6 +2894,7 @@ mod tests {
                 kind: BlockKind::Model,
                 ts: index as u64,
                 markdown: "small".to_string(),
+                spans: Vec::new(),
             })
             .collect::<Vec<_>>();
         storage.write_transcript_entries(&initial).unwrap();
@@ -2783,6 +2905,7 @@ mod tests {
                 kind: BlockKind::Model,
                 ts: 1_000,
                 markdown: "x".repeat(1_100_000),
+                spans: Vec::new(),
             }])
             .unwrap();
         writer.flush().unwrap();
@@ -2809,6 +2932,7 @@ mod tests {
                         kind: BlockKind::Model,
                         ts: index as u64,
                         markdown: format!("line {index}"),
+                        spans: Vec::new(),
                     })
                     .collect(),
             )
@@ -2838,6 +2962,7 @@ mod tests {
                 kind: BlockKind::Model,
                 ts: index as u64,
                 markdown: format!("line {index}"),
+                spans: Vec::new(),
             })
             .collect::<Vec<_>>();
         fs::write(
@@ -2872,11 +2997,13 @@ mod tests {
             kind: BlockKind::Model,
             ts: 1,
             markdown: "before".to_string(),
+            spans: Vec::new(),
         };
         let after = TranscriptEntry {
             kind: BlockKind::ToolOutput,
             ts: 2,
             markdown: "after".to_string(),
+            spans: Vec::new(),
         };
         fs::write(
             &path,
@@ -2909,6 +3036,7 @@ mod tests {
                 kind: BlockKind::Model,
                 ts: index as u64,
                 markdown: format!("line {index}"),
+                spans: Vec::new(),
             })
             .collect::<Vec<_>>();
         let mut contents = entries
@@ -2946,6 +3074,7 @@ mod tests {
                         kind,
                         ts: 1,
                         markdown: "transient".to_string(),
+                        spans: Vec::new(),
                     })
                     .is_err()
             );
@@ -2971,6 +3100,7 @@ mod tests {
                 kind: BlockKind::Model,
                 ts: 1,
                 markdown: "future".to_string(),
+                spans: Vec::new(),
             })
             .unwrap();
         storage
@@ -3001,6 +3131,7 @@ mod tests {
                 kind: BlockKind::Model,
                 ts: 1,
                 markdown: "old".to_string(),
+                spans: Vec::new(),
             })
             .unwrap();
         let path = task_dir.join(GlobalFileNames::TRANSCRIPT);

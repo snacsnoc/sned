@@ -432,7 +432,7 @@ impl OutputEvent {
         Self::Line(Line::from(Span::styled(
             text.into(),
             Style::default()
-                .fg(theme::WARNING_FG)
+                .fg(theme::warning_fg())
                 .add_modifier(Modifier::DIM),
         )))
     }
@@ -446,7 +446,7 @@ impl OutputEvent {
         use crate::cli::tui::theme;
         Self::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(theme::ACCENT),
+            Style::default().fg(theme::accent()),
         )))
     }
 
@@ -454,7 +454,7 @@ impl OutputEvent {
         use crate::cli::tui::theme;
         Self::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(theme::TOOL_CALL_FG),
+            Style::default().fg(theme::tool_call_fg()),
         )))
     }
 
@@ -463,9 +463,9 @@ impl OutputEvent {
         Self::Line(Line::from(Span::styled(
             text.into(),
             Style::default().fg(if is_error {
-                theme::ERROR_FG
+                theme::error_fg()
             } else {
-                theme::PROMPT_FG
+                theme::prompt_fg()
             }),
         )))
     }
@@ -479,7 +479,7 @@ impl OutputEvent {
         use crate::cli::tui::theme;
         Self::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(theme::WARNING_FG),
+            Style::default().fg(theme::warning_fg()),
         )))
     }
 
@@ -487,7 +487,7 @@ impl OutputEvent {
         use crate::cli::tui::theme;
         Self::Line(Line::from(Span::styled(
             format!("[sned] ERROR: {text}"),
-            Style::default().fg(theme::ERROR_FG),
+            Style::default().fg(theme::error_fg()),
         )))
     }
 
@@ -499,25 +499,33 @@ impl OutputEvent {
         use crate::cli::tui::theme;
         Self::Line(Line::from(Span::styled(
             format!("[sned] Warning: {text}"),
-            Style::default().fg(theme::WARNING_FG),
+            Style::default().fg(theme::warning_fg()),
         )))
     }
 
     pub fn info(text: impl fmt::Display) -> Self {
         use crate::cli::tui::theme;
-        Self::Line(Line::from(Span::styled(
-            format!("[sned] {text}"),
+        use ratatui::style::Color;
+        // High contrast drops the dim: muted cyan reads washed out, so
+        // system lines go flat gray instead.
+        let style = if theme::high_contrast() {
+            Style::default().fg(Color::Gray)
+        } else {
             Style::default()
-                .fg(theme::INFO_FG)
-                .add_modifier(Modifier::DIM),
-        )))
+                .fg(theme::info_fg())
+                .add_modifier(Modifier::DIM)
+        };
+        Self::Line(Line::from(Span::styled(format!("[sned] {text}"), style)))
     }
 
     pub fn tool_call(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
         Self::ToolHeaderLine(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(theme::TOOL_CALL_FG),
+            theme::emphasize_for(
+                theme::high_contrast(),
+                Style::default().fg(theme::tool_call_fg()),
+            ),
         )))
     }
 
@@ -525,7 +533,7 @@ impl OutputEvent {
         use crate::cli::tui::theme;
         Self::Line(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(theme::ACCENT),
+            theme::emphasize_for(theme::high_contrast(), Style::default().fg(theme::accent())),
         )))
     }
 
@@ -536,7 +544,7 @@ impl OutputEvent {
         use crate::cli::tui::theme;
         Self::TurnIndicator(Line::from(Span::styled(
             text.into(),
-            Style::default().fg(theme::ACCENT),
+            theme::emphasize_for(theme::high_contrast(), Style::default().fg(theme::accent())),
         )))
     }
 
@@ -545,7 +553,7 @@ impl OutputEvent {
     /// DarkGray foreground for visual hierarchy against bright model
     /// text, except for error lines which stay bright red.
     pub fn tool_output_line(text: impl Into<String>, style: ratatui::style::Style) -> Self {
-        let is_error = style.fg == Some(crate::cli::tui::theme::ERROR_FG);
+        let is_error = style.fg == Some(crate::cli::tui::theme::error_fg());
         let final_style = if is_error {
             style
         } else if style.fg.is_some() {
@@ -553,7 +561,7 @@ impl OutputEvent {
             style.add_modifier(ratatui::style::Modifier::DIM)
         } else {
             // No foreground set — use DarkGray for subtle appearance.
-            ratatui::style::Style::default().fg(crate::cli::tui::theme::STATUS_FG)
+            ratatui::style::Style::default().fg(crate::cli::tui::theme::status_fg())
         };
         Self::ToolOutputLine(Line::from(Span::styled(text.into(), final_style)))
     }

@@ -107,18 +107,18 @@ pub enum BlockKind {
 /// Accent styling applied to each non-separator transcript row at render time.
 fn block_kind_accent_style(kind: BlockKind) -> Style {
     match kind {
-        BlockKind::Model => Style::default().fg(theme::ACCENT),
-        BlockKind::ToolHeader => Style::default().fg(theme::TOOL_CALL_FG),
-        BlockKind::ToolOutput | BlockKind::CommandOutput => Style::default().fg(theme::STATUS_FG),
-        BlockKind::CommandHeader => Style::default().fg(theme::INFO_FG),
+        BlockKind::Model => Style::default().fg(theme::accent()),
+        BlockKind::ToolHeader => Style::default().fg(theme::tool_call_fg()),
+        BlockKind::ToolOutput | BlockKind::CommandOutput => Style::default().fg(theme::status_fg()),
+        BlockKind::CommandHeader => Style::default().fg(theme::info_fg()),
         BlockKind::Reasoning => Style::default()
-            .fg(theme::ACCENT)
+            .fg(theme::accent())
             .add_modifier(Modifier::DIM),
-        BlockKind::UserPrompt => Style::default().fg(theme::ECHO_FG),
-        BlockKind::BlockingPrompt => Style::default().fg(theme::WARNING_FG),
-        BlockKind::Completion => Style::default().fg(theme::SUCCESS_FG),
-        BlockKind::Error => Style::default().fg(theme::ERROR_FG),
-        BlockKind::Separator => Style::default().fg(theme::BORDER_FG),
+        BlockKind::UserPrompt => Style::default().fg(theme::echo_fg()),
+        BlockKind::BlockingPrompt => Style::default().fg(theme::warning_fg()),
+        BlockKind::Completion => Style::default().fg(theme::success_fg()),
+        BlockKind::Error => Style::default().fg(theme::error_fg()),
+        BlockKind::Separator => Style::default().fg(theme::border_fg()),
     }
 }
 
@@ -1828,9 +1828,11 @@ impl App {
             self.reasoning_partial_line.push_str(content);
             let line = Line::from(Span::styled(
                 format!("  Ɵ {}", self.reasoning_partial_line),
-                Style::default()
-                    .fg(crate::cli::tui::theme::ACCENT)
-                    .add_modifier(Modifier::ITALIC),
+                Style::default().fg(crate::cli::tui::theme::accent()).add_modifier(
+                    crate::cli::tui::theme::reasoning_modifier_for(
+                        crate::cli::tui::theme::high_contrast(),
+                    ),
+                ),
             ));
             self.replace_last_stream_line(line, StreamKind::Reasoning);
             if complete {
@@ -2137,7 +2139,7 @@ impl App {
                     let mut spans = Vec::with_capacity(first.spans.len() + 1);
                     spans.push(Span::styled(
                         "\u{2666} ",
-                        Style::default().fg(crate::cli::tui::theme::ACCENT),
+                        Style::default().fg(crate::cli::tui::theme::accent()),
                     ));
                     spans.extend(first.spans.iter().cloned());
                     first.spans = spans;
@@ -2203,7 +2205,7 @@ impl App {
                 let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
                 new_spans.push(Span::styled(
                     "\u{2666} ",
-                    Style::default().fg(crate::cli::tui::theme::ACCENT),
+                    Style::default().fg(crate::cli::tui::theme::accent()),
                 ));
                 new_spans.extend(first.spans.iter().cloned());
                 first.spans = new_spans;
@@ -2302,7 +2304,7 @@ impl App {
             let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
             new_spans.push(Span::styled(
                 "\u{2666} ",
-                Style::default().fg(crate::cli::tui::theme::ACCENT),
+                Style::default().fg(crate::cli::tui::theme::accent()),
             ));
             new_spans.extend(first.spans.iter().cloned());
             first.spans = new_spans;
@@ -3231,7 +3233,7 @@ impl App {
 
     fn push_submission_echo(&mut self, text: &str, writer: &OutputWriterArc, local_command: bool) {
         let style = Style::default()
-            .fg(theme::ECHO_FG)
+            .fg(theme::echo_fg())
             .add_modifier(Modifier::BOLD);
         let lines: Vec<&str> = text.split('\n').collect();
         let is_multiline = lines.len() > 1;
@@ -4556,7 +4558,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 message,
-                Style::default().fg(theme::WARNING_FG),
+                Style::default().fg(theme::warning_fg()),
             ))),
             area,
         );
@@ -4692,10 +4694,10 @@ impl App {
                 choice.shortcut().to_string()
             };
             let color = match choice.result() {
-                crate::core::approval::ApprovalResult::Approved => theme::SUCCESS_FG,
-                crate::core::approval::ApprovalResult::Denied => theme::ERROR_FG,
-                crate::core::approval::ApprovalResult::Always => theme::ACCENT,
-                crate::core::approval::ApprovalResult::AllowExternalDirectory => theme::ACCENT,
+                crate::core::approval::ApprovalResult::Approved => theme::success_fg(),
+                crate::core::approval::ApprovalResult::Denied => theme::error_fg(),
+                crate::core::approval::ApprovalResult::Always => theme::accent(),
+                crate::core::approval::ApprovalResult::AllowExternalDirectory => theme::accent(),
             };
             actions.push(Span::styled(
                 format!("[{shortcut}]"),
@@ -4706,7 +4708,7 @@ impl App {
         if max_scroll > 0 {
             actions.push(Span::styled(
                 "  [↑/↓/wheel] Review",
-                Style::default().fg(theme::STATUS_FG),
+                Style::default().fg(theme::status_fg()),
             ));
         }
         frame.render_widget(Paragraph::new(Line::from(actions)), action_area);
@@ -4781,10 +4783,10 @@ impl App {
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect) {
         if let Some(notification) = self.status_notification.as_ref() {
             let (marker, color) = match notification.kind {
-                NotificationKind::Info => ("i", theme::ACCENT),
-                NotificationKind::Success => ("✓", theme::SUCCESS_FG),
-                NotificationKind::Warning => ("!", theme::WARNING_FG),
-                NotificationKind::Error => ("×", theme::ERROR_FG),
+                NotificationKind::Info => ("i", theme::accent()),
+                NotificationKind::Success => ("✓", theme::success_fg()),
+                NotificationKind::Warning => ("!", theme::warning_fg()),
+                NotificationKind::Error => ("×", theme::error_fg()),
             };
             let left = self.status_left_required();
             let message = Self::truncate_status_text(
@@ -4806,28 +4808,41 @@ impl App {
         let leading_width = 1usize;
         let left_width = UnicodeWidthStr::width(required_left.as_str());
         let right_budget = total_width.saturating_sub(leading_width + left_width + 1);
-        let mut right_segments = Vec::new();
+        let mut right_segments: Vec<(String, bool)> = Vec::new();
         if let Some(pct) = self.context_pct {
-            right_segments.push(format!("{:.0}% ctx", 100.0 - pct));
+            right_segments.push((format!("{:.0}% ctx", 100.0 - pct), false));
         }
         if let Some(elapsed) = self.elapsed {
-            right_segments.push(format!("⏱ {}", format_duration(elapsed)));
+            right_segments.push((format!("⏱ {}", format_duration(elapsed)), false));
         }
         if self.output_overflow {
-            right_segments.push(format!("⚠ {} dropped", self.output_overflow_count));
+            right_segments.push((
+                format!("⚠ {} dropped", self.output_overflow_count),
+                true,
+            ));
         }
         if self.scroll_mode == ScrollMode::Manual && self.unseen_output_count > 0 {
-            right_segments.push(format!("↑ {} new", self.unseen_output_count));
+            right_segments.push((format!("↑ {} new", self.unseen_output_count), false));
         }
         if !self.in_scrollback && self.scrollback_count > 0 {
-            right_segments.push(format!("↑{} scrollback", self.scrollback_count));
+            right_segments.push((format!("↑{} scrollback", self.scrollback_count), false));
         }
 
         let mut right = String::new();
-        for segment in right_segments {
+        let mut right_spans: Vec<Span> = Vec::new();
+        for (segment, alert) in right_segments {
             let separator = if right.is_empty() { "" } else { " · " };
             let candidate = format!("{right}{separator}{segment}");
             if UnicodeWidthStr::width(candidate.as_str()) <= right_budget {
+                if !separator.is_empty() {
+                    right_spans.push(Span::styled(separator, theme::status_style()));
+                }
+                let style = if alert {
+                    theme::status_alert_style()
+                } else {
+                    theme::status_style()
+                };
+                right_spans.push(Span::styled(segment, style));
                 right = candidate;
             }
         }
@@ -4857,11 +4872,12 @@ impl App {
         left = Self::truncate_status_text(&left, left_budget);
         let spacer_len = total_width
             .saturating_sub(leading_width + UnicodeWidthStr::width(left.as_str()) + right_width);
-        let status_line = Line::from(vec![
+        let mut status_spans = vec![
             Span::styled(format!(" {left}"), theme::status_style()),
             Span::raw(" ".repeat(spacer_len.saturating_sub(1))),
-            Span::styled(right, theme::status_style()),
-        ]);
+        ];
+        status_spans.extend(right_spans);
+        let status_line = Line::from(status_spans);
         let status = Paragraph::new(status_line);
         frame.render_widget(status, status_area);
     }
@@ -4897,7 +4913,7 @@ impl App {
                 frame.render_widget(Clear, output_area);
                 frame.render_widget(
                     Paragraph::new(Line::from("Reflowing transcript…"))
-                        .style(Style::default().fg(theme::STATUS_FG))
+                        .style(Style::default().fg(theme::status_fg()))
                         .block(theme::border_block(" sned ")),
                     output_area,
                 );
@@ -5279,7 +5295,7 @@ impl App {
                     let mut lines = vec![
                         Line::from(Span::styled(
                             entry.usage(),
-                            Style::default().fg(theme::ACCENT),
+                            Style::default().fg(theme::accent()),
                         )),
                         Line::from(entry.description.clone()),
                         Line::from(entry.detail()),
@@ -5502,10 +5518,10 @@ mod tests {
         let rows = app.collect_output_rows_range(0, 3, app.last_wrap_width());
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].spans[0].content, "│");
-        assert_eq!(rows[0].spans[0].style.fg, Some(theme::ACCENT));
+        assert_eq!(rows[0].spans[0].style.fg, Some(theme::accent()));
         assert_eq!(rows[1].spans[0].content, "separator");
         assert_eq!(rows[2].spans[0].content, "│");
-        assert_eq!(rows[2].spans[0].style.fg, Some(theme::STATUS_FG));
+        assert_eq!(rows[2].spans[0].style.fg, Some(theme::status_fg()));
 
         let line = Line::from("1234567890");
         assert_eq!(
@@ -5518,23 +5534,23 @@ mod tests {
     fn block_kind_accent_styles_match_theme() {
         assert_eq!(
             block_kind_accent_style(BlockKind::Model).fg,
-            Some(theme::ACCENT)
+            Some(theme::accent())
         );
         assert_eq!(
             block_kind_accent_style(BlockKind::ToolHeader).fg,
-            Some(theme::TOOL_CALL_FG)
+            Some(theme::tool_call_fg())
         );
         assert_eq!(
             block_kind_accent_style(BlockKind::CommandHeader).fg,
-            Some(theme::INFO_FG)
+            Some(theme::info_fg())
         );
         assert_eq!(
             block_kind_accent_style(BlockKind::UserPrompt).fg,
-            Some(theme::ECHO_FG)
+            Some(theme::echo_fg())
         );
         assert_eq!(
             block_kind_accent_style(BlockKind::BlockingPrompt).fg,
-            Some(theme::WARNING_FG)
+            Some(theme::warning_fg())
         );
     }
 
@@ -6709,7 +6725,7 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("⠋ Processing…"));
-        assert_eq!(buffer.cell((0, 9)).map(|cell| cell.fg), Some(theme::ACCENT));
+        assert_eq!(buffer.cell((0, 9)).map(|cell| cell.fg), Some(theme::accent()));
     }
 
     #[test]
@@ -6728,7 +6744,7 @@ mod tests {
 
         assert_eq!(
             terminal.backend().buffer().cell((0, 9)).map(|cell| cell.fg),
-            Some(theme::ERROR_FG)
+            Some(theme::error_fg())
         );
     }
 
@@ -7867,7 +7883,7 @@ mod tests {
                 .all(|kind| *kind == BlockKind::Reasoning)
         );
         let style = app.output_lines[0].spans[0].style;
-        assert_eq!(style.fg, Some(crate::cli::tui::theme::ACCENT));
+        assert_eq!(style.fg, Some(crate::cli::tui::theme::accent()));
         assert!(style.add_modifier.contains(Modifier::ITALIC));
     }
 
@@ -7890,7 +7906,7 @@ mod tests {
             "reasoning stored as one logical row"
         );
         let line = &app.output_lines[0];
-        assert_eq!(line.spans[0].style.fg, Some(crate::cli::tui::theme::ACCENT));
+        assert_eq!(line.spans[0].style.fg, Some(crate::cli::tui::theme::accent()));
         assert!(line.spans[0].style.add_modifier.contains(Modifier::ITALIC));
     }
 
@@ -8120,7 +8136,7 @@ mod tests {
         let mut app = App::new();
         app.push_turn_indicator(Line::from(Span::styled(
             "\u{2666}",
-            Style::default().fg(crate::cli::tui::theme::ACCENT),
+            Style::default().fg(crate::cli::tui::theme::accent()),
         )));
         app.push_stream_line(Line::from("  **bold** text"), StreamKind::Model);
         app.push_stream_line(Line::from("  more"), StreamKind::Model);
@@ -8178,7 +8194,7 @@ mod tests {
         let mut app = App::new();
         app.push_turn_indicator(Line::from(Span::styled(
             "\u{2666}",
-            Style::default().fg(crate::cli::tui::theme::ACCENT),
+            Style::default().fg(crate::cli::tui::theme::accent()),
         )));
         app.push_stream_line(Line::from("plain line"), StreamKind::Model);
 
@@ -8297,7 +8313,7 @@ mod tests {
         assert!(rendered.contains("Ɵ Thinking…"));
         assert_eq!(
             buffer.cell((0, 9)).map(|cell| cell.fg),
-            Some(theme::REASONING_FG)
+            Some(theme::reasoning_fg())
         );
     }
 
@@ -8327,7 +8343,7 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("⠋ Processing…"));
-        assert_eq!(buffer.cell((0, 9)).map(|cell| cell.fg), Some(theme::ACCENT));
+        assert_eq!(buffer.cell((0, 9)).map(|cell| cell.fg), Some(theme::accent()));
     }
 
     #[test]
@@ -8350,7 +8366,7 @@ mod tests {
         // Now push a completion line and render again.
         app.push_completion_line(Line::from(Span::styled(
             "MARKER_COMPLETION_TEXT",
-            Style::default().fg(theme::PROMPT_FG),
+            Style::default().fg(theme::prompt_fg()),
         )));
         terminal
             .draw(|frame| app.render(frame))
@@ -8417,7 +8433,7 @@ mod tests {
 
         app.push_error_line(Line::from(Span::styled(
             "MARKER_ERROR_TEXT",
-            Style::default().fg(theme::ERROR_FG),
+            Style::default().fg(theme::error_fg()),
         )));
         terminal
             .draw(|frame| app.render(frame))
@@ -9726,7 +9742,7 @@ mod tests {
         // Set up the turn indicator
         app.push_turn_indicator(Line::from(Span::styled(
             "\u{2666}",
-            Style::default().fg(crate::cli::tui::theme::ACCENT),
+            Style::default().fg(crate::cli::tui::theme::accent()),
         )));
 
         // Push a single plain text line that will trigger the can_skip_reinsert

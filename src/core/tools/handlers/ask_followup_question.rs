@@ -62,7 +62,7 @@ impl AskFollowupQuestionHandler {
             use crate::cli::output::OutputEvent;
             use ratatui::style::{Modifier, Style};
             let timeout_secs = crate::core::approval::followup_timeout().as_secs();
-            use crate::cli::tui::theme::{ACCENT, WARNING_FG};
+            use crate::cli::tui::theme::{accent, warning_fg};
             let task_id = ctx.task_id.clone();
 
             // Arm the prompt state before emitting any lines so a drain that
@@ -72,7 +72,7 @@ impl AskFollowupQuestionHandler {
 
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("\n{} {}\n", "[Sned Question]", question),
-                Style::default().fg(WARNING_FG).add_modifier(Modifier::BOLD),
+                Style::default().fg(warning_fg()).add_modifier(Modifier::BOLD),
             ));
 
             // Render the question text as markdown so the TUI displays
@@ -84,7 +84,7 @@ impl AskFollowupQuestionHandler {
 
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 "Your answer: ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ));
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("(waiting up to {timeout_secs}s for your response)"),

@@ -18,13 +18,13 @@ pub fn render_plan_panel(plan: &PlanState, frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(ratatui::widgets::Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::ACCENT))
-        .title(Span::styled(" Plan ", Style::default().fg(theme::ACCENT)));
+        .border_style(Style::default().fg(theme::accent()))
+        .title(Span::styled(" Plan ", Style::default().fg(theme::accent())));
 
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
-        .style(Style::default().fg(theme::ACCENT));
+        .style(Style::default().fg(theme::accent()));
 
     frame.render_widget(paragraph, area);
 }
@@ -59,7 +59,7 @@ fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
 
     lines.push(Line::from(Span::styled(
         format!("Status: {status}"),
-        Style::default().fg(theme::ACCENT),
+        Style::default().fg(theme::accent()),
     )));
 
     // Progress bar
@@ -95,7 +95,7 @@ fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
         let is_current = plan.approved && step.index == plan.current_step_index;
         let style = if is_current {
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()

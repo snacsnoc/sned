@@ -597,9 +597,9 @@ impl ExecuteCommandHandler {
             tracing::debug!(command = %cmd_str, cwd = ?cwd, "executing command");
 
             if !json_output {
-                use crate::cli::tui::theme::INFO_FG;
+                use crate::cli::tui::theme::info_fg;
                 use ratatui::style::{Modifier, Style};
-                let style = Style::default().fg(INFO_FG).add_modifier(Modifier::DIM);
+                let style = Style::default().fg(info_fg()).add_modifier(Modifier::DIM);
                 // Keep the complete header in one event so parallel commands
                 // cannot interleave another event between its continuation rows.
                 let line = Line::from(Span::styled(format_command_header(cmd_str), style));
@@ -744,20 +744,20 @@ impl ExecuteCommandHandler {
                                     if stream_limit.is_none() {
                                         // No cap: stream every line.
                                         use crate::cli::output::OutputEvent;
-                                        use crate::cli::tui::theme::WARNING_FG;
+                                        use crate::cli::tui::theme::warning_fg;
                                         use ratatui::style::Style;
                                         output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                                             line.clone(),
-                                            Style::default().fg(WARNING_FG),
+                                            Style::default().fg(warning_fg()),
                                         ))));
                                     } else if stderr_displayed <= half {
                                         // Head: print live
                                         use crate::cli::output::OutputEvent;
-                                        use crate::cli::tui::theme::WARNING_FG;
+                                        use crate::cli::tui::theme::warning_fg;
                                         use ratatui::style::Style;
                                         output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                                             line.clone(),
-                                            Style::default().fg(WARNING_FG),
+                                            Style::default().fg(warning_fg()),
                                         ))));
                                     } else if stderr_displayed == half + 1 && !stderr_truncated {
                                         // First skipped line on this stream: emit condensed note once
@@ -886,19 +886,19 @@ impl ExecuteCommandHandler {
                                     if !json_output {
                                         if stream_limit.is_none() {
                                             use crate::cli::output::OutputEvent;
-                                            use crate::cli::tui::theme::WARNING_FG;
+                                            use crate::cli::tui::theme::warning_fg;
                                             use ratatui::style::Style;
                                             output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                                                 line.clone(),
-                                                Style::default().fg(WARNING_FG),
+                                                Style::default().fg(warning_fg()),
                                             ))));
                                         } else if stderr_displayed <= half {
                                             use crate::cli::output::OutputEvent;
-                                            use crate::cli::tui::theme::WARNING_FG;
+                                            use crate::cli::tui::theme::warning_fg;
                                             use ratatui::style::Style;
                                             output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
                                                 line.clone(),
-                                                Style::default().fg(WARNING_FG),
+                                                Style::default().fg(warning_fg()),
                                             ))));
                                         } else if stderr_displayed == half + 1 && !stderr_truncated {
                                             use ratatui::style::{Modifier, Style};

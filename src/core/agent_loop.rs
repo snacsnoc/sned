@@ -12,7 +12,7 @@
 //! reverse order when possible.
 
 use crate::cli::output::OutputEvent;
-use crate::cli::tui::theme::{ERROR_FG, PROMPT_FG};
+use crate::cli::tui::theme::{error_fg, prompt_fg};
 use crate::core::agent_types::code_block_display_limit;
 pub use crate::core::agent_types::{AgentConfig, AgentError, AgentMode, TaskState, TurnResult};
 use crate::core::context::{
@@ -546,7 +546,7 @@ fn streaming_model_line(text: String, style_markdown: bool) -> Line<'static> {
                 .expect("markdown renderer returned empty output");
             for span in &mut line.spans {
                 if span.style.fg.is_none() {
-                    span.style.fg = Some(crate::cli::tui::theme::ACCENT);
+                    span.style.fg = Some(crate::cli::tui::theme::accent());
                 }
             }
             return line;
@@ -556,7 +556,7 @@ fn streaming_model_line(text: String, style_markdown: bool) -> Line<'static> {
     // Block constructs need full-turn context and remain raw until TurnEnd.
     Line::from(Span::styled(
         text,
-        Style::default().fg(crate::cli::tui::theme::ACCENT),
+        Style::default().fg(crate::cli::tui::theme::accent()),
     ))
 }
 
@@ -658,7 +658,7 @@ fn report_shadow_commit_result(
         .join(" ");
     output_writer.emit(OutputEvent::tool_output_line(
         format!("Change tracking failed; /diff and /log will not include this turn: {detail}"),
-        Style::default().fg(ERROR_FG),
+        Style::default().fg(error_fg()),
     ));
 }
 
@@ -3379,7 +3379,7 @@ impl AgentLoop {
                                 MAX_STREAM_RETRY_ATTEMPTS + 1,
                                 delay.as_secs(),
                             ),
-                            Style::default().fg(crate::cli::tui::theme::WARNING_FG),
+                            Style::default().fg(crate::cli::tui::theme::warning_fg()),
                         ));
                 }
                 if !self.wait_for_stream_retry_delay(delay).await {
@@ -4377,7 +4377,7 @@ impl AgentLoop {
                             .output_writer
                             .emit(OutputEvent::tool_output_line(
                                 format!("  {status} {stats}"),
-                                Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG }),
+                                Style::default().fg(if is_error { error_fg() } else { prompt_fg() }),
                             ));
                         if is_error {
                             for detail in
@@ -4387,7 +4387,7 @@ impl AgentLoop {
                                     .output_writer
                                     .emit(OutputEvent::tool_output_line(
                                         format!("    {detail}"),
-                                        Style::default().fg(ERROR_FG),
+                                        Style::default().fg(error_fg()),
                                     ));
                             }
                         } else {
@@ -4411,8 +4411,8 @@ impl AgentLoop {
                             &tool_params,
                             &result_output.text,
                             is_error,
-                            if is_error { ERROR_FG } else { PROMPT_FG },
-                            PROMPT_FG,
+                            if is_error { error_fg() } else { prompt_fg() },
+                            prompt_fg(),
                         );
                         for line in digest_lines {
                             let mut style = Style::default();
@@ -4434,8 +4434,10 @@ impl AgentLoop {
                             | "use_subagents"
                     ) && (tool_name != "attempt_completion" || is_error)
                     {
-                        let style =
-                            Style::default().fg(if is_error { ERROR_FG } else { PROMPT_FG });
+                        let style = crate::cli::tui::theme::emphasize_for(
+                            crate::cli::tui::theme::high_contrast(),
+                            Style::default().fg(if is_error { error_fg() } else { prompt_fg() }),
+                        );
                         let status = if is_error { "✗" } else { "✓" };
                         self.config
                             .output_writer
@@ -4763,7 +4765,7 @@ impl AgentLoop {
                         .output_writer
                         .emit(OutputEvent::tool_output_line(
                             format!("  📝 {}", parts.join(", ")),
-                            Style::default().fg(crate::cli::tui::theme::INFO_FG),
+                            Style::default().fg(crate::cli::tui::theme::info_fg()),
                         ));
                 }
             }
@@ -7922,7 +7924,7 @@ Irrespective of whether additional information or instructions are given, you ar
             span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
         }));
         assert!(inline.spans.iter().any(|span| {
-            span.content == "`code`" && span.style.fg == Some(crate::cli::tui::theme::PROMPT_FG)
+            span.content == "`code`" && span.style.fg == Some(crate::cli::tui::theme::prompt_fg())
         }));
 
         let heading = streaming_model_line("  ### heading".to_string(), true);
@@ -7943,14 +7945,14 @@ Irrespective of whether additional information or instructions are given, you ar
         assert_eq!(partial.to_string(), "**bol");
         assert_eq!(
             partial.spans[0].style.fg,
-            Some(crate::cli::tui::theme::ACCENT)
+            Some(crate::cli::tui::theme::accent())
         );
 
         let block = streaming_model_line("---".to_string(), true);
         assert_eq!(block.to_string(), "---");
         assert_eq!(
             block.spans[0].style.fg,
-            Some(crate::cli::tui::theme::ACCENT)
+            Some(crate::cli::tui::theme::accent())
         );
     }
 

@@ -1269,11 +1269,11 @@ impl ReadFileHandler {
         if let Some(writer) = output_writer {
             for warning in &warnings {
                 use crate::cli::output::OutputEvent;
-                use crate::cli::tui::theme::WARNING_FG;
+                use crate::cli::tui::theme::warning_fg;
                 use ratatui::style::Style;
                 writer.emit(OutputEvent::tool_output_line(
                     warning.clone(),
-                    Style::default().fg(WARNING_FG),
+                    Style::default().fg(warning_fg()),
                 ));
             }
         }

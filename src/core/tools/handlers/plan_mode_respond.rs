@@ -47,10 +47,10 @@ impl PlanModeRespondHandler {
         if needs_more {
             if !ctx.json_output {
                 use crate::cli::output::OutputEvent;
-                use crate::cli::tui::theme::ACCENT;
+                use crate::cli::tui::theme::accent;
                 ctx.output_writer.emit(OutputEvent::tool_output_line(
                     response.to_string(),
-                    ratatui::style::Style::default().fg(ACCENT),
+                    ratatui::style::Style::default().fg(accent()),
                 ));
             }
             return Ok(
@@ -90,11 +90,11 @@ impl PlanModeRespondHandler {
             );
         } else {
             use crate::cli::output::OutputEvent;
-            use crate::cli::tui::theme::ACCENT;
+            use crate::cli::tui::theme::accent;
             use ratatui::style::{Modifier, Style};
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("\n📋 Plan Generated\n{response}\n"),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ));
         }
 

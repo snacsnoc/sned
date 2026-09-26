@@ -387,6 +387,10 @@ pub struct TaskOptions {
     #[arg(long, value_name = "tokens", hide_short_help = true)]
     pub context_window: Option<u64>,
 
+    /// High-contrast DOS-bright TUI palette (color-blind friendlier)
+    #[arg(long)]
+    pub high_contrast: bool,
+
     /// Enable debug logging to /tmp/sned-debug.log. Default disabled
     #[arg(long, hide_short_help = true)]
     pub debug: bool,
@@ -1673,6 +1677,7 @@ async fn build_task_components(
     use crate::core::context::SystemPromptContext;
     use crate::storage::state_manager::StateManager;
 
+    crate::cli::tui::theme::set_high_contrast(task_opts.high_contrast);
     if let Some(ref cwd) = task_opts.cwd {
         std::env::set_current_dir(cwd)?;
     }
@@ -2396,6 +2401,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_high_contrast_flag() {
+        let cli = Cli::try_parse_from(["sned", "--high-contrast", "test"]).unwrap();
+        assert!(cli.task_opts.high_contrast);
+        let cli = Cli::try_parse_from(["sned", "test"]).unwrap();
+        assert!(!cli.task_opts.high_contrast);
+    }
+
+    #[test]
     fn context_window_override_wins_over_profile() {
         use crate::providers::ModelInfo;
 
@@ -2978,6 +2991,7 @@ mod tests {
                 max_context_turns: None,
                 max_tokens: None,
                 context_window: None,
+                high_contrast: false,
                 debug: false,
                 prompt_file: None,
                 result_file: None,
@@ -3053,6 +3067,7 @@ mod tests {
                 max_context_turns: None,
                 max_tokens: None,
                 context_window: None,
+                high_contrast: false,
                 debug: false,
                 prompt_file: None,
                 result_file: None,
@@ -3180,6 +3195,7 @@ mod tests {
                 max_context_turns: None,
                 max_tokens: None,
                 context_window: None,
+                high_contrast: false,
                 debug: false,
                 prompt_file: None,
                 result_file: None,
