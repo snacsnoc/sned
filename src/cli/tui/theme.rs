@@ -15,8 +15,13 @@ pub const ACCENT: Color = Color::Cyan;
 /// Status bar foreground (dim for subtle appearance).
 pub const STATUS_FG: Color = Color::DarkGray;
 
-/// Prompt echo color (user input confirmation).
+/// Prompt-adjacent green: markdown inline code, tool success lines.
 pub const PROMPT_FG: Color = Color::LightGreen;
+
+/// User echo color (submitted input confirmation). White and bold: the echo
+/// must read as the user's own words, not as another green result. Scoped
+/// to echo sites only; code spans and success lines keep PROMPT_FG.
+pub const ECHO_FG: Color = Color::White;
 
 /// Success color for completed work and approval-ready input.
 pub const SUCCESS_FG: Color = Color::LightGreen;
@@ -29,6 +34,15 @@ pub const ERROR_FG: Color = Color::Red;
 
 /// Tool call color (e.g., execute_command, file operations).
 pub const TOOL_CALL_FG: Color = Color::Magenta;
+
+/// Approval input border. Light magenta: approval demands action now, so it
+/// must not share success green ("all good") or warning yellow. It only ever
+/// paints the input border, where magenta tool-call text never appears.
+pub const APPROVAL_FG: Color = Color::LightMagenta;
+
+/// Reasoning input border. Light blue: reasoning is busy-wait, not a warning,
+/// so it must not share warning yellow. Distinct from idle blue by shade.
+pub const REASONING_FG: Color = Color::LightBlue;
 
 /// Info/subtle color (dim white for status messages).
 pub const INFO_FG: Color = Color::White;
@@ -73,9 +87,9 @@ pub fn input_block(title: Option<String>, state: InputBorderState) -> Block<'sta
     let border_color = match state {
         InputBorderState::Idle => Color::Blue,
         InputBorderState::Processing => ACCENT,
-        InputBorderState::Reasoning => WARNING_FG,
+        InputBorderState::Reasoning => REASONING_FG,
         InputBorderState::Error => ERROR_FG,
-        InputBorderState::Approval => SUCCESS_FG,
+        InputBorderState::Approval => APPROVAL_FG,
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -89,19 +103,21 @@ pub fn input_block(title: Option<String>, state: InputBorderState) -> Block<'sta
 
 /// Create a styled block for overlays (file picker, etc.).
 ///
+/// Square corners set overlays apart from the rounded input box.
+///
 /// # Arguments
 /// * `title` - The title to display
 ///
 /// # Returns
 /// A `Block` with:
-/// - Rounded border type
+/// - Plain (square) border type
 /// - DarkGray border color
 /// - Transparent background
 /// - The provided title
 pub fn overlay_block(title: impl Into<String>) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Plain)
         .border_style(Style::default().fg(BORDER_FG))
         .title(title.into())
 }

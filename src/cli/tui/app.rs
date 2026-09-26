@@ -114,7 +114,7 @@ fn block_kind_accent_style(kind: BlockKind) -> Style {
         BlockKind::Reasoning => Style::default()
             .fg(theme::ACCENT)
             .add_modifier(Modifier::DIM),
-        BlockKind::UserPrompt => Style::default().fg(theme::PROMPT_FG),
+        BlockKind::UserPrompt => Style::default().fg(theme::ECHO_FG),
         BlockKind::BlockingPrompt => Style::default().fg(theme::WARNING_FG),
         BlockKind::Completion => Style::default().fg(theme::SUCCESS_FG),
         BlockKind::Error => Style::default().fg(theme::ERROR_FG),
@@ -3231,7 +3231,7 @@ impl App {
 
     fn push_submission_echo(&mut self, text: &str, writer: &OutputWriterArc, local_command: bool) {
         let style = Style::default()
-            .fg(theme::PROMPT_FG)
+            .fg(theme::ECHO_FG)
             .add_modifier(Modifier::BOLD);
         let lines: Vec<&str> = text.split('\n').collect();
         let is_multiline = lines.len() > 1;
@@ -4692,7 +4692,7 @@ impl App {
                 choice.shortcut().to_string()
             };
             let color = match choice.result() {
-                crate::core::approval::ApprovalResult::Approved => theme::PROMPT_FG,
+                crate::core::approval::ApprovalResult::Approved => theme::SUCCESS_FG,
                 crate::core::approval::ApprovalResult::Denied => theme::ERROR_FG,
                 crate::core::approval::ApprovalResult::Always => theme::ACCENT,
                 crate::core::approval::ApprovalResult::AllowExternalDirectory => theme::ACCENT,
@@ -4782,7 +4782,7 @@ impl App {
         if let Some(notification) = self.status_notification.as_ref() {
             let (marker, color) = match notification.kind {
                 NotificationKind::Info => ("i", theme::ACCENT),
-                NotificationKind::Success => ("✓", theme::PROMPT_FG),
+                NotificationKind::Success => ("✓", theme::SUCCESS_FG),
                 NotificationKind::Warning => ("!", theme::WARNING_FG),
                 NotificationKind::Error => ("×", theme::ERROR_FG),
             };
@@ -5530,7 +5530,7 @@ mod tests {
         );
         assert_eq!(
             block_kind_accent_style(BlockKind::UserPrompt).fg,
-            Some(theme::PROMPT_FG)
+            Some(theme::ECHO_FG)
         );
         assert_eq!(
             block_kind_accent_style(BlockKind::BlockingPrompt).fg,
@@ -8297,7 +8297,7 @@ mod tests {
         assert!(rendered.contains("Ɵ Thinking…"));
         assert_eq!(
             buffer.cell((0, 9)).map(|cell| cell.fg),
-            Some(theme::WARNING_FG)
+            Some(theme::REASONING_FG)
         );
     }
 
