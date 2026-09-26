@@ -1081,8 +1081,8 @@ pub struct App {
     pub mention_search_tx: Option<tokio::sync::mpsc::UnboundedSender<MentionSearchUpdate>>,
     /// Whether the current mention query is waiting for the initial file index.
     pub mention_search_refresh_pending: bool,
-    /// Last known context usage percentage from the API.
-    pub context_pct: Option<f64>,
+    /// Last known context usage (tokens used, window size) from the API.
+    pub context_usage: Option<(u64, u64)>,
     /// Cached visible output window result (start_idx, take_count, start_row_offset).
     pub cached_visible_window: Option<(usize, usize, usize)>,
     /// Fingerprint for the visible window cache (output_len, scroll_y, wrap_width, content_height, cached_visual_rows, scroll_mode).
@@ -1525,7 +1525,7 @@ impl App {
             mention_search_active: false,
             mention_search_query: String::new(),
             mention_search_deadline: Instant::now(),
-            context_pct: None,
+            context_usage: None,
             slash_command_active: false,
             slash_command_help_active: false,
             slash_command_track_changes: false,
@@ -4809,8 +4809,8 @@ impl App {
         let left_width = UnicodeWidthStr::width(required_left.as_str());
         let right_budget = total_width.saturating_sub(leading_width + left_width + 1);
         let mut right_segments: Vec<(String, bool)> = Vec::new();
-        if let Some(pct) = self.context_pct {
-            right_segments.push((format!("{:.0}% ctx", 100.0 - pct), false));
+        if let Some((tokens, window)) = self.context_usage {
+            right_segments.push((format_context_usage(tokens, window), false));
         }
         if let Some(elapsed) = self.elapsed {
             right_segments.push((format!("⏱ {}", format_duration(elapsed)), false));
@@ -5465,6 +5465,29 @@ impl App {
     /// Get current spinner character.
     pub fn spinner_char(&self) -> char {
         spinner_frame(self.spinner_index)
+    }
+}
+
+/// Compact token count for the status bar (e.g., "45k/200k" fits the old "73% ctx" slot).
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1000 {
+        format!("{}k", tokens / 1000)
+    } else {
+        format!("{tokens}")
+    }
+}
+
+fn format_context_usage(tokens: u64, window: u64) -> String {
+    if window > 0 {
+        format!(
+            "{}/{}",
+            format_token_count(tokens),
+            format_token_count(window)
+        )
+    } else {
+        format_token_count(tokens)
     }
 }
 
@@ -7365,7 +7388,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         let mut app = App::new();
         app.mode = "ACT".to_string();
-        app.context_pct = Some(27.0);
+        app.context_usage = Some((54_000, 200_000));
         app.elapsed = Some(Duration::from_secs(42));
         app.queued_message_count = 2;
         app.unseen_output_count = 3;
@@ -7382,7 +7405,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("73% ctx"));
+        assert!(rendered.contains("54k/200k"));
         assert!(rendered.contains("⏱ 42s"));
     }
 
@@ -7398,7 +7421,7 @@ mod tests {
         app.mode = "ACT".to_string();
         app.provider_name = "openai".to_string();
         app.model_name = "a-very-long-model-name".to_string();
-        app.context_pct = Some(35.0);
+        app.context_usage = Some((70_000, 200_000));
         app.elapsed = Some(Duration::from_secs(42));
         app.queued_message_count = 2;
 
@@ -7414,9 +7437,18 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("[YOLO] ACT"));
-        assert!(rendered.contains("65% ctx"));
+        assert!(rendered.contains("70k/200k"));
         assert!(rendered.contains("⏱ 42s"));
         assert!(!rendered.contains("queued"));
+    }
+
+    #[test]
+    fn test_format_context_usage_compacts_counts() {
+        assert_eq!(format_context_usage(54_000, 200_000), "54k/200k");
+        assert_eq!(format_context_usage(999, 200_000), "999/200k");
+        assert_eq!(format_context_usage(1_048_576, 1_048_576), "1M/1M");
+        assert_eq!(format_context_usage(999_999, 200_000), "999k/200k");
+        assert_eq!(format_context_usage(12_345, 0), "12k");
     }
 
     #[test]
