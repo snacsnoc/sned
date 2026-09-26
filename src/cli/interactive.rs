@@ -2728,6 +2728,7 @@ async fn handle_key_event_inner(
                 app.set_input_text("");
                 app.clear_pastes();
                 app.update_placeholder();
+                clear_input_overlays(app);
                 return Ok(Some(Action::ModelApiKeySubmitted(request, api_key)));
             }
             _ => {
@@ -9575,6 +9576,42 @@ mod tests {
         .await?;
 
         assert!(action.is_none());
+        assert!(app.pending_model_switch.is_none());
+        assert!(!app.picker_active);
+        assert!(!app.mention_search_active);
+        assert!(app.mention_search_query.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_enter_model_switch_confirm_clears_overlays() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(1);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.pending_model_switch = Some(crate::cli::tui::app::PendingModelSwitch {
+            provider: "openai".to_string(),
+            model_id: "gpt-4".to_string(),
+        });
+        app.set_input_text("secret-key");
+        app.picker_active = true;
+        app.mention_search_active = true;
+        app.mention_search_query = "@src".to_string();
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(
+            matches!(action, Some(Action::ModelApiKeySubmitted(_, key)) if key == "secret-key")
+        );
         assert!(app.pending_model_switch.is_none());
         assert!(!app.picker_active);
         assert!(!app.mention_search_active);
