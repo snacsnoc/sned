@@ -1500,6 +1500,7 @@ impl ApprovalRequest {
         self.choices.iter().any(|choice| choice.result == result)
     }
 
+    #[must_use]
     pub fn respond(self, result: ApprovalResult) -> bool {
         self.responder
             .send(ApprovalResponse::Decision(result))
@@ -1735,9 +1736,9 @@ fn format_tool_parameters_in_workspace(
             }
             let allow_commands = obj
                 .get("allow_commands")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let timeout = obj.get("timeout").and_then(|v| v.as_i64()).unwrap_or(300);
+            let timeout = obj.get("timeout").and_then(serde_json::Value::as_i64).unwrap_or(300);
             output.push_str(&format!(
                 "\n    Subagents: {prompt_count} prompt(s), timeout {timeout}s"
             ));

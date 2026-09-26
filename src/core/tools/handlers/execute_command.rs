@@ -90,8 +90,7 @@ impl StreamLine {
         match self {
             Self::Text(text) => text,
             Self::Overlong => format!(
-                "({stream} line exceeded {} bytes and was discarded.)",
-                MAX_STREAM_LINE_BYTES
+                "({stream} line exceeded {MAX_STREAM_LINE_BYTES} bytes and was discarded.)"
             ),
         }
     }

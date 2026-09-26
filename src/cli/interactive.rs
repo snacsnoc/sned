@@ -476,7 +476,7 @@ impl InteractiveSession {
     }
 
     pub async fn run(&self, prompt: Option<String>) -> anyhow::Result<()> {
-        tracing::debug!(target: "sned::session", "InteractiveSession::run() called, prompt={}", prompt.as_ref().map_or("None".to_string(), |s| format!("{} chars", s.len())));
+        tracing::debug!(target: "sned::session", "InteractiveSession::run() called, prompt={}", prompt.as_ref().map_or_else(|| "None".to_string(), |s| format!("{} chars", s.len())));
         let agent = self.agent_loop.clone();
         let state_manager = self.state_manager.clone();
 
@@ -654,8 +654,8 @@ async fn activate_model_switch(
             sess.task_opts.model = Some(request.model_id.clone());
             sess.task_opts.api_key = temp_opts.api_key;
 
-            app.provider_name = request.provider.clone();
-            app.model_name = request.model_id.clone();
+            app.provider_name.clone_from(&request.provider);
+            app.model_name.clone_from(&request.model_id);
             app.needs_redraw = true;
             app.show_notification(
                 format!(
@@ -1554,7 +1554,7 @@ fn drain_output_queues_with_summary(
     let mut pending_model_update = app.take_pending_transcript_model_line();
     let mut pending_reasoning_lines = app.take_pending_transcript_reasoning_lines();
     let pending_reasoning_snapshot =
-        reasoning_mailbox.and_then(|mailbox| mailbox.take_with_sequence());
+        reasoning_mailbox.and_then(super::output::ReasoningMailbox::take_with_sequence);
 
     let mut deferred_priority = std::mem::take(&mut app.deferred_priority_events);
     // Approvals have no per-frame budget: a prompt must become visible even
@@ -1816,11 +1816,13 @@ fn drain_output_queues_with_summary(
     // processed, preserving emission order.
     let preceding_main_remaining = if let Some(priority) = post_main_priority.front() {
         if priority.sequence == 0 {
-            !rx.is_empty() || finalized_output.is_some_and(|w| w.has_deferred_finalized_events())
+            !rx.is_empty()
+                || finalized_output
+                    .is_some_and(super::output::OutputWriter::has_deferred_finalized_events)
         } else {
             !rx.is_empty()
                 || finalized_output
-                    .and_then(|w| w.oldest_deferred_sequence())
+                    .and_then(super::output::OutputWriter::oldest_deferred_sequence)
                     .is_some_and(|seq| seq < priority.sequence)
         }
     } else {
@@ -2225,7 +2227,7 @@ async fn refresh_input_completions(
             app.mention_search_active = true;
             app.picker_active = true;
             app.picker_selection_explicit = false;
-            app.mention_search_query = query.clone();
+            app.mention_search_query.clone_from(&query);
             invalidate_mention_search(app);
             schedule_immediate_mention_search(app, query);
         } else if query != app.mention_search_query {
@@ -2794,7 +2796,10 @@ async fn handle_key_event_inner(
 
             // Shutdown commands should bypass the session echo lock so /quit still works
             // even if the agent is currently holding the session mutex.
-            if cli_cmd.as_ref().is_some_and(|cmd| cmd.is_shutdown()) {
+            if cli_cmd
+                .as_ref()
+                .is_some_and(super::slash_commands::CliOnlyCommand::is_shutdown)
+            {
                 app.input = App::new_textarea(Vec::new());
                 app.clear_pastes();
                 clear_input_overlays(app);
@@ -3174,7 +3179,7 @@ async fn switch_to_fresh_task(
         .to_string();
     *task_storage = session.lock().await.task_storage();
     refresh_session_handles(app, session, queue_handle, state_handle, task_opts).await;
-    app.task_id = task_id.clone();
+    app.task_id.clone_from(task_id);
     app.start_task_transcript_writer(task_storage)?;
     app.clear_output()?;
     app.set_input_text("");
@@ -4909,8 +4914,7 @@ async fn run_main_loop(
             let (highlight_hits, highlight_misses) =
                 crate::cli::syntax_highlight::highlight_cache_stats();
             crate::cli::output::emit_timing_text(&format!(
-                "[timing] render_cache: markdown_hits={} markdown_misses={} highlight_hits={} highlight_misses={}",
-                markdown_hits, markdown_misses, highlight_hits, highlight_misses,
+                "[timing] render_cache: markdown_hits={markdown_hits} markdown_misses={markdown_misses} highlight_hits={highlight_hits} highlight_misses={highlight_misses}"
             ));
 
             if let Some(session_start) = self.session_start_time {

@@ -876,11 +876,13 @@ impl MessageQueueHandle {
     }
 
     /// Synchronous queue length (for use in the TUI main loop).
+    #[must_use]
     pub fn try_queued_message_count(&self) -> Option<usize> {
         self.queue.try_lock().ok().map(|q| q.len())
     }
 
     /// Synchronously read the queue count and text previews for the TUI.
+    #[must_use]
     pub fn try_queued_message_snapshot(&self, limit: usize) -> Option<(usize, Vec<String>)> {
         let queue = self.queue.try_lock().ok()?;
         let count = queue.len();
@@ -1935,8 +1937,7 @@ impl AgentLoop {
                                 queue_remaining
                             );
                             self.config.output_writer.emit(OutputEvent::info(format!(
-                                "Processing queued message ({} more queued)",
-                                queue_remaining
+                                "Processing queued message ({queue_remaining} more queued)"
                             )));
                         } else {
                             info!("[sned] Processing queued message");
@@ -2024,8 +2025,7 @@ impl AgentLoop {
                                         queue_remaining,
                                     );
                                     self.config.output_writer.emit(OutputEvent::info(format!(
-                                        "Processing queued message ({} more queued)",
-                                        queue_remaining
+                                        "Processing queued message ({queue_remaining} more queued)"
                                     )));
                                 } else {
                                     info!("[sned] Processing queued message");
@@ -2676,16 +2676,15 @@ impl AgentLoop {
                         ));
                         break;
                     };
-                    match tokio::time::timeout(remaining, rx.recv()).await {
-                        Ok(chunk) => chunk,
-                        Err(_) => {
-                            preoutput_deadline_exceeded = true;
-                            retryable_stream_error_before_output = Some(format!(
-                                "provider {output_kind} produced no output within {}s",
-                                preoutput_budget.as_secs()
-                            ));
-                            break;
-                        }
+                    if let Ok(chunk) = tokio::time::timeout(remaining, rx.recv()).await {
+                        chunk
+                    } else {
+                        preoutput_deadline_exceeded = true;
+                        retryable_stream_error_before_output = Some(format!(
+                            "provider {output_kind} produced no output within {}s",
+                            preoutput_budget.as_secs()
+                        ));
+                        break;
                     }
                 };
                 let Some(chunk) = next_chunk else {
@@ -2946,13 +2945,13 @@ impl AgentLoop {
                         };
                         let cache_writes = usage_chunk
                             .cache_write_tokens
-                            .or(prev_info.and_then(|r| r.cache_writes));
+                            .or_else(|| prev_info.and_then(|r| r.cache_writes));
                         let cache_reads = usage_chunk
                             .cache_read_tokens
-                            .or(prev_info.and_then(|r| r.cache_reads));
+                            .or_else(|| prev_info.and_then(|r| r.cache_reads));
                         let reasoning_tokens = usage_chunk
                             .reasoning_tokens
-                            .or(prev_info.and_then(|r| r.reasoning_tokens));
+                            .or_else(|| prev_info.and_then(|r| r.reasoning_tokens));
                         // Gemini marks thinking tokens separately from candidate output;
                         // OpenAI-compatible providers include reasoning in completion_tokens.
                         let context_output_tokens = if usage_chunk.thoughts_token_count.is_some() {
@@ -2985,7 +2984,9 @@ impl AgentLoop {
                             cache_reads,
                             reasoning_tokens,
                             context_tokens: Some(context_tokens),
-                            cost: usage_chunk.total_cost.or(prev_info.and_then(|r| r.cost)),
+                            cost: usage_chunk
+                                .total_cost
+                                .or_else(|| prev_info.and_then(|r| r.cost)),
                             context_window: Some(context_window),
                             context_usage_percentage: Some(context_usage_pct),
                         };
@@ -5093,7 +5094,7 @@ impl AgentLoop {
     /// the provider mutex cannot be locked or the model id is empty.
     fn resolve_active_model_id(&self) -> Option<String> {
         let guard = self.config.provider.lock().ok()?;
-        let id = guard.get_model().id.clone();
+        let id = guard.get_model().id;
         if id.is_empty() { None } else { Some(id) }
     }
 
@@ -5520,7 +5521,7 @@ impl AgentLoop {
             // Keep the latest usage available after short sessions too; only
             // conversation history remains debounced below.
             if let Err(e) = storage.update_metadata(|metadata| {
-                metadata.last_api_req_info = persisted_usage.clone();
+                metadata.last_api_req_info.clone_from(&persisted_usage);
             }) {
                 error!("Failed to save last API request info: {}", e);
             }
@@ -5656,7 +5657,7 @@ impl AgentLoop {
                 );
             }
 
-            request.messages = history.clone();
+            request.messages.clone_from(&history);
 
             let value = context_window::validate_context_window(
                 request,

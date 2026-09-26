@@ -592,7 +592,7 @@ fn collect_symbol_occurrences(
             if cap_name.starts_with("name.")
                 && let Ok(t) = cap.node.utf8_text(content_bytes)
             {
-                match_to_name_text.entry(mid).or_insert(t.to_string());
+                match_to_name_text.entry(mid).or_insert_with(|| t.to_string());
             }
         }
     }

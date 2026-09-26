@@ -436,11 +436,11 @@ impl HookManager {
                     if let Some(modification) = output.context_modification {
                         // Append modifications
                         let existing = combined_output.context_modification.unwrap_or_default();
-                        if !existing.is_empty() {
+                        if existing.is_empty() {
+                            combined_output.context_modification = Some(modification);
+                        } else {
                             combined_output.context_modification =
                                 Some(format!("{existing}\n{modification}"));
-                        } else {
-                            combined_output.context_modification = Some(modification);
                         }
                     }
                     if let Some(error) = output.error_message {
@@ -762,8 +762,8 @@ impl HookManager {
                                 nix::unistd::Pid::from_raw(-(pid as i32)),
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
-                                Ok(nix::sys::wait::WaitStatus::Exited(_, _))
-                                | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                                Ok(nix::sys::wait::WaitStatus::Exited(_, _)
+                                | nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
                                 _ => std::thread::sleep(std::time::Duration::from_millis(100)),
                             }
                         }
@@ -796,8 +796,8 @@ impl HookManager {
                                 nix::unistd::Pid::from_raw(-(pid as i32)),
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
-                                Ok(nix::sys::wait::WaitStatus::Exited(_, _))
-                                | Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                                Ok(nix::sys::wait::WaitStatus::Exited(_, _)
+                                | nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
                                 _ => std::thread::sleep(std::time::Duration::from_millis(100)),
                             }
                         }

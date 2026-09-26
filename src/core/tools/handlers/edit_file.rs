@@ -432,10 +432,7 @@ impl EditFileHandler {
         let start = column.saturating_sub(1).saturating_sub(32);
         let end = (start + 96).min(line.len());
         let snippet = line.get(start..end).unwrap_or(line);
-        format!(
-            "{error} near line {line_number}, column {column}: {:?}",
-            snippet
-        )
+        format!("{error} near line {line_number}, column {column}: {snippet:?}")
     }
 
     fn parse_stringified_edits_array(
@@ -596,7 +593,7 @@ impl EditFileHandler {
                 .or_else(|| params.get("text"))
                 .or_else(|| params.get("replace"))
                 .cloned()
-                .unwrap_or(serde_json::json!(""));
+                .unwrap_or_else(|| serde_json::json!(""));
             let object = params.as_object_mut().ok_or("edit_file arguments must be a JSON object")?;
             object.remove("path");
             object.remove("old_text");
@@ -647,11 +644,11 @@ impl EditFileHandler {
             || files.iter().any(|file| {
                 file.get("path")
                     .and_then(serde_json::Value::as_str)
-                    .is_none_or(|path| path.is_empty())
+                    .is_none_or(str::is_empty)
                     || file
                         .get("edits")
                         .and_then(serde_json::Value::as_array)
-                        .is_none_or(|edits| edits.is_empty())
+                        .is_none_or(std::vec::Vec::is_empty)
             })
         {
             return Err("Invalid 'paths' edit payload: expected a nonempty JSON array of {path, edits} objects. Use the 'files' parameter.".to_string());

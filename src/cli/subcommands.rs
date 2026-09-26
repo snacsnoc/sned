@@ -802,12 +802,11 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
 
     let provider = match &opts.provider {
         Some(p) => p.clone(),
-        None => match get_provider_from_env() {
-            Some(p) => {
+        None => {
+            if let Some(p) = get_provider_from_env() {
                 println!("Auto-detected provider from environment: {p}");
                 p.to_string()
-            }
-            None => {
+            } else {
                 crate::cli::colors::eprint_error(
                     "Could not auto-detect provider. Use --provider to specify one.",
                 );
@@ -816,7 +815,7 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-        },
+        }
     };
 
     let Some(secret_key) = super::runtime_provider_secret_key(&provider) else {
@@ -826,13 +825,14 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
 
     let api_key = match &opts.apikey {
         Some(k) => k.clone(),
-        None => match read_interactive_api_key(&provider)? {
-            Some(key) => key,
-            None => {
+        None => {
+            if let Some(key) = read_interactive_api_key(&provider)? {
+                key
+            } else {
                 println!("API key entry cancelled.");
                 return Ok(());
             }
-        },
+        }
     };
 
     validate_api_key(&api_key)?;

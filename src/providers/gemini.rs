@@ -557,9 +557,7 @@ async fn process_gemini_sse_line(
                         };
                         let args_truncated =
                             args_str.len() > crate::providers::MAX_TOOL_ARGUMENT_SIZE;
-                        let args_str = if !args_truncated {
-                            args_str
-                        } else {
+                        let args_str = if args_truncated {
                             tracing::warn!(
                                 tool_name = %fc.name,
                                 args_size = args_str.len(),
@@ -568,6 +566,8 @@ async fn process_gemini_sse_line(
                             let truncated = crate::providers::MAX_TOOL_ARGUMENT_SIZE;
                             let safe_end = args_str.floor_char_boundary(truncated);
                             args_str[..safe_end].to_string()
+                        } else {
+                            args_str
                         };
                         accumulated_tool_calls.insert(
                             call_id.clone(),

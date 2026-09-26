@@ -250,6 +250,7 @@ impl FileContextTracker {
     }
 
     /// Set the task ID for persistent metadata storage.
+    #[must_use]
     pub fn with_task_id(mut self, task_id: impl Into<String>) -> Self {
         self.task_id = Some(task_id.into());
         self

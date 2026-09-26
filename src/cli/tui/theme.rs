@@ -68,6 +68,7 @@ pub enum InputBorderState {
 }
 
 /// Create a styled block for the input area.
+#[must_use]
 pub fn input_block(title: Option<String>, state: InputBorderState) -> Block<'static> {
     let border_color = match state {
         InputBorderState::Idle => Color::Blue,

@@ -393,7 +393,9 @@ fn apply_context_history_updates(
     // become a reason to split that provider-required pair.
     let summary_insert_index = if compacted_summary.is_some() && messages_to_update.len() > 2 {
         let tool_use_ids = assistant_tool_use_ids(&messages_to_update[1]);
-        if !tool_use_ids.is_empty() {
+        if tool_use_ids.is_empty() {
+            2.min(messages_to_update.len())
+        } else {
             let mut tool_result_index = 2;
             while tool_result_index < messages_to_update.len()
                 && messages_to_update[tool_result_index].role == MessageRole::User
@@ -414,8 +416,6 @@ fn apply_context_history_updates(
             } else {
                 2.min(messages_to_update.len())
             }
-        } else {
-            2.min(messages_to_update.len())
         }
     } else {
         2.min(messages_to_update.len())

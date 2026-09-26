@@ -716,12 +716,12 @@ impl ReadFileHandler {
             all_lines[start_idx..end_exclusive.min(total_lines)].to_vec()
         };
 
-        let clamping_note = if clamped_start != original_start {
+        let clamping_note = if clamped_start == original_start {
+            None
+        } else {
             Some(format!(
                 "[Note: start_line was clamped from {original_start} to {clamped_start} (file has {total_lines} lines)]"
             ))
-        } else {
-            None
         };
 
         let hash_content = collected_lines.join("\n");
@@ -1111,8 +1111,8 @@ impl ReadFileHandler {
                         .or_insert(0);
                     *count += 1;
                     // Record only the lines actually returned to the model.
-                    let window = res.visible_range.map_or(
-                        (start_line.unwrap_or(1), end_line.unwrap_or(usize::MAX)),
+                    let window = res.visible_range.map_or_else(
+                        || (start_line.unwrap_or(1), end_line.unwrap_or(usize::MAX)),
                         |(start, end, _)| (start, end),
                     );
                     let ring = state

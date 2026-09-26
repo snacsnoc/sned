@@ -71,7 +71,7 @@ fn timing_stderr_allowed() -> bool {
     !std::io::stderr().is_terminal()
         || matches!(
             std::env::var("SNED_TIMING_STDERR").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
+            Some("1" | "true" | "yes")
         )
 }
 
@@ -576,6 +576,7 @@ impl OutputEvent {
     /// (`ModelUpdateLine`) whose latest value supersedes prior ones. Lossy
     /// events may be dropped without losing user-visible content; every
     /// other event is finalized and must keep its content + order.
+    #[must_use]
     pub fn is_lossy(&self) -> bool {
         matches!(self, Self::ModelUpdateLine(_))
     }
@@ -591,6 +592,7 @@ impl OutputEvent {
         Self::UserPromptLine(Line::from(text.into()))
     }
 
+    #[must_use]
     pub fn queued_message_started(remaining: usize) -> Self {
         Self::QueuedMessageStarted { remaining }
     }
@@ -1180,7 +1182,7 @@ impl ChannelOutputWriter {
 
 impl OutputWriter for ChannelOutputWriter {
     fn emit(&self, event: OutputEvent) {
-        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let OutputEvent::ReasoningChunk(chunk) = event {
             let sequence = inner.next_sequence;
@@ -1289,7 +1291,7 @@ impl OutputWriter for ChannelOutputWriter {
     }
 
     fn flush_deferred_finalized_events(&self) -> (usize, usize) {
-        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.flush_deferred_finalized_events_inner(&mut inner)
     }
 
@@ -1297,7 +1299,7 @@ impl OutputWriter for ChannelOutputWriter {
         !self
             .inner
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .deferred_finalized_events
             .events
             .is_empty()
@@ -1306,7 +1308,7 @@ impl OutputWriter for ChannelOutputWriter {
     fn oldest_deferred_sequence(&self) -> Option<u64> {
         self.inner
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .deferred_finalized_events
             .events
             .front()

@@ -320,14 +320,13 @@ pub(crate) async fn send_chunk(
             );
             false
         }
-        result = tx.send(chunk) => match result {
-            Ok(()) => true,
-            Err(_) => {
-                tracing::debug!(
-                    "{provider_name} provider channel closed, cannot send {chunk_type} chunk"
-                );
-                false
-            }
+        result = tx.send(chunk) => if result.is_ok() {
+            true
+        } else {
+            tracing::debug!(
+                "{provider_name} provider channel closed, cannot send {chunk_type} chunk"
+            );
+            false
         }
     }
 }
@@ -581,7 +580,7 @@ fn pattern_qwen_model_profile(model_id: &str) -> Option<QwenModelProfile> {
     let (major, rest) = parse_qwen_version_part(rest)?;
     let rest = rest.strip_prefix('.')?;
     let (minor, _) = parse_qwen_version_part(rest)?;
-    if !matches!((major, minor), (3, 6) | (3, 8)) {
+    if !matches!((major, minor), (3, 6 | 8)) {
         return None;
     }
 
@@ -969,6 +968,7 @@ pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -
 /// Encode a provider-side truncation as a tool error. A syntactically
 /// repairable prefix is still incomplete model input and must not reach a
 /// tool handler.
+#[must_use]
 pub fn rejected_truncated_tool_args(provider_name: &str, context: &str) -> String {
     serde_json::json!({
         TOOL_ARGUMENTS_ERROR_FIELD: format!(
@@ -980,10 +980,12 @@ pub fn rejected_truncated_tool_args(provider_name: &str, context: &str) -> Strin
 
 /// Returns the provider-side argument error encoded by
 /// [`validate_tool_call_args`], if any.
+#[must_use]
 pub fn tool_arguments_error(value: &serde_json::Value) -> Option<&str> {
     value.as_object()?.get(TOOL_ARGUMENTS_ERROR_FIELD)?.as_str()
 }
 
+#[must_use]
 pub fn tool_arguments_are_rejected(args: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(args)
         .ok()
@@ -1036,7 +1038,7 @@ fn repair_close_braces(args: &str) -> String {
                         matches!(next, Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't'));
                     let valid_unicode_escape = next == Some('u')
                         && chars.get(index + 2..index + 6).is_some_and(|digits| {
-                            digits.iter().all(|digit| digit.is_ascii_hexdigit())
+                            digits.iter().all(char::is_ascii_hexdigit)
                         });
                     if valid_escape {
                         repaired.push('\\');

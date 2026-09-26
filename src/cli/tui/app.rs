@@ -4001,7 +4001,7 @@ impl App {
         let output_ids = self.output_line_ids.iter().copied().collect::<Vec<_>>();
         let output_kinds = self.output_line_kinds.iter().copied().collect::<Vec<_>>();
         let error_lines = self.error_lines.iter().cloned().collect::<Vec<_>>();
-        let result_output_ids = output_ids.clone();
+        let result_output_ids = output_ids;
         let result_output_lines = output_lines.clone();
         let result_output_kinds = output_kinds.clone();
         let result_error_lines = error_lines.clone();
@@ -4386,33 +4386,34 @@ impl App {
         // tool/command bodies from their next header.
         matches!(
             (prev, next),
-            (
+            (BlockKind::Model, BlockKind::ToolHeader
+            | BlockKind::CommandHeader
+            | BlockKind::ToolOutput
+            | BlockKind::CommandOutput
+            | BlockKind::Reasoning
+            | BlockKind::UserPrompt
+            | BlockKind::BlockingPrompt
+            | BlockKind::Completion
+            | BlockKind::Error)
+            | (
+                _,
+                BlockKind::UserPrompt
+                | BlockKind::BlockingPrompt
+                | BlockKind::Completion
+                | BlockKind::Error,
+            )
+            | (
+                BlockKind::ToolOutput
+                | BlockKind::CommandOutput
+                | BlockKind::ToolHeader
+                | BlockKind::CommandHeader
+                | BlockKind::Reasoning
+                | BlockKind::UserPrompt
+                | BlockKind::BlockingPrompt
+                | BlockKind::Completion
+                | BlockKind::Error,
                 BlockKind::Model,
-                BlockKind::ToolHeader
-                    | BlockKind::CommandHeader
-                    | BlockKind::ToolOutput
-                    | BlockKind::CommandOutput
-                    | BlockKind::Reasoning
-                    | BlockKind::UserPrompt
-                    | BlockKind::BlockingPrompt
-                    | BlockKind::Completion
-                    | BlockKind::Error,
-            ) | (_, BlockKind::UserPrompt)
-                | (_, BlockKind::BlockingPrompt)
-                | (_, BlockKind::Completion)
-                | (_, BlockKind::Error)
-                | (
-                    BlockKind::ToolOutput
-                        | BlockKind::CommandOutput
-                        | BlockKind::ToolHeader
-                        | BlockKind::CommandHeader
-                        | BlockKind::Reasoning
-                        | BlockKind::UserPrompt
-                        | BlockKind::BlockingPrompt
-                        | BlockKind::Completion
-                        | BlockKind::Error,
-                    BlockKind::Model,
-                )
+            )
                 | (BlockKind::ToolHeader, BlockKind::ToolOutput)
                 | (BlockKind::CommandHeader, BlockKind::CommandOutput)
                 | (BlockKind::ToolOutput, BlockKind::ToolHeader)
@@ -4840,7 +4841,7 @@ impl App {
             (false, true) => self.provider_name.clone(),
             (false, false) => format!("{} / {}", self.provider_name, self.model_name),
         };
-        let mut left = required_left.clone();
+        let mut left = required_left;
         if !provider_model.is_empty() {
             let prefix = " · ";
             let provider_budget =
@@ -4889,11 +4890,7 @@ impl App {
             && self.output_lines.len() >= ASYNC_LAYOUT_REFLOW_THRESHOLD
         {
             let reflow_pending = self.start_layout_reflow(wrap_width);
-            if !reflow_pending {
-                // Thread creation failed, but the synchronous fallback has
-                // already rebuilt the index. Render the transcript now.
-                self.needs_redraw = true;
-            } else {
+            if reflow_pending {
                 self.transcript_selection_area = None;
                 self.transcript_selection_row_sources.clear();
                 self.rendered_hyperlink_targets.clear();
@@ -4906,6 +4903,9 @@ impl App {
                 );
                 return;
             }
+            // Thread creation failed, but the synchronous fallback has
+            // already rebuilt the index. Render the transcript now.
+            self.needs_redraw = true;
         }
 
         self.restore_pending_manual_viewport_after_reflow(wrap_width);

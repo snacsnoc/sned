@@ -511,7 +511,9 @@ impl AnchorStorage {
     /// Save anchor state to disk
     fn save(&mut self) {
         let anchors_file = &self.cache_file;
-        let cache_dir = anchors_file.parent().unwrap_or(std::path::Path::new("."));
+        let cache_dir = anchors_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
 
         // Ensure cache directory exists
         if let Err(e) = std::fs::create_dir_all(cache_dir) {
@@ -842,81 +844,106 @@ pub struct AnchorTransition {
 }
 
 impl AnchorSnapshot {
+    #[must_use]
     pub fn absolute_path(&self) -> &str {
         &self.absolute_path
     }
+    #[must_use]
     pub fn task_id(&self) -> &str {
         &self.task_id
     }
+    #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
     }
+    #[must_use]
     pub fn raw_digest(&self) -> &str {
         &self.raw_digest
     }
+    #[must_use]
     pub fn normalized_digest(&self) -> &str {
         &self.normalized_digest
     }
+    #[must_use]
     pub fn lines(&self) -> &[String] {
         &self.lines
     }
+    #[must_use]
     pub fn anchors(&self) -> &[String] {
         &self.anchors
     }
+    #[must_use]
     pub fn snapshot_mode(&self) -> bool {
         self.snapshot_mode
     }
 }
 
 impl AnchorTransition {
+    #[must_use]
     pub fn absolute_path(&self) -> &str {
         &self.absolute_path
     }
+    #[must_use]
     pub fn task_id(&self) -> &str {
         &self.task_id
     }
+    #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
     }
+    #[must_use]
     pub fn raw_digest(&self) -> &str {
         &self.raw_digest
     }
+    #[must_use]
     pub fn normalized_digest(&self) -> &str {
         &self.normalized_digest
     }
+    #[must_use]
     pub fn anchors(&self) -> &[String] {
         &self.anchors
     }
+    #[must_use]
     pub fn expected_generation(&self) -> Option<u64> {
         self.expected_generation
     }
+    #[must_use]
     pub fn input_raw_digest(&self) -> &str {
         &self.input_raw_digest
     }
+    #[must_use]
     pub fn output_raw_digest(&self) -> &str {
         &self.output_raw_digest
     }
+    #[must_use]
     pub fn input_normalized_digest(&self) -> &str {
         &self.input_normalized_digest
     }
+    #[must_use]
     pub fn output_normalized_digest(&self) -> &str {
         &self.output_normalized_digest
     }
+    #[must_use]
     pub fn output_lines(&self) -> &[String] {
         &self.output_lines
     }
+    #[must_use]
     pub fn provenance(&self) -> &[LineProvenance] {
         &self.provenance
     }
+    #[must_use]
     pub fn retired_identities(&self) -> &[String] {
         &self.retired_identities
     }
+    #[must_use]
     pub fn edit_ranges(&self) -> &[AppliedEdit] {
         &self.edit_ranges
     }
+    #[must_use]
     pub fn is_noop(&self) -> bool {
         self.is_noop
     }
+    #[must_use]
     pub fn snapshot_mode(&self) -> bool {
         self.snapshot_mode
     }
@@ -1250,7 +1277,7 @@ impl AnchorStateManager {
         let cache_dir = storage
             .cache_file
             .parent()
-            .unwrap_or(std::path::Path::new("."));
+            .unwrap_or_else(|| std::path::Path::new("."));
         std::fs::create_dir_all(cache_dir).map_err(persistence)?;
         let _lock = AnchorCacheLock::acquire(&storage.cache_file.with_extension("json.lock"))
             .map_err(persistence)?;
@@ -1322,7 +1349,7 @@ impl AnchorStateManager {
             .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?;
         crate::storage::disk::atomic_write_file(&storage.cache_file, &json).map_err(persistence)?;
         // There are no fallible operations after durable replacement.
-        storage.persisted_tasks = tasks.clone();
+        storage.persisted_tasks.clone_from(&tasks);
         storage.tasks = tasks;
         Ok(())
     }
@@ -1991,7 +2018,9 @@ impl EditExecutor {
                         } else {
                             Vec::new()
                         };
-                        let error = if !trimmed_matches.is_empty() {
+                        let error = if trimmed_matches.is_empty() {
+                            "Exact block replacement failed: 'old_text' was not found in the file. Ensure the quoted lines match the current file contents exactly.".to_string()
+                        } else {
                             let start = trimmed_matches[0];
                             format!(
                                 "Exact block replacement failed: 'old_text' matches line {} only after trimming whitespace.\nFile has:\n{}\nSupplied 'old_text':\n{}\nIndentation and whitespace must match the file exactly.",
@@ -1999,8 +2028,6 @@ impl EditExecutor {
                                 lines[start..start + old_lines.len()].join("\n"),
                                 old_lines.join("\n")
                             )
-                        } else {
-                            "Exact block replacement failed: 'old_text' was not found in the file. Ensure the quoted lines match the current file contents exactly.".to_string()
                         };
                         failed_edits.push(FailedEdit {
                             edit: edit.clone(),
@@ -2026,8 +2053,7 @@ impl EditExecutor {
                         failed_edits.push(FailedEdit {
                             edit: edit.clone(),
                             error: format!(
-                                "Exact block replacement failed: 'old_text' matches {} occurrences in the file:\n{}\nProvide more surrounding context lines in 'old_text' to identify a unique block.",
-                                count, occurrences
+                                "Exact block replacement failed: 'old_text' matches {count} occurrences in the file:\n{occurrences}\nProvide more surrounding context lines in 'old_text' to identify a unique block."
                             ),
                         });
                     }
@@ -2348,6 +2374,7 @@ impl EditExecutor {
     /// occurrences and a fingerprint-based recovery path. Reconciliation
     /// retires duplicate words after changed revisions because a line-content
     /// diff cannot prove which identical occurrence retained its identity.
+    #[must_use]
     pub fn resolve_anchor(
         &self,
         anchor_type: &str,
@@ -2468,8 +2495,7 @@ impl EditExecutor {
             return (
                 usize::MAX,
                 Some(format!(
-                    "{anchor_type} \"{anchor_name}\" exists, but the supplied content does not match the line it currently binds to (now: {:?}). The anchor is stale: the quoted word resolved to a different line after a prior edit. Please re-read the file with read_file to get fresh anchors before retrying.",
-                    bound_content
+                    "{anchor_type} \"{anchor_name}\" exists, but the supplied content does not match the line it currently binds to (now: {bound_content:?}). The anchor is stale: the quoted word resolved to a different line after a prior edit. Please re-read the file with read_file to get fresh anchors before retrying."
                 )),
             );
         }
@@ -2609,8 +2635,7 @@ impl EditExecutor {
             return (
                 usize::MAX,
                 Some(format!(
-                    "{anchor_type} contains multiple lines. Anchors must refer to a single line only in the format Anchor{0}line_text.",
-                    ANCHOR_DELIMITER
+                    "{anchor_type} contains multiple lines. Anchors must refer to a single line only in the format Anchor{ANCHOR_DELIMITER}line_text."
                 )),
             );
         }
@@ -2620,8 +2645,7 @@ impl EditExecutor {
             return (
                 usize::MAX,
                 Some(format!(
-                    "{anchor_type} is missing or incorrectly formatted. It must start with a single word followed by the delimiter (e.g., \"Apple{0}\").",
-                    ANCHOR_DELIMITER
+                    "{anchor_type} is missing or incorrectly formatted. It must start with a single word followed by the delimiter (e.g., \"Apple{ANCHOR_DELIMITER}\")."
                 )),
             );
         }
@@ -2662,6 +2686,7 @@ impl EditExecutor {
     /// Applies resolved edits to lines.
     /// Returns the outcome — see [`ApplyOutcome`]. Overlap is detected
     /// before application; glued-anchor detection runs after assembly.
+    #[must_use]
     pub fn apply_edits(&self, lines: &[String], resolved_edits: &[ResolvedEdit]) -> ApplyOutcome {
         self.apply_edits_with_provenance(lines, resolved_edits).0
     }
@@ -2758,8 +2783,7 @@ impl EditExecutor {
                     return Some(FailedEdit {
                         edit: resolved.edit.clone(),
                         error: format!(
-                            "duplicate insertion rejected: insertion text repeats the anchored line {:?} at its boundary. {} preserves the anchor; use replace with anchor and end_anchor when wrapping existing code",
-                            anchor_line, edit_type
+                            "duplicate insertion rejected: insertion text repeats the anchored line {anchor_line:?} at its boundary. {edit_type} preserves the anchor; use replace with anchor and end_anchor when wrapping existing code"
                         ),
                     });
                 }
@@ -2916,7 +2940,7 @@ impl EditExecutor {
             .collect();
 
         applied_edits.sort_by_key(|applied| applied.original_start_idx);
-        provenance.edit_ranges = applied_edits.clone();
+        provenance.edit_ranges.clone_from(&applied_edits);
 
         // Defense-in-depth: refuse to write content that still has any
         // `Word§` or `hex§` fragment in touched or added lines. The model

@@ -1304,16 +1304,15 @@ pub fn filter_slash_commands(entries: &[SlashCommandEntry], query: &str) -> Vec<
     }
 
     // Priority 4: substring match on name or description
-    let substring: Vec<SlashCommandEntry> = entries
+    entries
         .iter()
         .filter(|e| {
             e.name.to_lowercase().contains(&query_lower)
                 || e.description.to_lowercase().contains(&query_lower)
         })
+        .take(10)
         .cloned()
-        .collect();
-
-    substring.into_iter().take(10).collect()
+        .collect()
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HelpSection {
@@ -1641,15 +1640,7 @@ pub fn format_stats_text(state: &crate::core::agent_types::TaskState) -> String 
         };
 
         format!(
-            "Token Usage:\n  Input:  {}\n  Output: {}\n  Cache:{}{}\n  Cost:{}\n  Context: {:.1}% ({} / {})",
-            tokens_in,
-            tokens_out,
-            cache_str,
-            reasoning_str,
-            cost_str,
-            context_pct,
-            context_tokens,
-            context_window
+            "Token Usage:\n  Input:  {tokens_in}\n  Output: {tokens_out}\n  Cache:{cache_str}{reasoning_str}\n  Cost:{cost_str}\n  Context: {context_pct:.1}% ({context_tokens} / {context_window})"
         )
     } else {
         "No API request info available yet.".to_string()

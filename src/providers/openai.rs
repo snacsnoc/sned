@@ -1201,10 +1201,14 @@ async fn process_openai_sse_line(
                     // the first delta, then use empty strings for continuations.
                     // Keep the original ID so the completed call can be dispatched.
                     if let Some(id) = tc.id.as_deref().filter(|id| !id.is_empty()) {
-                        accumulated_tool_calls
-                            .entry(tool_index)
-                            .or_insert_with(|| (String::new(), String::new(), String::new()))
-                            .0 = id.to_owned();
+                        id.clone_into(
+                            &mut accumulated_tool_calls
+                                .entry(tool_index)
+                                .or_insert_with(|| {
+                                    (String::new(), String::new(), String::new())
+                                })
+                                .0,
+                        );
                     }
 
                     if let Some(function) = tc.function {

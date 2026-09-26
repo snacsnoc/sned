@@ -230,6 +230,7 @@ impl TaskTranscriptWriter {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "transcript writer stopped"))
     }
 
+    #[must_use]
     pub fn take_error(&self) -> Option<String> {
         let mut latest = None;
         while let Ok(error) = self.errors.try_recv() {
@@ -1188,7 +1189,7 @@ impl TaskStorage {
             let mut growth = SYNC_TRANSCRIPT_GROWTH
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let state = growth.entry(transcript_path.clone()).or_default();
+            let state = growth.entry(transcript_path).or_default();
             state.entries = state.entries.saturating_add(entries.len());
             state.bytes = state.bytes.saturating_add(bytes_written);
             state.entries >= TRANSCRIPT_COMPACTION_APPEND_THRESHOLD

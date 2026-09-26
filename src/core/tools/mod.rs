@@ -711,6 +711,7 @@ pub fn coerce_string_array(
 /// accepted only when the first array element immediately follows `[` (for
 /// example, `["cargo test", "cargo clippy"]`), while shell commands such as
 /// `[ "foo" ]` remain one scalar command.
+#[must_use]
 pub fn coerce_command_array(params: &serde_json::Value) -> Vec<String> {
     if let Some(values) = params.get("commands").and_then(|value| value.as_array()) {
         return values
@@ -777,10 +778,10 @@ pub(crate) fn parse_relaxed_stringified_string_array(value: &str) -> Option<Vec<
                 backslash_repaired.push_str("\\\\");
                 continue;
             };
-            if !matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') {
-                backslash_repaired.push_str("\\\\");
-            } else {
+            if matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') {
                 backslash_repaired.push('\\');
+            } else {
+                backslash_repaired.push_str("\\\\");
             }
         } else {
             backslash_repaired.push(character);
@@ -846,10 +847,10 @@ pub(crate) fn parse_relaxed_stringified_string_array(value: &str) -> Option<Vec<
                 repaired.push_str("\\\\");
                 continue;
             };
-            if !matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') {
-                repaired.push_str("\\\\");
-            } else {
+            if matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') {
                 repaired.push('\\');
+            } else {
+                repaired.push_str("\\\\");
             }
         } else if character == '"' {
             repaired.push_str("\\\"");

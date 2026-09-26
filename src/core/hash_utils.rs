@@ -172,6 +172,7 @@ fn strip_duplicate_anchor_suffix(content: &str) -> &str {
 /// hash-prefixed "updated anchor" lines shown in edit diffs
 /// (`deadbeef§Apple §content`).
 ///
+#[must_use]
 pub fn strip_hashes(content: &str) -> String {
     if content.is_empty() {
         return String::new();

@@ -5,6 +5,7 @@ use std::io::{self, Read};
 pub const READ_CHUNK_BYTES: usize = 32 * 1024;
 pub const MAX_CONFIGURED_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 
+#[must_use]
 pub fn configured_output_limit(env_var: &str, default: usize) -> usize {
     std::env::var(env_var)
         .ok()
@@ -20,6 +21,7 @@ pub struct CapturedOutput {
 }
 
 impl CapturedOutput {
+    #[must_use]
     pub fn new(limit: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(limit.min(READ_CHUNK_BYTES)),
@@ -27,18 +29,22 @@ impl CapturedOutput {
         }
     }
 
+    #[must_use]
     pub fn is_truncated(&self, limit: usize) -> bool {
         self.total_bytes > limit as u64
     }
 
+    #[must_use]
     pub fn retained_len(&self) -> usize {
         self.bytes.len()
     }
 
+    #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
 
+    #[must_use]
     pub fn display(&self, limit: usize, stream: &str) -> String {
         let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
         if let Some(marker) = self.truncation_marker(limit, stream) {
@@ -48,6 +54,7 @@ impl CapturedOutput {
         text
     }
 
+    #[must_use]
     pub fn truncation_marker(&self, limit: usize, stream: &str) -> Option<String> {
         self.is_truncated(limit).then(|| {
             format!(
@@ -58,6 +65,7 @@ impl CapturedOutput {
         })
     }
 
+    #[must_use]
     pub fn into_display_bytes(self, limit: usize, stream: &str) -> Vec<u8> {
         self.display(limit, stream).into_bytes()
     }

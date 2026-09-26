@@ -618,16 +618,16 @@ pub fn apply_config_override(cli: &Cli) {
     if let Some(cmd) = &cli.command {
         match cmd {
             Command::Session { opts, .. } if opts.config.is_some() => {
-                config_path = opts.config.clone();
+                config_path.clone_from(&opts.config);
             }
             Command::History { opts } if opts.config.is_some() => {
-                config_path = opts.config.clone();
+                config_path.clone_from(&opts.config);
             }
             Command::Config { opts } if opts.config.is_some() => {
-                config_path = opts.config.clone();
+                config_path.clone_from(&opts.config);
             }
             Command::Auth { opts } if opts.config.is_some() => {
-                config_path = opts.config.clone();
+                config_path.clone_from(&opts.config);
             }
             _ => {}
         }
@@ -1106,7 +1106,6 @@ pub(crate) fn create_provider(
             );
             let base_url = stored_state
                 .anthropic_base_url
-                .clone()
                 .filter(|u| !u.is_empty());
             Arc::new(crate::providers::Providers::Anthropic(
                 crate::providers::anthropic::AnthropicProvider::new(
@@ -1279,9 +1278,8 @@ pub(crate) fn create_provider(
                     .is_none()
             {
                 anyhow::bail!(
-                    "--thinking is not supported by Gemini model '{}'. \
-                     This model uses --reasoning-effort (thinking level), not a token budget.",
-                    default_model
+                    "--thinking is not supported by Gemini model '{default_model}'. \
+                     This model uses --reasoning-effort (thinking level), not a token budget."
                 );
             }
             if task_opts.reasoning_effort.is_some()
@@ -1292,9 +1290,8 @@ pub(crate) fn create_provider(
                     .unwrap_or(false)
             {
                 anyhow::bail!(
-                    "--reasoning-effort is not supported by Gemini model '{}'. \
-                     This model uses --thinking (token budget), not a thinking level.",
-                    default_model
+                    "--reasoning-effort is not supported by Gemini model '{default_model}'. \
+                     This model uses --thinking (token budget), not a thinking level."
                 );
             }
             Arc::new(crate::providers::Providers::Gemini(
@@ -1338,7 +1335,7 @@ pub(crate) fn create_provider(
                 crate::providers::deepseek::DeepSeekProvider::new(
                     crate::providers::deepseek::DeepSeekConfig {
                         api_key,
-                        model_id: model_id_str.clone(),
+                        model_id: model_id_str,
                         model_info: Some(deepseek_model_info),
                         extra_body,
                     },
@@ -1375,7 +1372,7 @@ pub(crate) fn create_provider(
                 crate::providers::openrouter::OpenRouterProvider::new(
                     crate::providers::openrouter::OpenRouterConfig {
                         api_key,
-                        model_id: model_id_str.clone(),
+                        model_id: model_id_str,
                         model_info: Some(openrouter_model_info),
                         provider_sort: None,
                         reasoning_effort: reasoning_effort_str,
@@ -1877,7 +1874,7 @@ async fn run_task_inner(
     let prompt = match (&task_opts.prompt_file, prompt) {
         (Some(path), None) => Some(
             std::fs::read_to_string(path)
-                .map_err(|e| anyhow::anyhow!("Failed to read prompt file {}: {}", path, e))?,
+                .map_err(|e| anyhow::anyhow!("Failed to read prompt file {path}: {e}"))?,
         ),
         (_, existing) => existing,
     };

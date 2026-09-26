@@ -228,8 +228,7 @@ impl BatchProcessor {
                 .unwrap_or(usize::MAX);
             if content_bytes > MAX_FINGERPRINT_CONTENT_BYTES {
                 return Err(FileEditorError::ValidationError(format!(
-                    "The 'content' fingerprint is limited to {} bytes; use a narrower anchor range or write_to_file for a broad rewrite.",
-                    MAX_FINGERPRINT_CONTENT_BYTES
+                    "The 'content' fingerprint is limited to {MAX_FINGERPRINT_CONTENT_BYTES} bytes; use a narrower anchor range or write_to_file for a broad rewrite."
                 )));
             }
         }
@@ -367,7 +366,7 @@ impl BatchProcessor {
             ) => {
                 let resolved_count = applied_edits.len();
                 batch.provenance = provenance;
-                batch.final_lines = final_lines.clone();
+                batch.final_lines.clone_from(&final_lines);
                 batch.final_content = final_lines.join("\n");
                 batch.applied_edits = applied_edits;
 

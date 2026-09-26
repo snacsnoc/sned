@@ -54,7 +54,11 @@ impl AskFollowupQuestionHandler {
                 ToolError::InvalidInput("Missing required parameter: question".to_string())
             })?;
 
-        if !ctx.json_output {
+        if ctx.json_output {
+            Err(ToolError::ExecutionFailed(
+                "Cannot read stdin in JSON mode".to_string(),
+            ))
+        } else {
             use crate::cli::output::OutputEvent;
             use ratatui::style::{Modifier, Style};
             let timeout_secs = crate::core::approval::followup_timeout().as_secs();
@@ -106,10 +110,6 @@ impl AskFollowupQuestionHandler {
             } else {
                 Ok(format!("User response: {response}"))
             }
-        } else {
-            Err(ToolError::ExecutionFailed(
-                "Cannot read stdin in JSON mode".to_string(),
-            ))
         }
     }
 }

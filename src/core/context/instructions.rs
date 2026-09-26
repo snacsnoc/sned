@@ -104,7 +104,7 @@ pub fn find_agents_md_files(cwd: &Path) -> Vec<PathBuf> {
     let results = top_level
         .metadata()
         .ok()
-        .filter(|metadata| metadata.is_file())
+        .filter(std::fs::Metadata::is_file)
         .map(|_| vec![top_level.clone()])
         .unwrap_or_default();
     tracing::debug!(
@@ -127,7 +127,7 @@ fn resolve_target_path(workspace_root: &Path, target: &Path) -> Option<PathBuf> 
     // Canonicalize the nearest existing ancestor and restore any missing path
     // components. This keeps relative paths and `..` components within the
     // same path scope even when a write target has not been created yet.
-    let mut existing = raw_target.clone();
+    let mut existing = raw_target;
     let mut missing_components = Vec::new();
     while !existing.exists() {
         missing_components.push(existing.file_name()?.to_os_string());
@@ -282,6 +282,7 @@ fn format_agent_rule_files(cwd: &Path, files: &[AgentRuleFile]) -> Option<String
 }
 
 /// Read and combine only the workspace-root AGENTS.md file.
+#[must_use]
 pub fn get_local_agents_rules(cwd: &Path, toggles: &RuleToggles) -> Option<String> {
     format_agent_rule_files(
         cwd,
@@ -366,11 +367,11 @@ pub fn get_local_cursor_rules(cwd: &Path, toggles: &RuleToggles) -> Vec<Option<S
         match fs::read_to_string(&cursor_rules_file) {
             Ok(content) => {
                 let content = content.trim();
-                if !content.is_empty() {
+                if content.is_empty() {
+                    results.push(None);
+                } else {
                     check_injection_patterns(content, ".cursorrules");
                     results.push(Some(format!("# Cursor Rules\n\n{content}")));
-                } else {
-                    results.push(None);
                 }
             }
             Err(e) => {
@@ -774,7 +775,7 @@ pub fn get_available_skills(skills: Vec<SkillMetadata>) -> Vec<SkillMetadata> {
 /// List supporting files (docs and scripts) in a skill directory
 #[must_use]
 pub fn list_supporting_files(skill_md_path: &Path) -> SkillSupportingFiles {
-    let skill_dir = skill_md_path.parent().unwrap_or(Path::new("."));
+    let skill_dir = skill_md_path.parent().unwrap_or_else(|| Path::new("."));
     let docs_dir = skill_dir.join("docs");
     let scripts_dir = skill_dir.join("scripts");
 

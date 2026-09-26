@@ -311,46 +311,46 @@ impl UseSubagentsHandler {
             result: value
                 .get("result")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+                .map(ToString::to_string),
             error: value
                 .get("error")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+                .map(ToString::to_string),
             tool_calls: value
                 .get("tool_calls")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
             input_tokens: value
                 .get("input_tokens")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
             output_tokens: value
                 .get("output_tokens")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
             cache_write_tokens: value
                 .get("cache_write_tokens")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
             cache_read_tokens: value
                 .get("cache_read_tokens")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
             total_cost: value
                 .get("total_cost")
-                .and_then(|v| v.as_f64())
+                .and_then(serde_json::Value::as_f64)
                 .unwrap_or(0.0),
             context_tokens: value
                 .get("context_tokens")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
             context_window: value
                 .get("context_window")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
             context_usage_pct: value
                 .get("context_usage_pct")
-                .and_then(|v| v.as_f64())
+                .and_then(serde_json::Value::as_f64)
                 .unwrap_or(0.0),
         })
     }
@@ -634,10 +634,10 @@ impl UseSubagentsHandler {
                     // error message.
                     let stderr_text = stderr_buf.trim().to_string();
                     let stdout_text = stdout_buf.trim().to_string();
-                    let error_text = if !stderr_text.is_empty() {
-                        stderr_text
-                    } else {
+                    let error_text = if stderr_text.is_empty() {
                         stdout_text
+                    } else {
+                        stderr_text
                     };
                     if let Some(mut parsed) = Self::read_result_file(&result_path) {
                         // Promote the recovered metrics; keep stderr as the
@@ -844,8 +844,7 @@ impl UseSubagentsHandler {
         let validation_error = if prompt_count_in_json > MAX_SUBAGENT_PROMPTS {
             Some((
                 format!(
-                    "too many prompts in JSON ({}; maximum {})",
-                    prompt_count_in_json, MAX_SUBAGENT_PROMPTS
+                    "too many prompts in JSON ({prompt_count_in_json}; maximum {MAX_SUBAGENT_PROMPTS})"
                 ),
                 ToolError::InvalidInput(format!(
                     "Too many subagent prompts provided ({prompt_count_in_json}). Maximum is {MAX_SUBAGENT_PROMPTS}."

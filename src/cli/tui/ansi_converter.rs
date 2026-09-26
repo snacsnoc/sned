@@ -102,13 +102,13 @@ impl Perform for RatatuiPerformer {
                         self.current_style = self.current_style.add_modifier(Modifier::UNDERLINED);
                     }
                     [30] => self.current_style = self.current_style.fg(Color::Black),
-                    [31] | [91] => self.current_style = self.current_style.fg(Color::Red),
-                    [32] | [92] => self.current_style = self.current_style.fg(Color::Green),
-                    [33] | [93] => self.current_style = self.current_style.fg(Color::Yellow),
-                    [34] | [94] => self.current_style = self.current_style.fg(Color::Blue),
-                    [35] | [95] => self.current_style = self.current_style.fg(Color::Magenta),
-                    [36] | [96] => self.current_style = self.current_style.fg(Color::Cyan),
-                    [37] | [97] => self.current_style = self.current_style.fg(Color::White),
+                    [31 | 91] => self.current_style = self.current_style.fg(Color::Red),
+                    [32 | 92] => self.current_style = self.current_style.fg(Color::Green),
+                    [33 | 93] => self.current_style = self.current_style.fg(Color::Yellow),
+                    [34 | 94] => self.current_style = self.current_style.fg(Color::Blue),
+                    [35 | 95] => self.current_style = self.current_style.fg(Color::Magenta),
+                    [36 | 96] => self.current_style = self.current_style.fg(Color::Cyan),
+                    [37 | 97] => self.current_style = self.current_style.fg(Color::White),
                     [90] => self.current_style = self.current_style.fg(Color::DarkGray),
                     // Background colors: 40-47
                     [40] => self.current_style = self.current_style.bg(Color::Black),
