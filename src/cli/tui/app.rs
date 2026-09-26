@@ -1060,6 +1060,8 @@ pub struct App {
     pub cached_wrap_width: Option<usize>,
     /// Pending clear confirmation (stores the trigger: "slash" or "ctrl_l")
     pub pending_clear: Option<String>,
+    /// First y seen toward two-step plan approval; any other key disarms it.
+    pub pending_plan_approve: bool,
     /// Saved draft input before history navigation
     pub history_draft: Option<String>,
     /// Cached plan state for TUI rendering (updated from interactive loop)
@@ -1253,6 +1255,7 @@ impl App {
     }
 
     pub fn set_input_text(&mut self, text: &str) {
+        self.pending_plan_approve = false;
         self.input = Self::new_textarea(Self::textarea_lines_from_text(text));
     }
 
@@ -1334,6 +1337,7 @@ impl App {
         self.slash_command_active = false;
         self.slash_command_help_active = false;
         self.model_picker_active = false;
+        self.pending_plan_approve = false;
         self.picker_results.clear();
         self.picker_index = 0;
         self.picker_selection_explicit = false;
@@ -1530,6 +1534,7 @@ impl App {
             cached_visual_rows: 0,
             cached_wrap_width: None,
             pending_clear: None,
+            pending_plan_approve: false,
             history_draft: None,
             plan_state_cache: None,
             plan_state_cache_ptr: None,

@@ -2733,6 +2733,53 @@ async fn handle_key_event_inner(
 ) -> anyhow::Result<Option<Action>> {
     use crate::core::approval::{is_followup_question_active, take_followup_sender};
 
+    // Two-step plan approval: a bare y arms, a second y approves. Any other
+    // key disarms and gets the held y back, so a message starting with y
+    // still types in full.
+    if app.pending_clear.is_none()
+        && app.pending_model_switch.is_none()
+        && matches!(key.code, KeyCode::Char('y' | 'Y'))
+        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        && app.input.lines().join("\n").is_empty()
+        && !app.has_pending_approval()
+        && !app.picker_active
+        && !app.slash_command_active
+        && !app.slash_command_help_active
+        && !app.model_picker_active
+        && !is_followup_question_active(task_id)
+        && app
+            .plan_state_cache
+            .as_ref()
+            .is_some_and(|plan| !plan.approved && !plan.complete && !plan.steps.is_empty())
+    {
+        if app.pending_plan_approve {
+            app.pending_plan_approve = false;
+            return Ok(Some(Action::PlanApprove));
+        }
+        app.pending_plan_approve = true;
+        app.push_styled(
+            "Approve plan? Press y again to confirm, or keep typing to cancel.",
+            Style::default().fg(theme::warning_fg()),
+        );
+        return Ok(None);
+    }
+    if app.pending_plan_approve {
+        app.pending_plan_approve = false;
+        // A modal or followup owns the input now; the held y dies with the
+        // arm instead of leaking into its answer.
+        if app.pending_clear.is_none()
+            && app.pending_model_switch.is_none()
+            && !app.has_pending_approval()
+            && !is_followup_question_active(task_id)
+        {
+            use tui_textarea::Input;
+            app.input.input(Input::from(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::empty(),
+            )));
+        }
+    }
+
     if app.pending_model_switch.is_some() {
         match key.code {
             KeyCode::Esc => {
@@ -3000,23 +3047,6 @@ async fn handle_key_event_inner(
     if key.code == KeyCode::PageDown {
         app.scroll_pages(1);
         return Ok(None);
-    }
-
-    if matches!(key.code, KeyCode::Char('y' | 'Y'))
-        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-        && app.input.lines().join("\n").is_empty()
-        && !app.has_pending_approval()
-        && !app.picker_active
-        && !app.slash_command_active
-        && !app.slash_command_help_active
-        && !app.model_picker_active
-        && !is_followup_question_active(task_id)
-        && app
-            .plan_state_cache
-            .as_ref()
-            .is_some_and(|plan| !plan.approved && !plan.complete && !plan.steps.is_empty())
-    {
-        return Ok(Some(Action::PlanApprove));
     }
 
     // Shift+Up/Down for manual scroll
@@ -5593,6 +5623,8 @@ async fn run_main_loop(
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         app.clear_text_selection();
+                        // Loop-level keys never reach the inner disarm.
+                        app.pending_plan_approve = false;
                         if app.pending_model_switch.is_some() {
                             cancel_pending_model_switch(app);
                             continue;
@@ -11456,7 +11488,20 @@ mod tests {
         )
         .await?;
 
+        assert!(action.is_none());
+        assert!(app.pending_plan_approve);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "test-task",
+        )
+        .await?;
+
         assert!(matches!(action, Some(Action::PlanApprove)));
+        assert!(!app.pending_plan_approve);
         assert!(app.input.lines().join("\n").is_empty());
         reset_prompt_state();
         Ok(())
@@ -11486,8 +11531,156 @@ mod tests {
         )
         .await?;
 
+        assert!(action.is_none());
+        assert!(app.pending_plan_approve);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "test-task",
+        )
+        .await?;
+
         assert!(matches!(action, Some(Action::PlanApprove)));
+        assert!(!app.pending_plan_approve);
         assert!(app.input.lines().join("\n").is_empty());
+        reset_prompt_state();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_y_then_letter_types_full_word() -> anyhow::Result<()> {
+        use crate::core::plan_state::PlanState;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        let plan = PlanState::create_plan(vec!["First step".to_string()]);
+        assert!(app.sync_plan_state_cache(Some(&plan)));
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "test-task",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(app.pending_plan_approve);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "test-task",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(!app.pending_plan_approve);
+        assert_eq!(app.input.lines().join("\n"), "ye");
+        reset_prompt_state();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_input_reset_disarms_plan_approve() -> anyhow::Result<()> {
+        use crate::core::plan_state::PlanState;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        let plan = PlanState::create_plan(vec!["First step".to_string()]);
+        assert!(app.sync_plan_state_cache(Some(&plan)));
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "test-task",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(app.pending_plan_approve);
+
+        app.set_input_text("");
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "test-task",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(app.pending_plan_approve);
+        reset_prompt_state();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_event_followup_answer_not_prefixed_after_arm() -> anyhow::Result<()> {
+        use crate::core::plan_state::PlanState;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        let plan = PlanState::create_plan(vec!["First step".to_string()]);
+        assert!(app.sync_plan_state_cache(Some(&plan)));
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "test-task",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(app.pending_plan_approve);
+
+        let task_id = "followup-arm-test";
+        crate::core::approval::set_followup_question_active(task_id, true);
+        let (reply_tx, _reply_rx) = std::sync::mpsc::channel();
+        crate::core::approval::set_followup_sender(task_id, reply_tx);
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            task_id,
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(!app.pending_plan_approve);
+        assert_eq!(app.input.lines().join("\n"), "1");
+
+        crate::core::approval::set_followup_question_active(task_id, false);
+        crate::core::approval::clear_followup_sender(task_id);
         reset_prompt_state();
         Ok(())
     }

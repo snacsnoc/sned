@@ -124,7 +124,7 @@ fn build_plan_lines(plan: &PlanState, area: Rect) -> Vec<Line<'static>> {
     if !plan.approved && !plan.complete {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Press y or type /plan approve to begin execution",
+            "Press y twice or type /plan approve to begin execution",
             theme::dim_style(),
         )));
     }
@@ -183,7 +183,7 @@ mod tests {
         .map(|span| span.content.into_owned())
         .collect::<String>();
 
-        assert!(text.contains("Press y"));
+        assert!(text.contains("Press y twice"));
         assert!(text.contains("/plan approve"));
     }
 }
