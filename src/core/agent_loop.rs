@@ -66,7 +66,7 @@ const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
 use crate::core::plan_state::PlanStepStatus;
 use crate::core::stream_parsing::{
     FenceDelimiter, ThinkOpenKind, classify_think_start, extract_response_text, is_think_end,
-    parse_fence_start, split_model_output, truncate_json_arguments,
+    parse_fence_start, split_model_output,
 };
 use crate::core::tool_output::{
     extract_edit_stats_detailed, format_heat_map, format_heat_map_plain, format_tool_call_lines,
@@ -994,6 +994,23 @@ impl AgentLoop {
         let Some(raw) = raw_arguments else {
             return Ok(serde_json::json!({}));
         };
+        // Oversized arguments are never executable, no matter how valid the
+        // JSON looks after repair. Fail the call; the stream assembly below
+        // keeps draining so the protocol stays in sync.
+        if raw.len() > MAX_TOOL_ARGUMENT_SIZE {
+            let preview: String = raw.chars().take(200).collect();
+            tracing::error!(
+                tool_name = %tool_name,
+                tool_id = %tool_id,
+                args_len = raw.len(),
+                args_preview = %preview,
+                "tool call arguments exceed size limit; call will not execute"
+            );
+            return Err(format!(
+                "Tool '{tool_name}' arguments exceed the {MAX_TOOL_ARGUMENT_SIZE}-byte limit ({} bytes, id: {tool_id}) and were not executed. Please retry with smaller arguments. Rejected argument prefix: {preview}",
+                raw.len()
+            ));
+        }
         // Treat empty string as no arguments (some providers send empty string instead of "{}")
         if raw.trim().is_empty() {
             return Ok(serde_json::json!({}));
@@ -1104,14 +1121,29 @@ impl AgentLoop {
     fn assistant_tool_input(prepared: &PreparedToolCall) -> serde_json::Value {
         match &prepared.parsed_args {
             Ok(value) => value.clone(),
-            Err(_) => serde_json::json!({
-                "_raw_arguments": prepared
+            Err(_) => {
+                let raw = prepared
                     .tool_call
                     .function
                     .arguments
                     .as_deref()
-                    .unwrap_or("")
-            }),
+                    .unwrap_or("");
+                // Oversized payloads keep only a prefix in history; the full
+                // bytes already went to the error above.
+                let raw = if raw.len() > MAX_TOOL_ARGUMENT_SIZE {
+                    let preview: String = raw.chars().take(200).collect();
+                    format!(
+                        "{preview}…[truncated: showing {} of {} bytes]",
+                        preview.len(),
+                        raw.len()
+                    )
+                } else {
+                    raw.to_string()
+                };
+                serde_json::json!({
+                    "_raw_arguments": raw
+                })
+            }
         }
     }
 
@@ -3173,19 +3205,17 @@ impl AgentLoop {
                                     .as_ref()
                                     .map(|a| a.clone() + &new_args)
                                     .unwrap_or(new_args);
-                                // Validate merged argument size
+                                // Oversized merges stay stored as-is so the stream
+                                // keeps draining; parse rejects them before
+                                // dispatch instead of repairing them into
+                                // executable calls.
                                 if merged.len() > MAX_TOOL_ARGUMENT_SIZE {
-                                    let truncated =
-                                        truncate_json_arguments(&merged, MAX_TOOL_ARGUMENT_SIZE);
-                                    if truncated.was_repaired {
-                                        tracing::warn!(
-                                            "Tool call arguments were truncated AND repaired (original JSON was malformed)"
-                                        );
-                                    }
-                                    existing.function.arguments = Some(truncated.value);
-                                } else {
-                                    existing.function.arguments = Some(merged);
+                                    tracing::warn!(
+                                        args_len = merged.len(),
+                                        "merged tool call arguments exceed size limit; call will not execute"
+                                    );
                                 }
+                                existing.function.arguments = Some(merged);
                             }
                             if tc.function.name.is_some() {
                                 existing.function.name = tc.function.name;
@@ -3194,22 +3224,13 @@ impl AgentLoop {
                                 existing.call_id = tc.call_id;
                             }
                         } else {
-                            // Validate initial argument size
                             if let Some(ref args) = tc.function.arguments
                                 && args.len() > MAX_TOOL_ARGUMENT_SIZE
                             {
-                                let truncated =
-                                    truncate_json_arguments(args, MAX_TOOL_ARGUMENT_SIZE);
-                                if truncated.was_repaired {
-                                    tracing::warn!(
-                                        "Tool call arguments were truncated AND repaired (original JSON was malformed)"
-                                    );
-                                }
-                                let mut truncated_tc = tc.clone();
-                                truncated_tc.function.arguments = Some(truncated.value);
-                                tool_call_order.push(key.clone());
-                                tool_calls_map.insert(key, truncated_tc);
-                                continue;
+                                tracing::warn!(
+                                    args_len = args.len(),
+                                    "tool call arguments exceed size limit; call will not execute"
+                                );
                             }
                             tool_call_order.push(key.clone());
                             tool_calls_map.insert(key, tc);
@@ -10730,6 +10751,63 @@ Irrespective of whether additional information or instructions are given, you ar
             .expect_err("provider repair marker must not reach a tool handler");
         assert!(error.contains("could not be repaired"));
         assert!(error.contains("invalid escape at line 1 column 23"));
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_rejects_oversized_arguments() {
+        use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
+        let oversized = format!(
+            "{{\"content\": \"{}\"}}",
+            "x".repeat(MAX_TOOL_ARGUMENT_SIZE)
+        );
+        assert!(oversized.len() > MAX_TOOL_ARGUMENT_SIZE);
+        let error = AgentLoop::parse_tool_arguments("write_to_file", "big-1", Some(&oversized))
+            .expect_err("oversized arguments must never reach a tool handler");
+        assert!(error.contains("exceed"));
+        assert!(error.contains("big-1"));
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_accepts_arguments_at_size_limit() {
+        use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
+        let at_limit = format!("{{\"a\":\"{}\"}}", "x".repeat(MAX_TOOL_ARGUMENT_SIZE - 8));
+        assert_eq!(at_limit.len(), MAX_TOOL_ARGUMENT_SIZE);
+        AgentLoop::parse_tool_arguments("write_to_file", "edge-1", Some(&at_limit))
+            .expect("arguments exactly at the limit must still dispatch");
+    }
+
+    #[test]
+    fn test_assistant_tool_input_bounds_oversized_raw_arguments() {
+        use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
+        let oversized = format!(
+            "{{\"content\": \"{}\"}}",
+            "x".repeat(MAX_TOOL_ARGUMENT_SIZE)
+        );
+        let prepared = PreparedToolCall {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call-big".to_string()),
+                function: crate::providers::ApiStreamToolCallFunction {
+                    id: Some("tool-big".to_string()),
+                    name: Some("write_to_file".to_string()),
+                    arguments: Some(oversized),
+                },
+                signature: None,
+            },
+            tool_id: "tool-big".to_string(),
+            tool_name: "write_to_file".to_string(),
+            parsed_args: Err("oversized".to_string()),
+        };
+        let input = AgentLoop::assistant_tool_input(&prepared);
+        let raw = input
+            .get("_raw_arguments")
+            .and_then(serde_json::Value::as_str)
+            .expect("failure input keeps a raw prefix for diagnostics");
+        assert!(
+            raw.len() < 1000,
+            "raw prefix must stay bounded, got {} bytes",
+            raw.len()
+        );
+        assert!(raw.contains("truncated"));
     }
 
     #[test]
