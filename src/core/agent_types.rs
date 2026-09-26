@@ -391,11 +391,13 @@ impl TaskState {
     /// Evicts oldest entries when cache exceeds size or entry limits.
     pub fn insert_file_content(&mut self, path: String, content: String) {
         let content_size = content.len();
-        let replaced_size = self
-            .file_content_cache
-            .peek(&path)
-            .map_or(0, std::string::String::len);
-        let mut total_size = self.file_content_cache_size().saturating_sub(replaced_size);
+        if content_size > MAX_FILE_CONTENT_CACHE_SIZE {
+            return;
+        }
+        // Drop the replaced entry before accounting: subtracting its size
+        // while it stays evictable counts it twice when eviction pops it.
+        self.file_content_cache.pop(&path);
+        let mut total_size = self.file_content_cache_size();
 
         while total_size + content_size > MAX_FILE_CONTENT_CACHE_SIZE {
             if let Some((_key, evicted_content)) = self.file_content_cache.pop_lru() {
@@ -506,6 +508,37 @@ mod tests {
         assert!(state.file_content_cache.peek(&"a".to_string()).is_some());
         assert!(state.file_content_cache.peek(&"b".to_string()).is_none());
         assert!(state.file_content_cache.peek(&"c".to_string()).is_some());
+        assert!(state.file_content_cache_size() <= MAX_FILE_CONTENT_CACHE_SIZE);
+    }
+
+    #[test]
+    fn test_insert_file_content_replacement_counts_once_under_eviction() {
+        let mut state = TaskState::default();
+        state.insert_file_content("a".to_string(), "a".repeat(4 * 1024 * 1024));
+        state.insert_file_content("b".to_string(), "b".repeat(6 * 1024 * 1024));
+        state.insert_file_content("a".to_string(), "c".repeat(8 * 1024 * 1024));
+
+        assert!(state.file_content_cache_size() <= MAX_FILE_CONTENT_CACHE_SIZE);
+        assert!(state.file_content_cache.peek(&"a".to_string()).is_some());
+        assert!(state.file_content_cache.peek(&"b".to_string()).is_none());
+    }
+
+    #[test]
+    fn test_insert_file_content_skips_entry_larger_than_cap() {
+        let mut state = TaskState::default();
+        state.insert_file_content("small".to_string(), "x".to_string());
+        state.insert_file_content(
+            "huge".to_string(),
+            "y".repeat(MAX_FILE_CONTENT_CACHE_SIZE + 1),
+        );
+
+        assert!(state.file_content_cache.peek(&"huge".to_string()).is_none());
+        assert!(
+            state
+                .file_content_cache
+                .peek(&"small".to_string())
+                .is_some()
+        );
         assert!(state.file_content_cache_size() <= MAX_FILE_CONTENT_CACHE_SIZE);
     }
 
