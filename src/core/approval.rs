@@ -473,9 +473,13 @@ fn command_approval_scope(command: &str) -> Option<CommandApprovalScope> {
     match base.as_str() {
         "git" => {
             let subcommand = parts.get(1)?.to_ascii_lowercase();
-            SAFE_GIT_SUBCOMMANDS
-                .contains(&subcommand.as_str())
-                .then_some(CommandApprovalScope::GitSubcommand(subcommand))
+            if !SAFE_GIT_SUBCOMMANDS.contains(&subcommand.as_str()) {
+                return None;
+            }
+            if subcommand == "diff" && !is_reusable_read_only_git_diff(&parts) {
+                return None;
+            }
+            Some(CommandApprovalScope::GitSubcommand(subcommand))
         }
         "sed" => is_reusable_read_only_sed(&parts).then_some(CommandApprovalScope::SedReadOnly),
         "find" => Some(CommandApprovalScope::FindReadOnly),
@@ -599,6 +603,109 @@ fn is_bare_command_name(command: &str) -> bool {
     command
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
+/// Known read-only `git diff` argument forms. Anything else (notably
+/// `--output`, which writes a file, and driver-running flags) gets no
+/// reusable scope and falls back to exact-request approval.
+fn is_reusable_read_only_git_diff(parts: &[&str]) -> bool {
+    const EXACT_FLAGS: &[&str] = &[
+        "--stat",
+        "--name-only",
+        "--name-status",
+        "--shortstat",
+        "--summary",
+        "--check",
+        "--quiet",
+        "--exit-code",
+        "--no-color",
+        "--color",
+        "--cached",
+        "--staged",
+        "--no-index",
+        "--merge-base",
+        "--no-patch",
+        "--minimal",
+        "--patience",
+        "--histogram",
+        "--raw",
+        "--numstat",
+        "--dirstat",
+        "--binary",
+        "--full-index",
+        "--no-prefix",
+        "--no-textconv",
+        "--no-renames",
+        "--find-renames",
+        "--find-copies",
+        "--find-copies-harder",
+        "--break-rewrites",
+        "--ignore-all-space",
+        "--ignore-blank-lines",
+        "--ignore-cr-at-eol",
+        "--abbrev-commit",
+        "-w",
+        "-b",
+        "-s",
+    ];
+
+    let mut paths_only = false;
+    for part in parts.iter().skip(2) {
+        if *part == "--" {
+            paths_only = true;
+            continue;
+        }
+        if paths_only || !part.starts_with('-') {
+            continue;
+        }
+        if EXACT_FLAGS.contains(part) {
+            continue;
+        }
+        if is_bare_diff_count_flag(part) || is_diff_valued_option(part) {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// Short count flags: `-U<n>`, `-M<n>[%]`, `-C<n>[%]` (bare forms allowed).
+fn is_bare_diff_count_flag(part: &str) -> bool {
+    let mut chars = part.chars();
+    match chars.next() {
+        Some('-') => {}
+        _ => return false,
+    }
+    let (kind, rest) = match chars.next() {
+        Some(kind @ ('U' | 'M' | 'C')) => (kind, chars.as_str()),
+        _ => return false,
+    };
+    let digits = rest.strip_suffix('%').unwrap_or(rest);
+    if digits.is_empty() {
+        return true;
+    }
+    if kind == 'U' && rest.ends_with('%') {
+        return false;
+    }
+    digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Long options that only shape stdout and take constrained values.
+fn is_diff_valued_option(part: &str) -> bool {
+    const VALUED_PREFIXES: &[&str] = &[
+        "--unified=",
+        "--abbrev=",
+        "--src-prefix=",
+        "--dst-prefix=",
+        "--output-indicator-new=",
+        "--output-indicator-old=",
+        "--output-indicator-context=",
+        "--diff-filter=",
+        "--relative=",
+    ];
+    VALUED_PREFIXES
+        .iter()
+        .any(|prefix| part.starts_with(prefix))
 }
 
 fn is_reusable_read_only_sed(parts: &[&str]) -> bool {
@@ -2643,6 +2750,35 @@ mod tests {
             "find . -delete",
         ] {
             assert!(command_approval_scopes(&serde_json::json!({"command": command})).is_none());
+        }
+    }
+
+    #[test]
+    fn test_command_approval_scopes_reject_output_writing_git_diff() {
+        assert_eq!(
+            command_approval_scopes(&serde_json::json!({"command": "git diff HEAD"})),
+            Some(vec![CommandApprovalScope::GitSubcommand(
+                "diff".to_string()
+            )])
+        );
+        assert_eq!(
+            command_approval_scopes(&serde_json::json!({"command": "git diff --stat --cached"})),
+            Some(vec![CommandApprovalScope::GitSubcommand(
+                "diff".to_string()
+            )])
+        );
+        for command in [
+            "git diff --output=/tmp/evil",
+            "git diff --output /tmp/evil",
+            "git diff --stat --output=/tmp/evil",
+            "git diff --ext-diff",
+            "git diff --textconv",
+            "git diff --made-up-flag-xyz",
+        ] {
+            assert!(
+                command_approval_scopes(&serde_json::json!({"command": command})).is_none(),
+                "{command} must not receive a reusable scope"
+            );
         }
     }
 
