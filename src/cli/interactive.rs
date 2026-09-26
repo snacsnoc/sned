@@ -2671,6 +2671,33 @@ async fn cancel_agent(
     Ok(())
 }
 
+/// Whether two Ctrl+C presses fall inside the force-quit window.
+fn is_ctrl_c_double_tap(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_some_and(|prev| now.duration_since(prev).as_secs() < 2)
+}
+
+/// What a Ctrl+C press means. Dismissing overlays never arms the quit
+/// timer: reaching for Esc-like dismissal is a vote to keep working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtrlCDecision {
+    ForceQuit,
+    DismissOverlays,
+    CancelAgent,
+    Idle,
+}
+
+fn decide_ctrl_c(is_double_tap: bool, overlays_open: bool, agent_busy: bool) -> CtrlCDecision {
+    if is_double_tap {
+        CtrlCDecision::ForceQuit
+    } else if overlays_open {
+        CtrlCDecision::DismissOverlays
+    } else if agent_busy {
+        CtrlCDecision::CancelAgent
+    } else {
+        CtrlCDecision::Idle
+    }
+}
+
 fn handle_idle_ctrl_c(app: &mut App) {
     clear_input_overlays(app);
     app.push_styled(
@@ -5574,56 +5601,62 @@ async fn run_main_loop(
                         let now = std::time::Instant::now();
                         let is_double_tap = {
                             let last = last_ctrlc.lock().unwrap();
-                            last.is_some_and(|prev| now.duration_since(prev).as_secs() < 2)
+                            is_ctrl_c_double_tap(*last, now)
                         };
-
-                        if is_double_tap {
-                            // Force exit on second Ctrl+C
-                            clear_input_overlays(app);
-                            // Always export on exit, even if the agent errored out.
-                            if let Some(ref export_path) = task_opts.export {
-                                let export_result =
-                                    export_conversation(&session, export_path).await;
-                                report_conversation_export(
-                                    &output_writer,
-                                    task_opts.json,
-                                    &export_result,
-                                    true,
-                                );
+                        let overlays_open = app.picker_active
+                            || app.slash_command_active
+                            || app.model_picker_active;
+                        // Only cancelling the agent or idling arms the quit
+                        // timer; dismissing overlays never does.
+                        match decide_ctrl_c(
+                            is_double_tap,
+                            overlays_open,
+                            agent_busy.load(Ordering::Relaxed),
+                        ) {
+                            CtrlCDecision::ForceQuit => {
+                                // Force exit on second Ctrl+C
+                                clear_input_overlays(app);
+                                // Always export on exit, even if the agent errored out.
+                                if let Some(ref export_path) = task_opts.export {
+                                    let export_result =
+                                        export_conversation(&session, export_path).await;
+                                    report_conversation_export(
+                                        &output_writer,
+                                        task_opts.json,
+                                        &export_result,
+                                        true,
+                                    );
+                                }
+                                let _ = app.flush_scrollback_pending();
+                                await_cancellation_cleanup(app).await;
+                                return Ok(());
                             }
-                            let _ = app.flush_scrollback_pending();
-                            await_cancellation_cleanup(app).await;
-                            return Ok(());
+                            CtrlCDecision::DismissOverlays => {
+                                clear_input_overlays(app);
+                                continue;
+                            }
+                            CtrlCDecision::CancelAgent => {
+                                {
+                                    let mut last = last_ctrlc.lock().unwrap();
+                                    *last = Some(now);
+                                }
+                                request_agent_cancel(app, &state_handle, &agent_task, &agent_busy)?;
+                                app.agent_busy = false;
+                                app.push_styled(
+                                    "Press Ctrl+C again to quit.",
+                                    Style::default().fg(theme::warning_fg()),
+                                );
+                                continue;
+                            }
+                            CtrlCDecision::Idle => {
+                                {
+                                    let mut last = last_ctrlc.lock().unwrap();
+                                    *last = Some(now);
+                                }
+                                handle_idle_ctrl_c(app);
+                                continue;
+                            }
                         }
-
-                        // First Ctrl+C - update timestamp
-                        {
-                            let mut last = last_ctrlc.lock().unwrap();
-                            *last = Some(now);
-                        }
-
-                        // Ctrl+C dismisses any input-bound overlay before it
-                        // begins agent cancellation or the exit gesture.
-                        if app.picker_active || app.slash_command_active || app.model_picker_active
-                        {
-                            clear_input_overlays(app);
-                            continue;
-                        }
-
-                        // If agent is busy, cancel it
-                        if agent_busy.load(Ordering::Relaxed) {
-                            request_agent_cancel(app, &state_handle, &agent_task, &agent_busy)?;
-                            app.agent_busy = false;
-                            app.push_styled(
-                                "Press Ctrl+C again to quit.",
-                                Style::default().fg(theme::warning_fg()),
-                            );
-                            continue;
-                        }
-
-                        // Not busy: dismiss a completion or hint about quitting.
-                        handle_idle_ctrl_c(app);
-                        continue;
                     }
 
                     if let Some(action) =
@@ -11780,6 +11813,38 @@ mod tests {
         assert!(!app.mention_search_active);
         assert!(!app.slash_command_active);
         assert!(!app.model_picker_active);
+    }
+
+    #[test]
+    fn test_ctrl_c_double_tap_window_boundaries() {
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        assert!(!is_ctrl_c_double_tap(None, now));
+        assert!(is_ctrl_c_double_tap(
+            Some(now - Duration::from_millis(1900)),
+            now
+        ));
+        assert!(!is_ctrl_c_double_tap(
+            Some(now - Duration::from_secs(2)),
+            now
+        ));
+        assert!(!is_ctrl_c_double_tap(
+            Some(now - Duration::from_secs(30)),
+            now
+        ));
+    }
+
+    #[test]
+    fn test_ctrl_c_decision_table() {
+        use CtrlCDecision::*;
+        for busy in [false, true] {
+            assert_eq!(decide_ctrl_c(true, true, busy), ForceQuit);
+            assert_eq!(decide_ctrl_c(true, false, busy), ForceQuit);
+            assert_eq!(decide_ctrl_c(false, true, busy), DismissOverlays);
+        }
+        assert_eq!(decide_ctrl_c(false, false, true), CancelAgent);
+        assert_eq!(decide_ctrl_c(false, false, false), Idle);
     }
 
     #[tokio::test]
