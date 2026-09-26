@@ -2837,9 +2837,7 @@ async fn handle_key_event_inner(
             provider: entry.provider.to_string(),
             model_id: entry.model_id.to_string(),
         };
-        app.model_picker_active = false;
-        app.model_picker_results.clear();
-        app.model_picker_selected = 0;
+        clear_model_picker(app);
         return Ok(Some(Action::ModelSwitch(request)));
     }
 
@@ -3078,9 +3076,7 @@ async fn handle_key_event_inner(
 
     // Escape key - dismiss model picker
     if key.code == KeyCode::Esc && app.model_picker_active {
-        app.model_picker_active = false;
-        app.model_picker_results.clear();
-        app.model_picker_selected = 0;
+        clear_model_picker(app);
         return Ok(None);
     }
 
