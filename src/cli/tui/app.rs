@@ -1334,6 +1334,18 @@ impl App {
         self.slash_command_active = false;
         self.slash_command_help_active = false;
         self.model_picker_active = false;
+        self.picker_results.clear();
+        self.picker_index = 0;
+        self.picker_selection_explicit = false;
+        self.mention_search_query.clear();
+        self.mention_search_deadline = Instant::now();
+        self.mention_search_generation = self.mention_search_generation.wrapping_add(1);
+        self.mention_search_refresh_pending = false;
+        self.slash_command_results.clear();
+        self.slash_command_selected = 0;
+        self.slash_command_completed_text = None;
+        self.model_picker_results.clear();
+        self.model_picker_selected = 0;
         self.clear_text_selection();
         self.needs_redraw = true;
         true
@@ -6607,6 +6619,54 @@ mod tests {
             app.input.lines().join("\n"),
             "draft that must remain untouched"
         );
+    }
+
+    #[test]
+    fn test_set_pending_approval_drops_overlay_payload() {
+        let mut app = App::new();
+        app.picker_active = true;
+        app.picker_results = vec![crate::core::file_search::FileSearchResult {
+            path: "src/main.rs".to_string(),
+            file_type: crate::core::file_search::FileType::File,
+            label: "main.rs".to_string(),
+        }];
+        app.picker_index = 1;
+        app.mention_search_active = true;
+        app.mention_search_query = "@src".to_string();
+        app.mention_search_refresh_pending = true;
+        app.slash_command_active = true;
+        app.slash_command_results = vec![crate::cli::slash_commands::SlashCommandEntry {
+            name: "exit".to_string(),
+            description: "Exit".to_string(),
+            aliases: vec![],
+            category: crate::cli::slash_commands::SlashCommandCategory::Local,
+            requires_args: false,
+        }];
+        app.slash_command_selected = 1;
+        app.slash_command_completed_text = Some("/ex".to_string());
+        app.model_picker_active = true;
+        app.model_picker_results = crate::cli::slash_commands::build_model_picker_entries();
+        app.model_picker_selected = 1;
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            3,
+            "Approval required · edit_file",
+            "Approve these edits?",
+        );
+        assert!(app.set_pending_approval(request));
+
+        assert!(!app.picker_active);
+        assert!(app.picker_results.is_empty());
+        assert_eq!(app.picker_index, 0);
+        assert!(!app.mention_search_active);
+        assert!(app.mention_search_query.is_empty());
+        assert!(!app.mention_search_refresh_pending);
+        assert!(!app.slash_command_active);
+        assert!(app.slash_command_results.is_empty());
+        assert_eq!(app.slash_command_selected, 0);
+        assert!(app.slash_command_completed_text.is_none());
+        assert!(!app.model_picker_active);
+        assert!(app.model_picker_results.is_empty());
+        assert_eq!(app.model_picker_selected, 0);
     }
 
     #[test]

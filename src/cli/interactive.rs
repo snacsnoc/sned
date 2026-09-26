@@ -824,6 +824,16 @@ fn clear_input_overlays(app: &mut App) {
     clear_model_picker(app);
 }
 
+/// Drop a pending model switch and its input. Both Esc and Ctrl+C cancel
+/// paths share it so a cancelled switch can't strand overlay state.
+fn cancel_pending_model_switch(app: &mut App) {
+    app.pending_model_switch = None;
+    app.set_input_text("");
+    app.update_placeholder();
+    clear_input_overlays(app);
+    app.push_plain("Model switch cancelled.");
+}
+
 fn textarea_cursor_byte_offset(lines: &[String], cursor: (usize, usize)) -> usize {
     let (row, column) = cursor;
     let preceding_lines = lines
@@ -2699,10 +2709,7 @@ async fn handle_key_event_inner(
     if app.pending_model_switch.is_some() {
         match key.code {
             KeyCode::Esc => {
-                app.pending_model_switch = None;
-                app.set_input_text("");
-                app.update_placeholder();
-                app.push_plain("Model switch cancelled.");
+                cancel_pending_model_switch(app);
                 return Ok(None);
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -2738,6 +2745,7 @@ async fn handle_key_event_inner(
             || key.code == KeyCode::Enter
         {
             let clear_error = app.clear_output().err();
+            clear_input_overlays(app);
             app.force_bottom();
             let trigger = app.pending_clear.take().unwrap();
             if let Some(sh) = state_handle.lock().await.as_ref() {
@@ -5562,10 +5570,7 @@ async fn run_main_loop(
                     {
                         app.clear_text_selection();
                         if app.pending_model_switch.is_some() {
-                            app.pending_model_switch = None;
-                            app.set_input_text("");
-                            app.update_placeholder();
-                            app.push_plain("Model switch cancelled.");
+                            cancel_pending_model_switch(app);
                             continue;
                         }
 
@@ -9515,6 +9520,65 @@ mod tests {
 
         assert!(action.is_none());
         assert!(app.pending_clear.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_confirm_clear_closes_input_overlays() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(1);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = slash_completion_test_app();
+        app.pending_clear = Some("slash".to_string());
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(app.pending_clear.is_none());
+        assert!(!app.slash_command_active);
+        assert!(app.slash_command_results.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_esc_model_switch_cancel_clears_overlays() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(1);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.pending_model_switch = Some(crate::cli::tui::app::PendingModelSwitch {
+            provider: "openai".to_string(),
+            model_id: "gpt-4".to_string(),
+        });
+        app.picker_active = true;
+        app.mention_search_active = true;
+        app.mention_search_query = "@src".to_string();
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(app.pending_model_switch.is_none());
+        assert!(!app.picker_active);
+        assert!(!app.mention_search_active);
+        assert!(app.mention_search_query.is_empty());
         Ok(())
     }
 
