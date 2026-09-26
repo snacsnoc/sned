@@ -2731,6 +2731,33 @@ async fn handle_key_event_inner(
         }
     }
 
+    // Armed confirm answers before any input-consuming path below.
+    if app.pending_clear.is_some() {
+        if key.code == KeyCode::Char('y')
+            || key.code == KeyCode::Char('Y')
+            || key.code == KeyCode::Enter
+        {
+            let clear_error = app.clear_output().err();
+            app.force_bottom();
+            let trigger = app.pending_clear.take().unwrap();
+            if let Some(sh) = state_handle.lock().await.as_ref() {
+                let mut state = sh.lock().await;
+                state.last_injected_plan_state_hash = None;
+            }
+            app.push_plain(format!("Display cleared (confirmed via {trigger})."));
+            if let Some(err) = clear_error {
+                app.push_styled(
+                    format!("Failed to clear persisted scrollback: {err}"),
+                    Style::default().fg(theme::warning_fg()),
+                );
+            }
+        } else {
+            app.pending_clear = None;
+            app.push_styled("Clear display cancelled.", theme::dim_style());
+        }
+        return Ok(None);
+    }
+
     fn accept_slash_completion(app: &mut App) -> bool {
         if app.slash_command_results.is_empty() {
             return false;
@@ -2941,32 +2968,6 @@ async fn handle_key_event_inner(
         return Ok(None);
     }
 
-    if app.pending_clear.is_some() {
-        if key.code == KeyCode::Char('y')
-            || key.code == KeyCode::Char('Y')
-            || key.code == KeyCode::Enter
-        {
-            let clear_error = app.clear_output().err();
-            app.force_bottom();
-            let trigger = app.pending_clear.take().unwrap();
-            if let Some(sh) = state_handle.lock().await.as_ref() {
-                let mut state = sh.lock().await;
-                state.last_injected_plan_state_hash = None;
-            }
-            app.push_plain(format!("Display cleared (confirmed via {trigger})."));
-            if let Some(err) = clear_error {
-                app.push_styled(
-                    format!("Failed to clear persisted scrollback: {err}"),
-                    Style::default().fg(theme::warning_fg()),
-                );
-            }
-        } else {
-            app.pending_clear = None;
-            app.push_styled("Clear display cancelled.", theme::dim_style());
-        }
-        return Ok(None);
-    }
-
     if matches!(key.code, KeyCode::Char('y' | 'Y'))
         && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
         && app.input.lines().join("\n").is_empty()
@@ -3093,7 +3094,7 @@ async fn handle_key_event_inner(
         app.clear_text_selection();
         app.pending_clear = Some("ctrl_l".to_string());
         app.push_styled(
-            "Clear display? (y to confirm, any other key to cancel): ",
+            "Clear display? (y/Y/Enter to confirm, any other key to cancel): ",
             Style::default().fg(theme::warning_fg()),
         );
         return Ok(None);
@@ -3283,8 +3284,8 @@ async fn switch_to_fresh_task(
     app.start_task_transcript_writer(task_storage)?;
     app.clear_output()?;
     app.set_input_text("");
-    app.slash_command_active = false;
-    app.picker_active = false;
+    // Typing "/new" itself leaves overlay payload behind.
+    clear_input_overlays(app);
     app.pending_clear = None;
     // A requested-but-unapplied /model switch targets the old task's provider
     // setup, so it can't carry over; say so instead of dropping it silently.
@@ -3297,7 +3298,6 @@ async fn switch_to_fresh_task(
             Style::default().fg(theme::warning_fg()),
         );
     }
-    app.mention_search_active = false;
     app.plan_state_cache = None;
     app.plan_state_cache_ptr = None;
     app.start_time = Some(Instant::now());
@@ -3364,7 +3364,7 @@ async fn handle_cli_only_command(
         CliOnlyCommand::Clear => {
             app.pending_clear = Some("slash".to_string());
             app.push_styled(
-                "Clear display? (y to confirm, any other key to cancel): ",
+                "Clear display? (y/Y/Enter to confirm, any other key to cancel): ",
                 Style::default().fg(theme::warning_fg()),
             );
         }
@@ -3475,7 +3475,8 @@ async fn handle_cli_only_command(
         }
         CliOnlyCommand::ModelSwitch(model_spec) => {
             if model_spec.is_empty() {
-                // No argument: show model picker
+                // Exactly one picker may hold the input.
+                clear_input_overlays(app);
                 app.model_picker_results = crate::cli::slash_commands::build_model_picker_entries();
                 app.model_picker_selected = 0;
                 app.model_picker_active = true;
@@ -9492,6 +9493,31 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_enter_with_armed_clear_does_not_submit() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(1);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.set_input_text("unsent message");
+        app.pending_clear = Some("ctrl_l".to_string());
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(action.is_none());
+        assert!(app.pending_clear.is_none());
+        Ok(())
+    }
+
     #[test]
     fn test_idle_ctrl_c_keeps_completion_and_shows_quit_hint() {
         let mut app = App::new();
@@ -12124,6 +12150,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_new_command_clears_overlay_payload() -> anyhow::Result<()> {
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+
+        let (tx, mut output_rx) = mpsc::channel(8);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let state_handle = Arc::new(Mutex::new(None));
+        let queue_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.slash_command_active = true;
+        app.slash_command_help_active = true;
+        app.slash_command_selected = 2;
+        app.slash_command_completed_text = Some("/new".to_string());
+        app.picker_active = true;
+        app.picker_index = 1;
+        app.picker_selection_explicit = true;
+        app.mention_search_active = true;
+        app.mention_search_query = "sr".to_string();
+        app.mention_search_refresh_pending = true;
+        app.model_picker_active = true;
+        app.model_picker_selected = 1;
+        let mut task_id = session
+            .lock()
+            .await
+            .agent_loop()
+            .await
+            .task_id()
+            .to_string();
+        let mut task_storage = session.lock().await.task_storage();
+
+        switch_to_fresh_task(
+            &mut app,
+            &output_writer,
+            &session,
+            &mut task_id,
+            &mut task_storage,
+            &agent_busy,
+            &state_handle,
+            &queue_handle,
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut output_rx,
+            &task_opts,
+        )
+        .await?;
+
+        assert!(!app.slash_command_active);
+        assert!(!app.slash_command_help_active);
+        assert!(app.slash_command_results.is_empty());
+        assert_eq!(app.slash_command_selected, 0);
+        assert!(app.slash_command_completed_text.is_none());
+        assert!(!app.picker_active);
+        assert!(app.picker_results.is_empty());
+        assert_eq!(app.picker_index, 0);
+        assert!(!app.picker_selection_explicit);
+        assert!(!app.mention_search_active);
+        assert!(app.mention_search_query.is_empty());
+        assert!(!app.mention_search_refresh_pending);
+        assert!(!app.model_picker_active);
+        assert!(app.model_picker_results.is_empty());
+        assert_eq!(app.model_picker_selected, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_fresh_task_retires_old_signal_listeners() -> anyhow::Result<()> {
         let task_opts = retry_test_task_opts();
         let session = InteractiveSession::build_with_writer(
@@ -12203,6 +12307,68 @@ mod tests {
             session.lock().await.agent_loop().await.task_id(),
             old_task_id.as_str()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bare_model_dismisses_other_overlays() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+        app.slash_command_active = true;
+        app.slash_command_selected = 1;
+        app.picker_active = true;
+        app.picker_index = 1;
+        app.mention_search_active = true;
+        app.mention_search_query = "sr".to_string();
+
+        handle_cli_only_command(
+            CliOnlyCommand::ModelSwitch(String::new()),
+            "/model",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle,
+            &Arc::new(Mutex::new(None)),
+            &task_opts,
+            false,
+        )
+        .await?;
+
+        assert!(app.model_picker_active);
+        assert!(!app.slash_command_active);
+        assert!(app.slash_command_results.is_empty());
+        assert!(!app.picker_active);
+        assert!(app.picker_results.is_empty());
+        assert!(!app.mention_search_active);
+        assert!(app.mention_search_query.is_empty());
         Ok(())
     }
 
