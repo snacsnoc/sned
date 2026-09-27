@@ -2288,18 +2288,26 @@ impl AgentLoop {
             );
             drop(conversation_guard);
 
-            // Update state if deleted range changed (re-use same lock scope)
+            // Update state if deleted range changed, then persist the
+            // range without holding the state guard across disk IO.
             if result.updated_conversation_history_deleted_range {
-                let mut state = self.state.lock().await;
-                let deleted_range = result.conversation_history_deleted_range;
-                state.conversation_history_deleted_range = deleted_range;
+                let (deleted_range, history_item) = {
+                    let mut state = self.state.lock().await;
+                    let deleted_range = result.conversation_history_deleted_range;
+                    state.conversation_history_deleted_range = deleted_range;
+                    let history_item = deleted_range.and_then(|_| {
+                        self.state_manager.as_ref().and_then(|state_manager| {
+                            state_manager.find_task_in_history(&self.config.task_id)
+                        })
+                    });
+                    (deleted_range, history_item)
+                };
 
                 // Persist deleted_range to HistoryItem for cross-session restoration (C1 fix part 1)
                 // Convert from (usize, usize) tuple to Vec<i32> for HistoryItem storage
-                if let Some(ref state_manager) = self.state_manager
-                    && let Some((start, end)) = deleted_range
-                    && let Some(mut history_item) =
-                        state_manager.find_task_in_history(&self.config.task_id)
+                if let Some((start, end)) = deleted_range
+                    && let Some(mut history_item) = history_item
+                    && let Some(ref state_manager) = self.state_manager
                 {
                     history_item.conversation_history_deleted_range =
                         Some(vec![start as i32, end as i32]);
@@ -5589,12 +5597,25 @@ impl AgentLoop {
     /// Save conversation history to disk if task storage is configured.
     async fn save_conversation_history(&self) {
         if let Some(ref storage) = self.deps.task_storage {
-            let mut state = self.state.lock().await;
-            state.turns_since_save += 1;
-            let persisted_usage = state
-                .last_api_req_info
-                .as_ref()
-                .map(crate::core::context::context_manager::PersistedApiReqInfo::from);
+            // Snapshot counters and usage under the guard, then release it:
+            // the metadata write takes a blocking file lock and performs
+            // disk IO that must never stall state readers or the UI.
+            let (persisted_usage, full_save, compacted_summary) = {
+                let mut state = self.state.lock().await;
+                state.turns_since_save += 1;
+                let full_save = state.turns_since_save >= 5;
+                if full_save {
+                    state.turns_since_save = 0;
+                }
+                (
+                    state
+                        .last_api_req_info
+                        .as_ref()
+                        .map(crate::core::context::context_manager::PersistedApiReqInfo::from),
+                    full_save,
+                    full_save.then(|| state.compacted_summary.clone()).flatten(),
+                )
+            };
 
             // Keep the latest usage available after short sessions too; only
             // conversation history remains debounced below.
@@ -5605,11 +5626,7 @@ impl AgentLoop {
             }
 
             // Debounce: only save every 5 turns to reduce I/O overhead
-            if state.turns_since_save >= 5 {
-                state.turns_since_save = 0;
-                let compacted_summary = state.compacted_summary.clone();
-                drop(state); // Drop state lock before acquiring history lock
-
+            if full_save {
                 let history = self.conversation_history.lock().await.clone();
                 if !history.is_empty()
                     && let Err(e) = storage.write_api_conversation_history_async(&history).await
@@ -5863,18 +5880,27 @@ impl AgentLoop {
     /// Clear compacted summary to allow re-compaction.
     /// Returns true if a summary was cleared, false if none existed.
     pub async fn clear_compacted_summary(&self) -> bool {
-        let mut state = self.state.lock().await;
-        if state.compacted_summary.is_some() {
-            state.compacted_summary = None;
-
+        // Snapshot under the guard, then run the blocking file removal
+        // without holding state.
+        let (had_summary, file_path) = {
+            let mut state = self.state.lock().await;
+            if state.compacted_summary.is_some() {
+                state.compacted_summary = None;
+                let file_path = self.deps.task_storage.as_ref().map(|storage| {
+                    storage
+                        .task_dir()
+                        .join(crate::storage::disk::GlobalFileNames::COMPACTED_SUMMARY)
+                });
+                (true, file_path)
+            } else {
+                (false, None)
+            }
+        };
+        if had_summary {
             // Also delete the file if task storage is configured
-            if let Some(ref storage) = self.deps.task_storage {
-                let file_path = storage
-                    .task_dir()
-                    .join(crate::storage::disk::GlobalFileNames::COMPACTED_SUMMARY);
+            if let Some(file_path) = file_path {
                 let _ = std::fs::remove_file(&file_path);
             }
-
             true
         } else {
             false
@@ -8065,6 +8091,82 @@ mod tests {
             rendered.iter().any(|line| line.contains("1 file created")),
             "applied content must count as created despite publication failure, got {rendered:?}"
         );
+    }
+
+    // The blocking metadata lock must not stall the runtime: a
+    // current-thread runtime would freeze its own timer behind the
+    // blocked worker, so this test needs multiple workers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_delayed_metadata_keeps_state_available() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let sned_dir = temp_dir.path().join(".sned");
+        let task_id = "delayed-metadata";
+        let task_storage =
+            crate::storage::task_storage::TaskStorage::new_with_dir(task_id, &sned_dir).unwrap();
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![],
+        )));
+        let agent =
+            AgentLoop::new(test_agent_config(provider, task_id)).with_task_storage(task_storage);
+
+        // Hold the task-directory lock from another thread so the metadata
+        // write inside the save blocks like slow disk access would.
+        let locker =
+            crate::storage::task_storage::TaskStorage::new_with_dir(task_id, &sned_dir).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let lock_thread = std::thread::spawn(move || {
+            let _ = locker.with_lock(|| {
+                let _ = held_tx.send(());
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Ok::<(), std::io::Error>(())
+            });
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("metadata lock must be held before saving");
+
+        // Prove the holder really owns the task lock the save will take.
+        let lock_path = sned_dir
+            .join("data")
+            .join("tasks")
+            .join(task_id)
+            .join(".lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("task lock file must exist");
+        assert!(
+            lock_file.try_lock().is_err(),
+            "task lock must be held by the background thread"
+        );
+
+        let state = agent.state.clone();
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let save = tokio::spawn(async move {
+            agent.save_conversation_history().await;
+            let _ = done_tx.send(());
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        match done_rx.try_recv() {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                panic!("save task ended without completing")
+            }
+            Ok(()) => panic!("save completed instead of blocking on the held lock"),
+        }
+        // State readers and the UI must not stall behind the blocked write.
+        // This try_lock fails while the state guard is held across the
+        // blocking metadata update.
+        assert!(
+            state.try_lock().is_ok(),
+            "task state must stay available while metadata persistence is delayed"
+        );
+        save.await
+            .expect("save must finish once the metadata lock is released");
+        lock_thread.join().expect("lock holder must exit");
     }
 
     #[tokio::test]
