@@ -4,6 +4,7 @@
 //! `dirac/src/core/task/tools/ToolExecutorCoordinator.ts`.
 
 pub mod definitions;
+pub mod execution;
 pub mod handlers;
 
 use std::collections::HashMap;

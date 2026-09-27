@@ -26,27 +26,22 @@ use crate::core::provider_retry::{
     DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES, RetryConfig, create_message_with_retry,
 };
 use crate::core::tools::SnedTool;
-use crate::core::tools::{
-    ToolContext, ToolFailureClass, ToolFailureMetadata, ToolPublicationOutcome, ToolRegistry,
-    ToolRequiredNextStep, coerce_command_array, coerce_string_array, tool_result_to_text,
-};
+use crate::core::tools::{ToolContext, ToolFailureClass, ToolRegistry, ToolRequiredNextStep};
 use crate::providers::{
-    ApiStreamChunk, ApiStreamToolCall, AssistantContentBlock, MessageContent, MessageRole,
-    Provider, ProviderRequest, RedactedThinkingBlock, SharedContentFields, StorageMessage,
-    TextContentBlock, ThinkingBlock, ToolResultContent, ToolResultContentBlock, ToolUseBlock,
-    UserContentBlock,
+    ApiStreamChunk, AssistantContentBlock, MessageContent, MessageRole, Provider, ProviderRequest,
+    RedactedThinkingBlock, SharedContentFields, StorageMessage, TextContentBlock, ThinkingBlock,
+    ToolResultContent, ToolResultContentBlock, ToolUseBlock, UserContentBlock,
 };
 use crate::providers::{ProviderError, Providers};
 use crate::storage::global_state::HistoryItem;
 use crate::storage::state_manager::StateManager;
 use crate::storage::task_storage::TaskStorage;
-use futures::future::FutureExt;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::hash::Hasher;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, mpsc};
@@ -91,9 +86,6 @@ fn truncated_debug_text(text: &str) -> String {
         text.to_string()
     }
 }
-/// Default concurrency limit for parallel non-grouped tool execution.
-/// Prevents I/O contention when many tools run simultaneously.
-const DEFAULT_TOOL_CONCURRENCY: usize = 12;
 /// Maximum number of times a single provider stream can be retried
 /// within one turn when the stream fails before any output is
 /// emitted. Without this cap, a provider returning repeated retryable
@@ -115,87 +107,14 @@ async fn wait_for_cancellation(flag: std::sync::Arc<std::sync::atomic::AtomicBoo
     }
 }
 
-#[derive(Debug, Clone)]
-struct ToolExecutionOutput {
-    text: String,
-    metadata: Option<ToolFailureMetadata>,
-    is_error: bool,
-    hook_context: Vec<String>,
-    publication_outcomes: Vec<ToolPublicationOutcome>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileActionPath {
-    normalized: String,
-    display: String,
-}
-
 fn stream_retry_delay(retry_attempt: usize) -> std::time::Duration {
     std::time::Duration::from_secs(1_u64 << retry_attempt.saturating_sub(1).min(2))
-}
-
-impl ToolExecutionOutput {
-    fn error(text: String, metadata: Option<ToolFailureMetadata>) -> Self {
-        Self {
-            text,
-            metadata,
-            is_error: true,
-            hook_context: Vec::new(),
-            publication_outcomes: Vec::new(),
-        }
-    }
-
-    fn success_with_hook_context(text: String, hook_context: Vec<String>) -> Self {
-        Self {
-            text,
-            metadata: None,
-            is_error: false,
-            hook_context,
-            publication_outcomes: Vec::new(),
-        }
-    }
-
-    fn error_with_hook_context(
-        text: String,
-        metadata: Option<ToolFailureMetadata>,
-        hook_context: Vec<String>,
-        publication_outcomes: Vec<ToolPublicationOutcome>,
-    ) -> Self {
-        Self {
-            text,
-            metadata,
-            is_error: true,
-            hook_context,
-            publication_outcomes,
-        }
-    }
-
-    fn cancelled_before_start() -> Self {
-        Self::error(
-            "Tool execution skipped: task was cancelled before the tool started".to_string(),
-            None,
-        )
-    }
-}
-
-/// Resolve a prepared but unstarted tool future. Cancellation observed here
-/// must not begin new work; an already-started future runs to completion so
-/// a file transaction is never dropped mid-application.
-async fn run_tool_unless_cancelled(
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    task: futures::future::BoxFuture<'static, ToolExecutionOutput>,
-) -> ToolExecutionOutput {
-    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-        ToolExecutionOutput::cancelled_before_start()
-    } else {
-        task.await
-    }
 }
 
 fn append_tool_result_blocks(
     blocks: &mut Vec<UserContentBlock>,
     tool_id: String,
-    result_output: ToolExecutionOutput,
+    result_output: crate::core::tools::execution::ToolExecutionOutput,
 ) {
     // Keep hook text beside its own result so per-tool context cannot be
     // mistaken for instructions belonging to a later parallel tool.
@@ -558,18 +477,6 @@ impl AgentLoopDeps {
         }
     }
 
-    fn registry(&self) -> &Arc<ToolRegistry> {
-        self.registry
-            .as_ref()
-            .expect("AgentLoopDeps: registry not initialized. Call with_tools() before run().")
-    }
-}
-
-struct PreparedToolCall {
-    tool_call: ApiStreamToolCall,
-    tool_id: String,
-    tool_name: String,
-    parsed_args: Result<serde_json::Value, String>,
 }
 
 /// A clonable handle for enqueuing messages into an AgentLoop from any task.
@@ -776,139 +683,9 @@ impl AgentLoop {
         })
     }
 
-    fn parse_tool_arguments(
-        tool_name: &str,
-        tool_id: &str,
-        raw_arguments: Option<&String>,
-    ) -> Result<serde_json::Value, String> {
-        let Some(raw) = raw_arguments else {
-            return Ok(serde_json::json!({}));
-        };
-        // Oversized arguments are never executable, no matter how valid the
-        // JSON looks after repair. Fail the call; the stream assembly below
-        // keeps draining so the protocol stays in sync.
-        if raw.len() > MAX_TOOL_ARGUMENT_SIZE {
-            let preview: String = raw.chars().take(200).collect();
-            tracing::error!(
-                tool_name = %tool_name,
-                tool_id = %tool_id,
-                args_len = raw.len(),
-                args_preview = %preview,
-                "tool call arguments exceed size limit; call will not execute"
-            );
-            return Err(format!(
-                "Tool '{tool_name}' arguments exceed the {MAX_TOOL_ARGUMENT_SIZE}-byte limit ({} bytes, id: {tool_id}) and were not executed. Please retry with smaller arguments. Rejected argument prefix: {preview}",
-                raw.len()
-            ));
-        }
-        // Treat empty string as no arguments (some providers send empty string instead of "{}")
-        if raw.trim().is_empty() {
-            return Ok(serde_json::json!({}));
-        }
-        match serde_json::from_str::<serde_json::Value>(raw) {
-            Ok(mut parsed) => {
-                if let Some(parse_error) = crate::providers::tool_arguments_error(&parsed) {
-                    return Err(format!(
-                        "Tool '{tool_name}' arguments could not be repaired as JSON (id: {tool_id}): {parse_error} Please retry the same tool call with valid JSON arguments."
-                    ));
-                }
-                let normalized = match tool_name {
-                    "execute_command" => {
-                        if let Some(raw) = parsed
-                            .get("commands")
-                            .and_then(serde_json::Value::as_str)
-                            .filter(|raw| raw.trim().starts_with("[\""))
-                        {
-                            let commands = crate::core::tools::parse_unambiguous_stringified_string_array(raw)
-                                .or_else(|| crate::core::tools::parse_relaxed_stringified_string_array(raw))
-                                .ok_or_else(|| format!(
-                                    "Tool '{tool_name}' arguments contain an ambiguous stringified 'commands' array (id: {tool_id}). Re-issue the tool call with a literal JSON array of command strings."
-                                ))?;
-                            parsed["commands"] = serde_json::json!(commands);
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    "edit_file" => crate::core::tools::handlers::edit_file::EditFileHandler::normalize_stringified_files_param(&mut parsed)
-                        .map_err(|error| format!("Tool '{tool_name}' arguments could not be normalized (id: {tool_id}): {error}"))?,
-                    _ => false,
-                };
-                if normalized {
-                    tracing::debug!(tool_name = %tool_name, tool_id = %tool_id, "normalized compatibility tool arguments");
-                }
-                Ok(parsed)
-            }
-            Err(err) => {
-                let preview: String = raw.chars().take(200).collect();
-                tracing::error!(
-                    tool_name = %tool_name,
-                    tool_id = %tool_id,
-                    error = %err,
-                    args_len = raw.len(),
-                    args_preview = %preview,
-                    "failed to parse tool call arguments JSON"
-                );
-                Err(format!(
-                    "Tool '{tool_name}' arguments were invalid JSON and could not be parsed (id: {tool_id}): {err}. Please retry with valid JSON arguments."
-                ))
-            }
-        }
-    }
-
-    fn prepare_tool_calls(
-        tool_call_order: &[String],
-        tool_calls_map: &mut HashMap<String, ApiStreamToolCall>,
-    ) -> Vec<PreparedToolCall> {
-        let mut prepared = Vec::with_capacity(tool_call_order.len());
-
-        for key in tool_call_order {
-            let Some(tool_call) = tool_calls_map.get_mut(key) else {
-                error!(
-                    "Tool call order mismatch: key '{}' not found in tool_calls_map. \
-                     This indicates a stream parsing bug.",
-                    key
-                );
-                continue;
-            };
-
-            if tool_call
-                .function
-                .id
-                .as_ref()
-                .is_none_or(std::string::String::is_empty)
-            {
-                let generated = ulid::Ulid::new().to_string();
-                tool_call.function.id = Some(generated);
-            }
-
-            let mut tool_call_clone = tool_call.clone();
-            let tool_id = tool_call_clone.function.id.take().unwrap_or_else(|| {
-                error!("Tool call ID is None after initialization, generating fallback");
-                ulid::Ulid::new().to_string()
-            });
-            let tool_name = tool_call_clone.function.name.take().unwrap_or_else(|| {
-                warn!("Tool call missing name, using 'unknown_tool'");
-                "unknown_tool".to_string()
-            });
-            let parsed_args = Self::parse_tool_arguments(
-                &tool_name,
-                &tool_id,
-                tool_call.function.arguments.as_ref(),
-            );
-
-            prepared.push(PreparedToolCall {
-                tool_call: tool_call_clone,
-                tool_id,
-                tool_name,
-                parsed_args,
-            });
-        }
-
-        prepared
-    }
-
-    fn assistant_tool_input(prepared: &PreparedToolCall) -> serde_json::Value {
+    fn assistant_tool_input(
+        prepared: &crate::core::tools::execution::PreparedToolCall,
+    ) -> serde_json::Value {
         match &prepared.parsed_args {
             Ok(value) => value.clone(),
             Err(_) => {
@@ -1389,7 +1166,7 @@ impl AgentLoop {
         tool: SnedTool,
         params: &serde_json::Value,
     ) {
-        let affected = Self::extract_action_path(tool, params);
+        let affected = crate::core::tools::execution::extract_action_path(tool, params);
         let mut guard = state.lock().await;
         if affected.is_empty() {
             guard.consecutive_reads.clear();
@@ -3031,7 +2808,10 @@ impl AgentLoop {
             tracing::debug!("");
         }
 
-        let prepared_tool_calls = Self::prepare_tool_calls(&tool_call_order, &mut tool_calls_map);
+        let prepared_tool_calls = crate::core::tools::execution::prepare_tool_calls(
+            &tool_call_order,
+            &mut tool_calls_map,
+        );
 
         // Discover applicable rules before any tool-path-related early return.
         // A second pass after execution below catches AGENTS.md files created
@@ -3285,646 +3065,48 @@ impl AgentLoop {
                 }
             }
 
-            let hook_manager_handle = self.deps.hook_manager.clone();
-            let config_handle = self.config.clone();
-
-            // Phase 1: Pre-process all tools (check plan mode, approval, resolve handlers)
-            // This is done sequentially since approval may require user interaction
-            type ToolTask = (
-                String,
-                String,
-                Option<ToolExecutionOutput>,
-                Option<futures::future::BoxFuture<'static, ToolExecutionOutput>>,
-                Vec<FileActionPath>,
-                serde_json::Value,
-            );
-            let mut tool_tasks: Vec<ToolTask> = Vec::with_capacity(prepared_tool_calls.len());
-
-            for prepared in &prepared_tool_calls {
-                let tool_name = prepared.tool_name.clone();
-                tracing::debug!(tool = %tool_name, "preparing tool execution");
-
-                // Skip tool calls with empty names (malformed provider response)
-                if tool_name.is_empty() {
-                    tracing::warn!("received tool call with empty name, skipping");
-                    continue;
-                }
-
-                // Read-warning decay runs after execution, not here: a
-                // denied or malformed call must not erase warning history
-                // for files it never touched.
-                let tool_id = prepared.tool_id.clone();
-                let tool_params = match &prepared.parsed_args {
-                    Ok(params) => params.clone(),
-                    Err(parse_error) => {
-                        tool_tasks.push((
-                            tool_id,
-                            tool_name,
-                            Some(ToolExecutionOutput::error(parse_error.clone(), None)),
-                            None,
-                            vec![],
-                            serde_json::Value::Null,
-                        ));
-                        continue;
-                    }
-                };
-
-                // A write/edit generated without the applicable nested rules
-                // must not run under an incomplete prompt. The rules have now
-                // been loaded, so return a retryable tool result and let the
-                // next provider request make the informed decision.
-                if scoped_rules_added && Self::is_mutating_file_tool(&tool_name) {
-                    tracing::debug!(
-                        tool = %tool_name,
-                        "deferred mutating file tool until scoped AGENTS.md rules are visible"
-                    );
-                    tool_tasks.push((
-                        tool_id,
-                        tool_name,
-                        Some(ToolExecutionOutput::error(
-                            "Scoped AGENTS.md rules were loaded for this path. Retry the file operation so the updated instructions are applied.".to_string(),
-                            None,
-                        )),
-                        None,
-                        vec![],
-                        tool_params,
-                    ));
-                    continue;
-                }
-
-                let immediate_output = if let Some(tool) = SnedTool::from_name(&tool_name) {
-                    // Reject tools that are not in the active profile so the model
-                    // cannot call tools its current profile has filtered out.
-                    let profile_denied = self
+            // Bind the cancellation flag in its own statement: a guard
+            // taken inside the inputs literal below would live across the
+            // batch await and deadlock the state lock it was read from.
+            let cancelled = self.state.lock().await.is_cancelled_atomic.clone();
+            let batch_output = crate::core::tools::execution::execute_tool_batch(
+                &prepared_tool_calls,
+                crate::core::tools::execution::ToolBatchInputs {
+                    mode: self.config.mode,
+                    state: self.state.clone(),
+                    tool_profile: self.deps.tool_profile,
+                    registry: self.deps.registry.clone(),
+                    approval_manager: self.deps.approval_manager.clone(),
+                    output_writer: self.config.output_writer.clone(),
+                    interactive_mode: self.config.interactive_mode,
+                    tool_context: tool_context.clone(),
+                    hook_manager: self.deps.hook_manager.clone(),
+                    config: self.config.clone(),
+                    conversation_history: self.conversation_history.clone(),
+                    task_storage: self.deps.task_storage.clone().map(Arc::new),
+                    scoped_rules_added,
+                    parallel_enabled: self
                         .deps
-                        .tool_profile
-                        .is_some_and(|p| !p.tools().contains(&tool));
-
-                    // Check plan mode restrictions
-                    let is_restricted = if self.config.mode == AgentMode::Plan {
-                        tracing::debug!(tool = %tool_name, "checking plan-mode restriction");
-                        let state = self.state.lock().await;
-                        state.strict_plan_mode_enabled && Self::is_plan_mode_restricted(tool)
-                    } else {
-                        false
-                    };
-
-                    if profile_denied {
-                        ToolExecutionOutput::error(
-                            format!(
-                                "Tool '{tool_name}' is not available in the current tool profile. Use one of the tools listed for this turn."
-                            ),
-                            None,
-                        )
-                    } else if is_restricted {
-                        ToolExecutionOutput::error(
-                            format!(
-                                "Tool '{tool_name}' is not available in PLAN MODE. This tool is restricted to ACT MODE for file modifications. Only use tools available for PLAN MODE when in that mode."
-                            ),
-                            None,
-                        )
-                    } else if let Some(handler) = self.deps.registry().get_handler(&tool) {
-                        // Check approval with per-path resolution (ported from autoApprove.ts:126-180)
-                        //
-                        // Key semantics matching TypeScript source:
-                        //   shouldAutoApprove = isYolo || (isSafe && autoApproveEnabled)
-                        // Safety gates auto-approval, NEVER post-approval execution.
-                        // Once the user approves at the prompt, the command always runs.
-                        // For execute_command: if auto-approved but command is unsafe,
-                        // force a prompt so the user can review.
-                        let action_paths = Self::extract_action_path(tool, &tool_params);
-                        let external_directories = Self::external_action_directories(
-                            tool,
-                            &tool_context.workspace_root,
-                            &action_paths,
-                        );
-                        let params_fingerprint = Self::tool_params_fingerprint(&tool_params);
-                        tracing::debug!(tool = %tool_name, "checking prior tool denial");
-                        let previously_denied = {
-                            let state = self.state.lock().await;
-                            state
-                                .is_denied_tool_action(&tool_name, &params_fingerprint)
-                                .is_some()
-                        };
-                        if previously_denied {
-                            ToolExecutionOutput::error(
-                                format!(
-                                    "Tool '{tool_name}' was already denied for this exact request. Ask the user before retrying the same action."
-                                ),
-                                Some(ToolFailureMetadata {
-                                    class: ToolFailureClass::ApprovalDenied,
-                                    affected_paths: action_paths.clone(),
-                                    required_next_step: Some(ToolRequiredNextStep::AskUser),
-                                }),
-                            )
-                        } else {
-                            let mut user_prompted = false;
-                            let mut session_command_scope_approved = false;
-                            let mut allowed_external_roots = Vec::new();
-                            let command_scopes = (tool_name == "execute_command")
-                                .then(|| {
-                                    crate::core::approval::command_approval_scopes(&tool_params)
-                                })
-                                .flatten();
-                            let approval_result = if let Some(ref approval_mgr) =
-                                self.deps.approval_manager
-                            {
-                                tracing::debug!(tool = %tool_name, "waiting for approval manager");
-                                let mgr = approval_mgr.lock().await;
-                                tracing::debug!(tool = %tool_name, "acquired approval manager");
-                                allowed_external_roots = mgr.external_directory_grants_for(
-                                    tool.category(),
-                                    &external_directories,
-                                );
-                                let external_needs_prompt = !external_directories.is_empty()
-                                    && !mgr.external_directories_are_granted(
-                                        tool.category(),
-                                        &external_directories,
-                                    );
-                                // Check if any action paths require prompting
-                                let needs_prompt = if external_needs_prompt {
-                                    true
-                                } else if action_paths.is_empty() {
-                                    if tool_name == "execute_command" {
-                                        session_command_scope_approved =
-                                            command_scopes.as_ref().is_some_and(|scopes| {
-                                                mgr.command_scopes_are_approved(scopes)
-                                            });
-                                        !session_command_scope_approved
-                                            && mgr.should_prompt(
-                                                tool,
-                                                Some(params_fingerprint.as_str()),
-                                            )
-                                    } else {
-                                        mgr.should_prompt(tool, None)
-                                    }
-                                } else {
-                                    // Has paths: check per-path approval
-                                    action_paths.iter().any(|p| {
-                                        mgr.should_prompt_with_path(tool, Some(p.as_str()))
-                                    })
-                                };
-                                if needs_prompt {
-                                    drop(mgr); // Drop lock before async call
-                                    user_prompted = true;
-                                    let approval = if external_needs_prompt {
-                                        crate::core::approval::prompt_for_external_directory_approval_async(
-                                            &tool_name,
-                                            &tool_params,
-                                            external_directories.clone(),
-                                            self.config.output_writer.clone(),
-                                            Some(tool_context.workspace_root.clone()),
-                                        )
-                                        .await
-                                    } else {
-                                        crate::core::approval::prompt_for_approval_async_in_workspace(
-                                            &tool_name,
-                                            &tool_params,
-                                            self.config.output_writer.clone(),
-                                            Some(tool_context.workspace_root.clone()),
-                                        )
-                                        .await
-                                    };
-                                    match approval {
-                                        Ok(crate::core::approval::ApprovalResult::Denied) => {
-                                            let mut state = self.state.lock().await;
-                                            let is_subagent = state.is_subagent_execution;
-                                            state.record_denied_tool_action(
-                                                crate::core::agent_types::DeniedToolAction {
-                                                    tool_name: tool_name.clone(),
-                                                    action_paths: action_paths.clone(),
-                                                    params_fingerprint: params_fingerprint.clone(),
-                                                },
-                                            );
-                                            Some(ToolExecutionOutput::error(
-                                                crate::core::approval::format_denial_message_with_context(
-                                                    &tool_name,
-                                                    is_subagent,
-                                                ),
-                                                Some(ToolFailureMetadata {
-                                                    class: ToolFailureClass::ApprovalDenied,
-                                                    affected_paths: action_paths.clone(),
-                                                    required_next_step: Some(
-                                                        ToolRequiredNextStep::AskUser,
-                                                    ),
-                                                }),
-                                            ))
-                                        }
-                                        Ok(crate::core::approval::ApprovalResult::Always) => {
-                                            if let Some(ref am) = self.deps.approval_manager {
-                                                let mut mgr = am.lock().await;
-                                                if tool_name == "execute_command" {
-                                                    mgr.auto_approve_command(
-                                                        &params_fingerprint,
-                                                        command_scopes.as_deref(),
-                                                    );
-                                                } else {
-                                                    mgr.auto_approve(tool, None);
-                                                }
-                                            }
-                                            None // Proceed to execute
-                                        }
-                                        Ok(
-                                            crate::core::approval::ApprovalResult::AllowExternalDirectory,
-                                        ) => {
-                                            if let Some(ref am) = self.deps.approval_manager {
-                                                let mut mgr = am.lock().await;
-                                                if let Some(error) = external_directories.iter().find_map(|directory| {
-                                                    mgr.grant_external_directory(directory, tool.category()).err()
-                                                }) {
-                                                    Some(ToolExecutionOutput::error(
-                                                        format!("Could not authorize external directory: {error}"),
-                                                        None,
-                                                    ))
-                                                } else {
-                                                    allowed_external_roots = mgr.external_directory_grants_for(
-                                                        tool.category(),
-                                                        &external_directories,
-                                                    );
-                                                    None
-                                                }
-                                            } else {
-                                                Some(ToolExecutionOutput::error(
-                                                    "External directory approval is unavailable for this task".to_string(),
-                                                    None,
-                                                ))
-                                            }
-                                        }
-                                        Ok(crate::core::approval::ApprovalResult::Approved) => {
-                                            allowed_external_roots = external_directories.clone();
-                                            None // Proceed to execute
-                                        }
-                                        Err(e) => Some(ToolExecutionOutput::error(
-                                            crate::core::approval::format_approval_error(
-                                                Some(&tool_name),
-                                                &e,
-                                            ),
-                                            None,
-                                        )),
-                                    }
-                                } else if tool_name == "execute_command" {
-                                    // Auto-approved path for execute_command: check command
-                                    // safety before auto-approving. If the command is
-                                    // unsafe, prompt the user instead (matching TS:
-                                    // shouldAutoApprove = isSafe && autoApproveEnabled).
-                                    let commands = coerce_command_array(&tool_params);
-                                    let script = tool_params.get("script").and_then(|s| s.as_str());
-                                    let yolo = mgr.is_yolo_mode();
-                                    let user_safe = mgr.get_user_safe_commands().clone();
-                                    let checker =
-                                        crate::core::approval::CommandSafetyChecker::new()
-                                            .with_yolo(yolo)
-                                            .with_user_safe_commands(user_safe);
-                                    let any_unsafe = if session_command_scope_approved {
-                                        commands.iter().any(|cmd| {
-                                            !cmd.is_empty()
-                                                && checker
-                                                    .is_structurally_safe_for_scope(cmd)
-                                                    .is_err()
-                                        }) || script.is_some_and(|s| {
-                                            checker.is_structurally_safe_for_scope(s).is_err()
-                                        })
-                                    } else {
-                                        commands.iter().any(|cmd| {
-                                            !cmd.is_empty() && checker.is_safe(cmd).is_err()
-                                        }) || script.is_some_and(|s| checker.is_safe(s).is_err())
-                                    };
-                                    if any_unsafe {
-                                        // In non-interactive mode, deny unsafe commands directly
-                                        // (no TUI available to prompt the user).
-                                        if !self.config.interactive_mode {
-                                            let mut state = self.state.lock().await;
-                                            let is_subagent = state.is_subagent_execution;
-                                            state.record_denied_tool_action(
-                                                crate::core::agent_types::DeniedToolAction {
-                                                    tool_name: tool_name.clone(),
-                                                    action_paths: action_paths.clone(),
-                                                    params_fingerprint: params_fingerprint.clone(),
-                                                },
-                                            );
-                                            Some(ToolExecutionOutput::error(
-                                                crate::core::approval::format_denial_message_with_context(
-                                                    &tool_name,
-                                                    is_subagent,
-                                                ),
-                                                Some(ToolFailureMetadata {
-                                                    class: ToolFailureClass::ApprovalDenied,
-                                                    affected_paths: action_paths.clone(),
-                                                    required_next_step: Some(
-                                                        ToolRequiredNextStep::AskUser,
-                                                    ),
-                                                }),
-                                            ))
-                                        } else {
-                                            drop(mgr);
-                                            user_prompted = true;
-                                            match crate::core::approval::prompt_for_approval_async_in_workspace(
-                                                &tool_name,
-                                                &tool_params,
-                                                self.config.output_writer.clone(),
-                                                Some(tool_context.workspace_root.clone()),
-                                            )
-                                            .await
-                                            {
-                                                Ok(
-                                                    crate::core::approval::ApprovalResult::Denied,
-                                                ) => {
-                                                    let mut state = self.state.lock().await;
-                                                    let is_subagent = state.is_subagent_execution;
-                                                    state.record_denied_tool_action(
-                                                        crate::core::agent_types::DeniedToolAction {
-                                                            tool_name: tool_name.clone(),
-                                                            action_paths: action_paths.clone(),
-                                                            params_fingerprint: params_fingerprint
-                                                                .clone(),
-                                                        },
-                                                    );
-                                                    Some(ToolExecutionOutput::error(
-                                                        crate::core::approval::format_denial_message_with_context(
-                                                            &tool_name,
-                                                            is_subagent,
-                                                        ),
-                                                        Some(ToolFailureMetadata {
-                                                            class: ToolFailureClass::ApprovalDenied,
-                                                            affected_paths: action_paths.clone(),
-                                                            required_next_step: Some(
-                                                                ToolRequiredNextStep::AskUser,
-                                                            ),
-                                                        }),
-                                                    ))
-                                                }
-                                                Ok(
-                                                    crate::core::approval::ApprovalResult::Always,
-                                                ) => {
-                                                    if let Some(ref am) = self.deps.approval_manager
-                                                    {
-                                                        let mut mgr = am.lock().await;
-                                                        mgr.auto_approve_command(
-                                                            &params_fingerprint,
-                                                            command_scopes.as_deref(),
-                                                        );
-                                                    }
-                                                    None
-                                                }
-                                                Ok(
-                                                    crate::core::approval::ApprovalResult::AllowExternalDirectory,
-                                                ) => Some(ToolExecutionOutput::error(
-                                                    "External directory access does not apply to execute_command"
-                                                        .to_string(),
-                                                    None,
-                                                )),
-                                                Ok(
-                                                    crate::core::approval::ApprovalResult::Approved,
-                                                ) => None,
-                                                Err(e) => Some(ToolExecutionOutput::error(
-                                                    crate::core::approval::format_approval_error(
-                                                        Some(&tool_name),
-                                                        &e,
-                                                    ),
-                                                    None,
-                                                )),
-                                            }
-                                        }
-                                    } else {
-                                        None // Safe command, auto-approve proceeds
-                                    }
-                                } else {
-                                    None // No approval needed
-                                }
-                            } else {
-                                None // No approval manager configured
-                            };
-
-                            if let Some(denied_text) = approval_result {
-                                tracing::debug!(tool = %tool_name, "tool execution denied by approval");
-                                denied_text
-                            } else {
-                                // Prompt approval already performed the safety review that the
-                                // handler otherwise applies to an auto-approved command.
-                                let mut tool_context = (*tool_context).clone();
-                                tool_context.explicitly_approved = user_prompted;
-                                tool_context.allowed_external_roots = allowed_external_roots;
-                                tool_context.session_command_scope_approved =
-                                    session_command_scope_approved;
-                                let tool_context = Arc::new(tool_context);
-                                let hook_manager = hook_manager_handle.clone();
-                                let config = config_handle.clone();
-                                let handler = handler.clone();
-                                let tool_name = tool_name.clone();
-                                let tool_params = tool_params.clone();
-                                let task_storage = self.deps.task_storage.clone().map(Arc::new);
-                                let edit_file_paths =
-                                    if tool_name == "edit_file" || tool_name == "write_to_file" {
-                                        Self::extract_file_action_path(
-                                            &tool_name,
-                                            &tool_params,
-                                            &tool_context.workspace_root,
-                                        )
-                                    } else {
-                                        vec![]
-                                    };
-
-                                // Condense reads the current history while the tool runs.
-                                let conversation_history = self.conversation_history.clone();
-
-                                let tool_params_for_task = tool_params.clone();
-                                tool_tasks.push((
-                                    tool_id,
-                                    tool_name.clone(),
-                                    None,
-                                    Some(
-                                        async move {
-                                            let params_text = tool_params.to_string();
-                                            tracing::debug!(
-                                                tool = %tool_name,
-                                                params_len = params_text.len(),
-                                                params_preview = %&params_text[..params_text.floor_char_boundary(params_text.len().min(1024))],
-                                                "executing tool"
-                                            );
-                                            let result = Self::execute_tool_with_hooks_internal(
-                                                &config,
-                                                hook_manager,
-                                                tool_context,
-                                                &tool_name,
-                                                &tool_params,
-                                                handler,
-                                                task_storage,
-                                                conversation_history,
-                                            )
-                                            .await;
-                                            tracing::debug!(
-                                                tool = %tool_name,
-                                                result_len = result.text.len(),
-                                                "tool execution complete"
-                                            );
-                                            result
-                                        }
-                                        .boxed(),
-                                    ),
-                                    edit_file_paths,
-                                    tool_params_for_task,
-                                ));
-                                continue;
-                            }
-                        }
-                    } else {
-                        tracing::warn!(tool = %tool_name, "tool handler not implemented");
-                        ToolExecutionOutput::error(
-                            format!("Tool execution for '{tool_name}' not yet implemented"),
-                            None,
-                        )
-                    }
-                } else {
-                    tracing::warn!(tool = %tool_name, "unknown tool requested");
-                    // Surface only the tools in the active profile so the model
-                    // does not hallucinate names from tools it cannot actually call.
-                    let active_profile = self
-                        .deps
-                        .tool_profile
-                        .unwrap_or(crate::core::tools::definitions::ToolProfile::Full);
-                    let available =
-                        crate::core::tools::definitions::get_tool_definitions_for_profile(
-                            active_profile,
-                        )
-                        .iter()
-                        .map(|t| t.function.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    ToolExecutionOutput::error(
-                        format!("Unknown tool: '{tool_name}'. Available tools: {available}"),
-                        None,
-                    )
-                };
-
-                tool_tasks.push((
-                    tool_id,
-                    tool_name,
-                    Some(immediate_output),
-                    None,
-                    vec![],
-                    tool_params,
-                ));
-            }
-
-            let parallel_enabled = self
-                .deps
-                .system_prompt_context
-                .as_ref()
-                .is_some_and(|context| context.enable_parallel_tool_calling);
-            {
-                let mut state = self.state.lock().await;
-                let batch = tool_tasks.len() as u32;
-                state.turn_tool_calls = state.turn_tool_calls.saturating_add(batch);
-                state.cumulative_tool_calls = state.cumulative_tool_calls.saturating_add(batch);
-            }
-            let mut result_map: std::collections::HashMap<usize, ToolExecutionOutput> =
-                std::collections::HashMap::with_capacity(tool_tasks.len());
-            let task_cancelled = self.state.lock().await.is_cancelled_atomic.clone();
-            if !parallel_enabled {
-                for (i, (_, _, _, task, _, _)) in tool_tasks.iter_mut().enumerate() {
-                    if let Some(future) = task.take() {
-                        result_map.insert(
-                            i,
-                            run_tool_unless_cancelled(task_cancelled.clone(), future).await,
-                        );
-                    }
-                }
-            }
-
-            // Mutating and unknown-effect tools run as barriers in provider
-            // order; read-only tools between two barriers form one bounded
-            // batch. Path-overlap grouping cannot order a write against a
-            // later validation command or symbol edit, so every barrier
-            // drains the pending reads before it starts.
-            if parallel_enabled {
-                use futures::{FutureExt, StreamExt};
-                type IndexedToolFuture =
-                    futures::future::BoxFuture<'static, (usize, ToolExecutionOutput)>;
-                let mut read_batch: Vec<IndexedToolFuture> = Vec::new();
-                for (i, (_, tool_name, _, task, _, _)) in tool_tasks.iter_mut().enumerate() {
-                    let Some(future) = task.take() else {
-                        continue;
-                    };
-                    if Self::tool_is_schedulable_read(tool_name) {
-                        let gated =
-                            run_tool_unless_cancelled(task_cancelled.clone(), future).boxed();
-                        read_batch.push(
-                            async move {
-                                let result = gated.await;
-                                (i, result)
-                            }
-                            .boxed(),
-                        );
-                        continue;
-                    }
-                    if !read_batch.is_empty() {
-                        let batch = std::mem::take(&mut read_batch);
-                        for (j, result) in futures::stream::iter(batch)
-                            .buffered(DEFAULT_TOOL_CONCURRENCY)
-                            .collect::<Vec<_>>()
-                            .await
-                        {
-                            result_map.insert(j, result);
-                        }
-                    }
-                    result_map.insert(
-                        i,
-                        run_tool_unless_cancelled(task_cancelled.clone(), future).await,
-                    );
-                }
-                if !read_batch.is_empty() {
-                    for (j, result) in futures::stream::iter(read_batch)
-                        .buffered(DEFAULT_TOOL_CONCURRENCY)
-                        .collect::<Vec<_>>()
-                        .await
-                    {
-                        result_map.insert(j, result);
-                    }
-                }
-            }
-
-            // One outcome per prepared call, immediate or executed: preflight
-            // failures (denied, malformed, unknown, deferred) participate
-            // before any statistics, completion, or plan decision. This must
-            // run before result_map is drained below.
-            let mut unified_failure_count = 0usize;
-            let mut unified_called = false;
-            for (index, (_, _, immediate, _, _, _)) in tool_tasks.iter().enumerate() {
-                if let Some(output) = immediate {
-                    unified_called = true;
-                    unified_failure_count += usize::from(output.is_error);
-                } else if let Some(output) = result_map.get(&index) {
-                    unified_called = true;
-                    unified_failure_count += usize::from(output.is_error);
-                } else {
-                    // A prepared call with no outcome at all: fail closed,
-                    // matching the fabricated execution error Phase 3 pairs.
-                    unified_called = true;
-                    unified_failure_count += 1;
-                }
-            }
+                        .system_prompt_context
+                        .as_ref()
+                        .is_some_and(|context| context.enable_parallel_tool_calling),
+                    cancelled,
+                },
+            )
+            .await;
             // Track tool execution statistics for consecutive_mistakes tracking
-            let tools_called = unified_called;
-            tool_failure_count = unified_failure_count;
-
-            let execution_results: Vec<ToolExecutionOutput> = (0..tool_tasks.len())
-                .filter_map(|i| result_map.remove(&i))
-                .collect();
+            let tools_called = batch_output.tools_called;
+            tool_failure_count = batch_output.tool_failure_count;
 
             // Phase 3: Collect results in order, then push as ONE StorageMessage
-            let mut execution_results_iter = execution_results.into_iter();
             let mut tool_result_blocks: Vec<UserContentBlock> = Vec::new();
-            for (tool_id, tool_name, immediate_result_text, _task, edit_file_path, tool_params) in
-                tool_tasks
-            {
-                let executed = immediate_result_text.is_none();
-                let mut result_output = if let Some(result_text) = immediate_result_text {
-                    result_text
-                } else {
-                    execution_results_iter.next().unwrap_or_else(|| {
-                        ToolExecutionOutput::error("Tool execution failed".to_string(), None)
-                    })
-                };
+            for outcome in batch_output.outcomes {
+                let tool_id = outcome.tool_id;
+                let tool_name = outcome.tool_name;
+                let tool_params = outcome.tool_params;
+                let edit_file_path = outcome.edit_file_paths;
+                let executed = outcome.executed;
+                let mut result_output = outcome.output;
 
                 if tool_name == "execute_command" {
                     Self::invalidate_changed_read_state(&self.state).await;
@@ -3963,7 +3145,12 @@ impl AgentLoop {
                 if content_changed && let Some(tool) = SnedTool::from_name(&tool_name) {
                     match tool {
                         SnedTool::WriteToFile => {
-                            files_created.extend(Self::extract_action_path(tool, &tool_params));
+                            files_created.extend(
+                                crate::core::tools::execution::extract_action_path(
+                                    tool,
+                                    &tool_params,
+                                ),
+                            );
                         }
                         SnedTool::EditFile => {
                             let (_, added, removed) =
@@ -3975,8 +3162,12 @@ impl AgentLoop {
                             }
                         }
                         SnedTool::ReplaceSymbol | SnedTool::RenameSymbol => {
-                            symbol_edited_paths
-                                .extend(Self::extract_action_path(tool, &tool_params));
+                            symbol_edited_paths.extend(
+                                crate::core::tools::execution::extract_action_path(
+                                    tool,
+                                    &tool_params,
+                                ),
+                            );
                         }
                         _ => {}
                     }
@@ -4718,59 +3909,6 @@ impl AgentLoop {
         if id.is_empty() { None } else { Some(id) }
     }
 
-    /// Check if a tool is restricted in plan mode.
-    fn is_plan_mode_restricted(tool: SnedTool) -> bool {
-        matches!(tool, SnedTool::WriteToFile | SnedTool::EditFile)
-    }
-
-    /// Extract the first action path from tool params for per-path approval.
-    ///
-    /// Each tool extracts paths differently:
-    /// - ReadFile/SearchFiles/ListFiles: `params.paths` (string or string[])
-    /// - WriteToFile: `params.path` (single string)
-    /// - EditFile: `params.files[0].path`
-    /// - ReplaceSymbol: `params.path` or `params.replacements[0].path`
-    /// - RenameSymbol: `params.paths[0]`
-    /// - GetFileSkeleton/FindSymbolReferences/DiagnosticsScan: `params.path`
-    fn extract_action_path(tool: SnedTool, params: &serde_json::Value) -> Vec<String> {
-        match tool {
-            SnedTool::ReadFile
-            | SnedTool::GetFileSkeleton
-            | SnedTool::FindSymbolReferences
-            | SnedTool::DiagnosticsScan
-            | SnedTool::RenameSymbol => coerce_string_array(params, "paths", "path"),
-            SnedTool::WriteToFile
-            | SnedTool::SearchFiles
-            | SnedTool::ListFiles
-            | SnedTool::GetFunction => params
-                .get("path")
-                .and_then(|p| p.as_str())
-                .map(|s| vec![String::from(s)])
-                .unwrap_or_default(),
-            SnedTool::EditFile => {
-                crate::core::tools::handlers::edit_file::EditFileHandler::requested_paths_for_locking(params)
-            }
-            SnedTool::ReplaceSymbol => {
-                if let Some(s) = params.get("path").and_then(|p| p.as_str()) {
-                    vec![String::from(s)]
-                } else {
-                    params
-                        .get("replacements")
-                        .and_then(|r| r.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|r| r.get("path"))
-                                .filter_map(|p| p.as_str())
-                                .map(String::from)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                }
-            }
-            _ => vec![],
-        }
-    }
-
     /// Shadow-commit message for a turn's actual workspace mutations, or
     /// `None` when nothing committable happened. Takes only executed
     /// outcomes, never the presentation mode: JSON versus TTY changes
@@ -4799,21 +3937,6 @@ impl AgentLoop {
         Some(format!("[sned] turn: {}", parts.join("; ")))
     }
 
-    /// Load AGENTS.md files for explicit file-oriented tool targets so the
-    /// following provider request sees the rules governing the work just
-    /// inspected or changed.
-    fn is_mutating_file_tool(tool_name: &str) -> bool {
-        matches!(
-            SnedTool::from_name(tool_name),
-            Some(
-                SnedTool::WriteToFile
-                    | SnedTool::EditFile
-                    | SnedTool::ReplaceSymbol
-                    | SnedTool::RenameSymbol
-            )
-        )
-    }
-
     /// Whether a tool can modify the workspace and therefore needs a rollback
     /// checkpoint before it starts. Read-only tools must never wait for a full
     /// workspace Git snapshot.
@@ -4822,24 +3945,13 @@ impl AgentLoop {
             || matches!(tool, SnedTool::ExecuteCommand | SnedTool::UseSubagents)
     }
 
-    /// Whether a parallel-scheduled call may run inside a read-only batch.
-    /// Only tools categorized as read-only qualify; unknown names fail
-    /// closed to barrier so an unrecognized mutation cannot slip into a
-    /// concurrent batch.
-    fn tool_is_schedulable_read(tool_name: &str) -> bool {
-        SnedTool::from_name(tool_name).is_some_and(|tool| {
-            matches!(
-                tool.category(),
-                crate::core::tools::ToolCategory::ReadOnly
-                    | crate::core::tools::ToolCategory::ReadFiles
-            )
-        })
-    }
-
+    /// Load AGENTS.md files for explicit file-oriented tool targets so the
+    /// following provider request sees the rules governing the work just
+    /// inspected or changed.
     fn discover_agents_rules_for_tool_calls(
         &mut self,
         workspace_root: &Path,
-        prepared_tool_calls: &[PreparedToolCall],
+        prepared_tool_calls: &[crate::core::tools::execution::PreparedToolCall],
     ) -> bool {
         let mut targets = HashSet::new();
         for prepared in prepared_tool_calls {
@@ -4849,7 +3961,9 @@ impl AgentLoop {
             let Ok(params) = &prepared.parsed_args else {
                 continue;
             };
-            targets.extend(Self::extract_action_path(tool, params));
+            targets.extend(crate::core::tools::execution::extract_action_path(
+                tool, params,
+            ));
         }
         if targets.is_empty() {
             return false;
@@ -4925,53 +4039,6 @@ impl AgentLoop {
         true
     }
 
-    fn external_action_directories(
-        tool: SnedTool,
-        workspace_root: &std::path::Path,
-        action_paths: &[String],
-    ) -> Vec<PathBuf> {
-        if !matches!(
-            tool.category(),
-            crate::core::tools::ToolCategory::ReadFiles
-                | crate::core::tools::ToolCategory::EditFiles
-        ) {
-            return Vec::new();
-        }
-
-        let mut directories = action_paths
-            .iter()
-            .filter(|path| {
-                let path = std::path::Path::new(path);
-                path.is_absolute() && !path.starts_with(workspace_root)
-            })
-            .filter_map(|path| crate::core::approval::external_directory_for_path(path))
-            .collect::<Vec<_>>();
-        directories.sort();
-        directories.dedup();
-        directories
-    }
-
-    fn canonicalize_tool_params(value: &serde_json::Value) -> serde_json::Value {
-        match value {
-            serde_json::Value::Object(map) => {
-                let ordered: std::collections::BTreeMap<_, _> = map
-                    .iter()
-                    .map(|(key, value)| (key.clone(), Self::canonicalize_tool_params(value)))
-                    .collect();
-                serde_json::Value::Object(ordered.into_iter().collect())
-            }
-            serde_json::Value::Array(items) => {
-                serde_json::Value::Array(items.iter().map(Self::canonicalize_tool_params).collect())
-            }
-            other => other.clone(),
-        }
-    }
-
-    fn tool_params_fingerprint(params: &serde_json::Value) -> String {
-        serde_json::to_string(&Self::canonicalize_tool_params(params))
-            .unwrap_or_else(|_| params.to_string())
-    }
-
     fn reread_recovery_hint(state: &TaskState) -> Option<String> {
         if state.must_reread_before_edit.is_empty() {
             return None;
@@ -4984,184 +4051,6 @@ impl AgentLoop {
         Some(format!(
             "[system] Before using edit_file again, refresh the stale path(s): {listed}{suffix}. Use read_file for the full file. A symbol-scoped read of just the surrounding definition can also refresh only the relevant anchors when one is available."
         ))
-    }
-
-    fn extract_file_action_path(
-        tool_name: &str,
-        params: &serde_json::Value,
-        workspace_root: &std::path::Path,
-    ) -> Vec<FileActionPath> {
-        let requested_paths = match tool_name {
-            "edit_file" => {
-                let Some(files) = params.get("files").and_then(|files| files.as_array()) else {
-                    return vec![];
-                };
-                let fallback = params.get("path").and_then(|path| path.as_str());
-                let use_fallback = fallback.is_some()
-                    && !files.is_empty()
-                    && files
-                        .iter()
-                        .all(|file| file.get("path").is_none() && file.get("edits").is_some());
-
-                files
-                    .iter()
-                    .filter_map(|file| {
-                        if use_fallback {
-                            return fallback.map(String::from);
-                        }
-                        match file.get("path") {
-                            Some(path) => path.as_str().map(String::from),
-                            None => file
-                                .get("edits")
-                                .and_then(|edits| edits.as_array())
-                                .and_then(|edits| edits.first())
-                                .and_then(|edit| edit.get("path"))
-                                .and_then(|path| path.as_str())
-                                .map(String::from),
-                        }
-                    })
-                    .collect()
-            }
-            "write_to_file" => params
-                .get("path")
-                .and_then(|path| path.as_str())
-                .map(|path| vec![String::from(path)])
-                .unwrap_or_default(),
-            _ => return vec![],
-        };
-
-        let mut seen = std::collections::HashSet::with_capacity(requested_paths.len());
-        requested_paths
-            .into_iter()
-            .filter_map(|display| {
-                let normalized =
-                    crate::core::tools::resolve_sanitized_path(workspace_root, &display)
-                        .ok()?
-                        .to_string_lossy()
-                        .into_owned();
-                if !seen.insert(normalized.clone()) {
-                    return None;
-                }
-                Some(FileActionPath {
-                    normalized,
-                    display,
-                })
-            })
-            .collect()
-    }
-
-    /// Static version of execute_tool_with_hooks for parallel execution.
-    /// Takes ownership of shared resources to avoid borrowing issues across async boundaries.
-    async fn execute_tool_with_hooks_internal(
-        config: &AgentConfig,
-        hook_manager: Option<Arc<crate::core::hooks::HookManager>>,
-        tool_context: Arc<ToolContext>,
-        tool_name: &str,
-        tool_params: &serde_json::Value,
-        handler: Arc<dyn crate::core::tools::ToolHandler>,
-        task_storage: Option<Arc<crate::storage::task_storage::TaskStorage>>,
-        conversation_history: Arc<Mutex<Vec<StorageMessage>>>,
-    ) -> ToolExecutionOutput {
-        let mut params_for_execution = tool_params.clone();
-        let mut hook_context = Vec::new();
-        if let Some(ref hook_mgr) = hook_manager {
-            let pre_result = hook_mgr.pre_tool_use(&config.task_id, tool_name, tool_params);
-            if let Some(error) = pre_result.error.as_deref() {
-                warn!(tool = tool_name, error, "PreToolUse hook reported an error");
-            }
-            if let Some(output) = pre_result.output {
-                if let Some(error) = output.error_message.as_deref() {
-                    warn!(tool = tool_name, error, "PreToolUse hook returned an error");
-                }
-                if output.cancel == Some(true) {
-                    return ToolExecutionOutput::error(
-                        format!("Tool '{tool_name}' was cancelled by PreToolUse hook."),
-                        None,
-                    );
-                }
-                if let Some(modification) = output.context_modification {
-                    info!("[PreToolUse hook] {}", modification);
-                    hook_context.push(format!("[Hook context from PreToolUse]: {modification}"));
-                }
-            }
-        }
-
-        if tool_name == "condense" {
-            let history = conversation_history.lock().await;
-            let history = match serde_json::to_value(&*history) {
-                Ok(history) => history,
-                Err(error) => {
-                    return ToolExecutionOutput::error_with_hook_context(
-                        format!("Failed to prepare conversation history for condense: {error}"),
-                        None,
-                        hook_context,
-                        Vec::new(),
-                    );
-                }
-            };
-            if let Some(params) = params_for_execution.as_object_mut() {
-                params.insert("history".to_string(), history);
-            }
-        }
-
-        let execute_future = handler.execute(&tool_context, params_for_execution);
-        let execution_result = if !matches!(
-            tool_name,
-            "edit_file" | "write_to_file" | "replace_symbol" | "rename_symbol"
-        ) && let Some(cancellation_flag) =
-            tool_context.cancellation_flag.clone()
-        {
-            tokio::select! {
-                result = execute_future => result,
-                () = async {
-                    while !cancellation_flag.load(std::sync::atomic::Ordering::Acquire) {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                } => Err(crate::core::tools::ToolError::ExecutionFailed(
-                    "Tool cancelled by user".to_string(),
-                )),
-            }
-        } else {
-            execute_future.await
-        };
-
-        match execution_result {
-            Ok(res) => {
-                let res_text = tool_result_to_text(res);
-
-                // Persist compacted summary immediately if condense tool was used
-                let summary = if tool_name == "condense" {
-                    tool_context.state.lock().await.compacted_summary.clone()
-                } else {
-                    None
-                };
-                if let Some(summary) = summary
-                    && let Some(storage) = task_storage
-                    && let Err(e) = storage.write_compacted_summary_async(&summary).await
-                {
-                    error!("Failed to persist compacted summary immediately: {}", e);
-                }
-
-                if let Some(ref hook_mgr) = hook_manager {
-                    let post_result =
-                        hook_mgr.post_tool_use(&config.task_id, tool_name, tool_params, &res_text);
-                    if let Some(post_output) = post_result.output
-                        && let Some(modification) = post_output.context_modification
-                    {
-                        info!("[PostToolUse hook] {}", modification);
-                        hook_context
-                            .push(format!("[Hook context from PostToolUse]: {modification}"));
-                    }
-                }
-                ToolExecutionOutput::success_with_hook_context(res_text, hook_context)
-            }
-            Err(e) => ToolExecutionOutput::error_with_hook_context(
-                format!("Error: {e}"),
-                e.metadata().cloned(),
-                hook_context,
-                e.publication_outcomes().unwrap_or(&[]).to_vec(),
-            ),
-        }
     }
 
     /// Returns the current conversation history.
@@ -6020,6 +4909,14 @@ fn compact_single_search_text(text: &mut String, min_bytes: usize) {
 mod tests {
     use super::*;
     use crate::core::stream_parsing::ThinkingTagStreamFilter;
+    use crate::core::tools::execution::{
+        DEFAULT_TOOL_CONCURRENCY, PreparedToolCall, ToolExecutionOutput,
+        execute_tool_with_hooks_internal, extract_action_path, extract_file_action_path,
+        is_mutating_file_tool, is_plan_mode_restricted, parse_tool_arguments, prepare_tool_calls,
+        tool_is_schedulable_read, tool_params_fingerprint,
+    };
+    use crate::providers::ApiStreamToolCall;
+    use std::collections::HashMap;
 
     #[test]
     fn truncated_debug_text_passes_short_text_through() {
@@ -6526,7 +5423,7 @@ mod tests {
                     agent.config.output_writer.clone(),
                     false,
                 ));
-                let rejected = AgentLoop::execute_tool_with_hooks_internal(
+                let rejected = execute_tool_with_hooks_internal(
                     &agent.config, None, context, "edit_file",
                     &json!({"files": [{"path": "fixture.txt", "edits": [{"anchor": stale, "text": "wrong"}]}]}),
                     Arc::new(EditFileHandler::new()), None, agent.conversation_history.clone(),
@@ -6838,7 +5735,7 @@ mod tests {
             false,
         ));
 
-        let output = AgentLoop::execute_tool_with_hooks_internal(
+        let output = execute_tool_with_hooks_internal(
             &config,
             None,
             context,
@@ -7700,7 +6597,7 @@ mod tests {
             "ask_followup_question",
         ] {
             assert!(
-                AgentLoop::tool_is_schedulable_read(tool),
+                tool_is_schedulable_read(tool),
                 "{tool} must stay schedulable"
             );
         }
@@ -7716,7 +6613,7 @@ mod tests {
             "",
         ] {
             assert!(
-                !AgentLoop::tool_is_schedulable_read(tool),
+                !tool_is_schedulable_read(tool),
                 "{tool} must fail closed to barrier"
             );
         }
@@ -8087,7 +6984,7 @@ mod tests {
             false,
         ));
 
-        let output = AgentLoop::execute_tool_with_hooks_internal(
+        let output = execute_tool_with_hooks_internal(
             &config,
             None,
             context,
@@ -10305,13 +9202,13 @@ Irrespective of whether additional information or instructions are given, you ar
 
     #[test]
     fn test_new_scoped_rules_defer_mutating_file_tools() {
-        assert!(AgentLoop::is_mutating_file_tool("write_to_file"));
-        assert!(AgentLoop::is_mutating_file_tool("edit_file"));
-        assert!(AgentLoop::is_mutating_file_tool("replace_symbol"));
-        assert!(AgentLoop::is_mutating_file_tool("rename_symbol"));
-        assert!(!AgentLoop::is_mutating_file_tool("read_file"));
-        assert!(!AgentLoop::is_mutating_file_tool("list_files"));
-        assert!(!AgentLoop::is_mutating_file_tool("execute_command"));
+        assert!(is_mutating_file_tool("write_to_file"));
+        assert!(is_mutating_file_tool("edit_file"));
+        assert!(is_mutating_file_tool("replace_symbol"));
+        assert!(is_mutating_file_tool("rename_symbol"));
+        assert!(!is_mutating_file_tool("read_file"));
+        assert!(!is_mutating_file_tool("list_files"));
+        assert!(!is_mutating_file_tool("execute_command"));
     }
 
     #[test]
@@ -11195,28 +10092,20 @@ Irrespective of whether additional information or instructions are given, you ar
     #[test]
     fn test_plan_mode_restricted_tools() {
         // WriteToFile is restricted in plan mode
-        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::WriteToFile));
+        assert!(is_plan_mode_restricted(SnedTool::WriteToFile));
         // EditFile is restricted in plan mode
-        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::EditFile));
+        assert!(is_plan_mode_restricted(SnedTool::EditFile));
 
         // Read-only tools are NOT restricted
-        assert!(!AgentLoop::is_plan_mode_restricted(SnedTool::ReadFile));
-        assert!(!AgentLoop::is_plan_mode_restricted(SnedTool::ListFiles));
-        assert!(!AgentLoop::is_plan_mode_restricted(SnedTool::SearchFiles));
+        assert!(!is_plan_mode_restricted(SnedTool::ReadFile));
+        assert!(!is_plan_mode_restricted(SnedTool::ListFiles));
+        assert!(!is_plan_mode_restricted(SnedTool::SearchFiles));
 
         // Other tools are NOT restricted
-        assert!(!AgentLoop::is_plan_mode_restricted(
-            SnedTool::ExecuteCommand
-        ));
-        assert!(!AgentLoop::is_plan_mode_restricted(
-            SnedTool::AskFollowupQuestion
-        ));
-        assert!(!AgentLoop::is_plan_mode_restricted(
-            SnedTool::AttemptCompletion
-        ));
-        assert!(!AgentLoop::is_plan_mode_restricted(
-            SnedTool::PlanModeRespond
-        ));
+        assert!(!is_plan_mode_restricted(SnedTool::ExecuteCommand));
+        assert!(!is_plan_mode_restricted(SnedTool::AskFollowupQuestion));
+        assert!(!is_plan_mode_restricted(SnedTool::AttemptCompletion));
+        assert!(!is_plan_mode_restricted(SnedTool::PlanModeRespond));
     }
 
     #[test]
@@ -11224,12 +10113,10 @@ Irrespective of whether additional information or instructions are given, you ar
         // PLAN mode should allow execute_command for read-only operations
         // (cat, wc, ls, grep, etc.) while still blocking file modifications.
         // The CommandSafetyChecker handles safety for execute_command.
-        assert!(!AgentLoop::is_plan_mode_restricted(
-            SnedTool::ExecuteCommand
-        ));
+        assert!(!is_plan_mode_restricted(SnedTool::ExecuteCommand));
         // WriteToFile and EditFile remain blocked in PLAN mode
-        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::WriteToFile));
-        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::EditFile));
+        assert!(is_plan_mode_restricted(SnedTool::WriteToFile));
+        assert!(is_plan_mode_restricted(SnedTool::EditFile));
     }
 
     #[tokio::test]
@@ -11264,14 +10151,12 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(state.strict_plan_mode_enabled);
 
         // Verify restricted tools are blocked
-        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::WriteToFile));
-        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::EditFile));
+        assert!(is_plan_mode_restricted(SnedTool::WriteToFile));
+        assert!(is_plan_mode_restricted(SnedTool::EditFile));
 
         // Verify non-restricted tools are allowed
-        assert!(!AgentLoop::is_plan_mode_restricted(SnedTool::ReadFile));
-        assert!(!AgentLoop::is_plan_mode_restricted(
-            SnedTool::PlanModeRespond
-        ));
+        assert!(!is_plan_mode_restricted(SnedTool::ReadFile));
+        assert!(!is_plan_mode_restricted(SnedTool::PlanModeRespond));
     }
 
     #[tokio::test]
@@ -11307,8 +10192,8 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(state.strict_plan_mode_enabled);
 
         // is_plan_mode_restricted only checks the tool type, not settings
-        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::WriteToFile));
-        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::EditFile));
+        assert!(is_plan_mode_restricted(SnedTool::WriteToFile));
+        assert!(is_plan_mode_restricted(SnedTool::EditFile));
 
         // But the actual restriction in execute_turn checks:
         // mode == Plan && strict_plan_mode_enabled && is_plan_mode_restricted
@@ -11345,8 +10230,8 @@ Irrespective of whether additional information or instructions are given, you ar
         state.strict_plan_mode_enabled = false;
 
         // is_plan_mode_restricted only checks the tool type, not settings
-        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::WriteToFile));
-        assert!(AgentLoop::is_plan_mode_restricted(SnedTool::EditFile));
+        assert!(is_plan_mode_restricted(SnedTool::WriteToFile));
+        assert!(is_plan_mode_restricted(SnedTool::EditFile));
 
         // But the actual restriction in execute_turn checks:
         // mode == Plan && strict_plan_mode_enabled && is_plan_mode_restricted
@@ -11844,14 +10729,14 @@ Irrespective of whether additional information or instructions are given, you ar
     #[test]
     fn test_extract_action_path_read_file_array() {
         let params = serde_json::json!({"paths": ["/home/user/project/src/main.rs"]});
-        let paths = AgentLoop::extract_action_path(SnedTool::ReadFile, &params);
+        let paths = extract_action_path(SnedTool::ReadFile, &params);
         assert_eq!(paths, vec!["/home/user/project/src/main.rs".to_string()]);
     }
 
     #[test]
     fn test_extract_action_path_read_file_string() {
         let params = serde_json::json!({"paths": "/home/user/project/README.md"});
-        let paths = AgentLoop::extract_action_path(SnedTool::ReadFile, &params);
+        let paths = extract_action_path(SnedTool::ReadFile, &params);
         assert_eq!(paths, vec!["/home/user/project/README.md".to_string()]);
     }
 
@@ -11860,7 +10745,7 @@ Irrespective of whether additional information or instructions are given, you ar
         let params = serde_json::json!({
             "paths": "[\"/tmp/outside-a.rs\",\"/tmp/outside-b.rs\"]"
         });
-        let paths = AgentLoop::extract_action_path(SnedTool::ReadFile, &params);
+        let paths = extract_action_path(SnedTool::ReadFile, &params);
         assert_eq!(
             paths,
             vec![
@@ -11873,21 +10758,21 @@ Irrespective of whether additional information or instructions are given, you ar
     #[test]
     fn test_extract_action_path_diagnostics_scan() {
         let params = serde_json::json!({"paths": ["/tmp/outside.rs"]});
-        let paths = AgentLoop::extract_action_path(SnedTool::DiagnosticsScan, &params);
+        let paths = extract_action_path(SnedTool::DiagnosticsScan, &params);
         assert_eq!(paths, vec!["/tmp/outside.rs".to_string()]);
     }
 
     #[test]
     fn test_extract_action_path_write_to_file() {
         let params = serde_json::json!({"path": "/home/user/project/new_file.rs"});
-        let paths = AgentLoop::extract_action_path(SnedTool::WriteToFile, &params);
+        let paths = extract_action_path(SnedTool::WriteToFile, &params);
         assert_eq!(paths, vec!["/home/user/project/new_file.rs".to_string()]);
     }
 
     #[test]
     fn test_parse_tool_arguments_invalid_json_returns_error() {
         let invalid = "{\"path\":\"src/main.rs\",\"content\":\"unterminated".to_string();
-        let parsed = AgentLoop::parse_tool_arguments("write_to_file", "abc123", Some(&invalid));
+        let parsed = parse_tool_arguments("write_to_file", "abc123", Some(&invalid));
         assert!(parsed.is_err());
     }
 
@@ -11897,7 +10782,7 @@ Irrespective of whether additional information or instructions are given, you ar
             crate::providers::TOOL_ARGUMENTS_ERROR_FIELD: "invalid escape at line 1 column 23"
         })
         .to_string();
-        let error = AgentLoop::parse_tool_arguments("edit_file", "abc123", Some(&invalid))
+        let error = parse_tool_arguments("edit_file", "abc123", Some(&invalid))
             .expect_err("provider repair marker must not reach a tool handler");
         assert!(error.contains("could not be repaired"));
         assert!(error.contains("invalid escape at line 1 column 23"));
@@ -11911,7 +10796,7 @@ Irrespective of whether additional information or instructions are given, you ar
             "x".repeat(MAX_TOOL_ARGUMENT_SIZE)
         );
         assert!(oversized.len() > MAX_TOOL_ARGUMENT_SIZE);
-        let error = AgentLoop::parse_tool_arguments("write_to_file", "big-1", Some(&oversized))
+        let error = parse_tool_arguments("write_to_file", "big-1", Some(&oversized))
             .expect_err("oversized arguments must never reach a tool handler");
         assert!(error.contains("exceed"));
         assert!(error.contains("big-1"));
@@ -11922,7 +10807,7 @@ Irrespective of whether additional information or instructions are given, you ar
         use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
         let at_limit = format!("{{\"a\":\"{}\"}}", "x".repeat(MAX_TOOL_ARGUMENT_SIZE - 8));
         assert_eq!(at_limit.len(), MAX_TOOL_ARGUMENT_SIZE);
-        AgentLoop::parse_tool_arguments("write_to_file", "edge-1", Some(&at_limit))
+        parse_tool_arguments("write_to_file", "edge-1", Some(&at_limit))
             .expect("arguments exactly at the limit must still dispatch");
     }
 
@@ -11975,7 +10860,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 signature: None,
             },
         );
-        let prepared = AgentLoop::prepare_tool_calls(&["0".to_string()], &mut tool_calls);
+        let prepared = prepare_tool_calls(&["0".to_string()], &mut tool_calls);
 
         assert_eq!(prepared.len(), 1);
         assert!(!prepared[0].tool_id.is_empty());
@@ -11995,7 +10880,7 @@ Irrespective of whether additional information or instructions are given, you ar
             "commands": r#"["awk 'NR>=115 && NR<=125 {print NR": "}' file.swift"]"#
         })
         .to_string();
-        let parsed = AgentLoop::parse_tool_arguments("execute_command", "command-1", Some(&raw))
+        let parsed = parse_tool_arguments("execute_command", "command-1", Some(&raw))
             .expect("recoverable commands should normalize before dispatch");
         assert_eq!(
             parsed,
@@ -12011,7 +10896,7 @@ Irrespective of whether additional information or instructions are given, you ar
             "files": r#"[{"edits":[{"anchor":"one§old","text":"new"},"path":"src/main.rs"}]"#
         })
         .to_string();
-        let parsed = AgentLoop::parse_tool_arguments("edit_file", "edit-1", Some(&raw))
+        let parsed = parse_tool_arguments("edit_file", "edit-1", Some(&raw))
             .expect("recoverable edit files should normalize before dispatch");
         assert_eq!(parsed["files"][0]["path"], "src/main.rs");
         assert_eq!(parsed["files"][0]["edits"].as_array().unwrap().len(), 1);
@@ -12023,7 +10908,7 @@ Irrespective of whether additional information or instructions are given, you ar
             "paths": r#"[{"path":"src/main.rs","edits":[{"anchor":"Word§old","text":"new"}]}]"#
         })
         .to_string();
-        let parsed = AgentLoop::parse_tool_arguments("edit_file", "edit-2", Some(&raw))
+        let parsed = parse_tool_arguments("edit_file", "edit-2", Some(&raw))
             .expect("unambiguous edit paths should normalize before dispatch");
         assert_eq!(parsed["files"][0]["path"], "src/main.rs");
         assert!(parsed.get("paths").is_none());
@@ -12204,13 +11089,13 @@ Irrespective of whether additional information or instructions are given, you ar
     fn test_parse_tool_arguments_empty_string_returns_empty_object() {
         // Some providers send empty string instead of "{}"
         let empty = "".to_string();
-        let parsed = AgentLoop::parse_tool_arguments("list_files", "call_123", Some(&empty));
+        let parsed = parse_tool_arguments("list_files", "call_123", Some(&empty));
         assert!(parsed.is_ok());
         assert_eq!(parsed.unwrap(), serde_json::json!({}));
 
         // Whitespace-only should also be treated as empty
         let whitespace = "   ".to_string();
-        let parsed = AgentLoop::parse_tool_arguments("list_files", "call_123", Some(&whitespace));
+        let parsed = parse_tool_arguments("list_files", "call_123", Some(&whitespace));
         assert!(parsed.is_ok());
         assert_eq!(parsed.unwrap(), serde_json::json!({}));
     }
@@ -12219,7 +11104,7 @@ Irrespective of whether additional information or instructions are given, you ar
     fn test_extract_action_path_edit_file() {
         let params =
             serde_json::json!({"files": [{"path": "/home/user/project/src/lib.rs", "edits": []}]});
-        let paths = AgentLoop::extract_action_path(SnedTool::EditFile, &params);
+        let paths = extract_action_path(SnedTool::EditFile, &params);
         assert_eq!(paths, vec!["/home/user/project/src/lib.rs".to_string()]);
     }
 
@@ -12229,7 +11114,7 @@ Irrespective of whether additional information or instructions are given, you ar
             "files": "[{\"path\":\"src/a.rs\",\"edits\":[]},{\"path\":\"src/b.rs\",\"edits\":[]}]"
         });
         assert_eq!(
-            AgentLoop::extract_action_path(SnedTool::EditFile, &params),
+            extract_action_path(SnedTool::EditFile, &params),
             vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
         );
     }
@@ -12237,14 +11122,14 @@ Irrespective of whether additional information or instructions are given, you ar
     #[test]
     fn test_extract_action_path_replace_symbol() {
         let params = serde_json::json!({"path": "/home/user/project/src/lib.rs"});
-        let paths = AgentLoop::extract_action_path(SnedTool::ReplaceSymbol, &params);
+        let paths = extract_action_path(SnedTool::ReplaceSymbol, &params);
         assert_eq!(paths, vec!["/home/user/project/src/lib.rs".to_string()]);
     }
 
     #[test]
     fn test_extract_action_path_replace_symbol_batch() {
         let params = serde_json::json!({"replacements": [{"path": "/home/user/project/a.rs"}, {"path": "/home/user/project/b.rs"}]});
-        let paths = AgentLoop::extract_action_path(SnedTool::ReplaceSymbol, &params);
+        let paths = extract_action_path(SnedTool::ReplaceSymbol, &params);
         assert_eq!(
             paths,
             vec![
@@ -12258,7 +11143,7 @@ Irrespective of whether additional information or instructions are given, you ar
     fn test_extract_action_path_rename_symbol() {
         let params =
             serde_json::json!({"paths": ["/home/user/project/a.rs", "/home/user/project/b.rs"]});
-        let paths = AgentLoop::extract_action_path(SnedTool::RenameSymbol, &params);
+        let paths = extract_action_path(SnedTool::RenameSymbol, &params);
         assert_eq!(
             paths,
             vec![
@@ -12271,14 +11156,14 @@ Irrespective of whether additional information or instructions are given, you ar
     #[test]
     fn test_extract_action_path_execute_command_none() {
         let params = serde_json::json!({"command": "ls -la"});
-        let paths = AgentLoop::extract_action_path(SnedTool::ExecuteCommand, &params);
+        let paths = extract_action_path(SnedTool::ExecuteCommand, &params);
         assert_eq!(paths, Vec::<String>::new());
     }
 
     #[test]
     fn test_extract_action_path_empty_params() {
         let params = serde_json::json!({});
-        let paths = AgentLoop::extract_action_path(SnedTool::ReadFile, &params);
+        let paths = extract_action_path(SnedTool::ReadFile, &params);
         assert_eq!(paths, Vec::<String>::new());
     }
 
@@ -12288,7 +11173,7 @@ Irrespective of whether additional information or instructions are given, you ar
         std::fs::write(workspace.path().join("a.rs"), "").unwrap();
         std::fs::write(workspace.path().join("b.rs"), "").unwrap();
         let params = serde_json::json!({"files": [{"path": "a.rs"}, {"path": "b.rs"}]});
-        let paths = AgentLoop::extract_file_action_path("edit_file", &params, workspace.path());
+        let paths = extract_file_action_path("edit_file", &params, workspace.path());
 
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0].display, "a.rs");
@@ -12308,7 +11193,7 @@ Irrespective of whether additional information or instructions are given, you ar
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "fn main() {}\n").unwrap();
         let params = serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"});
-        let paths = AgentLoop::extract_file_action_path("write_to_file", &params, workspace.path());
+        let paths = extract_file_action_path("write_to_file", &params, workspace.path());
 
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].display, "src/main.rs");
@@ -12337,9 +11222,9 @@ Irrespective of whether additional information or instructions are given, you ar
         });
 
         let edit_paths =
-            AgentLoop::extract_file_action_path("edit_file", &edit_params, workspace.path());
+            extract_file_action_path("edit_file", &edit_params, workspace.path());
         let write_paths =
-            AgentLoop::extract_file_action_path("write_to_file", &write_params, workspace.path());
+            extract_file_action_path("write_to_file", &write_params, workspace.path());
 
         assert_eq!(edit_paths.len(), 1);
         assert_eq!(edit_paths[0].display, "src/./main.rs");
@@ -12350,7 +11235,7 @@ Irrespective of whether additional information or instructions are given, you ar
     fn test_extract_file_action_path_unknown_tool() {
         let workspace = tempfile::tempdir().unwrap();
         let params = serde_json::json!({"path": "foo.rs"});
-        let paths = AgentLoop::extract_file_action_path("read_file", &params, workspace.path());
+        let paths = extract_file_action_path("read_file", &params, workspace.path());
         assert!(paths.is_empty());
     }
 
@@ -12366,8 +11251,8 @@ Irrespective of whether additional information or instructions are given, you ar
         });
 
         assert_eq!(
-            AgentLoop::tool_params_fingerprint(&left),
-            AgentLoop::tool_params_fingerprint(&right)
+            tool_params_fingerprint(&left),
+            tool_params_fingerprint(&right)
         );
     }
 
