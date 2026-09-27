@@ -443,13 +443,40 @@ pub struct RecoveredHistory {
     /// Surviving messages in file order. Gap-merged neighbors keep their
     /// earliest file index, so positions only shift down by earlier drops.
     pub messages: Vec<StorageMessage>,
-    /// Original file indices with no surviving message, ascending. A caller
-    /// holding ranges over the file must remap or invalidate when non-empty.
+    /// Original file indices with no surviving message, ascending: removed
+    /// records plus gap-merged later indices folded into an earlier message.
+    /// A caller holding ranges over the file must remap or invalidate when
+    /// non-empty; see [`RecoveredHistory::remap_file_range`].
     pub dropped: Vec<usize>,
     /// True when bulk parsing failed and per-element recovery ran.
     pub used_fallback: bool,
     /// First parse failure encountered, when any.
     pub first_error: Option<String>,
+}
+
+impl RecoveredHistory {
+    /// Remap a saved `[start, end)` file-index range onto the recovered
+    /// messages, or return `None` when the range no longer identifies the
+    /// same span. Surviving positions shift down by earlier drops, so each
+    /// bound moves past the dropped indices below it. A dropped record
+    /// inside the range, an end past the shortened vector, or an inverted
+    /// range invalidates it: the caller must not apply old coordinates
+    /// unquestioningly.
+    #[must_use]
+    pub fn remap_file_range(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        if start > end {
+            return None;
+        }
+        if self.dropped.iter().any(|d| *d >= start && *d < end) {
+            return None;
+        }
+        let shift = |index: usize| index - self.dropped.iter().filter(|d| **d < index).count();
+        let (remapped_start, remapped_end) = (shift(start), shift(end));
+        if remapped_end > self.messages.len() {
+            return None;
+        }
+        Some((remapped_start, remapped_end))
+    }
 }
 
 /// Manages per-task file storage at ~/.sned/data/tasks/{taskId}/
@@ -753,7 +780,7 @@ impl TaskStorage {
     /// Repair plus the original file indices left with no surviving message,
     /// so callers holding ranges over the file can remap or invalidate them.
     /// Survivors keep file order; gap-merged neighbors carry the earliest
-    /// index and are never reported as dropped.
+    /// index while the folded-away later index is reported as dropped.
     fn repair_conversation_history_tracked(
         history: Vec<(usize, StorageMessage)>,
     ) -> (Vec<StorageMessage>, Vec<usize>) {
@@ -810,7 +837,11 @@ impl TaskStorage {
         // Fold same-role neighbors only where a removal opened the gap;
         // strict providers reject the new adjacency, while pre-existing
         // adjacency went through the live send path untouched and stays.
+        // A folded-away later index has no surviving message of its own,
+        // so it joins the reported drops: positions after it shift down
+        // exactly like a removed record.
         let mut merged: Vec<(usize, usize, StorageMessage)> = Vec::with_capacity(pruned.len());
+        let mut merged_away: Vec<usize> = Vec::new();
         for (index, message) in pruned {
             let gap_merge = merged.last().is_some_and(|(_, last_index, last)| {
                 last.role == message.role && index > *last_index + 1
@@ -821,6 +852,7 @@ impl TaskStorage {
                     Self::merge_message_content(&last.content, &message.content, message.role)
                 {
                     merged.push((first_index, index, StorageMessage { content, ..last }));
+                    merged_away.push(index);
                     continue;
                 }
                 merged.push((first_index, last_index, last));
@@ -828,6 +860,8 @@ impl TaskStorage {
             merged.push((index, index, message));
         }
         let messages = merged.into_iter().map(|(_, _, message)| message).collect();
+        dropped.extend(merged_away);
+        dropped.sort_unstable();
         (messages, dropped)
     }
 
@@ -3447,6 +3481,113 @@ mod tests {
         assert!(recovered.used_fallback);
         assert_eq!(recovered.dropped, vec![1]);
         assert_eq!(recovered.messages, vec![before, after, later]);
+    }
+
+    #[test]
+    fn test_history_repair_reports_gap_merged_indices_as_dropped() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields, ToolUseBlock,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("history-repair-merge-lineage");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let first = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("first".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        let orphan = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                ToolUseBlock {
+                    id: "orphan".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        let second = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("second".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        storage
+            .write_api_conversation_history(&[first.clone(), orphan, second])
+            .unwrap();
+
+        let recovered = storage.read_api_conversation_history_with_recovery();
+        assert!(!recovered.used_fallback);
+        assert_eq!(
+            recovered.messages,
+            vec![StorageMessage {
+                content: MessageContent::Text("first\nsecond".to_string()),
+                ..first
+            }]
+        );
+        // The gap-merged message keeps file index 0, but file index 2 has
+        // no surviving message of its own: saved ranges must shift past it
+        // too, so it belongs in the reported lineage.
+        assert_eq!(recovered.dropped, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_remap_file_range_shifts_bounds_and_invalidates_stale_spans() {
+        use crate::providers::{MessageContent, MessageRole};
+
+        let message = |text: &str| StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        // File indices 0, 2, 3 survive as three messages; 1 and 4 dropped.
+        let recovered = RecoveredHistory {
+            messages: vec![message("a"), message("b"), message("c")],
+            dropped: vec![1, 4],
+            used_fallback: true,
+            first_error: None,
+        };
+        assert_eq!(recovered.remap_file_range(0, 1), Some((0, 1)));
+        assert_eq!(recovered.remap_file_range(2, 4), Some((1, 3)));
+        // A dropped record inside the range destroys the span identity,
+        // even when the bounds themselves survive.
+        assert_eq!(recovered.remap_file_range(0, 2), None);
+        assert_eq!(recovered.remap_file_range(0, 5), None);
+        assert_eq!(recovered.remap_file_range(2, 5), None);
+        // An end past the shortened vector, or an inverted range, cannot map.
+        assert_eq!(recovered.remap_file_range(5, 6), None);
+        assert_eq!(recovered.remap_file_range(3, 2), None);
+        // Clean recovery leaves saved coordinates verbatim.
+        let clean = RecoveredHistory {
+            messages: vec![message("a")],
+            dropped: Vec::new(),
+            used_fallback: false,
+            first_error: None,
+        };
+        assert_eq!(clean.remap_file_range(0, 1), Some((0, 1)));
+        assert_eq!(clean.remap_file_range(0, 0), Some((0, 0)));
     }
 
     #[test]

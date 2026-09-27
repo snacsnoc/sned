@@ -5881,15 +5881,41 @@ impl AgentLoop {
     /// Returns true if history was loaded, false otherwise.
     pub async fn load_conversation_history(&self) -> bool {
         if let Some(ref storage) = self.deps.task_storage {
-            let history: Vec<StorageMessage> = storage.read_api_conversation_history();
+            let mut recovered = storage.read_api_conversation_history_with_recovery();
             let compacted_summary: Option<crate::core::context::context_manager::CompactedSummary> =
                 storage.read_compacted_summary();
 
             let mut loaded = false;
 
-            if !history.is_empty() {
+            // Resolve the saved deleted range BEFORE installing the recovered
+            // messages below: remap needs the pre-install lineage and length.
+            // The saved coordinates predate recovery: remap them against
+            // the dropped lineage, or invalidate when recovery removed
+            // records inside the range. Never apply old coordinates to the
+            // shortened vector unquestioningly.
+            let remapped_deleted_range = if let Some(ref state_manager) = self.state_manager
+                && let Some(history_item) = state_manager.find_task_in_history(&self.config.task_id)
+                && let Some(deleted_range_vec) = history_item.conversation_history_deleted_range
+                && deleted_range_vec.len() >= 2
+            {
+                // Convert from Vec<i32> to (usize, usize) tuple for TaskState
+                let remapped = recovered
+                    .remap_file_range(deleted_range_vec[0] as usize, deleted_range_vec[1] as usize);
+                if remapped.is_none() {
+                    tracing::debug!(
+                        dropped = ?recovered.dropped,
+                        saved_range = ?deleted_range_vec,
+                        "Discarding saved deleted range: recovery changed the history it was recorded against"
+                    );
+                }
+                Some(remapped)
+            } else {
+                None
+            };
+
+            if !recovered.messages.is_empty() {
                 let mut current = self.conversation_history.lock().await;
-                *current = history;
+                std::mem::swap(&mut *current, &mut recovered.messages);
                 loaded = true;
             }
 
@@ -5916,17 +5942,10 @@ impl AgentLoop {
 
             // Load conversation_history_deleted_range from HistoryItem (C1 fix part 2)
             // This ensures compacted messages don't reappear on --continue
-            if let Some(ref state_manager) = self.state_manager
-                && let Some(history_item) = state_manager.find_task_in_history(&self.config.task_id)
-                && let Some(deleted_range_vec) = history_item.conversation_history_deleted_range
-            {
-                // Convert from Vec<i32> to (usize, usize) tuple for TaskState
-                if deleted_range_vec.len() >= 2 {
-                    let mut state = self.state.lock().await;
-                    state.conversation_history_deleted_range =
-                        Some((deleted_range_vec[0] as usize, deleted_range_vec[1] as usize));
-                    loaded = true;
-                }
+            if let Some(remapped) = remapped_deleted_range {
+                let mut state = self.state.lock().await;
+                state.conversation_history_deleted_range = remapped;
+                loaded = true;
             }
 
             loaded
@@ -11207,6 +11226,152 @@ Irrespective of whether additional information or instructions are given, you ar
 
         // SAFETY: single-threaded test; restoring env after test
         unsafe { env::remove_var("SNED_DIR") };
+    }
+
+    #[tokio::test]
+    async fn test_resume_remaps_deleted_range_across_recovery_drop() {
+        use crate::test_support::env_lock;
+        use std::env;
+        use tempfile::TempDir;
+
+        let task_id = "resume-remap-range";
+        // Build storage handles under the env lock, then restore the
+        // environment before any await: nothing below re-reads SNED_DIR,
+        // so no guard is held across await points.
+        let (_temp_dir, task_storage) = {
+            let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+            let previous_sned_dir = env::var_os("SNED_DIR");
+            let temp_dir = TempDir::new().unwrap();
+            // SAFETY: exclusive access via env_lock; restored below.
+            unsafe {
+                env::set_var("SNED_DIR", temp_dir.path().join(".sned"));
+            }
+            let task_storage = TaskStorage::new(task_id).unwrap();
+            // SAFETY: exclusive access via env_lock; restoring prior value.
+            unsafe {
+                match previous_sned_dir {
+                    Some(value) => env::set_var("SNED_DIR", value),
+                    None => env::remove_var("SNED_DIR"),
+                }
+            }
+            (temp_dir, task_storage)
+        };
+
+        // File index 1 holds a dangling tool use with no matching result,
+        // so repair drops it: survivors shift down by one.
+        let messages = vec![
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("first instruction".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: Some(1000),
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                    ToolUseBlock {
+                        id: "orphan".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "a.rs"}),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    },
+                )]),
+                model_info: None,
+                metrics: None,
+                ts: Some(1001),
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("assistant reply".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: Some(1002),
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("Do not modify any files".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: Some(1003),
+            },
+        ];
+        task_storage
+            .write_api_conversation_history(&messages)
+            .unwrap();
+
+        // Saved pre-recovery coordinates covering file indices 2..4.
+        let state_manager = Arc::new(StateManager::new().unwrap());
+        state_manager.add_task_to_history(HistoryItem {
+            id: task_id.to_string(),
+            ulid: Some(task_id.to_string()),
+            number: 0,
+            ts: 0,
+            task: "resume".to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_writes: None,
+            cache_reads: None,
+            total_cost: 0.0,
+            size: None,
+            shadow_git_config_work_tree: None,
+            cwd_on_task_initialization: None,
+            conversation_history_deleted_range: Some(vec![2, 4]),
+            is_favorited: None,
+            workspace_root_path: None,
+            checkpoint_manager_error_message: None,
+            model_id: None,
+        });
+
+        let config = AgentConfig {
+            provider: Arc::new(std::sync::Mutex::new(Arc::new(Providers::Mock(
+                crate::providers::mock::MockProvider::new(vec![]),
+            )))),
+            mode: AgentMode::Act,
+            task_id: task_id.to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: true,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: Some(3),
+            double_check_completion: true,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: false,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
+        };
+        let mut agent = AgentLoop::new(config).with_task_storage(task_storage);
+        agent.state_manager = Some(state_manager);
+
+        assert!(agent.load_conversation_history().await);
+
+        let history = agent.get_conversation_history().await;
+        assert_eq!(history.len(), 3, "dangling tool use is repaired away");
+        let MessageContent::Text(retained) = &history[2].content else {
+            panic!("later user instruction must survive recovery");
+        };
+        assert_eq!(retained, "Do not modify any files");
+
+        // File range (2, 4) must follow the survivors down by the one
+        // dropped record instead of pointing past the shortened vector.
+        assert_eq!(
+            agent.state.lock().await.conversation_history_deleted_range,
+            Some((1, 3)),
+            "saved range must be remapped against recovery lineage"
+        );
     }
 
     #[test]
