@@ -79,6 +79,240 @@ pub fn is_think_end(line: &str, _open_kind: ThinkOpenKind) -> bool {
     trimmed == "</think>" || trimmed == "<!-- /think -->" || trimmed == "```"
 }
 
+const THINKING_OPEN_TAGS: [&str; 2] = ["<think>", "<!-- think -->"];
+const THINKING_CLOSE_TAGS: [&str; 2] = ["</think>", "<!-- /think -->"];
+
+/// Incremental stream filter that hides provider thinking sections while
+/// passing visible model text through chunk by chunk.
+#[derive(Debug, Default)]
+pub struct ThinkingTagStreamFilter {
+    pending: String,
+    hidden: String,
+    think_open_kind: Option<ThinkOpenKind>,
+    fence_marker: Option<FenceDelimiter>,
+    at_line_start: bool,
+}
+
+impl ThinkingTagStreamFilter {
+    pub fn new() -> Self {
+        Self {
+            at_line_start: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn push(&mut self, chunk: &str) -> String {
+        let mut input = std::mem::take(&mut self.pending);
+        input.push_str(chunk);
+        let mut visible = String::new();
+        let mut pos = 0;
+
+        loop {
+            if pos == input.len() {
+                break;
+            }
+            let remaining = &input[pos..];
+
+            if self.think_open_kind == Some(ThinkOpenKind::CodeFenceThink) {
+                if self.at_line_start {
+                    if let Some((line, consumed)) = complete_stream_line(remaining) {
+                        if is_think_end(line, ThinkOpenKind::CodeFenceThink) {
+                            pos += consumed;
+                            self.think_open_kind = None;
+                            self.at_line_start = true;
+                            continue;
+                        }
+                    } else if could_be_fenced_think_line(remaining, "```") {
+                        break;
+                    }
+                }
+                let ch = remaining
+                    .chars()
+                    .next()
+                    .expect("remaining input is not empty");
+                self.hidden.push(ch);
+                pos += ch.len_utf8();
+                self.at_line_start = ch == '\n';
+                continue;
+            }
+
+            if self.think_open_kind == Some(ThinkOpenKind::TagOrUnicode) {
+                if let Some(tag) = complete_prefix(remaining, &THINKING_CLOSE_TAGS) {
+                    pos += tag.len();
+                    self.think_open_kind = None;
+                    continue;
+                }
+                if has_partial_prefix(remaining, &THINKING_CLOSE_TAGS) {
+                    break;
+                }
+                let ch = remaining
+                    .chars()
+                    .next()
+                    .expect("remaining input is not empty");
+                self.hidden.push(ch);
+                pos += ch.len_utf8();
+                continue;
+            }
+
+            if self.at_line_start {
+                if self.fence_marker.is_none() {
+                    if let Some((line, consumed)) = complete_stream_line(remaining) {
+                        if classify_think_start(line) == Some(ThinkOpenKind::CodeFenceThink) {
+                            pos += consumed;
+                            self.think_open_kind = Some(ThinkOpenKind::CodeFenceThink);
+                            self.at_line_start = true;
+                            continue;
+                        }
+                    } else if could_be_fenced_think_line(remaining, "```think") {
+                        break;
+                    }
+                }
+                match fence_prefix(remaining, self.fence_marker) {
+                    FencePrefix::Complete(fence) => {
+                        self.fence_marker = match self.fence_marker {
+                            Some(_) => None,
+                            None => Some(fence),
+                        };
+                        self.at_line_start = false;
+                    }
+                    FencePrefix::Partial => break,
+                    FencePrefix::NotFence => self.at_line_start = false,
+                }
+            }
+
+            if self.fence_marker.is_none() {
+                if let Some(tag) = complete_prefix(remaining, &THINKING_OPEN_TAGS) {
+                    pos += tag.len();
+                    self.think_open_kind = Some(ThinkOpenKind::TagOrUnicode);
+                    continue;
+                }
+                if has_partial_prefix(remaining, &THINKING_OPEN_TAGS) {
+                    break;
+                }
+            }
+
+            let ch = remaining
+                .chars()
+                .next()
+                .expect("remaining input is not empty");
+            pos += ch.len_utf8();
+            visible.push(ch);
+            if ch == '\n' {
+                self.at_line_start = true;
+            }
+        }
+
+        self.pending.push_str(&input[pos..]);
+
+        visible
+    }
+
+    pub fn finish(&mut self) -> String {
+        if self.think_open_kind == Some(ThinkOpenKind::CodeFenceThink) {
+            if is_think_end(&self.pending, ThinkOpenKind::CodeFenceThink) {
+                self.pending.clear();
+                self.think_open_kind = None;
+            } else {
+                self.hidden.push_str(&self.pending);
+                self.pending.clear();
+            }
+            String::new()
+        } else if self.think_open_kind == Some(ThinkOpenKind::TagOrUnicode) {
+            self.hidden.push_str(&self.pending);
+            self.pending.clear();
+            String::new()
+        } else if classify_think_start(&self.pending) == Some(ThinkOpenKind::CodeFenceThink) {
+            self.pending.clear();
+            self.think_open_kind = Some(ThinkOpenKind::CodeFenceThink);
+            String::new()
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+
+    pub fn take_hidden(&mut self) -> Option<String> {
+        (!self.hidden.is_empty()).then(|| std::mem::take(&mut self.hidden))
+    }
+}
+
+fn complete_stream_line(input: &str) -> Option<(&str, usize)> {
+    let newline = input.find('\n')?;
+    let line = input[..newline]
+        .strip_suffix('\r')
+        .unwrap_or(&input[..newline]);
+    Some((line, newline + 1))
+}
+
+fn could_be_fenced_think_line(input: &str, marker: &str) -> bool {
+    let trimmed = input.trim_start_matches(' ');
+    let indent = input.len() - trimmed.len();
+    indent <= 3
+        && (marker.starts_with(trimmed)
+            || (trimmed.starts_with(marker) && trimmed[marker.len()..].trim().is_empty()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencePrefix {
+    Complete(FenceDelimiter),
+    Partial,
+    NotFence,
+}
+
+fn complete_prefix<'a>(input: &str, tags: &'a [&str]) -> Option<&'a str> {
+    tags.iter().copied().find(|tag| input.starts_with(tag))
+}
+
+fn has_partial_prefix(input: &str, tags: &[&str]) -> bool {
+    tags.iter().any(|tag| tag.starts_with(input))
+}
+
+fn fence_prefix(input: &str, active_fence: Option<FenceDelimiter>) -> FencePrefix {
+    let line_end = input.find('\n');
+    let line = line_end.map_or(input, |end| &input[..end]);
+
+    if let Some((candidate, suffix)) = parse_fence_start(line) {
+        if let Some(opener) = active_fence {
+            if candidate.marker != opener.marker {
+                return FencePrefix::NotFence;
+            }
+            if candidate.run_length >= opener.run_length
+                && suffix.trim().is_empty()
+                && (line_end.is_some() || !suffix.is_empty())
+            {
+                return FencePrefix::Complete(candidate);
+            }
+            if line_end.is_none() && suffix.is_empty() {
+                return FencePrefix::Partial;
+            }
+            return FencePrefix::NotFence;
+        }
+
+        if line_end.is_none() && suffix.is_empty() {
+            return FencePrefix::Partial;
+        }
+        return FencePrefix::Complete(candidate);
+    }
+
+    let bytes = line.as_bytes();
+    let indent = bytes.iter().take_while(|&&byte| byte == b' ').count();
+    if indent > 3 || indent == bytes.len() {
+        return if indent <= 3 {
+            FencePrefix::Partial
+        } else {
+            FencePrefix::NotFence
+        };
+    }
+    let rest = &bytes[indent..];
+    let marker = rest[0];
+    if !matches!(marker, b'`' | b'~')
+        || active_fence.is_some_and(|fence| fence.marker != marker)
+        || !rest.iter().all(|&byte| byte == marker)
+    {
+        return FencePrefix::NotFence;
+    }
+    FencePrefix::Partial
+}
+
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
 
 /// Result of JSON truncation/repair operation.
@@ -840,5 +1074,14 @@ mod tests {
     fn test_strip_tool_call_lines_still_strips_outside_fences() {
         let input = "▶ execute_command\n```\n✓ kept\n```\n✓ done\nanswer";
         assert_eq!(strip_tool_call_lines(input), "```\n✓ kept\n```\nanswer");
+    }
+
+    #[test]
+    fn thinking_filter_retains_only_a_partial_delimiter_between_chunks() {
+        let mut filter = ThinkingTagStreamFilter::new();
+        assert_eq!(filter.push(&"x".repeat(100_000)), "x".repeat(100_000));
+        assert!(filter.pending.len() < "<!-- think -->".len());
+        assert_eq!(filter.push("<thi"), "");
+        assert_eq!(filter.pending, "<thi");
     }
 }
