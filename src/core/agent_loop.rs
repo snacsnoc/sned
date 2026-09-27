@@ -396,6 +396,27 @@ impl ToolExecutionOutput {
             hook_context,
         }
     }
+
+    fn cancelled_before_start() -> Self {
+        Self::error(
+            "Tool execution skipped: task was cancelled before the tool started".to_string(),
+            None,
+        )
+    }
+}
+
+/// Resolve a prepared but unstarted tool future. Cancellation observed here
+/// must not begin new work; an already-started future runs to completion so
+/// a file transaction is never dropped mid-application.
+async fn run_tool_unless_cancelled(
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    task: futures::future::BoxFuture<'static, ToolExecutionOutput>,
+) -> ToolExecutionOutput {
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        ToolExecutionOutput::cancelled_before_start()
+    } else {
+        task.await
+    }
 }
 
 fn append_tool_result_blocks(
@@ -1849,7 +1870,10 @@ impl AgentLoop {
                     .plan_state
                     .as_ref()
                     .is_some_and(|plan| plan.paused && plan.approved);
-                if plan_is_paused {
+                // A cancelled run must reach the normal cancellation handling
+                // below even while the plan stays paused.
+                let pause_can_wait = plan_is_paused && !state.is_cancelled;
+                if pause_can_wait {
                     drop(state);
                     paused_plan_epoch = true;
                     if !pause_notice_emitted {
@@ -4243,10 +4267,14 @@ impl AgentLoop {
             }
             let mut result_map: std::collections::HashMap<usize, ToolExecutionOutput> =
                 std::collections::HashMap::with_capacity(tool_tasks.len());
+            let task_cancelled = self.state.lock().await.is_cancelled_atomic.clone();
             if !parallel_enabled {
                 for (i, (_, _, _, task, _, _)) in tool_tasks.iter_mut().enumerate() {
                     if let Some(future) = task.take() {
-                        result_map.insert(i, future.await);
+                        result_map.insert(
+                            i,
+                            run_tool_unless_cancelled(task_cancelled.clone(), future).await,
+                        );
                     }
                 }
             }
@@ -4277,10 +4305,12 @@ impl AgentLoop {
                             break;
                         }
                     }
+                    use futures::FutureExt;
+                    let gated = run_tool_unless_cancelled(task_cancelled.clone(), future).boxed();
                     if let Some(idx) = found_group {
-                        edit_groups[idx].1.push((i, future));
+                        edit_groups[idx].1.push((i, gated));
                     } else {
-                        edit_groups.push((paths, vec![(i, future)]));
+                        edit_groups.push((paths, vec![(i, gated)]));
                     }
                 }
             }
@@ -4290,8 +4320,11 @@ impl AgentLoop {
                 .enumerate()
                 .filter_map(|(i, (_, tool_name, _, task, _, _))| {
                     if task.is_some() && tool_name != "edit_file" && tool_name != "write_to_file" {
+                        use futures::FutureExt;
                         non_edit_executed.insert(i);
-                        task.take()
+                        task.take().map(|future| {
+                            run_tool_unless_cancelled(task_cancelled.clone(), future).boxed()
+                        })
                     } else {
                         None
                     }
@@ -8855,6 +8888,192 @@ Irrespective of whether additional information or instructions are given, you ar
             .expect("paused plan task should observe cancellation")
             .expect("paused plan task should not panic");
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_run_observes_cancellation_while_plan_stays_paused() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("SENTINEL_NOT_CONSUMED"),
+        ));
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut config = test_agent_config(provider, "test-run-paused-plan-cancel");
+        config.max_turns = 1;
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+        {
+            let mut state = agent.state.lock().await;
+            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+                "Resume this step later".to_string(),
+            ]);
+            plan.approved = true;
+            plan.paused = true;
+            state.plan_state = Some(plan);
+        }
+
+        let state_handle = Arc::clone(&agent.state);
+        let state_manager = Arc::new(StateManager::new().unwrap());
+        let run = tokio::spawn(async move { agent.run(vec![], state_manager).await });
+        tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+
+        {
+            let mut state = state_handle.lock().await;
+            assert!(state.plan_state.as_ref().is_some_and(|plan| plan.paused));
+            state.is_cancelled = true;
+            state
+                .is_cancelled_atomic
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), run)
+            .await
+            .expect("cancelled run must exit while the plan stays paused")
+            .expect("paused plan task should not panic");
+        assert!(result.is_ok());
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("SENTINEL_NOT_CONSUMED")),
+            "no provider turn may run after cancellation"
+        );
+    }
+
+    struct CancelProbeHandler {
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::core::tools::ToolHandler for CancelProbeHandler {
+        fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, crate::core::tools::ToolError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            let started = self.started.clone();
+            Box::pin(async move {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!("handler ran"))
+            })
+        }
+
+        fn description(&self, _params: &serde_json::Value) -> String {
+            "cancel probe".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_during_pending_approval_starts_no_tool() {
+        use crate::core::approval::{ApprovalManager, ApprovalResult};
+        use crate::core::tools::ToolRegistry;
+        use crate::test_support::env_lock;
+        use tokio::time::{Duration, timeout};
+
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let _approval_guard = crate::core::approval::approval_test_guard();
+        let _input_override = crate::core::approval::override_approval_input_for_test();
+
+        let responses = vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call_1".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("write_to_file".to_string()),
+                    arguments: Some(
+                        serde_json::json!({"path": "cancelled.txt", "content": "must not run"})
+                            .to_string(),
+                    ),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        })]];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests),
+        ));
+        let (tx, _rx) = mpsc::channel(32);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval output receiver should be available");
+        let mut config = test_agent_config(provider, "test-cancel-during-approval");
+        config.output_writer = writer;
+
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::WriteToFile,
+            Arc::new(CancelProbeHandler {
+                started: Arc::clone(&started),
+            }),
+        );
+        let approval_manager = Arc::new(tokio::sync::Mutex::new(ApprovalManager::new()));
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_approval_manager(approval_manager);
+        let state_handle = Arc::clone(&agent.state);
+
+        let turn = tokio::spawn(async move {
+            let result = agent.execute_turn().await;
+            (agent, result)
+        });
+
+        let request = loop {
+            let event = timeout(Duration::from_secs(2), approval_rx.recv())
+                .await
+                .expect("approval prompt should arrive")
+                .expect("priority output should stay open");
+            if let OutputEvent::ApprovalRequested(request) = event.event {
+                break request;
+            }
+        };
+
+        {
+            let mut state = state_handle.lock().await;
+            state.is_cancelled = true;
+            state
+                .is_cancelled_atomic
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        assert!(request.respond(ApprovalResult::Approved));
+
+        let (agent, result) = timeout(Duration::from_secs(5), turn)
+            .await
+            .expect("tool batch should finish")
+            .expect("agent task should not panic");
+        assert!(matches!(result, TurnResult::Continue));
+        assert!(
+            !started.load(std::sync::atomic::Ordering::SeqCst),
+            "no unstarted tool may begin after cancellation"
+        );
+        let history = agent.conversation_history.lock().await;
+        let skipped = history
+            .last()
+            .and_then(|message| match &message.content {
+                MessageContent::UserBlocks(blocks) => Some(blocks),
+                _ => None,
+            })
+            .expect("tool result message should be recorded")
+            .iter()
+            .filter_map(|block| match block {
+                UserContentBlock::ToolResult(result) => match &result.content {
+                    ToolResultContent::Text(text) => Some(text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            skipped[0].contains("cancelled"),
+            "the skipped tool must record cancellation, not success"
+        );
     }
 
     #[tokio::test]
