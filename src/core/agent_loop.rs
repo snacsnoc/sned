@@ -1599,6 +1599,55 @@ impl AgentLoop {
     /// files the model abandoned. The `READ_LOOP_INSPECTION_TOOLS`
     /// allowlist preserves state across read-only shell commands; mutating
     /// shell commands are invalidated after execution separately.
+    /// Whether a read-warning key tracks a path a mutation changed.
+    /// Handler keys may be canonicalized while params stay relative, so
+    /// exact matches and relative/absolute suffix pairs both invalidate.
+    fn read_state_key_matches_tracked(key: &str, affected: &str) -> bool {
+        if key == affected {
+            return true;
+        }
+        let key = key.replace('\\', "/");
+        let affected = affected.replace('\\', "/");
+        if key == affected {
+            return true;
+        }
+        key.ends_with(&format!("/{affected}")) || affected.ends_with(&format!("/{key}"))
+    }
+
+    /// Invalidate read-warning state for paths a mutation actually changed.
+    /// Runs only after a mutating tool executes successfully; denials,
+    /// parse failures and deferrals never reach this point, so warning
+    /// history for untouched files survives them.
+    async fn invalidate_read_state_for_mutation(
+        state: &Arc<Mutex<TaskState>>,
+        tool: SnedTool,
+        params: &serde_json::Value,
+    ) {
+        let affected = Self::extract_action_path(tool, params);
+        let mut guard = state.lock().await;
+        if affected.is_empty() {
+            guard.consecutive_reads.clear();
+            guard.last_read_turn.clear();
+            guard.recent_read_windows.clear();
+            return;
+        }
+        guard.consecutive_reads.retain(|key, _| {
+            !affected
+                .iter()
+                .any(|path| Self::read_state_key_matches_tracked(key, path))
+        });
+        guard.last_read_turn.retain(|key, _| {
+            !affected
+                .iter()
+                .any(|path| Self::read_state_key_matches_tracked(key, path))
+        });
+        guard.recent_read_windows.retain(|key, _| {
+            !affected
+                .iter()
+                .any(|path| Self::read_state_key_matches_tracked(key, path))
+        });
+    }
+
     fn decay_read_loop_state(state: &mut TaskState, tool_name: &str) {
         if Self::READ_LOOP_INSPECTION_TOOLS.contains(&tool_name) {
             return;
@@ -3763,21 +3812,9 @@ impl AgentLoop {
                     continue;
                 }
 
-                // Read-loop state decay. The blanket `tool_name != "read_file"`
-                // wipe that lived here previously silently reset
-                // `consecutive_reads` on every `execute_command`, which made
-                // the read-loop warning useless the moment the model interleaved
-                // reads with shell commands — the exact pattern that hit
-                // miniMAX-M3 on SDRSkeleton (9 narrow reads with intervening
-                // `xcodebuild` greps and a Python brace-depth script, no
-                // diagnostic ever fired). Inspection tools keep state alive;
-                // mutating tools reset state. See `decay_read_loop_state`
-                // for the full classification.
-                {
-                    let mut state = self.state.lock().await;
-                    Self::decay_read_loop_state(&mut state, &tool_name);
-                }
-
+                // Read-warning decay runs after execution, not here: a
+                // denied or malformed call must not erase warning history
+                // for files it never touched.
                 let tool_id = prepared.tool_id.clone();
                 let tool_params = match &prepared.parsed_args {
                     Ok(params) => params.clone(),
@@ -4382,6 +4419,7 @@ impl AgentLoop {
             for (tool_id, tool_name, immediate_result_text, _task, edit_file_path, tool_params) in
                 tool_tasks
             {
+                let executed = immediate_result_text.is_none();
                 let mut result_output = if let Some(result_text) = immediate_result_text {
                     result_text
                 } else {
@@ -4392,6 +4430,23 @@ impl AgentLoop {
 
                 if tool_name == "execute_command" {
                     Self::invalidate_changed_read_state(&self.state).await;
+                }
+
+                // Warning state follows actual mutation: a successfully
+                // executed mutating tool invalidates its own paths, while
+                // denied, malformed or deferred calls retain history for
+                // files they never touched.
+                if Self::READ_LOOP_MUTATING_TOOLS.contains(&tool_name.as_str()) {
+                    if executed
+                        && !result_output.is_error
+                        && let Some(tool) = SnedTool::from_name(&tool_name)
+                    {
+                        Self::invalidate_read_state_for_mutation(&self.state, tool, &tool_params)
+                            .await;
+                    }
+                } else if !Self::READ_LOOP_INSPECTION_TOOLS.contains(&tool_name.as_str()) {
+                    let mut state = self.state.lock().await;
+                    Self::decay_read_loop_state(&mut state, &tool_name);
                 }
 
                 // Workspace effects derive from actual per-path outcomes, not
@@ -8167,6 +8222,103 @@ mod tests {
         save.await
             .expect("save must finish once the metadata lock is released");
         lock_thread.join().expect("lock holder must exit");
+    }
+
+    #[tokio::test]
+    async fn test_denied_malformed_edit_preserves_unrelated_read_warnings() {
+        use serde_json::json;
+        let responses = vec![tool_call_chunks(&[
+            (
+                "bad-args",
+                "edit_file",
+                serde_json::Value::String("{oops".to_string()),
+            ),
+            (
+                "denied",
+                "edit_file",
+                json!({"files": [{"path": "b.txt", "edits": []}]}),
+            ),
+        ])];
+        // Malformed arguments never parse, so build that call directly.
+        let mut first = responses.into_iter().next().unwrap();
+        first[0] = ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("bad-args".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("edit_file".to_string()),
+                    arguments: Some("{oops".to_string()),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        });
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                vec![first],
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::EditFile, Arc::new(EditStatsHandler));
+        let mut config = test_agent_config(provider, "read-warning-retention");
+        config.mode = AgentMode::Plan;
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        {
+            let mut state = agent.state.lock().await;
+            state.turns_completed = 5;
+            state.consecutive_reads.insert("a.txt".to_string(), 3);
+            state.last_read_turn.insert("a.txt".to_string(), 4);
+            let mut ring = std::collections::VecDeque::new();
+            ring.push_back((10, 20));
+            state.recent_read_windows.insert("a.txt".to_string(), ring);
+        }
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
+        // Both calls fail before execution, so the turn counts a mistake.
+        assert_eq!(agent.state.lock().await.consecutive_mistakes, 1);
+        let state = agent.state.lock().await;
+        assert_eq!(state.consecutive_reads.get("a.txt"), Some(&3));
+        assert_eq!(state.last_read_turn.get("a.txt"), Some(&4));
+        assert_eq!(
+            state.recent_read_windows.get("a.txt").map(|r| r.len()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_successful_edit_invalidates_only_edited_paths() {
+        use serde_json::json;
+        let responses = vec![tool_call_chunks(&[(
+            "e1",
+            "edit_file",
+            json!({"files": [{"path": "b.txt", "edits": []}]}),
+        )])];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::EditFile, Arc::new(EditStatsHandler));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "read-warning-invalidate"))
+            .with_tools(Arc::new(registry));
+        {
+            let mut state = agent.state.lock().await;
+            state.turns_completed = 5;
+            state.consecutive_reads.insert("a.txt".to_string(), 3);
+            state.consecutive_reads.insert("b.txt".to_string(), 2);
+            state.last_read_turn.insert("a.txt".to_string(), 4);
+            state.last_read_turn.insert("b.txt".to_string(), 4);
+        }
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let state = agent.state.lock().await;
+        assert_eq!(state.consecutive_reads.get("a.txt"), Some(&3));
+        assert!(!state.consecutive_reads.contains_key("b.txt"));
+        assert!(state.last_read_turn.contains_key("a.txt"));
+        assert!(!state.last_read_turn.contains_key("b.txt"));
     }
 
     #[tokio::test]
