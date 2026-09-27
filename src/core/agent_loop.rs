@@ -4831,25 +4831,22 @@ impl AgentLoop {
                         format_heat_map(&edit_files),
                         Style::default().add_modifier(Modifier::DIM),
                     ));
+            }
 
-                // Auto-commit to shadow git after file-modifying turns
-                // Only commit if files were actually modified (not just attempted or failed)
-                // Check that we have actual changes (added or removed lines > 0)
-                let has_actual_changes = edit_files
-                    .iter()
-                    .any(|(_, added, removed)| *added > 0 || *removed > 0);
-                if self.config.track_changes
-                    && has_actual_changes
-                    && let Ok(workspace_root) = std::env::current_dir()
-                {
-                    let message = format!("[sned] turn: {}", format_heat_map_plain(&edit_files));
-                    // Run synchronous git operations in spawn_blocking to avoid blocking runtime
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::core::shadow_git::commit_turn(&workspace_root, &message)
-                    })
-                    .await;
-                    report_shadow_commit_result(&self.config.output_writer, result);
-                }
+            // Auto-commit to shadow git after file-modifying turns in any
+            // output mode. Only commit when files were actually modified
+            // (not just attempted, failed, or denied).
+            if self.config.track_changes
+                && let Some(message) =
+                    Self::shadow_commit_message(&edit_files, &files_created, &symbol_edited_paths)
+                && let Ok(workspace_root) = std::env::current_dir()
+            {
+                // Run synchronous git operations in spawn_blocking to avoid blocking runtime
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::core::shadow_git::commit_turn(&workspace_root, &message)
+                })
+                .await;
+                report_shadow_commit_result(&self.config.output_writer, result);
             }
 
             // Print action digest summarizing what happened in this turn
@@ -5277,6 +5274,34 @@ impl AgentLoop {
             }
             _ => vec![],
         }
+    }
+
+    /// Shadow-commit message for a turn's actual workspace mutations, or
+    /// `None` when nothing committable happened. Takes only executed
+    /// outcomes, never the presentation mode: JSON versus TTY changes
+    /// rendering, not whether a mutation is recorded.
+    fn shadow_commit_message(
+        edit_files: &[(String, i32, i32)],
+        files_created: &[String],
+        symbol_edited_paths: &[String],
+    ) -> Option<String> {
+        let mut parts = Vec::new();
+        if edit_files
+            .iter()
+            .any(|(_, added, removed)| *added > 0 || *removed > 0)
+        {
+            parts.push(format_heat_map_plain(edit_files));
+        }
+        if !files_created.is_empty() {
+            parts.push(format!("created {}", files_created.join(", ")));
+        }
+        if !symbol_edited_paths.is_empty() {
+            parts.push(format!("symbols {}", symbol_edited_paths.join(", ")));
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!("[sned] turn: {}", parts.join("; ")))
     }
 
     /// Load AGENTS.md files for explicit file-oriented tool targets so the
@@ -8059,6 +8084,35 @@ mod tests {
             digest.contains("1 file created"),
             "failed write must not count as created, got {rendered:?}"
         );
+    }
+
+    #[test]
+    fn test_shadow_commit_message_covers_all_mutation_kinds() {
+        assert_eq!(AgentLoop::shadow_commit_message(&[], &[], &[]), None);
+        assert_eq!(
+            AgentLoop::shadow_commit_message(&[], &["new.txt".to_string()], &[]),
+            Some("[sned] turn: created new.txt".to_string())
+        );
+        assert_eq!(
+            AgentLoop::shadow_commit_message(&[], &[], &["a.rs".to_string()]),
+            Some("[sned] turn: symbols a.rs".to_string())
+        );
+        // Zero-stat edits commit nothing.
+        assert_eq!(
+            AgentLoop::shadow_commit_message(&[("e.txt".to_string(), 0, 0)], &[], &[]),
+            None
+        );
+        // Edited files keep the established heat-map summary first.
+        let edited = &[("e.txt".to_string(), 2, 1)];
+        assert_eq!(
+            AgentLoop::shadow_commit_message(edited, &[], &[]),
+            Some(format!("[sned] turn: {}", format_heat_map_plain(edited)))
+        );
+        let mixed =
+            AgentLoop::shadow_commit_message(edited, &["n.txt".to_string()], &["s.rs".to_string()])
+                .expect("mutations must produce a message");
+        assert!(mixed.contains("created n.txt"), "got {mixed}");
+        assert!(mixed.contains("symbols s.rs"), "got {mixed}");
     }
 
     #[tokio::test]
