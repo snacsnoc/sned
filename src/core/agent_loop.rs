@@ -1324,8 +1324,10 @@ impl AgentLoop {
     #[must_use]
     pub fn new(config: AgentConfig) -> Self {
         let is_subagent = config.is_subagent_execution;
+        let strict_plan_mode_enabled = config.strict_plan_mode_enabled;
         let state = TaskState {
             is_subagent_execution: is_subagent,
+            strict_plan_mode_enabled,
             ..TaskState::default()
         };
         let cancelled = state.is_cancelled_atomic.clone();
@@ -1758,6 +1760,7 @@ impl AgentLoop {
         {
             let mut state = self.state.lock().await;
             state.double_check_completion_enabled = self.config.double_check_completion;
+            state.strict_plan_mode_enabled = self.config.strict_plan_mode_enabled;
             state.first_tool_result_printed = false;
             // Initialize session start time for session summary
             state.session_start_time = Some(std::time::Instant::now());
@@ -8319,6 +8322,69 @@ mod tests {
         assert!(!state.consecutive_reads.contains_key("b.txt"));
         assert!(state.last_read_turn.contains_key("a.txt"));
         assert!(!state.last_read_turn.contains_key("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_plan_mode_flows_from_config_into_state() {
+        for enabled in [true, false] {
+            let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+                vec![],
+            )));
+            let mut config = test_agent_config(provider, "strict-plan-new");
+            config.strict_plan_mode_enabled = enabled;
+            let agent = AgentLoop::new(config);
+            assert_eq!(
+                agent.state.lock().await.strict_plan_mode_enabled,
+                enabled,
+                "constructor must copy strict-plan mode into state"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_startup_applies_configured_strict_plan_mode() {
+        use crate::test_support::env_lock;
+
+        for enabled in [true, false] {
+            let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+            let temp_dir = tempfile::tempdir().unwrap();
+            let data_dir = temp_dir.path().join("data");
+            std::fs::create_dir_all(data_dir.join("state")).unwrap();
+            std::fs::create_dir_all(data_dir.join("settings")).unwrap();
+            let old_sned_dir = std::env::var_os("SNED_DIR");
+            // SAFETY: env_lock serializes process-environment mutation.
+            unsafe {
+                std::env::set_var("SNED_DIR", temp_dir.path());
+            }
+            let provider = Arc::new(Providers::Mock(
+                crate::providers::mock::MockProvider::single_text_response("should not run"),
+            ));
+            let mut config = test_agent_config(provider, "strict-plan-startup");
+            config.strict_plan_mode_enabled = enabled;
+            let mut agent = AgentLoop::new(config);
+            {
+                let mut state = agent.state.lock().await;
+                state.is_cancelled = true;
+                state
+                    .is_cancelled_atomic
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            let state_manager = Arc::new(StateManager::new().unwrap());
+            let result = agent.run(vec![], state_manager).await;
+            assert!(result.is_ok());
+            assert_eq!(
+                agent.state.lock().await.strict_plan_mode_enabled,
+                enabled,
+                "startup must apply the configured strict-plan mode"
+            );
+            // SAFETY: restore the process environment for later tests.
+            unsafe {
+                match old_sned_dir {
+                    Some(ref value) => std::env::set_var("SNED_DIR", value),
+                    None => std::env::remove_var("SNED_DIR"),
+                }
+            }
+        }
     }
 
     #[tokio::test]
