@@ -8205,6 +8205,39 @@ mod tests {
         unsafe { std::env::remove_var("SNED_APPROVAL_DENY") };
     }
 
+    #[test]
+    fn test_unknown_tools_fail_closed_to_barrier() {
+        // Read-only tools may run inside concurrent read batches...
+        for tool in [
+            "read_file",
+            "search_files",
+            "list_files",
+            "get_file_skeleton",
+            "ask_followup_question",
+        ] {
+            assert!(
+                AgentLoop::tool_is_schedulable_read(tool),
+                "{tool} must stay schedulable"
+            );
+        }
+        // ...while mutating, unknown-effect, and unknown tools must not:
+        // an unrecognized mutation must never slip into a concurrent batch.
+        for tool in [
+            "edit_file",
+            "write_to_file",
+            "replace_symbol",
+            "rename_symbol",
+            "execute_command",
+            "definitely_not_a_tool",
+            "",
+        ] {
+            assert!(
+                !AgentLoop::tool_is_schedulable_read(tool),
+                "{tool} must fail closed to barrier"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_json_and_tty_modes_share_mutation_bookkeeping() {
         use serde_json::json;
