@@ -12,6 +12,7 @@
 //! reverse order when possible.
 
 pub mod agent_loop;
+pub mod agent_stream;
 pub mod agent_types;
 pub mod anchor_dictionary;
 pub mod approval;

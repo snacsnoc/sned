@@ -13,10 +13,13 @@
 
 use crate::cli::output::OutputEvent;
 use crate::cli::tui::theme::{error_fg, prompt_fg};
+use crate::core::agent_stream::{
+    StreamAccumulator, StreamEvent, StreamOutcome, StreamProviderInfo,
+};
 use crate::core::agent_types::code_block_display_limit;
 pub use crate::core::agent_types::{AgentConfig, AgentError, AgentMode, TaskState, TurnResult};
 use crate::core::context::{
-    ApiReqInfo, PromptBuilder, SystemPromptContext, context_manager, context_window,
+    PromptBuilder, SystemPromptContext, context_manager, context_window,
 };
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::provider_retry::{
@@ -64,9 +67,7 @@ const DEFAULT_THINKING_HISTORY_LIMIT: usize = 2_000;
 const THINKING_HISTORY_LIMIT_ENV: &str = "SNED_THINKING_HISTORY_LIMIT";
 
 use crate::core::plan_state::PlanStepStatus;
-use crate::core::stream_parsing::{
-    ThinkingTagStreamFilter, extract_response_text, split_model_output,
-};
+use crate::core::stream_parsing::{extract_response_text, split_model_output};
 use crate::core::tool_output::{
     extract_edit_stats_detailed, format_heat_map, format_heat_map_plain, format_tool_call_lines,
     format_tool_call_lines_with_raw_arguments, format_tool_result, format_tool_result_digest,
@@ -428,10 +429,6 @@ fn update_model_line_with_prefix_if_pending(
         return;
     }
     update_model_line(line, output_writer, style_markdown);
-}
-
-fn stream_error_is_retryable(error: &str) -> bool {
-    error.contains("(retryable)")
 }
 
 fn report_shadow_commit_result(
@@ -2060,6 +2057,70 @@ impl AgentLoop {
         }
     }
 
+    /// Measurement stays a loop method because it reads turn state and
+    /// resolves the model id.
+    async fn record_stream_timing(
+        &self,
+        chunk: &ApiStreamChunk,
+        provider: &std::sync::Arc<Providers>,
+        decoded_chunks: u64,
+        text_chunks: u64,
+        reasoning_chunks: u64,
+        max_gap: std::time::Duration,
+        attempt: usize,
+    ) {
+        let ApiStreamChunk::Timing(provider_timing) = chunk else {
+            return;
+        };
+        if !crate::cli::output::timing_enabled() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        state.provider_stream_completed_time = provider_timing
+            .completed_at
+            .or_else(|| Some(std::time::Instant::now()));
+        let request_to_first_chunk_us = state.request_sent_time.and_then(|request| {
+            state
+                .first_provider_chunk_time
+                .map(|chunk| chunk.duration_since(request).as_micros() as u64)
+        });
+        let first_chunk_to_displayable_text_us =
+            state.first_provider_chunk_time.and_then(|chunk| {
+                state.first_displayable_text_time.map(|displayable| {
+                    displayable.duration_since(chunk).as_micros() as u64
+                })
+            });
+        let displayable_text_to_output_us =
+            state.first_displayable_text_time.and_then(|displayable| {
+                state
+                    .first_output_emit_time
+                    .map(|output| output.duration_since(displayable).as_micros() as u64)
+            });
+        crate::cli::output::emit_timing_record(&crate::cli::output::ProviderTimingRecord {
+            record_type: "sned_timing_provider_attempt",
+            run_id: crate::cli::output::timing_run_id(),
+            session_id: self.config.task_id.clone(),
+            turn: state.turns_completed.saturating_add(1),
+            attempt: attempt + 1,
+            provider: provider.name().to_string(),
+            model: self.resolve_active_model_id(),
+            stream: true,
+            request_to_headers_us: provider_timing.request_to_headers_us,
+            headers_to_first_byte_us: provider_timing.headers_to_first_byte_us,
+            request_to_first_chunk_us,
+            first_chunk_to_displayable_text_us,
+            displayable_text_to_output_us,
+            stream_total_us: provider_timing.stream_total_us,
+            raw_sse_frames: provider_timing.raw_sse_frames,
+            decoded_chunks,
+            text_chunks,
+            reasoning_chunks,
+            empty_sse_frames: provider_timing.empty_sse_frames,
+            max_inter_raw_byte_gap_us: provider_timing.max_inter_raw_byte_gap_us,
+            max_inter_decoded_chunk_gap_us: max_gap.as_micros() as u64,
+        });
+    }
+
     /// Executes a single turn of the agent loop.
     async fn execute_turn(&mut self) -> TurnResult {
         // Reset per-turn counters so cumulative token totals stay correct but
@@ -2510,18 +2571,20 @@ impl AgentLoop {
                 }
             });
 
-            // 4. Process stream chunks
-            let mut accumulated_text = String::new();
-            let mut filtered_text = String::new();
+            // 4. Process stream chunks. Interpretation lives in the
+            // accumulator; only presentation, measurement, timing, and
+            // cancellation state remain here.
+            let stream_provider_info = {
+                let guard = self.config.provider.lock().expect("provider poisoned");
+                StreamProviderInfo {
+                    provider_name: guard.name().to_string(),
+                    context_window: crate::core::context::get_context_window_info(guard.as_ref())
+                        .context_window,
+                }
+            };
+            let mut accumulator =
+                StreamAccumulator::new(self.config.json_output, stream_provider_info);
             let mut first_chunk_received = false;
-            let mut accumulated_reasoning = String::new();
-            let mut accumulated_signature: Option<String> = None;
-            let mut accumulated_text_signature: Option<String> = None;
-            let mut accumulated_redacted_data: Vec<String> = Vec::new();
-            // Use HashMap for O(1) merge + Vec to preserve insertion order (P4)
-            let mut tool_calls_map: HashMap<String, ApiStreamToolCall> = HashMap::with_capacity(4);
-            let mut tool_call_order: Vec<String> = Vec::new();
-            let mut announced_tool_call_ids = std::collections::HashSet::new();
             let mut tool_call_detected = false;
             let mut display_buffer = String::new();
             let mut in_code_block = false;
@@ -2531,14 +2594,8 @@ impl AgentLoop {
             let mut code_block_snipped = false;
             let code_block_display_limit = code_block_display_limit(self.config.interactive_mode);
 
-            let mut stream_errored = false;
-            let mut retryable_stream_error_before_output: Option<String> = None;
-            let mut non_retryable_stream_error: Option<String> = None;
-            let mut substantive_stream_output_received = false;
-            let mut thinking_tag_filter = ThinkingTagStreamFilter::new();
             let mut partial_line_displayed = false;
             let mut last_partial_flush_at: Option<std::time::Instant> = None;
-            let mut stream_usage: Option<ApiReqInfo> = None;
             let mut preoutput_deadline_exceeded = false;
             let mut decoded_chunks = 0u64;
             let mut text_chunks = 0u64;
@@ -2558,7 +2615,7 @@ impl AgentLoop {
                         preoutput_budget.checked_sub(preoutput_retry_started_at.elapsed())
                     else {
                         preoutput_deadline_exceeded = true;
-                        retryable_stream_error_before_output = Some(format!(
+                        accumulator.note_preoutput_failure(format!(
                             "provider {output_kind} produced no output within {}s",
                             preoutput_budget.as_secs()
                         ));
@@ -2568,7 +2625,7 @@ impl AgentLoop {
                         chunk
                     } else {
                         preoutput_deadline_exceeded = true;
-                        retryable_stream_error_before_output = Some(format!(
+                        accumulator.note_preoutput_failure(format!(
                             "provider {output_kind} produced no output within {}s",
                             preoutput_budget.as_secs()
                         ));
@@ -2610,31 +2667,26 @@ impl AgentLoop {
                     first_chunk_received = true;
                 }
 
-                match chunk {
-                    ApiStreamChunk::Text(text_chunk) => {
-                        text_chunks = text_chunks.saturating_add(1);
-                        tracing::debug!(text = %text_chunk.text, "received text chunk");
-                        let processed = thinking_tag_filter.push(&text_chunk.text);
-                        filtered_text.push_str(&processed);
-                        if self.config.json_output {
-                            substantive_stream_output_received |= !text_chunk.text.is_empty();
-                            tracing::info!(
-                                target: "json_output",
-                                "{}",
-                                serde_json::json!({
-                                    "type": "text",
-                                    "text": text_chunk.text
-                                })
-                                .to_string()
-                            );
-                        } else {
-                            // Only display non-thinking content
-                            if !processed.is_empty() {
-                                substantive_stream_output_received = true;
+                if matches!(&chunk, ApiStreamChunk::Timing(_)) {
+                    self.record_stream_timing(
+                        &chunk,
+                        &provider,
+                        decoded_chunks,
+                        text_chunks,
+                        reasoning_chunks,
+                        max_inter_decoded_chunk_gap,
+                        stream_retry_attempt,
+                    )
+                    .await;
+                }
+                for event in accumulator.push(&chunk) {
+                    match event {
+                        StreamEvent::VisibleText(processed) => {
+                            text_chunks = text_chunks.saturating_add(1);
+                            if !self.config.json_output && !processed.is_empty() {
                                 self.record_first_displayable_text_time().await;
                                 display_buffer.push_str(&processed);
                                 while let Some(nl_pos) = display_buffer.find('\n') {
-                                    // Extract line and trim in one pass (reduces allocations)
                                     let line = display_buffer[..nl_pos].to_string();
                                     display_buffer.drain(..=nl_pos);
                                     let trimmed_line = line.trim();
@@ -2679,7 +2731,6 @@ impl AgentLoop {
 
                                     if in_code_block {
                                         code_block_lines += 1;
-                                        // For code blocks, preserve leading indentation (only trim end)
                                         let code_line = line.trim_end().to_string();
                                         if code_block_lines > code_block_display_limit {
                                             code_block_snipped = true;
@@ -2690,7 +2741,6 @@ impl AgentLoop {
                                         continue;
                                     }
 
-                                    // Regular content - already trimmed
                                     self.record_first_output_emit_time().await;
                                     if partial_line_displayed {
                                         update_model_line_with_prefix_if_pending(
@@ -2742,412 +2792,87 @@ impl AgentLoop {
                                 }
                             }
                         }
-                        if text_chunk.signature.is_some() {
-                            accumulated_text_signature = text_chunk.signature.clone();
+                        StreamEvent::ReasoningText(reasoning) => {
+                            reasoning_chunks = reasoning_chunks.saturating_add(1);
+                            self.record_first_reasoning_chunk_time().await;
+                            if !self.config.json_output && !reasoning.is_empty() {
+                                self.config
+                                    .output_writer
+                                    .emit(OutputEvent::ReasoningChunk(reasoning));
+                            }
                         }
-                        accumulated_text.push_str(&text_chunk.text);
-                    }
-                    ApiStreamChunk::Reasoning(reasoning_chunk) => {
-                        reasoning_chunks = reasoning_chunks.saturating_add(1);
-                        substantive_stream_output_received |= !reasoning_chunk.reasoning.is_empty();
-                        self.record_first_reasoning_chunk_time().await;
-                        if self.config.json_output {
-                            tracing::info!(
-                                target: "json_output",
-                                "{}",
-                                serde_json::json!({
-                                    "type": "reasoning",
-                                    "reasoning": reasoning_chunk.reasoning,
-                                    "signature": reasoning_chunk.signature,
-                                    "redacted_data": reasoning_chunk.redacted_data,
-                                })
-                                .to_string()
-                            );
-                        } else if !reasoning_chunk.reasoning.is_empty() {
-                            self.config.output_writer.emit(OutputEvent::ReasoningChunk(
-                                reasoning_chunk.reasoning.clone(),
-                            ));
+                        StreamEvent::PrepareToolCall { name, .. } => {
+                            if !self.config.json_output {
+                                if !tool_call_detected {
+                                    self.config.output_writer.flush();
+                                    tool_call_detected = true;
+                                }
+                                self.config
+                                    .output_writer
+                                    .emit(OutputEvent::tool_call(format!("Preparing {name}…")));
+                            }
                         }
-                        accumulated_reasoning.push_str(&reasoning_chunk.reasoning);
-                        if reasoning_chunk.signature.is_some() {
-                            accumulated_signature = reasoning_chunk.signature.clone();
-                        }
-                        if let Some(redacted_data) = reasoning_chunk.redacted_data {
-                            accumulated_redacted_data.push(redacted_data);
-                        }
-                    }
-                    ApiStreamChunk::Usage(usage_chunk) => {
-                        if self.config.json_output {
-                            tracing::info!(
-                                target: "json_output",
-                                "{}",
-                                serde_json::json!({
-                                    "type": "usage",
-                                    "input_tokens": usage_chunk.input_tokens,
-                                    "output_tokens": usage_chunk.output_tokens,
-                                    "cache_write_tokens": usage_chunk.cache_write_tokens,
-                                    "cache_read_tokens": usage_chunk.cache_read_tokens,
-                                    "reasoning_tokens": usage_chunk.reasoning_tokens,
-                                    "total_cost": usage_chunk.total_cost,
-                                    "stop_reason": usage_chunk.stop_reason,
-                                    "id": usage_chunk.id,
-                                })
-                                .to_string()
-                            );
-                        }
-                        let is_synthetic_empty_usage = usage_chunk.input_tokens == 0
-                            && usage_chunk.output_tokens == 0
-                            && usage_chunk.cache_write_tokens == Some(0)
-                            && usage_chunk.cache_read_tokens.is_none()
-                            && usage_chunk.reasoning_tokens.is_none()
-                            && usage_chunk.total_cost.is_none()
-                            && usage_chunk.id.is_none();
-                        let mut state = self.state.lock().await;
-                        if is_synthetic_empty_usage {
-                            // Keep the last measured usage when this provider
-                            // response has no usage data. Do not replace it
-                            // with a fabricated zero or an estimate.
-                            continue;
-                        }
-                        let prev_info = stream_usage.as_ref();
-                        let context_window_info = crate::core::context::get_context_window_info(
-                            self.config
-                                .provider
-                                .lock()
-                                .expect("provider poisoned")
-                                .as_ref(),
-                        );
-                        let context_window = context_window_info.context_window;
-                        let guard = self.config.provider.lock().expect("provider lock poisoned");
-                        let provider_name = guard.name().to_string();
-                        drop(guard);
-                        let tokens_in = if usage_chunk.input_tokens > 0 {
-                            usage_chunk.input_tokens
-                        } else {
-                            prev_info.and_then(|r| r.tokens_in).unwrap_or(0)
-                        };
-                        let tokens_out = if usage_chunk.output_tokens > 0 {
-                            usage_chunk.output_tokens
-                        } else {
-                            prev_info.and_then(|r| r.tokens_out).unwrap_or(0)
-                        };
-                        let cache_writes = usage_chunk
-                            .cache_write_tokens
-                            .or_else(|| prev_info.and_then(|r| r.cache_writes));
-                        let cache_reads = usage_chunk
-                            .cache_read_tokens
-                            .or_else(|| prev_info.and_then(|r| r.cache_reads));
-                        let reasoning_tokens = usage_chunk
-                            .reasoning_tokens
-                            .or_else(|| prev_info.and_then(|r| r.reasoning_tokens));
-                        // Gemini marks thinking tokens separately from candidate output;
-                        // OpenAI-compatible providers include reasoning in completion_tokens.
-                        let context_output_tokens = if usage_chunk.thoughts_token_count.is_some() {
-                            tokens_out.saturating_add(reasoning_tokens.unwrap_or(0))
-                        } else {
-                            tokens_out
-                        };
-                        let context_tokens =
-                            crate::core::context::context_window::calculate_context_tokens(
-                                tokens_in,
-                                context_output_tokens,
-                                cache_writes,
-                                cache_reads,
-                                &provider_name,
-                            );
-                        let context_usage_pct =
-                            crate::core::context::context_window::calculate_context_usage_percentage(
-                                tokens_in,
-                                context_output_tokens,
-                                cache_writes,
-                                cache_reads,
-                                context_window,
-                                &provider_name,
-                            );
-                        let usage = ApiReqInfo {
-                            request: None,
-                            tokens_in: Some(tokens_in),
-                            tokens_out: Some(tokens_out),
-                            cache_writes,
-                            cache_reads,
-                            reasoning_tokens,
-                            context_tokens: Some(context_tokens),
-                            cost: usage_chunk
-                                .total_cost
-                                .or_else(|| prev_info.and_then(|r| r.cost)),
-                            context_window: Some(context_window),
-                            context_usage_percentage: Some(context_usage_pct),
-                        };
-                        stream_usage = Some(usage.clone());
-                        state.last_api_req_info = Some(usage);
-                        if usage_chunk.input_tokens > 0 {
-                            state.cumulative_tokens_in = state
-                                .cumulative_tokens_in
-                                .saturating_add(usage_chunk.input_tokens);
-                        }
-                        if usage_chunk.output_tokens > 0 {
-                            state.cumulative_tokens_out = state
-                                .cumulative_tokens_out
-                                .saturating_add(usage_chunk.output_tokens);
-                        }
-                        if let Some(cache_writes) = usage_chunk.cache_write_tokens
-                            && cache_writes > 0
-                        {
-                            state.cumulative_cache_writes =
-                                state.cumulative_cache_writes.saturating_add(cache_writes);
-                        }
-                        if let Some(cache_reads) = usage_chunk.cache_read_tokens
-                            && cache_reads > 0
-                        {
-                            state.cumulative_cache_reads =
-                                state.cumulative_cache_reads.saturating_add(cache_reads);
-                        }
-                        if let Some(reasoning_tokens) = usage_chunk.reasoning_tokens
-                            && reasoning_tokens > 0
-                        {
-                            state.cumulative_reasoning_tokens = state
-                                .cumulative_reasoning_tokens
-                                .saturating_add(reasoning_tokens);
-                        }
-                        if let Some(cost) = usage_chunk.total_cost
-                            && cost > 0.0
-                        {
-                            state.cumulative_cost += cost;
-                        }
-                    }
-                    ApiStreamChunk::Timing(provider_timing) => {
-                        if crate::cli::output::timing_enabled() {
-                            let mut state = self.state.lock().await;
-                            state.provider_stream_completed_time = provider_timing
-                                .completed_at
-                                .or_else(|| Some(std::time::Instant::now()));
-                            let request_to_first_chunk_us =
-                                state.request_sent_time.and_then(|request| {
-                                    state.first_provider_chunk_time.map(|chunk| {
-                                        chunk.duration_since(request).as_micros() as u64
-                                    })
-                                });
-                            let first_chunk_to_displayable_text_us =
-                                state.first_provider_chunk_time.and_then(|chunk| {
-                                    state.first_displayable_text_time.map(|displayable| {
-                                        displayable.duration_since(chunk).as_micros() as u64
-                                    })
-                                });
-                            let displayable_text_to_output_us =
-                                state.first_displayable_text_time.and_then(|displayable| {
-                                    state.first_output_emit_time.map(|output| {
-                                        output.duration_since(displayable).as_micros() as u64
-                                    })
-                                });
-                            crate::cli::output::emit_timing_record(
-                                &crate::cli::output::ProviderTimingRecord {
-                                    record_type: "sned_timing_provider_attempt",
-                                    run_id: crate::cli::output::timing_run_id(),
-                                    session_id: self.config.task_id.clone(),
-                                    turn: state.turns_completed.saturating_add(1),
-                                    attempt: stream_retry_attempt + 1,
-                                    provider: provider.name().to_string(),
-                                    model: self.resolve_active_model_id(),
-                                    stream: true,
-                                    request_to_headers_us: provider_timing.request_to_headers_us,
-                                    headers_to_first_byte_us: provider_timing
-                                        .headers_to_first_byte_us,
-                                    request_to_first_chunk_us,
-                                    first_chunk_to_displayable_text_us,
-                                    displayable_text_to_output_us,
-                                    stream_total_us: provider_timing.stream_total_us,
-                                    raw_sse_frames: provider_timing.raw_sse_frames,
-                                    decoded_chunks,
-                                    text_chunks,
-                                    reasoning_chunks,
-                                    empty_sse_frames: provider_timing.empty_sse_frames,
-                                    max_inter_raw_byte_gap_us: provider_timing
-                                        .max_inter_raw_byte_gap_us,
-                                    max_inter_decoded_chunk_gap_us: max_inter_decoded_chunk_gap
-                                        .as_micros()
-                                        as u64,
-                                },
-                            );
-                        }
-                    }
-                    ApiStreamChunk::ToolCallStarted { call_id, name } => {
-                        if !self.config.json_output && announced_tool_call_ids.insert(call_id) {
-                            if !tool_call_detected {
+                        StreamEvent::ToolCallReceived => {
+                            if !tool_call_detected && !self.config.json_output {
                                 self.config.output_writer.flush();
                                 tool_call_detected = true;
                             }
-                            self.config
-                                .output_writer
-                                .emit(OutputEvent::tool_call(format!("Preparing {name}…")));
                         }
-                    }
-                    ApiStreamChunk::ToolCalls(tool_chunk) => {
-                        substantive_stream_output_received = true;
-                        // Print separator when first tool call is detected
-                        if !tool_call_detected && !self.config.json_output {
-                            self.config.output_writer.flush();
-                            tool_call_detected = true;
+                        StreamEvent::UsageUpdated { usage, deltas } => {
+                            let mut state = self.state.lock().await;
+                            state.last_api_req_info = Some(usage);
+                            state.cumulative_tokens_in =
+                                state.cumulative_tokens_in.saturating_add(deltas.tokens_in);
+                            state.cumulative_tokens_out = state
+                                .cumulative_tokens_out
+                                .saturating_add(deltas.tokens_out);
+                            state.cumulative_cache_writes = state
+                                .cumulative_cache_writes
+                                .saturating_add(deltas.cache_writes);
+                            state.cumulative_cache_reads = state
+                                .cumulative_cache_reads
+                                .saturating_add(deltas.cache_reads);
+                            state.cumulative_reasoning_tokens = state
+                                .cumulative_reasoning_tokens
+                                .saturating_add(deltas.reasoning_tokens);
+                            state.cumulative_cost += deltas.cost;
                         }
-
-                        let tc = tool_chunk.tool_call;
-                        let key = tc
-                            .call_id
-                            .clone()
-                            .unwrap_or_else(|| tc.function.id.clone().unwrap_or_default());
-                        // Prevent empty-key collisions when provider sends tool calls without IDs.
-                        // Two calls both keyed by "" would overwrite each other in tool_calls_map.
-                        let key = if key.is_empty() {
-                            ulid::Ulid::new().to_string()
-                        } else {
-                            key
-                        };
-                        tracing::info!(
-                            tool_name = ?tc.function.name,
-                            tool_id = ?key,
-                            has_args = tc.function.arguments.is_some(),
-                            "received tool call from stream"
-                        );
-
-                        if self.config.json_output {
-                            tracing::info!(
-                                target: "json_output",
-                                "{}",
-                                serde_json::json!({
-                                    "type": "tool_calls",
-                                    "tool_call": {
-                                        "call_id": tc.call_id,
-                                        "function": {
-                                            "id": tc.function.id,
-                                            "name": tc.function.name,
-                                            "arguments": tc.function.arguments,
-                                        }
-                                    },
-                                    "id": tool_chunk.id,
-                                    "signature": tool_chunk.signature,
-                                })
-                                .to_string()
-                            );
-                        }
-                        // Allow partial tool call deltas with arguments even when name is missing.
-                        // Provider may send name in a later chunk; merge logic assembles complete call.
-                        let args_absent = tc.function.arguments.is_none()
-                            || tc
-                                .function
-                                .arguments
-                                .as_ref()
-                                .is_some_and(std::string::String::is_empty);
-                        if (tc.function.name.is_none()
-                            || tc
-                                .function
-                                .name
-                                .as_ref()
-                                .is_some_and(std::string::String::is_empty))
-                            && args_absent
-                        {
-                            tracing::warn!(
-                                "received tool call with empty name and no arguments, skipping"
-                            );
-                            continue;
-                        }
-                        // Merge partial tool call chunks by ID using HashMap for O(1) lookup (P4)
-                        // Preserve insertion order via tool_call_order vec
-                        if let Some(existing) = tool_calls_map.get_mut(&key) {
-                            if let Some(new_args) = tc.function.arguments
-                                && !new_args.is_empty()
-                            {
-                                let merged = existing
-                                    .function
-                                    .arguments
-                                    .as_ref()
-                                    .map(|a| a.clone() + &new_args)
-                                    .unwrap_or(new_args);
-                                // Oversized merges stay stored as-is so the stream
-                                // keeps draining; parse rejects them before
-                                // dispatch instead of repairing them into
-                                // executable calls.
-                                if merged.len() > MAX_TOOL_ARGUMENT_SIZE {
-                                    tracing::warn!(
-                                        args_len = merged.len(),
-                                        "merged tool call arguments exceed size limit; call will not execute"
-                                    );
-                                }
-                                existing.function.arguments = Some(merged);
+                        StreamEvent::StreamError {
+                            error: err,
+                            retryable,
+                            substantive_output,
+                        } => {
+                            if retryable && substantive_output && !self.config.json_output {
+                                self.config.output_writer.emit(OutputEvent::error(format!(
+                                    "Provider stream error: {err}"
+                                )));
                             }
-                            if tc.function.name.is_some() {
-                                existing.function.name = tc.function.name;
-                            }
-                            if tc.call_id.is_some() {
-                                existing.call_id = tc.call_id;
-                            }
-                        } else {
-                            if let Some(ref args) = tc.function.arguments
-                                && args.len() > MAX_TOOL_ARGUMENT_SIZE
-                            {
-                                tracing::warn!(
-                                    args_len = args.len(),
-                                    "tool call arguments exceed size limit; call will not execute"
-                                );
-                            }
-                            tool_call_order.push(key.clone());
-                            tool_calls_map.insert(key, tc);
-                        }
-                    }
-                    ApiStreamChunk::Error(err) => {
-                        tracing::error!(error = %err, "received error chunk from provider stream");
-                        let retryable = stream_error_is_retryable(&err);
-                        if !retryable {
-                            stream_errored = true;
-                            if non_retryable_stream_error.is_none() {
-                                if self.config.json_output {
-                                    tracing::info!(
-                                        target: "json_output",
-                                        "{}",
-                                        serde_json::json!({
-                                            "type": "error",
-                                            "error": err
-                                        })
-                                    );
-                                }
-                                non_retryable_stream_error = Some(err);
-                            }
-                            continue;
-                        }
-                        if non_retryable_stream_error.is_some() {
-                            continue;
-                        }
-                        if !substantive_stream_output_received {
-                            retryable_stream_error_before_output = Some(err);
-                            // OpenAI-compatible providers emit the transport
-                            // timing marker after the error. Keep draining so
-                            // the failed attempt remains observable and the
-                            // retry decision happens only at stream end.
-                            continue;
-                        }
-                        stream_errored = true;
-                        if self.config.json_output {
-                            tracing::info!(
-                                target: "json_output",
-                                "{}",
-                                serde_json::json!({
-                                    "type": "error",
-                                    "error": err
-                                })
-                            );
-                        } else {
-                            self.config
-                                .output_writer
-                                .emit(OutputEvent::error(format!("Provider stream error: {err}")));
                         }
                     }
                 }
             }
 
-            let filtered_tail = thinking_tag_filter.finish();
-            filtered_text.push_str(&filtered_tail);
+            let outcome = accumulator.finish();
             if !self.config.json_output {
-                display_buffer.push_str(&filtered_tail);
+                display_buffer.push_str(&outcome.filtered_tail);
             }
-            let leaked_thinking = thinking_tag_filter.take_hidden();
+            let StreamOutcome {
+                text: accumulated_text,
+                filtered_text,
+                filtered_tail: _,
+                leaked_thinking,
+                reasoning: accumulated_reasoning,
+                signature: accumulated_signature,
+                text_signature: accumulated_text_signature,
+                redacted_data: accumulated_redacted_data,
+                tool_call_order,
+                tool_calls: tool_calls_map,
+                usage: _,
+                substantive_output: _,
+                errored: stream_errored,
+                retryable_error_before_output: retryable_stream_error_before_output,
+                non_retryable_error: non_retryable_stream_error,
+            } = outcome;
 
             // Final flush: print any remaining buffered content and ensure newline
             if in_code_block && !self.config.json_output {
@@ -6294,6 +6019,7 @@ fn compact_single_search_text(text: &mut String, min_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::stream_parsing::ThinkingTagStreamFilter;
 
     #[test]
     fn truncated_debug_text_passes_short_text_through() {
