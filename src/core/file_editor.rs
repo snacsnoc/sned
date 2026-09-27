@@ -3078,7 +3078,16 @@ impl FileEditor {
         self.anchor_mgr.reconcile(absolute_path, lines, task_id)
     }
 
-    /// Applies edits to a file's content.
+    /// Legacy single-content edit wrapper. A returned `Ok` is partial by
+    /// design: edits that resolve are applied and committed while
+    /// unresolvable ones come back in `failed_edits`, so callers must inspect
+    /// that tail instead of treating `Ok` as fully applied. Only an empty
+    /// resolution set errors. This wrapper offers none of the edit_file
+    /// handler's per-file atomic batch guarantees; it has no production
+    /// callers and is retained for end-to-end coverage.
+    #[deprecated(
+        note = "Partial-Ok legacy wrapper with no production callers; build new flows on the edit_file handler path."
+    )]
     pub fn apply_edits(
         &self,
         content: &str,
@@ -4435,6 +4444,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_file_editor_end_to_end() {
         let task_id = "e2e_test";
         let dir = tempfile::tempdir().unwrap();
@@ -4471,6 +4481,49 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
+    fn test_legacy_apply_edits_returns_partial_ok_with_failed_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let editor = FileEditor {
+            executor: EditExecutor::new(),
+            anchor_mgr: AnchorStateManager::with_cache_file(dir.path().join("anchors.json")),
+        };
+        let content = "one\ntwo\nthree";
+        let (normalized, _) = normalize_file_content(content);
+        let anchors = editor.reconcile_anchors(
+            "/tmp/partial.py",
+            &split_content_lines(&normalized),
+            Some("partial"),
+        );
+        let edits = vec![
+            Edit {
+                anchor: format!("{}§one", anchors[0]),
+                end_anchor: None,
+                edit_type: "replace".to_string(),
+                text: "ONE".to_string(),
+                content: None,
+                old_text: None,
+            },
+            Edit {
+                anchor: "Missing§nothing matches this".to_string(),
+                end_anchor: None,
+                edit_type: "replace".to_string(),
+                text: "NOWHERE".to_string(),
+                content: None,
+                old_text: None,
+            },
+        ];
+        let (final_content, applied, failed) = editor
+            .apply_edits(content, &edits, "/tmp/partial.py", Some("partial"))
+            .unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(failed.len(), 1);
+        assert!(final_content.contains("ONE"));
+        assert!(!final_content.contains("NOWHERE"));
+    }
+
+    #[test]
+    #[allow(deprecated)]
     fn test_apply_edits_insert_preserves_untouched_mixed_newlines() {
         let dir = tempfile::tempdir().unwrap();
         let editor = FileEditor {
