@@ -4279,105 +4279,55 @@ impl AgentLoop {
                 }
             }
 
-            let mut non_edit_executed = std::collections::HashSet::new();
-            type EditGroup = (
-                std::collections::HashSet<String>,
-                Vec<(
-                    usize,
-                    futures::future::BoxFuture<'static, ToolExecutionOutput>,
-                )>,
-            );
-            let mut edit_groups: Vec<EditGroup> = Vec::new();
-            for (i, (_, tool_name, _, task, edit_file_paths, _tool_params)) in
-                tool_tasks.iter_mut().enumerate()
-            {
-                if (tool_name == "edit_file" || tool_name == "write_to_file")
-                    && let Some(future) = task.take()
-                {
-                    let paths: std::collections::HashSet<String> = edit_file_paths
-                        .iter()
-                        .map(|path| path.normalized.clone())
-                        .collect();
-                    let mut found_group = None;
-                    for (idx, (group_paths, _)) in edit_groups.iter().enumerate() {
-                        if paths.iter().any(|p| group_paths.contains(p)) {
-                            found_group = Some(idx);
-                            break;
-                        }
-                    }
-                    use futures::FutureExt;
-                    let gated = run_tool_unless_cancelled(task_cancelled.clone(), future).boxed();
-                    if let Some(idx) = found_group {
-                        edit_groups[idx].1.push((i, gated));
-                    } else {
-                        edit_groups.push((paths, vec![(i, gated)]));
-                    }
-                }
-            }
-
-            let non_edit_futures: Vec<_> = tool_tasks
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(i, (_, tool_name, _, task, _, _))| {
-                    if task.is_some() && tool_name != "edit_file" && tool_name != "write_to_file" {
-                        use futures::FutureExt;
-                        non_edit_executed.insert(i);
-                        task.take().map(|future| {
-                            run_tool_unless_cancelled(task_cancelled.clone(), future).boxed()
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let non_edit_results: Vec<_> = {
-                use futures::StreamExt;
-                futures::stream::iter(non_edit_futures)
-                    .buffered(DEFAULT_TOOL_CONCURRENCY)
-                    .collect()
-                    .await
-            };
-
-            // Overlapping file writes stay ordered to avoid stale reads and lost updates.
-            let edit_group_futures: Vec<_> = edit_groups
-                .into_iter()
-                .map(|(_paths, calls)| {
-                    async move {
-                        let mut results = Vec::new();
-                        for (i, future) in calls {
-                            let result = future.await;
-                            results.push((i, result));
-                        }
-                        results
-                    }
-                    .boxed()
-                })
-                .collect();
-
-            let edit_group_results = futures::future::join_all(edit_group_futures).await;
-
-            let mut non_edit_iter = non_edit_results.into_iter();
-            for i in 0..tool_tasks.len() {
-                if non_edit_executed.contains(&i) {
-                    let Some(result) = non_edit_iter.next() else {
-                        error!(
-                            "Tool execution invariant violated: non_edit_results has fewer items \
-                             than non_edit_executed indices (missing at index {}). This indicates \
-                             a bug in parallel tool execution logic.",
-                            i
-                        );
-                        return TurnResult::Error(
-                            "Internal error: tool execution produced inconsistent results"
-                                .to_string(),
-                        );
+            // Mutating and unknown-effect tools run as barriers in provider
+            // order; read-only tools between two barriers form one bounded
+            // batch. Path-overlap grouping cannot order a write against a
+            // later validation command or symbol edit, so every barrier
+            // drains the pending reads before it starts.
+            if parallel_enabled {
+                use futures::{FutureExt, StreamExt};
+                type IndexedToolFuture =
+                    futures::future::BoxFuture<'static, (usize, ToolExecutionOutput)>;
+                let mut read_batch: Vec<IndexedToolFuture> = Vec::new();
+                for (i, (_, tool_name, _, task, _, _)) in tool_tasks.iter_mut().enumerate() {
+                    let Some(future) = task.take() else {
+                        continue;
                     };
-                    result_map.insert(i, result);
+                    if Self::tool_is_schedulable_read(tool_name) {
+                        let gated =
+                            run_tool_unless_cancelled(task_cancelled.clone(), future).boxed();
+                        read_batch.push(
+                            async move {
+                                let result = gated.await;
+                                (i, result)
+                            }
+                            .boxed(),
+                        );
+                        continue;
+                    }
+                    if !read_batch.is_empty() {
+                        let batch = std::mem::take(&mut read_batch);
+                        for (j, result) in futures::stream::iter(batch)
+                            .buffered(DEFAULT_TOOL_CONCURRENCY)
+                            .collect::<Vec<_>>()
+                            .await
+                        {
+                            result_map.insert(j, result);
+                        }
+                    }
+                    result_map.insert(
+                        i,
+                        run_tool_unless_cancelled(task_cancelled.clone(), future).await,
+                    );
                 }
-            }
-            for group_result in edit_group_results {
-                for (i, result) in group_result {
-                    result_map.insert(i, result);
+                if !read_batch.is_empty() {
+                    for (j, result) in futures::stream::iter(read_batch)
+                        .buffered(DEFAULT_TOOL_CONCURRENCY)
+                        .collect::<Vec<_>>()
+                        .await
+                    {
+                        result_map.insert(j, result);
+                    }
                 }
             }
 
@@ -5247,6 +5197,20 @@ impl AgentLoop {
     fn tool_may_modify_workspace(tool: SnedTool) -> bool {
         matches!(tool.category(), crate::core::tools::ToolCategory::EditFiles)
             || matches!(tool, SnedTool::ExecuteCommand | SnedTool::UseSubagents)
+    }
+
+    /// Whether a parallel-scheduled call may run inside a read-only batch.
+    /// Only tools categorized as read-only qualify; unknown names fail
+    /// closed to barrier so an unrecognized mutation cannot slip into a
+    /// concurrent batch.
+    fn tool_is_schedulable_read(tool_name: &str) -> bool {
+        SnedTool::from_name(tool_name).is_some_and(|tool| {
+            matches!(
+                tool.category(),
+                crate::core::tools::ToolCategory::ReadOnly
+                    | crate::core::tools::ToolCategory::ReadFiles
+            )
+        })
     }
 
     fn discover_agents_rules_for_tool_calls(
@@ -6996,6 +6960,128 @@ mod tests {
         }
     }
 
+    /// Records per-call start/finish events so scheduling tests assert
+    /// barrier order from the log instead of elapsed time.
+    struct OrderProbeHandler {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        delay_ms: u64,
+        rendezvous: Option<(Arc<std::sync::atomic::AtomicUsize>, usize)>,
+    }
+
+    impl OrderProbeHandler {
+        fn label(params: &serde_json::Value) -> String {
+            if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
+                return path.to_string();
+            }
+            if let Some(paths) = params.get("paths").and_then(|v| v.as_array()) {
+                return paths
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+            }
+            if let Some(files) = params.get("files").and_then(|v| v.as_array()) {
+                return files
+                    .iter()
+                    .filter_map(|f| f.get("path"))
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+            }
+            if let Some(commands) = params.get("commands").and_then(|v| v.as_array()) {
+                return commands
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+            }
+            if let Some(pattern) = params.get("pattern").and_then(|v| v.as_str()) {
+                return pattern.to_string();
+            }
+            "call".to_string()
+        }
+    }
+
+    impl crate::core::tools::ToolHandler for OrderProbeHandler {
+        fn execute(
+            &self,
+            _ctx: &ToolContext,
+            params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, crate::core::tools::ToolError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            let log = self.log.clone();
+            let delay_ms = self.delay_ms;
+            let rendezvous = self.rendezvous.clone();
+            let label = Self::label(&params);
+            Box::pin(async move {
+                log.lock().unwrap().push(format!("start {label}"));
+                if let Some((arrived, expected)) = rendezvous {
+                    arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    for _ in 0..5000 {
+                        if arrived.load(std::sync::atomic::Ordering::SeqCst) >= expected {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    assert!(
+                        arrived.load(std::sync::atomic::Ordering::SeqCst) >= expected,
+                        "read rendezvous timed out: independent reads did not overlap"
+                    );
+                } else if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                log.lock().unwrap().push(format!("finish {label}"));
+                Ok(serde_json::json!("ok"))
+            })
+        }
+
+        fn description(&self, _params: &serde_json::Value) -> String {
+            "order probe".to_string()
+        }
+    }
+
+    fn tool_call_chunks<S: AsRef<str>>(calls: &[(S, S, serde_json::Value)]) -> Vec<ApiStreamChunk> {
+        calls
+            .iter()
+            .map(|(id, name, args)| {
+                ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                    tool_call: ApiStreamToolCall {
+                        call_id: Some(id.as_ref().to_string()),
+                        function: ApiStreamToolCallFunction {
+                            id: None,
+                            name: Some(name.as_ref().to_string()),
+                            arguments: Some(args.to_string()),
+                        },
+                        signature: None,
+                    },
+                    id: None,
+                    signature: None,
+                })
+            })
+            .collect()
+    }
+
+    fn assert_log_order(log: &[String], first: &str, second: &str) {
+        let a = log
+            .iter()
+            .position(|e| e == first)
+            .unwrap_or_else(|| panic!("missing log event {first:?} in {log:?}"));
+        let b = log
+            .iter()
+            .position(|e| e == second)
+            .unwrap_or_else(|| panic!("missing log event {second:?} in {log:?}"));
+        assert!(
+            a < b,
+            "{first:?} must precede {second:?} in barrier order, got {log:?}"
+        );
+    }
+
     struct StaticResultHandler(&'static str);
 
     impl crate::core::tools::ToolHandler for StaticResultHandler {
@@ -7403,6 +7489,212 @@ mod tests {
             max_active.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "disabled parallel tool calling must keep tool execution sequential"
+        );
+    }
+
+    fn parallel_probe_agent(
+        responses: Vec<Vec<ApiStreamChunk>>,
+        log: &Arc<std::sync::Mutex<Vec<String>>>,
+        rendezvous: Option<(Arc<std::sync::atomic::AtomicUsize>, usize)>,
+    ) -> AgentLoop {
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        for tool in [
+            SnedTool::WriteToFile,
+            SnedTool::EditFile,
+            SnedTool::ReadFile,
+            SnedTool::ExecuteCommand,
+            SnedTool::ReplaceSymbol,
+        ] {
+            registry.register(
+                tool,
+                Arc::new(OrderProbeHandler {
+                    log: log.clone(),
+                    delay_ms: 50,
+                    rendezvous: rendezvous.clone(),
+                }),
+            );
+        }
+        AgentLoop::new(test_agent_config(provider, "parallel-barrier"))
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                enable_parallel_tool_calling: true,
+                ..Default::default()
+            })
+    }
+
+    #[tokio::test]
+    async fn test_overlapping_write_groups_stay_in_provider_order() {
+        use serde_json::json;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let edit = |id: String, paths: &[&str]| {
+            (
+                id,
+                "edit_file".to_string(),
+                json!({"files": paths.iter().map(|p| json!({"path": p, "edits": []})).collect::<Vec<_>>()}),
+            )
+        };
+        let turn1 = vec![
+            edit("c1".to_string(), &["overlap-a.txt"]),
+            edit("c2".to_string(), &["overlap-a.txt", "overlap-b.txt"]),
+            edit("c3".to_string(), &["overlap-b.txt"]),
+        ];
+        let turn2 = vec![
+            edit("d1".to_string(), &["chain-a.txt"]),
+            edit("d2".to_string(), &["chain-b.txt"]),
+            edit("d3".to_string(), &["chain-a.txt", "chain-b.txt"]),
+        ];
+        let responses = vec![tool_call_chunks(&turn1), tool_call_chunks(&turn2)];
+        let mut agent = parallel_probe_agent(responses, &log, None);
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let log = log.lock().unwrap();
+        assert_log_order(
+            &log,
+            "finish overlap-a.txt",
+            "start overlap-a.txt,overlap-b.txt",
+        );
+        assert_log_order(
+            &log,
+            "finish overlap-a.txt,overlap-b.txt",
+            "start overlap-b.txt",
+        );
+        assert_log_order(&log, "finish chain-a.txt", "start chain-b.txt");
+        assert_log_order(&log, "finish chain-b.txt", "start chain-a.txt,chain-b.txt");
+    }
+
+    #[tokio::test]
+    async fn test_write_completes_before_dependent_read() {
+        use serde_json::json;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = vec![tool_call_chunks(&[
+            (
+                "w1",
+                "write_to_file",
+                json!({"path": "dep.txt", "content": "new"}),
+            ),
+            (
+                "r1",
+                "read_file",
+                json!({"paths": ["dep.txt", "other.txt"]}),
+            ),
+        ])];
+        let mut agent = parallel_probe_agent(responses, &log, None);
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let log = log.lock().unwrap();
+        assert_log_order(&log, "finish dep.txt", "start dep.txt,other.txt");
+        assert_eq!(log.iter().filter(|e| e.starts_with("start")).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_write_completes_before_validation_command() {
+        use serde_json::json;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = vec![tool_call_chunks(&[
+            (
+                "w1",
+                "write_to_file",
+                json!({"path": "built.txt", "content": "new"}),
+            ),
+            ("v1", "execute_command", json!({"commands": ["cargo test"]})),
+        ])];
+        let mut agent = parallel_probe_agent(responses, &log, None);
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let log = log.lock().unwrap();
+        assert_log_order(&log, "finish built.txt", "start cargo test");
+    }
+
+    #[tokio::test]
+    async fn test_anchor_edit_completes_before_symbol_edit() {
+        use serde_json::json;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = vec![tool_call_chunks(&[
+            (
+                "e1",
+                "edit_file",
+                json!({"files": [{"path": "anchor.rs", "edits": []}]}),
+            ),
+            ("s1", "replace_symbol", json!({"path": "sym.rs"})),
+        ])];
+        let mut agent = parallel_probe_agent(responses, &log, None);
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let log = log.lock().unwrap();
+        assert_log_order(&log, "finish anchor.rs", "start sym.rs");
+    }
+
+    #[tokio::test]
+    async fn test_independent_reads_stay_concurrent() {
+        use serde_json::json;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let responses = vec![tool_call_chunks(&[
+            ("r1", "read_file", json!({"paths": ["one.txt"]})),
+            ("r2", "read_file", json!({"paths": ["two.txt"]})),
+        ])];
+        let mut agent = parallel_probe_agent(responses, &log, Some((arrived.clone(), 2)));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert_eq!(arrived.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_read_batches_respect_concurrency_cap() {
+        use serde_json::json;
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls: Vec<(String, String, serde_json::Value)> = (0..20)
+            .map(|i| {
+                (
+                    format!("r{i}"),
+                    "read_file".to_string(),
+                    json!({"paths": [format!("file-{i}.txt")]}),
+                )
+            })
+            .collect();
+        let borrowed: Vec<(&str, &str, serde_json::Value)> = calls
+            .iter()
+            .map(|(id, name, args)| (id.as_str(), name.as_str(), args.clone()))
+            .collect();
+        let responses = vec![tool_call_chunks(&borrowed)];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::ReadFile,
+            Arc::new(ConcurrencyProbeHandler {
+                active,
+                max_active: max_active.clone(),
+            }),
+        );
+        let mut agent = AgentLoop::new(test_agent_config(provider, "read-cap"))
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                enable_parallel_tool_calling: true,
+                ..Default::default()
+            });
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let history = agent.get_conversation_history().await;
+        let results = history
+            .iter()
+            .filter_map(|m| match &m.content {
+                MessageContent::UserBlocks(blocks) => Some(blocks.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(results, 20);
+        assert!(
+            max_active.load(std::sync::atomic::Ordering::SeqCst) <= DEFAULT_TOOL_CONCURRENCY,
+            "read batch must stay within the concurrency cap"
         );
     }
 
