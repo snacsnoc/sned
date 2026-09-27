@@ -555,11 +555,13 @@ fn normalize_legacy_hook_messages(messages: &mut Vec<StorageMessage>) {
     }
 }
 
-fn ensure_tool_results_follow_tool_use(messages: &mut [StorageMessage]) {
-    for i in 0..messages.len().saturating_sub(1) {
-        let message = &messages[i];
+fn ensure_tool_results_follow_tool_use(messages: &mut Vec<StorageMessage>) {
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
 
         if message.role != MessageRole::Assistant {
+            index += 1;
             continue;
         }
 
@@ -575,30 +577,93 @@ fn ensure_tool_results_follow_tool_use(messages: &mut [StorageMessage]) {
         }
 
         if tool_use_ids.is_empty() {
+            index += 1;
             continue;
         }
 
-        let next_message = &messages[i + 1];
-
-        if next_message.role != MessageRole::User {
+        let next_is_user = messages
+            .get(index + 1)
+            .is_some_and(|next| next.role == MessageRole::User);
+        if !next_is_user {
+            // No user message follows the tool use (a summary or chatter
+            // sits between, or the turn was cut): insert the missing
+            // results so the pair stays valid instead of dangling. A
+            // later message may already hold results for these calls;
+            // fabricating here as well would send duplicates for one call.
+            let results_survive_downstream =
+                messages[index + 1..]
+                    .iter()
+                    .any(|message| match &message.content {
+                        MessageContent::UserBlocks(blocks) => {
+                            blocks.iter().any(|block| match block {
+                                UserContentBlock::ToolResult(tool_result) => {
+                                    tool_use_ids.contains(&tool_result.tool_use_id)
+                                }
+                                _ => false,
+                            })
+                        }
+                        _ => false,
+                    });
+            if results_survive_downstream {
+                index += 1;
+                continue;
+            }
+            let fabricated = tool_use_ids
+                .iter()
+                .map(|tool_use_id| {
+                    UserContentBlock::ToolResult(crate::providers::ToolResultBlock {
+                        tool_use_id: tool_use_id.clone(),
+                        content: crate::providers::ToolResultContent::Text(
+                            "result missing".to_string(),
+                        ),
+                        shared: crate::providers::SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                    })
+                })
+                .collect();
+            messages.insert(
+                index + 1,
+                StorageMessage {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::UserBlocks(fabricated),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+            );
+            index += 1;
             continue;
         }
+
+        let next_message = &messages[index + 1];
 
         let mut tool_result_map: std::collections::HashMap<String, UserContentBlock> =
             std::collections::HashMap::with_capacity(4);
         let mut other_blocks: Vec<UserContentBlock> = Vec::new();
 
-        if let MessageContent::UserBlocks(blocks) = &next_message.content {
-            for block in blocks {
-                match block {
-                    UserContentBlock::ToolResult(tool_result) => {
-                        tool_result_map.insert(tool_result.tool_use_id.clone(), block.clone());
-                    }
-                    _ => {
-                        other_blocks.push(block.clone());
+        // A genuine user text message after tool use is not an empty result
+        // slot: repair must carry its text forward, never replace it.
+        let mut trailing_text: Option<String> = None;
+        match &next_message.content {
+            MessageContent::UserBlocks(blocks) => {
+                for block in blocks {
+                    match block {
+                        UserContentBlock::ToolResult(tool_result) => {
+                            tool_result_map.insert(tool_result.tool_use_id.clone(), block.clone());
+                        }
+                        _ => {
+                            other_blocks.push(block.clone());
+                        }
                     }
                 }
             }
+            MessageContent::Text(text) => {
+                trailing_text = Some(text.clone());
+            }
+            _ => {}
         }
 
         // Always reorder tool results to match tool use order when both exist.
@@ -626,6 +691,7 @@ fn ensure_tool_results_follow_tool_use(messages: &mut [StorageMessage]) {
         }
 
         if !needs_update {
+            index += 1;
             continue;
         }
 
@@ -637,7 +703,18 @@ fn ensure_tool_results_follow_tool_use(messages: &mut [StorageMessage]) {
         }
 
         new_content.extend(other_blocks);
-        messages[i + 1].content = MessageContent::UserBlocks(new_content);
+        if let Some(text) = trailing_text {
+            new_content.push(UserContentBlock::Text(TextContentBlock {
+                text,
+                shared: crate::providers::SharedContentFields {
+                    call_id: None,
+                    signature: None,
+                },
+                reasoning_details: None,
+            }));
+        }
+        messages[index + 1].content = MessageContent::UserBlocks(new_content);
+        index += 1;
     }
 }
 
@@ -1039,6 +1116,226 @@ mod tests {
             assert!(matches!(blocks[0], UserContentBlock::Text(_)));
         } else {
             panic!("Expected UserBlocks");
+        }
+    }
+
+    fn assistant_tool_use_message(ids: &[(&str, &str)]) -> StorageMessage {
+        StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(
+                ids.iter()
+                    .map(|(id, name)| {
+                        AssistantContentBlock::ToolUse(crate::providers::ToolUseBlock {
+                            id: (*id).to_string(),
+                            name: (*name).to_string(),
+                            input: serde_json::json!({}),
+                            shared: crate::providers::SharedContentFields {
+                                call_id: None,
+                                signature: None,
+                            },
+                            reasoning_details: None,
+                        })
+                    })
+                    .collect(),
+            ),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }
+    }
+
+    fn user_text_message(text: &str) -> StorageMessage {
+        StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }
+    }
+
+    fn repaired_texts(messages: &[StorageMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .flat_map(|message| match &message.content {
+                MessageContent::Text(text) => vec![text.clone()],
+                MessageContent::UserBlocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        UserContentBlock::Text(text_block) => Some(text_block.text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_reduction_repair_preserves_surviving_user_instruction() {
+        let result_a = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                crate::providers::ToolResultBlock {
+                    tool_use_id: "call_a".to_string(),
+                    content: crate::providers::ToolResultContent::Text("file content".to_string()),
+                    shared: crate::providers::SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        let messages = vec![
+            user_text_message("Initial task"),
+            assistant_tool_use_message(&[("call_a", "read_file")]),
+            result_a,
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("Noted".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            user_text_message("Middle chatter"),
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("More chatter".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            user_text_message("Do not modify any files"),
+        ];
+        let summary = CompactedSummary::new("Earlier work summary".to_string(), 2);
+
+        let truncated = get_truncated_messages(&messages, Some((2, 5)), Some(&summary));
+
+        let texts = repaired_texts(&truncated);
+        assert!(
+            texts.iter().any(|text| text == "Do not modify any files"),
+            "reduction repair must never erase a surviving user instruction, got: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "Earlier work summary"),
+            "summary must survive alongside the repair, got: {texts:?}"
+        );
+        let has_result_for_a = truncated.iter().any(|message| match &message.content {
+            MessageContent::UserBlocks(blocks) => blocks.iter().any(|block| match block {
+                UserContentBlock::ToolResult(result) => result.tool_use_id == "call_a",
+                _ => false,
+            }),
+            _ => false,
+        });
+        assert!(
+            has_result_for_a,
+            "retained tool use must keep its paired result ID"
+        );
+    }
+
+    #[test]
+    fn test_repair_keeps_genuine_text_beside_fabricated_results() {
+        let mut messages = vec![
+            assistant_tool_use_message(&[("call_a", "read_file"), ("call_b", "execute_command")]),
+            user_text_message("Do not modify any files"),
+        ];
+
+        ensure_tool_results_follow_tool_use(&mut messages);
+
+        let MessageContent::UserBlocks(blocks) = &messages[1].content else {
+            panic!("repaired message must stay blocks");
+        };
+        assert_eq!(blocks.len(), 3);
+        match &blocks[0] {
+            UserContentBlock::ToolResult(result) => {
+                assert_eq!(result.tool_use_id, "call_a");
+            }
+            _ => panic!("results must precede preserved text"),
+        }
+        match &blocks[1] {
+            UserContentBlock::ToolResult(result) => {
+                assert_eq!(result.tool_use_id, "call_b");
+            }
+            _ => panic!("results must precede preserved text"),
+        }
+        match &blocks[2] {
+            UserContentBlock::Text(text) => {
+                assert_eq!(text.text, "Do not modify any files");
+            }
+            _ => panic!("genuine user text must survive repair verbatim"),
+        }
+    }
+
+    #[test]
+    fn test_repair_preserves_text_mixed_with_real_results() {
+        let mut messages = vec![
+            assistant_tool_use_message(&[("call_a", "read_file"), ("call_b", "execute_command")]),
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![
+                    UserContentBlock::ToolResult(crate::providers::ToolResultBlock {
+                        tool_use_id: "call_a".to_string(),
+                        content: crate::providers::ToolResultContent::Text(
+                            "real output".to_string(),
+                        ),
+                        shared: crate::providers::SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                    }),
+                    UserContentBlock::Text(crate::providers::TextContentBlock {
+                        text: "keep me verbatim".to_string(),
+                        shared: crate::providers::SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    }),
+                ]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ];
+
+        ensure_tool_results_follow_tool_use(&mut messages);
+
+        let MessageContent::UserBlocks(blocks) = &messages[1].content else {
+            panic!("repaired message must stay blocks");
+        };
+        assert_eq!(blocks.len(), 3);
+        match &blocks[0] {
+            UserContentBlock::ToolResult(result) => {
+                assert_eq!(result.tool_use_id, "call_a");
+                match &result.content {
+                    crate::providers::ToolResultContent::Text(text) => {
+                        assert_eq!(text, "real output");
+                    }
+                    _ => panic!("real result content must survive"),
+                }
+            }
+            _ => panic!("results must precede preserved text"),
+        }
+        match &blocks[1] {
+            UserContentBlock::ToolResult(result) => {
+                assert_eq!(result.tool_use_id, "call_b");
+            }
+            _ => panic!("missing result must be fabricated in tool-use order"),
+        }
+        match &blocks[2] {
+            UserContentBlock::Text(text) => {
+                assert_eq!(text.text, "keep me verbatim");
+            }
+            _ => panic!("mixed-in user text must survive repair verbatim"),
         }
     }
 
