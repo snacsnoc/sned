@@ -311,7 +311,7 @@ fn strip_common_indent(lines: &[&str]) -> Vec<String> {
         .map(|line| {
             if line.trim().is_empty() {
                 String::new()
-            } else if line.len() >= dedent {
+            } else if line.len() - line.trim_start().len() >= dedent {
                 line[dedent..].to_string()
             } else {
                 line.to_string()
@@ -424,11 +424,27 @@ pub fn split_model_output(text: &str) -> (Option<String>, Option<String>) {
 /// - `[sned]` — internal status messages
 #[must_use]
 pub fn strip_tool_call_lines(input: &str) -> String {
-    input
-        .lines()
-        .filter(|line| !is_tool_call_marker_line(line))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut literal_fence: Option<FenceDelimiter> = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for line in input.lines() {
+        let stripped = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(opener) = literal_fence {
+            kept.push(line);
+            if is_fence_closer(stripped, opener) {
+                literal_fence = None;
+            }
+            continue;
+        }
+        if let Some((fence, _)) = parse_fence_start(stripped) {
+            literal_fence = Some(fence);
+            kept.push(line);
+            continue;
+        }
+        if !is_tool_call_marker_line(line) {
+            kept.push(line);
+        }
+    }
+    kept.join("\n")
 }
 
 /// Return the cleaned assistant response that is safe to show through the
@@ -764,5 +780,47 @@ mod tests {
     fn test_contains_code_block_over_limit() {
         assert!(contains_code_block_over_limit("```\na\nb\n```", 1));
         assert!(!contains_code_block_over_limit("```\na\n```", 1));
+    }
+
+    #[test]
+    fn test_dedent_never_cuts_short_indent_lines() {
+        let lines = vec![
+            "                alpha".to_string(),
+            "                beta".to_string(),
+            "12345678901234567890".to_string(),
+        ];
+        assert_eq!(
+            strip_common_indent(&lines.iter().map(String::as_str).collect::<Vec<_>>()),
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "12345678901234567890".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_dedent_never_splits_a_multibyte_character() {
+        let lines = vec![
+            "                alpha".to_string(),
+            "                beta".to_string(),
+            "123456789012345Étail".to_string(),
+        ];
+        assert_eq!(
+            strip_common_indent(&lines.iter().map(String::as_str).collect::<Vec<_>>())[2],
+            "123456789012345Étail".to_string()
+        );
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_keeps_fenced_marker_lookalikes() {
+        let input = "```\n✓ done\n[sned] note\n▶ run\n```\nafter";
+        assert_eq!(strip_tool_call_lines(input), input);
+    }
+
+    #[test]
+    fn test_strip_tool_call_lines_still_strips_outside_fences() {
+        let input = "▶ execute_command\n```\n✓ kept\n```\n✓ done\nanswer";
+        assert_eq!(strip_tool_call_lines(input), "```\n✓ kept\n```\nanswer");
     }
 }

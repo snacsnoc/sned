@@ -19,7 +19,7 @@ pub const ANCHOR_DELIMITER: &str = "§";
 
 static ANCHOR_STRIP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r"(?m)^[ \t]*(?:\d+:\s+)?(?:[A-Z][a-zA-Z0-9]*|[0-9a-f]{{8,16}})\s*{}",
+        r"(?m)^[ \t]*(?:\d+:\s+)?(?:[0-9a-f]{{8,16}}\s*{0}\s*)?(?:[A-Z][a-zA-Z0-9]*|[0-9a-f]{{8,16}})\s*{0}",
         regex::escape(ANCHOR_DELIMITER)
     ))
     .unwrap()
@@ -181,16 +181,11 @@ pub fn strip_hashes(content: &str) -> String {
     content
         .split('\n')
         .map(|line| {
-            let mut stripped = line.to_string();
-            let mut had_anchor = false;
-            loop {
-                let next = ANCHOR_STRIP_REGEX.replace_all(&stripped, "").into_owned();
-                if next == stripped {
-                    break;
-                }
-                had_anchor = true;
-                stripped = next;
-            }
+            // A single wrapper per line: the optional hex prefix above already
+            // absorbs `hex§Word§` updated anchors, so a repeated strip would
+            // eat a literal `Word§` that belongs to the source itself.
+            let stripped = ANCHOR_STRIP_REGEX.replace(line, "").into_owned();
+            let had_anchor = stripped.len() != line.len();
             // The suffix is display metadata only inside a copied anchor wrapper.
             // Identical text in ordinary source must remain verbatim.
             if had_anchor {
@@ -416,5 +411,18 @@ mod tests {
         // Verify hashes are deterministic
         let hashes2 = compute_hashes(&lines);
         assert_eq!(hashes, hashes2);
+    }
+
+    #[test]
+    fn test_strip_hashes_keeps_literal_delimiter_in_source() {
+        assert_eq!(strip_hashes("AxD6h8§Apple§example"), "Apple§example");
+    }
+
+    #[test]
+    fn test_split_anchor_keeps_literal_delimiter_in_content() {
+        assert_eq!(
+            split_anchor("AxD6h8§Apple§example"),
+            ("AxD6h8".to_string(), "Apple§example".to_string())
+        );
     }
 }

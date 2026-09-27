@@ -92,7 +92,19 @@ pub(crate) fn normalize_file_content(content: &str) -> (String, FileTextFormat) 
 }
 
 pub(crate) fn restore_file_content(content: &str, format: FileTextFormat) -> String {
-    let content = if format.line_endings.is_empty() && format.line_ending == FileLineEnding::Lf {
+    let endings = format.line_endings.clone();
+    restore_file_content_with_endings(content, format, &endings)
+}
+
+/// Restores newlines from an explicit per-newline ending table instead of the
+/// recorded positions. Insertions shift positions, so callers with splice
+/// provenance pass untouched boundaries through and default the rest.
+pub(crate) fn restore_file_content_with_endings(
+    content: &str,
+    format: FileTextFormat,
+    endings: &[FileLineEnding],
+) -> String {
+    let content = if endings.is_empty() && format.line_ending == FileLineEnding::Lf {
         content.to_string()
     } else {
         let mut restored = String::with_capacity(content.len());
@@ -102,8 +114,7 @@ pub(crate) fn restore_file_content(content: &str, format: FileTextFormat) -> Str
             if character == '\n' {
                 let is_model_crlf = previous_was_cr;
                 if !is_model_crlf
-                    && format
-                        .line_endings
+                    && endings
                         .get(newline_index)
                         .copied()
                         .unwrap_or(format.line_ending)
@@ -3141,6 +3152,19 @@ impl FileEditor {
         let (_, format) = normalize_file_content(content);
         let final_content = if applied_edits.is_empty() {
             content.to_string()
+        } else if provenance.origins.len() == final_lines.len() {
+            let origins = &provenance.origins;
+            let newline_endings: Vec<FileLineEnding> = (0..final_lines.len().saturating_sub(1))
+                .map(|index| match (origins[index], origins[index + 1]) {
+                    (Some(first), Some(second)) if second == first + 1 => format
+                        .line_endings
+                        .get(first)
+                        .copied()
+                        .unwrap_or(format.line_ending),
+                    _ => format.line_ending,
+                })
+                .collect();
+            restore_file_content_with_endings(&final_lines.join("\n"), format, &newline_endings)
         } else {
             restore_file_content(&final_lines.join("\n"), format)
         };
@@ -4444,6 +4468,35 @@ mod tests {
             final_content.contains("def greeting():"),
             "Final content should contain greeting"
         );
+    }
+
+    #[test]
+    fn test_apply_edits_insert_preserves_untouched_mixed_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let editor = FileEditor {
+            executor: EditExecutor::new(),
+            anchor_mgr: AnchorStateManager::with_cache_file(dir.path().join("anchors.json")),
+        };
+        let content = "a\r\nb\nc";
+        let (normalized, _) = normalize_file_content(content);
+        let anchors = editor.reconcile_anchors(
+            "/tmp/mixed.py",
+            &split_content_lines(&normalized),
+            Some("mixed"),
+        );
+        let edits = vec![Edit {
+            anchor: format!("{}§a", anchors[0]),
+            end_anchor: None,
+            edit_type: "insert_after".to_string(),
+            text: "X".to_string(),
+            content: None,
+            old_text: None,
+        }];
+        let (final_content, _, failed) = editor
+            .apply_edits(content, &edits, "/tmp/mixed.py", Some("mixed"))
+            .unwrap();
+        assert!(failed.is_empty());
+        assert_eq!(final_content, "a\r\nX\r\nb\nc");
     }
 
     #[test]
