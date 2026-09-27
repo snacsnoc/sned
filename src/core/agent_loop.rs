@@ -3763,6 +3763,9 @@ impl AgentLoop {
             // independent of presentation mode.
             let mut files_created: Vec<String> = Vec::new();
             let mut symbol_edited_paths: Vec<String> = Vec::new();
+            // Commands that actually started, as opposed to calls that were
+            // denied, malformed, or otherwise rejected before dispatch.
+            let mut commands_executed: usize = 0;
 
             // Print the complete dispatched call so the user can verify what the
             // model asked Sned to do (skip malformed tool calls with empty names).
@@ -4433,6 +4436,9 @@ impl AgentLoop {
 
                 if tool_name == "execute_command" {
                     Self::invalidate_changed_read_state(&self.state).await;
+                    if executed {
+                        commands_executed += 1;
+                    }
                 }
 
                 // Warning state follows actual mutation: a successfully
@@ -4856,10 +4862,7 @@ impl AgentLoop {
                     .iter()
                     .filter(|(_, added, removed)| *added > 0 || *removed > 0)
                     .count();
-                let commands_run = prepared_tool_calls
-                    .iter()
-                    .filter(|prepared| prepared.tool_name == "execute_command")
-                    .count();
+                let commands_run = commands_executed;
 
                 let mut parts = Vec::new();
                 if files_created > 0 {
@@ -8113,6 +8116,93 @@ mod tests {
                 .expect("mutations must produce a message");
         assert!(mixed.contains("created n.txt"), "got {mixed}");
         assert!(mixed.contains("symbols s.rs"), "got {mixed}");
+    }
+
+    #[tokio::test]
+    async fn test_digest_counts_executed_commands() {
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+        use serde_json::json;
+        let (tx, mut rx) = mpsc::channel(64);
+        let responses = vec![tool_call_chunks(&[(
+            "c1",
+            "execute_command",
+            json!({"commands": ["echo digest-probe"]}),
+        )])];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new()),
+        );
+        let mut config = test_agent_config(provider, "digest-executed");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("📝") && line.contains("1 command run")),
+            "executed command must appear in digest, got {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_digest_omits_denied_command() {
+        use crate::core::approval::ApprovalManager;
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+        use crate::test_support::env_lock;
+        use serde_json::json;
+        // SAFETY: env mutation is serialized by env_lock; restored below.
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let responses = vec![tool_call_chunks(&[(
+            "c1",
+            "execute_command",
+            json!({"commands": ["rm -rf /tmp/sned-digest-denied"]}),
+        )])];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new()),
+        );
+        let mut config = test_agent_config(provider, "digest-denied");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let approval_manager = Arc::new(tokio::sync::Mutex::new(ApprovalManager::new()));
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_approval_manager(approval_manager);
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let history = agent.get_conversation_history().await;
+        assert!(
+            tool_result_texts(&history)
+                .iter()
+                .any(|text| text.contains("was denied")),
+            "setup must actually deny the command"
+        );
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("📝") && line.contains("command")),
+            "denied command never ran and must stay out of the digest, got {rendered:?}"
+        );
+
+        // SAFETY: restoring env after test.
+        unsafe { std::env::remove_var("SNED_APPROVAL_DENY") };
     }
 
     #[tokio::test]
