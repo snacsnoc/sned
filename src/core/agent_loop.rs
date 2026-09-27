@@ -6120,7 +6120,30 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
     let mut search_result_count = 0;
     let mut edit_result_count = 0;
 
-    for message in history.iter_mut().rev() {
+    // The newest tool-result batch has never appeared in a provider request:
+    // compaction runs before the request is built. Everything after the
+    // newest assistant tool-use message belongs to that undelivered batch
+    // and is exempt from age-based collapse.
+    let mut newest_tool_use_index: Option<usize> = None;
+    for (index, message) in history.iter().enumerate() {
+        if message.role != MessageRole::Assistant {
+            continue;
+        }
+        let MessageContent::AssistantBlocks(blocks) = &message.content else {
+            continue;
+        };
+        if blocks
+            .iter()
+            .any(|block| matches!(block, AssistantContentBlock::ToolUse(_)))
+        {
+            newest_tool_use_index = Some(index);
+        }
+    }
+
+    for (index, message) in history.iter_mut().enumerate().rev() {
+        if newest_tool_use_index.is_some_and(|cutoff| index > cutoff) {
+            continue;
+        }
         if message.role != MessageRole::User {
             continue;
         }
@@ -6960,6 +6983,38 @@ mod tests {
 
         fn description(&self, _params: &serde_json::Value) -> String {
             "static result".to_string()
+        }
+    }
+
+    struct PatternEchoHandler;
+
+    impl crate::core::tools::ToolHandler for PatternEchoHandler {
+        fn execute(
+            &self,
+            _ctx: &ToolContext,
+            params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, crate::core::tools::ToolError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let pattern = params
+                    .get("pattern")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                Ok(serde_json::Value::String(format!(
+                    "RESULT-{pattern}\n{}",
+                    "y".repeat(1200)
+                )))
+            })
+        }
+
+        fn description(&self, _params: &serde_json::Value) -> String {
+            "pattern echo".to_string()
         }
     }
 
@@ -12411,7 +12466,7 @@ Irrespective of whether additional information or instructions are given, you ar
         };
 
         let mut history = Vec::new();
-        for n in 1..=3 {
+        for n in 1..=4 {
             history.extend(make_search_pair(n, 5000));
         }
 
@@ -12436,7 +12491,11 @@ Irrespective of whether additional information or instructions are given, you ar
         );
         assert!(
             get_result_text(5).contains(&"z".repeat(5000)),
-            "most recent search results must not be compacted"
+            "delivered search results within retention must not be compacted"
+        );
+        assert!(
+            get_result_text(7).contains(&"z".repeat(5000)),
+            "undelivered newest batch must not be compacted"
         );
     }
 
@@ -12488,7 +12547,7 @@ Irrespective of whether additional information or instructions are given, you ar
         };
 
         let mut history = Vec::new();
-        for n in 1..=3 {
+        for n in 1..=4 {
             history.extend(make_skeleton_pair(n, 5000));
         }
 
@@ -12513,7 +12572,11 @@ Irrespective of whether additional information or instructions are given, you ar
         );
         assert!(
             get_result_text(5).contains(&"y".repeat(5000)),
-            "most recent skeleton results must not be compacted"
+            "delivered skeleton results within retention must not be compacted"
+        );
+        assert!(
+            get_result_text(7).contains(&"y".repeat(5000)),
+            "undelivered newest batch must not be compacted"
         );
     }
 
@@ -12565,7 +12628,7 @@ Irrespective of whether additional information or instructions are given, you ar
         };
 
         let mut history = Vec::new();
-        for n in 1..=3 {
+        for n in 1..=4 {
             history.extend(make_edit_pair(n, 5000));
         }
 
@@ -12591,7 +12654,11 @@ Irrespective of whether additional information or instructions are given, you ar
         );
         assert!(
             get_result_text(5).contains(&"w".repeat(5000)),
-            "most recent edit results must not be compacted"
+            "delivered edit results within retention must not be compacted"
+        );
+        assert!(
+            get_result_text(7).contains(&"w".repeat(5000)),
+            "undelivered newest batch must not be compacted"
         );
     }
 
@@ -14386,6 +14453,236 @@ Irrespective of whether additional information or instructions are given, you ar
                 .any(|event| matches!(event, OutputEvent::Completion(_))),
             "no completion payload before the failure is addressed"
         );
+    }
+
+    fn next_request_text(requests: &[crate::providers::ProviderRequest], index: usize) -> String {
+        use crate::providers::{MessageContent, ToolResultContent, UserContentBlock};
+        requests
+            .get(index)
+            .expect("next provider request must exist")
+            .messages
+            .iter()
+            .flat_map(|message| match &message.content {
+                MessageContent::Text(text) => vec![text.clone()],
+                MessageContent::UserBlocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        UserContentBlock::ToolResult(result) => match &result.content {
+                            ToolResultContent::Text(text) => Some(text.clone()),
+                            ToolResultContent::Blocks(inner) => Some(
+                                inner
+                                    .iter()
+                                    .filter_map(|content| match content {
+                                        crate::providers::ToolResultContentBlock::Text { text } => {
+                                            Some(text.clone())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            ),
+                        },
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn test_fresh_read_batch_survives_into_next_request() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+
+        // Scratch files must live under the workspace: the read handler
+        // rejects absolute paths outside it. Cargo's target dir is
+        // gitignored and the tempdir self-cleans on drop.
+        let dir = tempfile::tempdir_in("target").unwrap();
+        let mut markers = Vec::new();
+        let mut paths = Vec::new();
+        for (marker, fill) in [("FRESH-A", "x"), ("FRESH-B", "y"), ("FRESH-C", "z")] {
+            let body = format!("{marker}-\n{}\n", fill.repeat(700));
+            let path = dir.path().join(format!("{marker}.txt"));
+            std::fs::write(&path, &body).unwrap();
+            markers.push((marker, fill.repeat(700)));
+            paths.push(path.to_string_lossy().into_owned());
+        }
+
+        let mut first_turn = Vec::new();
+        for (index, path) in paths.iter().enumerate() {
+            first_turn.push(ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some(format!("call_r{}", index)),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("read_file".to_string()),
+                        arguments: Some(serde_json::json!({"path": path}).to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }));
+        }
+        let responses = vec![
+            first_turn,
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "done".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, recorded.clone()),
+        ));
+        let (tx, _rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-fresh-read-batch");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::ReadFile,
+            Arc::new(ReadFileHandler::new()),
+        );
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        agent.execute_turn().await;
+        agent.execute_turn().await;
+
+        let requests = recorded.lock().unwrap();
+        let second = next_request_text(&requests, 1);
+        for (marker, run) in &markers {
+            assert!(
+                second.contains(&format!("{marker}-")),
+                "fresh batch body must reach the next request before any compaction"
+            );
+            assert!(
+                second.contains(run),
+                "fresh batch body must reach the next request before any compaction"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fresh_search_batch_survives_into_next_request() {
+        use crate::core::tools::ToolRegistry;
+
+        let markers = ["SEARCH-A", "SEARCH-B", "SEARCH-C"];
+        let mut first_turn = Vec::new();
+        for (index, marker) in markers.iter().enumerate() {
+            first_turn.push(ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some(format!("call_s{}", index)),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("search_files".to_string()),
+                        arguments: Some(serde_json::json!({"pattern": marker}).to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }));
+        }
+        let responses = vec![
+            first_turn,
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "done".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, recorded.clone()),
+        ));
+        let (tx, _rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-fresh-search-batch");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::SearchFiles,
+            Arc::new(PatternEchoHandler),
+        );
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        agent.execute_turn().await;
+        agent.execute_turn().await;
+
+        let requests = recorded.lock().unwrap();
+        let second = next_request_text(&requests, 1);
+        for marker in markers {
+            let body = format!("RESULT-{marker}\n{}", "y".repeat(1200));
+            assert!(
+                second.contains(&body),
+                "fresh batch body must reach the next request before any compaction"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fresh_command_batch_survives_into_next_request() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+
+        let markers = ["CMD-A", "CMD-B", "CMD-C"];
+        let mut first_turn = Vec::new();
+        for (index, marker) in markers.iter().enumerate() {
+            first_turn.push(ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some(format!("call_c{}", index)),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("execute_command".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"commands": [format!("awk 'BEGIN {{ for (i=0;i<30;i++) printf \"{marker}-%04d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n\", i }}'")]}).to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }));
+        }
+        let responses = vec![
+            first_turn,
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "done".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, recorded.clone()),
+        ));
+        let (tx, _rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-fresh-command-batch");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new().with_yolo(true)),
+        );
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        agent.execute_turn().await;
+        agent.execute_turn().await;
+
+        let requests = recorded.lock().unwrap();
+        let second = next_request_text(&requests, 1);
+        for marker in markers {
+            let mid_batch_line = format!("{marker}-0020-{}", "x".repeat(30));
+            assert!(
+                second.contains(&mid_batch_line),
+                "fresh batch body must reach the next request before any compaction"
+            );
+        }
     }
 
     // =====================================================================
