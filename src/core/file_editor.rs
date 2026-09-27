@@ -1354,6 +1354,67 @@ impl AnchorStateManager {
         Ok(())
     }
 
+    /// Durably publishes a reconciled document with the same compare-and-swap
+    /// discipline as [`Self::check_transitions`]: the in-memory and durable
+    /// baselines must still match under the cache lock, and memory is updated
+    /// only after the atomic replacement succeeds. A memory-only baseline
+    /// with no durable counterpart is stale, never a fresh publication.
+    fn publish_reconciled_document(
+        &self,
+        absolute_path: &str,
+        task_id: &str,
+        memory_expected: Option<TrackedDocument>,
+        disk_expected: Option<TrackedDocument>,
+        document: &TrackedDocument,
+    ) -> Result<(), AnchorTransitionError> {
+        if disk_expected.is_none() && memory_expected.is_some() {
+            return Err(AnchorTransitionError::StaleGeneration {
+                path: absolute_path.into(),
+            });
+        }
+        let persistence =
+            |error: std::io::Error| AnchorTransitionError::Persistence(error.to_string());
+        let mut storage = self.storage();
+        let cache_dir = storage
+            .cache_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(cache_dir).map_err(persistence)?;
+        let _lock = AnchorCacheLock::acquire(&storage.cache_file.with_extension("json.lock"))
+            .map_err(persistence)?;
+        let mut tasks: IndexMap<String, IndexMap<String, TrackedDocument>> =
+            match std::fs::read(&storage.cache_file) {
+                Ok(bytes) => serde_json::from_slice(&bytes)
+                    .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => IndexMap::new(),
+                Err(error) => return Err(persistence(error)),
+            };
+        let memory = storage
+            .tasks
+            .get(task_id)
+            .and_then(|files| files.get(absolute_path));
+        let disk = tasks
+            .get(task_id)
+            .and_then(|files| files.get(absolute_path));
+        if memory != memory_expected.as_ref() || disk != disk_expected.as_ref() {
+            return Err(AnchorTransitionError::StaleGeneration {
+                path: absolute_path.into(),
+            });
+        }
+        let mut files = tasks.shift_remove(task_id).unwrap_or_default();
+        files.shift_remove(absolute_path);
+        files.insert(absolute_path.to_string(), document.clone());
+        tasks.insert(task_id.to_string(), files);
+        AnchorStorage::enforce_limits(&mut tasks);
+        let json = serde_json::to_string_pretty(&tasks)
+            .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?;
+        crate::storage::disk::atomic_write_file(&storage.cache_file, &json).map_err(persistence)?;
+        // There are no fallible operations after durable replacement.
+        storage.persisted_tasks.clone_from(&tasks);
+        storage.tasks = tasks;
+        Ok(())
+    }
+
     #[cfg(not(test))]
     #[must_use]
     pub fn new() -> Self {
@@ -1422,22 +1483,6 @@ impl AnchorStateManager {
         storage.tasks.insert(task_id.to_string(), state);
 
         storage.tasks.get_mut(task_id).unwrap()
-    }
-
-    fn update_state(&self, absolute_path: &str, document: TrackedDocument, task_id: &str) {
-        let mut storage = self.storage();
-        let state = Self::get_task_state_mut(&mut storage, task_id);
-
-        // Implement LRU for files - use shift_remove to maintain insertion order
-        state.shift_remove(absolute_path);
-        state.insert(absolute_path.to_string(), document);
-
-        if state.len() > MAX_TRACKED_FILES {
-            let oldest = state.keys().next().cloned();
-            if let Some(oldest_key) = oldest {
-                state.shift_remove(&oldest_key);
-            }
-        }
     }
 
     fn republish_document(
@@ -1516,19 +1561,22 @@ impl AnchorStateManager {
         }
 
         let current_hashes = compute_hashes(current_lines);
-        let (tracked, durable_missing) = {
+        // A corrupt or unreadable cache fails closed; only a missing file
+        // counts as an empty cache. Swallowing this read would let a stale
+        // manager report success for anchors that were never published.
+        let cache_file = self.storage().cache_file.clone();
+        let durable_document = AnchorStorage::read_tasks(&cache_file)
+            .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?
+            .get(task_id)
+            .and_then(|files| files.get(absolute_path))
+            .cloned();
+        let durable_missing_for = durable_document.is_none();
+        let memory_expected;
+        let tracked = {
             let mut storage = self.storage();
             // Readers must adopt a newer committed document before diffing or
             // returning the identical-content fast path from a stale manager.
-            let durable_document = AnchorStorage::read_tasks(&storage.cache_file)
-                .ok()
-                .and_then(|tasks| {
-                    tasks
-                        .get(task_id)
-                        .and_then(|files| files.get(absolute_path))
-                        .cloned()
-                });
-            if let Some(document) = durable_document {
+            if let Some(document) = durable_document.clone() {
                 storage
                     .tasks
                     .entry(task_id.to_string())
@@ -1542,18 +1590,10 @@ impl AnchorStateManager {
             }
             let state = Self::get_task_state_mut(&mut storage, task_id);
             let tracked = state.get(absolute_path).cloned();
-            let durable_missing = tracked.is_some()
-                && AnchorStorage::read_tasks(&storage.cache_file)
-                    .ok()
-                    .and_then(|tasks| {
-                        tasks
-                            .get(task_id)
-                            .and_then(|files| files.get(absolute_path))
-                            .cloned()
-                    })
-                    .is_none();
-            (tracked, durable_missing)
+            memory_expected = tracked.clone();
+            tracked
         };
+        let durable_missing = tracked.is_some() && durable_missing_for;
 
         // Fast path: if hashes are identical, nothing changed
         if let Some(tracked) = &tracked
@@ -1597,8 +1637,13 @@ impl AnchorStateManager {
                 tracked.anchors.push(identity);
             }
             let anchors = tracked.anchors.clone();
-            self.update_state(absolute_path, tracked, task_id);
-            self.save();
+            self.publish_reconciled_document(
+                absolute_path,
+                task_id,
+                memory_expected,
+                durable_document,
+                &tracked,
+            )?;
             return Ok(anchors);
         }
 
@@ -1673,10 +1718,13 @@ impl AnchorStateManager {
         next_document.anchors = new_anchors;
         let tracked = next_document;
         let anchors = tracked.anchors.clone();
-        self.update_state(absolute_path, tracked, task_id);
-
-        // Persist anchor state to disk
-        self.save();
+        self.publish_reconciled_document(
+            absolute_path,
+            task_id,
+            memory_expected,
+            durable_document,
+            &tracked,
+        )?;
 
         Ok(anchors)
     }
@@ -3553,6 +3601,60 @@ mod tests {
             restarted.observe_snapshot("file", "unpublished", Some("staged")),
             Err(AnchorTransitionError::StaleGeneration { .. })
         ));
+    }
+
+    #[test]
+    fn checked_reconcile_reports_corrupt_cache_without_clobbering_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        let _ = manager.reconcile_checked("file", &split_content_lines("old"), Some("staged"));
+        std::fs::write(&cache, "malformed cache").unwrap();
+        let memory = manager.storage().tasks.clone();
+        assert!(matches!(
+            manager.reconcile_checked("file", &split_content_lines("changed"), Some("staged")),
+            Err(AnchorTransitionError::Persistence(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), "malformed cache");
+        assert_eq!(manager.storage().tasks, memory);
+    }
+
+    #[test]
+    fn checked_reconcile_reports_unwritable_cache_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        std::fs::create_dir(cache.with_extension("json.lock")).unwrap();
+        assert!(matches!(
+            manager.reconcile_checked("file", &split_content_lines("old"), Some("staged")),
+            Err(AnchorTransitionError::Persistence(_))
+        ));
+        assert!(!cache.exists());
+        let parent = dir.path().join("parent");
+        std::fs::write(&parent, "not a dir").unwrap();
+        let nested = AnchorStateManager::with_cache_file(parent.join("anchors.json"));
+        assert!(matches!(
+            nested.reconcile_checked("file", &split_content_lines("old"), Some("staged")),
+            Err(AnchorTransitionError::Persistence(_))
+        ));
+    }
+
+    #[test]
+    fn checked_reconcile_rejects_changed_content_after_durable_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        let _ = manager
+            .reconcile_checked("file", &split_content_lines("old"), Some("staged"))
+            .unwrap();
+        std::fs::remove_file(&cache).unwrap();
+        let memory = manager.storage().tasks.clone();
+        assert!(matches!(
+            manager.reconcile_checked("file", &split_content_lines("changed"), Some("staged")),
+            Err(AnchorTransitionError::StaleGeneration { .. })
+        ));
+        assert_eq!(manager.storage().tasks, memory);
+        assert!(!cache.exists());
     }
 
     #[test]
