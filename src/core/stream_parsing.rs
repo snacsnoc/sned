@@ -312,7 +312,9 @@ fn strip_common_indent(lines: &[&str]) -> Vec<String> {
             if line.trim().is_empty() {
                 String::new()
             } else if line.len() - line.trim_start().len() >= dedent {
-                line[dedent..].to_string()
+                // A byte dedent can land inside a multibyte character;
+                // keep such lines verbatim rather than panic or split one.
+                line.get(dedent..).unwrap_or(line).to_string()
             } else {
                 line.to_string()
             }
@@ -809,6 +811,22 @@ mod tests {
         assert_eq!(
             strip_common_indent(&lines.iter().map(String::as_str).collect::<Vec<_>>())[2],
             "123456789012345Étail".to_string()
+        );
+    }
+
+    #[test]
+    fn test_dedent_keeps_line_when_cut_lands_inside_a_character() {
+        // Fifteen spaces plus a two-byte NBSP: the 16-byte dedent lands
+        // between the NBSP bytes, which byte indexing cannot express.
+        let nbsp_line = "               \u{a0}x".to_string();
+        let lines = vec![
+            "                alpha".to_string(),
+            "                beta".to_string(),
+            nbsp_line.clone(),
+        ];
+        assert_eq!(
+            strip_common_indent(&lines.iter().map(String::as_str).collect::<Vec<_>>()),
+            vec!["alpha".to_string(), "beta".to_string(), nbsp_line]
         );
     }
 
