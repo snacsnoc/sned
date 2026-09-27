@@ -412,6 +412,23 @@ pub struct EnvironmentMetadataEntry {
     pub sned_version: String,
 }
 
+/// Conversation history load result with the index lineage a caller needs
+/// to remap saved message ranges (such as compaction deleted-ranges) after
+/// recovery drops records from the middle of the file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveredHistory {
+    /// Surviving messages in file order. Gap-merged neighbors keep their
+    /// earliest file index, so positions only shift down by earlier drops.
+    pub messages: Vec<StorageMessage>,
+    /// Original file indices with no surviving message, ascending. A caller
+    /// holding ranges over the file must remap or invalidate when non-empty.
+    pub dropped: Vec<usize>,
+    /// True when bulk parsing failed and per-element recovery ran.
+    pub used_fallback: bool,
+    /// First parse failure encountered, when any.
+    pub first_error: Option<String>,
+}
+
 /// Manages per-task file storage at ~/.sned/data/tasks/{taskId}/
 pub struct TaskStorage {
     task_dir: PathBuf,
@@ -513,6 +530,12 @@ impl TaskStorage {
 
     /// Read API conversation history (Anthropic MessageParam format)
     pub fn read_api_conversation_history(&self) -> Vec<StorageMessage> {
+        self.read_api_conversation_history_with_recovery().messages
+    }
+
+    /// Read API conversation history with the recovery lineage a caller
+    /// needs to remap saved message ranges after mid-file record loss.
+    pub fn read_api_conversation_history_with_recovery(&self) -> RecoveredHistory {
         let file_path = self
             .task_dir
             .join(GlobalFileNames::API_CONVERSATION_HISTORY);
@@ -523,14 +546,21 @@ impl TaskStorage {
                         .into_iter()
                         .enumerate()
                         .collect::<Vec<(usize, StorageMessage)>>();
-                    Self::repair_conversation_history(indexed)
+                    let (messages, dropped) = Self::repair_conversation_history_tracked(indexed);
+                    RecoveredHistory {
+                        messages,
+                        dropped,
+                        used_fallback: false,
+                        first_error: None,
+                    }
                 }
                 Err(bulk_error) => {
                     match Self::recover_history_elements(&contents) {
                         Some((recovered, dropped, first_error)) if !recovered.is_empty() => {
-                            // Nothing lost: bulk parsing rejects files our own
-                            // writer produces, so a clean recovery is routine,
-                            // not corruption. No backup, no warn.
+                            // Nothing lost: legacy files our old writer
+                            // produced still need per-element recovery, so a
+                            // clean recovery is routine, not corruption. No
+                            // backup, no warn.
                             if dropped.is_empty() {
                                 tracing::info!(
                                     file_path = %file_path.display(),
@@ -561,7 +591,17 @@ impl TaskStorage {
                                     "Recovered valid API conversation history around corrupted records and backup failed"
                                 );
                             }
-                            Self::repair_conversation_history(recovered)
+                            let (messages, repair_dropped) =
+                                Self::repair_conversation_history_tracked(recovered);
+                            let mut dropped = dropped;
+                            dropped.extend(repair_dropped);
+                            dropped.sort_unstable();
+                            RecoveredHistory {
+                                messages,
+                                dropped,
+                                used_fallback: true,
+                                first_error,
+                            }
                         }
                         Some((_, dropped, first_error)) => {
                             // Create backup of corrupted file before discarding
@@ -583,7 +623,12 @@ impl TaskStorage {
                                     "Failed to parse API conversation history JSON and backup failed"
                                 );
                             }
-                            Vec::new()
+                            RecoveredHistory {
+                                messages: Vec::new(),
+                                dropped,
+                                used_fallback: true,
+                                first_error,
+                            }
                         }
                         None => {
                             // Create backup of corrupted file before discarding
@@ -602,22 +647,60 @@ impl TaskStorage {
                                     "Failed to parse API conversation history JSON and backup failed"
                                 );
                             }
-                            Vec::new()
+                            RecoveredHistory {
+                                messages: Vec::new(),
+                                dropped: Vec::new(),
+                                used_fallback: true,
+                                first_error: Some(bulk_error.to_string()),
+                            }
                         }
                     }
                 }
             },
-            Err(_) => Vec::new(),
+            Err(_) => RecoveredHistory {
+                messages: Vec::new(),
+                dropped: Vec::new(),
+                used_fallback: false,
+                first_error: None,
+            },
         }
+    }
+
+    /// Encode history for storage with no duplicate `signature` keys.
+    ///
+    /// Thinking blocks carry the provider signature twice (direct field plus
+    /// flattened shared fields), and struct serialization emits both keys
+    /// while struct deserialization rejects the duplicate. The direct field
+    /// is authoritative because reads feed it and drop the shared copy, so
+    /// it wins conflicts and backfills from the shared copy when empty;
+    /// serializing through Value then collapses the synced pair to one key.
+    fn encode_history_for_storage(history: &[StorageMessage]) -> io::Result<String> {
+        let mut normalized = history.to_vec();
+        for message in &mut normalized {
+            if let MessageContent::AssistantBlocks(blocks) = &mut message.content {
+                for block in blocks {
+                    if let AssistantContentBlock::Thinking(thinking) = block {
+                        let resolved = thinking
+                            .signature
+                            .clone()
+                            .or(thinking.shared.signature.clone());
+                        thinking.signature = resolved.clone();
+                        thinking.shared.signature = resolved;
+                    }
+                }
+            }
+        }
+        let value = serde_json::to_value(&normalized)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        serde_json::to_string(&value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Parse history message-by-message, collecting the indices that fail
     /// plus the first failure's error. Returns None when the file is not a
-    /// JSON array at all. Bulk parsing rejects files our own writer
-    /// produces (thinking blocks serialize duplicate `signature` keys, which
-    /// derived struct deserialization refuses), while per-element conversion
-    /// through Value accepts them, so one unreadable record no longer
-    /// discards the whole session.
+    /// JSON array at all. Legacy files keep the duplicate `signature` keys
+    /// the old writer emitted, which bulk struct deserialization refuses;
+    /// per-element conversion through Value accepts them, so one unreadable
+    /// record no longer discards the whole session.
     fn recover_history_elements(
         contents: &str,
     ) -> Option<(Vec<(usize, StorageMessage)>, Vec<usize>, Option<String>)> {
@@ -644,7 +727,13 @@ impl TaskStorage {
     /// history stays provider-valid. Runs on every load: pre-existing
     /// adjacency went through the live send path and is preserved, while
     /// crash-torn tails the bulk parse accepts still get repaired.
-    fn repair_conversation_history(history: Vec<(usize, StorageMessage)>) -> Vec<StorageMessage> {
+    /// Repair plus the original file indices left with no surviving message,
+    /// so callers holding ranges over the file can remap or invalidate them.
+    /// Survivors keep file order; gap-merged neighbors carry the earliest
+    /// index and are never reported as dropped.
+    fn repair_conversation_history_tracked(
+        history: Vec<(usize, StorageMessage)>,
+    ) -> (Vec<StorageMessage>, Vec<usize>) {
         let mut offered = HashSet::new();
         let mut answered = HashSet::new();
         for (_, message) in &history {
@@ -668,8 +757,10 @@ impl TaskStorage {
         }
 
         // Survivors carry their recovery index so the merge below can tell
-        // removal-opened gaps apart from pre-existing adjacency.
+        // removal-opened gaps apart from pre-existing adjacency. Fully
+        // pruned messages are lineage drops: no survivor covers them.
         let mut pruned: Vec<(usize, StorageMessage)> = Vec::with_capacity(history.len());
+        let mut dropped: Vec<usize> = Vec::new();
         for (index, mut message) in history.into_iter() {
             let keep = match &mut message.content {
                 MessageContent::AssistantBlocks(blocks) => {
@@ -688,6 +779,8 @@ impl TaskStorage {
             };
             if keep {
                 pruned.push((index, message));
+            } else {
+                dropped.push(index);
             }
         }
 
@@ -711,7 +804,8 @@ impl TaskStorage {
             }
             merged.push((index, index, message));
         }
-        merged.into_iter().map(|(_, _, message)| message).collect()
+        let messages = merged.into_iter().map(|(_, _, message)| message).collect();
+        (messages, dropped)
     }
 
     /// Combine two same-role message contents. Returns None for
@@ -803,8 +897,7 @@ impl TaskStorage {
     /// Write API conversation history
     pub fn write_api_conversation_history(&self, history: &[StorageMessage]) -> io::Result<()> {
         self.with_lock_file(API_CONVERSATION_HISTORY_LOCK_FILE, || {
-            let data = serde_json::to_string(history)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let data = Self::encode_history_for_storage(history)?;
             let file_path = self
                 .task_dir
                 .join(GlobalFileNames::API_CONVERSATION_HISTORY);
@@ -817,8 +910,7 @@ impl TaskStorage {
         &self,
         history: &[StorageMessage],
     ) -> io::Result<()> {
-        let data = serde_json::to_string(history)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let data = Self::encode_history_for_storage(history)?;
         let file_path = self
             .task_dir
             .join(GlobalFileNames::API_CONVERSATION_HISTORY);
@@ -2266,11 +2358,10 @@ mod tests {
             task_dir: task_dir.clone(),
         };
 
-        // Thinking blocks serialize duplicate `signature` keys (direct field
-        // plus flattened shared fields), which bulk parsing rejects while
-        // per-element conversion accepts. The collapsed key feeds the direct
-        // field, so the shared copy reads back empty; the fix guarantees the
-        // record survives, not that the writer's duplicate keys round-trip.
+        // Thinking blocks carry the signature twice in memory (direct field
+        // plus flattened shared fields). The writer resolves the pair with
+        // direct-field precedence and stores one key, which reads back into
+        // the direct field while the shared copy reads back empty.
         let history = vec![StorageMessage {
             id: None,
             role: MessageRole::Assistant,
@@ -3116,6 +3207,223 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn test_history_writer_emits_single_signature_key_with_direct_precedence() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields, ThinkingBlock,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("history-codec-precedence");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let history = vec![StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Thinking(
+                ThinkingBlock {
+                    thinking: "hmm".to_string(),
+                    signature: Some("direct-sig".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: Some("shared-sig".to_string()),
+                    },
+                    summary: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }];
+
+        storage.write_api_conversation_history(&history).unwrap();
+        let contents =
+            fs::read_to_string(task_dir.join(GlobalFileNames::API_CONVERSATION_HISTORY)).unwrap();
+        assert_eq!(
+            contents.matches("\"signature\"").count(),
+            1,
+            "writer must emit no duplicate signature keys"
+        );
+        assert!(
+            serde_json::from_str::<Vec<StorageMessage>>(&contents).is_ok(),
+            "stored history must bulk-parse without the legacy fallback"
+        );
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read.len(), 1);
+        match &read[0].content {
+            MessageContent::AssistantBlocks(blocks) => match &blocks[0] {
+                AssistantContentBlock::Thinking(thinking) => {
+                    assert_eq!(thinking.signature, Some("direct-sig".to_string()));
+                }
+                other => panic!("expected thinking block, got {other:?}"),
+            },
+            other => panic!("expected assistant blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_history_writer_promotes_shared_signature_when_direct_missing() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields, ThinkingBlock,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("history-codec-promote");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let history = vec![StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Thinking(
+                ThinkingBlock {
+                    thinking: "hmm".to_string(),
+                    signature: None,
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: Some("shared-sig".to_string()),
+                    },
+                    summary: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }];
+
+        storage.write_api_conversation_history(&history).unwrap();
+        let contents =
+            fs::read_to_string(task_dir.join(GlobalFileNames::API_CONVERSATION_HISTORY)).unwrap();
+        assert!(
+            serde_json::from_str::<Vec<StorageMessage>>(&contents).is_ok(),
+            "stored history must bulk-parse without the legacy fallback"
+        );
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read.len(), 1);
+        match &read[0].content {
+            MessageContent::AssistantBlocks(blocks) => match &blocks[0] {
+                AssistantContentBlock::Thinking(thinking) => {
+                    assert_eq!(thinking.signature, Some("shared-sig".to_string()));
+                }
+                other => panic!("expected thinking block, got {other:?}"),
+            },
+            other => panic!("expected assistant blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_duplicate_signature_keys_still_recover() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields, ThinkingBlock,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("history-codec-legacy");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let message = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Thinking(
+                ThinkingBlock {
+                    thinking: "hmm".to_string(),
+                    signature: Some("sig".to_string()),
+                    shared: SharedContentFields {
+                        call_id: None,
+                        signature: Some("sig".to_string()),
+                    },
+                    summary: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        // Struct serialization still emits both keys; files written before
+        // the canonical writer keep this shape and must stay loadable.
+        let contents = format!("[{}]", serde_json::to_string(&message).unwrap());
+        assert_eq!(contents.matches("\"signature\"").count(), 2);
+        assert!(serde_json::from_str::<Vec<StorageMessage>>(&contents).is_err());
+
+        let history_path = task_dir.join(GlobalFileNames::API_CONVERSATION_HISTORY);
+        fs::write(&history_path, &contents).unwrap();
+        let read = storage.read_api_conversation_history();
+        assert_eq!(read.len(), 1);
+        match &read[0].content {
+            MessageContent::AssistantBlocks(blocks) => match &blocks[0] {
+                AssistantContentBlock::Thinking(thinking) => {
+                    assert_eq!(thinking.thinking, "hmm");
+                    assert_eq!(thinking.signature, Some("sig".to_string()));
+                }
+                other => panic!("expected thinking block, got {other:?}"),
+            },
+            other => panic!("expected assistant blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_history_recovery_reports_dropped_middle_index() {
+        use crate::providers::{MessageContent, MessageRole};
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("history-recovery-lineage");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let before = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("before".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        let after = StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("after".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        let later = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("later".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        let poison = serde_json::json!({"role": "user", "content": [{"type": "bogus_block"}]});
+        let contents = format!(
+            "[{},{},{},{}]",
+            serde_json::to_string(&before).unwrap(),
+            poison,
+            serde_json::to_string(&after).unwrap(),
+            serde_json::to_string(&later).unwrap()
+        );
+        fs::write(
+            task_dir.join(GlobalFileNames::API_CONVERSATION_HISTORY),
+            &contents,
+        )
+        .unwrap();
+
+        let recovered = storage.read_api_conversation_history_with_recovery();
+        assert!(recovered.used_fallback);
+        assert_eq!(recovered.dropped, vec![1]);
+        assert_eq!(recovered.messages, vec![before, after, later]);
     }
 
     #[test]
