@@ -14285,8 +14285,15 @@ Irrespective of whether additional information or instructions are given, you ar
         use crate::core::approval::ApprovalManager;
         use crate::core::tools::ToolRegistry;
         use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+        use crate::test_support::env_lock;
 
         let _approval_guard = crate::core::approval::approval_test_guard();
+        // Force the non-interactive denial path. With a TTY stdin,
+        // is_terminal() returns true and the prompt would fail closed with
+        // Unavailable instead of returning Denied.
+        // SAFETY: env mutation is serialized by env_lock; restored below.
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
 
         let responses = vec![vec![
             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
@@ -14359,6 +14366,8 @@ Irrespective of whether additional information or instructions are given, you ar
             "every stored result must carry its prepared call ID"
         );
         assert!(stored.iter().all(|(_, text)| text.contains("was denied")));
+        // SAFETY: restoring env after test.
+        unsafe { std::env::remove_var("SNED_APPROVAL_DENY") };
     }
 
     #[tokio::test]
@@ -14487,8 +14496,15 @@ Irrespective of whether additional information or instructions are given, you ar
         use crate::core::tools::ToolRegistry;
         use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
         use crate::core::tools::handlers::read_file::ReadFileHandler;
+        use crate::test_support::env_lock;
 
         let _approval_guard = crate::core::approval::approval_test_guard();
+        // Force the non-interactive denial path. With a TTY stdin,
+        // is_terminal() returns true and the prompt would fail closed with
+        // Unavailable instead of returning Denied.
+        // SAFETY: env mutation is serialized by env_lock; restored below.
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var("SNED_APPROVAL_DENY", "1") };
 
         let responses = vec![vec![
             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
@@ -14595,6 +14611,8 @@ Irrespective of whether additional information or instructions are given, you ar
             "every stored result must carry its prepared call ID"
         );
         assert!(stored[1].1.contains("was denied"));
+        // SAFETY: restoring env after test.
+        unsafe { std::env::remove_var("SNED_APPROVAL_DENY") };
     }
 
     #[tokio::test]
