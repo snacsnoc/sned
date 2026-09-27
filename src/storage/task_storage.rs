@@ -231,7 +231,22 @@ impl TaskTranscriptWriter {
                                 }
                                 continue;
                             }
-                            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                                // Defined disconnect path: the writer may be
+                                // dropped without shutdown, so flush buffered
+                                // entries instead of discarding them.
+                                if !pending.is_empty()
+                                    && let Err(error) = flush_transcript_batch(
+                                        &storage,
+                                        &mut pending,
+                                        &mut appends_since_compaction,
+                                        &mut bytes_since_compaction,
+                                    )
+                                {
+                                    let _ = error_sender.send(error.to_string());
+                                }
+                                break;
+                            }
                         }
                     };
 
@@ -373,7 +388,15 @@ fn flush_transcript_batch(
     }
 
     let batch = std::mem::take(pending);
-    let bytes_written = storage.append_transcript_entries(&batch)?;
+    // A failed append must stay observable and retryable: restore the batch
+    // so the entries are neither silently dropped nor reported as flushed.
+    let bytes_written = match storage.append_transcript_entries(&batch) {
+        Ok(bytes_written) => bytes_written,
+        Err(error) => {
+            *pending = batch;
+            return Err(error);
+        }
+    };
     *appends_since_compaction = appends_since_compaction.saturating_add(batch.len());
     *bytes_since_compaction = bytes_since_compaction.saturating_add(bytes_written);
     if *appends_since_compaction >= TRANSCRIPT_COMPACTION_APPEND_THRESHOLD
@@ -3454,5 +3477,188 @@ mod tests {
         assert!(path.exists());
         storage.auto_purge(1).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_transcript_batch_failure_keeps_entries_pending() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-failed-batch");
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let mut pending = vec![
+            TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: 1,
+                markdown: "first".to_string(),
+                spans: Vec::new(),
+            },
+            TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: 2,
+                markdown: "second".to_string(),
+                spans: Vec::new(),
+            },
+        ];
+        let mut appends = 0usize;
+        let mut bytes = 0u64;
+
+        // Missing task dir fails the append at lock acquisition.
+        assert!(flush_transcript_batch(&storage, &mut pending, &mut appends, &mut bytes).is_err());
+        assert_eq!(pending.len(), 2, "failed batch must stay pending");
+
+        fs::create_dir_all(&task_dir).unwrap();
+        assert!(flush_transcript_batch(&storage, &mut pending, &mut appends, &mut bytes).is_ok());
+        assert!(pending.is_empty());
+        assert_eq!(
+            storage.read_transcript(DEFAULT_TRANSCRIPT_CAP).unwrap(),
+            vec![
+                TranscriptEntry {
+                    kind: BlockKind::Model,
+                    ts: 1,
+                    markdown: "first".to_string(),
+                    spans: Vec::new(),
+                },
+                TranscriptEntry {
+                    kind: BlockKind::Model,
+                    ts: 2,
+                    markdown: "second".to_string(),
+                    spans: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_transcript_writer_flushes_pending_on_disconnect() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-writer-disconnect");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let writer = TaskTranscriptWriter::start(storage).unwrap();
+        writer
+            .append(
+                (0..3)
+                    .map(|index| TranscriptEntry {
+                        kind: BlockKind::Model,
+                        ts: index as u64,
+                        markdown: format!("pending {index}"),
+                        spans: Vec::new(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        // Drop without shutdown: the worker must still flush buffered
+        // entries on its disconnect path instead of discarding them.
+        drop(writer);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let lines = fs::read_to_string(&path)
+                .map(|contents| contents.lines().count())
+                .unwrap_or(0);
+            if lines == 3 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disconnect dropped {lines} of 3 pending entries"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn test_retained_oversize_transcript_ignores_small_appends_without_storm() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-retained-oversize");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let retained = (0..1100)
+            .map(|index| TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: index as u64,
+                markdown: "x".repeat(1100),
+                spans: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            &path,
+            retained
+                .iter()
+                .map(|entry| serde_json::to_string(entry).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > TRANSCRIPT_COMPACTION_MAX_BYTES);
+
+        for index in 0..10 {
+            storage
+                .write_transcript_entry(&TranscriptEntry {
+                    kind: BlockKind::Model,
+                    ts: 10_000 + index,
+                    markdown: "small".to_string(),
+                    spans: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let on_disk_lines = io::BufReader::new(fs::File::open(&path).unwrap())
+            .lines()
+            .count();
+        assert_eq!(on_disk_lines, 1110);
+    }
+
+    #[test]
+    fn test_huge_entry_compacts_to_cap_then_small_append_holds() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("transcript-huge-entry");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+        let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
+        let small = (0..DEFAULT_TRANSCRIPT_CAP as u64)
+            .map(|index| TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: index,
+                markdown: "small".to_string(),
+                spans: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        storage.write_transcript_entries(&small).unwrap();
+        storage
+            .write_transcript_entry(&TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: DEFAULT_TRANSCRIPT_CAP as u64,
+                markdown: "x".repeat(1_100_000),
+                spans: Vec::new(),
+            })
+            .unwrap();
+
+        let count_lines = || {
+            io::BufReader::new(fs::File::open(&path).unwrap())
+                .lines()
+                .count()
+        };
+        assert_eq!(count_lines(), DEFAULT_TRANSCRIPT_CAP);
+
+        storage
+            .write_transcript_entry(&TranscriptEntry {
+                kind: BlockKind::Model,
+                ts: DEFAULT_TRANSCRIPT_CAP as u64 + 1,
+                markdown: "small".to_string(),
+                spans: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(count_lines(), DEFAULT_TRANSCRIPT_CAP + 1);
     }
 }
