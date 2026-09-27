@@ -722,6 +722,18 @@ mod tests {
     }
 
     #[test]
+    fn test_advance_stops_at_failed_step() {
+        let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
+        plan.mark_step(0, PlanStepStatus::Running).unwrap();
+        plan.mark_step(0, PlanStepStatus::Failed).unwrap();
+
+        assert_eq!(plan.advance(), None);
+        assert_eq!(plan.steps[0].status, PlanStepStatus::Failed);
+        assert_eq!(plan.steps[1].status, PlanStepStatus::Pending);
+        assert!(!plan.complete);
+    }
+
+    #[test]
     fn test_completion_detection() {
         let mut plan = PlanState::create_plan(vec!["Step one".to_string(), "Step two".to_string()]);
         assert!(!plan.is_complete());

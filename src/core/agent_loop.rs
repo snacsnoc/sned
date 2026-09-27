@@ -4348,13 +4348,33 @@ impl AgentLoop {
                 }
             }
 
+            // One outcome per prepared call, immediate or executed: preflight
+            // failures (denied, malformed, unknown, deferred) participate
+            // before any statistics, completion, or plan decision. This must
+            // run before result_map is drained below.
+            let mut unified_failure_count = 0usize;
+            let mut unified_called = false;
+            for (index, (_, _, immediate, _, _, _)) in tool_tasks.iter().enumerate() {
+                if let Some(output) = immediate {
+                    unified_called = true;
+                    unified_failure_count += usize::from(output.is_error);
+                } else if let Some(output) = result_map.get(&index) {
+                    unified_called = true;
+                    unified_failure_count += usize::from(output.is_error);
+                } else {
+                    // A prepared call with no outcome at all: fail closed,
+                    // matching the fabricated execution error Phase 3 pairs.
+                    unified_called = true;
+                    unified_failure_count += 1;
+                }
+            }
+            // Track tool execution statistics for consecutive_mistakes tracking
+            let tools_called = unified_called;
+            tool_failure_count = unified_failure_count;
+
             let execution_results: Vec<ToolExecutionOutput> = (0..tool_tasks.len())
                 .filter_map(|i| result_map.remove(&i))
                 .collect();
-
-            // Track tool execution statistics for consecutive_mistakes tracking
-            let tools_called = !execution_results.is_empty();
-            tool_failure_count = execution_results.iter().filter(|r| r.is_error).count();
 
             // Phase 3: Collect results in order, then push as ONE StorageMessage
             let mut execution_results_iter = execution_results.into_iter();
@@ -4822,20 +4842,19 @@ impl AgentLoop {
             })
         };
         let plan_active = self.plan_execution_active().await;
-        let completion_candidate = prepared_tool_calls.iter().any(|prepared| {
-            matches!(
-                SnedTool::from_name(&prepared.tool_name),
-                Some(SnedTool::AttemptCompletion)
-            )
-        }) || text_only_completes_task;
+        // Completion derives from an accepted completion outcome, never a
+        // tool name alone: a rejected attempt_completion leaves
+        // completion_result unset, and a failure elsewhere in the batch
+        // must not be hidden by a completion request.
+        let completion_candidate = completion_result.is_some() || text_only_completes_task;
         let plan_mode_responded = prepared_tool_calls.iter().any(|prepared| {
             matches!(
                 SnedTool::from_name(&prepared.tool_name),
                 Some(SnedTool::PlanModeRespond)
             )
         });
-        let is_completion = (completion_candidate
-            || (tool_failure_count == 0 && plan_mode_responded))
+        let is_completion = tool_failure_count == 0
+            && (completion_candidate || plan_mode_responded)
             && !plan_active
             && !plan_blocks_completion;
 
@@ -7422,6 +7441,11 @@ mod tests {
         assert_eq!(tool_results.len(), 2);
         assert!(tool_results[0].contains("didn't respond within 5 minutes"));
         assert_eq!(tool_results[1], "write completed");
+        assert_eq!(
+            agent.state.lock().await.consecutive_mistakes,
+            1,
+            "the timed-out approval must count as a tool failure"
+        );
     }
 
     fn drain_rendered_output(
@@ -13636,7 +13660,11 @@ Irrespective of whether additional information or instructions are given, you ar
         let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
         agent.state.lock().await.double_check_completion_enabled = true;
 
-        let _ = agent.execute_turn().await;
+        let result = agent.execute_turn().await;
+        assert!(
+            matches!(result, TurnResult::Continue),
+            "a rejected completion with no plan must continue, never complete"
+        );
 
         let mut completion_count = 0;
         let mut tool_output = Vec::new();
@@ -13912,6 +13940,451 @@ Irrespective of whether additional information or instructions are given, you ar
                 .iter()
                 .chain(second_events.iter())
                 .any(|event| matches!(event, OutputEvent::Completion(_)))
+        );
+    }
+
+    fn assistant_tool_use_ids(history: &[crate::providers::StorageMessage]) -> Vec<String> {
+        use crate::providers::{AssistantContentBlock, MessageContent};
+        history
+            .iter()
+            .rev()
+            .find_map(|message| match &message.content {
+                MessageContent::AssistantBlocks(blocks) => Some(blocks),
+                _ => None,
+            })
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        AssistantContentBlock::ToolUse(tool_use) => {
+                            Some(tool_use.id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn stored_tool_results(
+        history: &[crate::providers::StorageMessage],
+    ) -> Vec<(String, String)> {
+        use crate::providers::{MessageContent, ToolResultContent, UserContentBlock};
+        history
+            .iter()
+            .rev()
+            .find_map(|message| match &message.content {
+                MessageContent::UserBlocks(blocks) => Some(blocks),
+                _ => None,
+            })
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        UserContentBlock::ToolResult(result) => match &result.content {
+                            ToolResultContent::Text(text) => {
+                                Some((result.tool_use_id.clone(), text.clone()))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_all_denied_batch_counts_mistakes_and_continues() {
+        use crate::core::approval::ApprovalManager;
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+
+        let _approval_guard = crate::core::approval::approval_test_guard();
+
+        let responses = vec![vec![
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_d1".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("execute_command".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"commands": ["rm -rf /tmp/sned-f02-d1"]})
+                                .to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_d2".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("execute_command".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"commands": ["rm -rf /tmp/sned-f02-d2"]})
+                                .to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+        ]];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let (tx, _rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-all-denied-batch");
+        config.interactive_mode = false;
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new()),
+        );
+        let approval_manager = Arc::new(tokio::sync::Mutex::new(ApprovalManager::new()));
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_approval_manager(approval_manager);
+
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
+        assert_eq!(
+            agent.state.lock().await.consecutive_mistakes,
+            1,
+            "denied calls are tool outcomes, not a text-only turn"
+        );
+        let history = agent.conversation_history.lock().await;
+        let stored = stored_tool_results(&history);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(
+            stored.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            assistant_tool_use_ids(&history),
+            "every stored result must carry its prepared call ID"
+        );
+        assert!(stored.iter().all(|(_, text)| text.contains("was denied")));
+    }
+
+    #[tokio::test]
+    async fn test_all_malformed_batch_counts_mistakes_and_continues() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+
+        let responses = vec![vec![
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_m1".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("execute_command".to_string()),
+                        arguments: Some("{oops".to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_m2".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("read_file".to_string()),
+                        arguments: Some("[oops".to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+        ]];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let (tx, _rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-all-malformed-batch");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new().with_yolo(true)),
+        );
+        registry.register(
+            crate::core::tools::SnedTool::ReadFile,
+            Arc::new(ReadFileHandler::new()),
+        );
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
+        assert_eq!(
+            agent.state.lock().await.consecutive_mistakes,
+            1,
+            "malformed calls are tool outcomes, not a text-only turn"
+        );
+        let history = agent.conversation_history.lock().await;
+        let stored = stored_tool_results(&history);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(
+            stored.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            assistant_tool_use_ids(&history),
+            "every stored result must carry its prepared call ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_tool_batch_counts_mistakes_and_continues() {
+        use crate::core::tools::ToolRegistry;
+
+        let responses = vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call_u1".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("definitely_not_a_tool_xyz".to_string()),
+                    arguments: Some(serde_json::json!({}).to_string()),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        })]];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let (tx, _rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-unknown-tool-batch");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+
+        let registry = ToolRegistry::new();
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
+        assert_eq!(
+            agent.state.lock().await.consecutive_mistakes,
+            1,
+            "unknown tools are tool outcomes, not a text-only turn"
+        );
+        let history = agent.conversation_history.lock().await;
+        let stored = stored_tool_results(&history);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            assistant_tool_use_ids(&history),
+            "every stored result must carry its prepared call ID"
+        );
+        assert!(stored[0].1.contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn test_mixed_success_and_denial_fails_plan_step_without_advancing() {
+        use crate::core::approval::ApprovalManager;
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+
+        let _approval_guard = crate::core::approval::approval_test_guard();
+
+        let responses = vec![vec![
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_ok".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("read_file".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"path": "shown.txt"}).to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_denied".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("execute_command".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"commands": ["rm -rf /tmp/sned-f02-d3"]})
+                                .to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+        ]];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority output receiver should be available");
+        let mut config = test_agent_config(provider, "test-mixed-success-denial");
+        config.interactive_mode = false;
+        config.output_writer = writer;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::ReadFile,
+            Arc::new(ReadFileHandler::new()),
+        );
+        registry.register(
+            crate::core::tools::SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new()),
+        );
+        let approval_manager = Arc::new(tokio::sync::Mutex::new(ApprovalManager::new()));
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_approval_manager(approval_manager);
+        {
+            let mut state = agent.state.lock().await;
+            let mut plan = crate::core::plan_state::PlanState::create_plan(vec![
+                "Read then clean".to_string(),
+            ]);
+            plan.approved = true;
+            plan.steps[0].status = crate::core::plan_state::PlanStepStatus::Running;
+            state.plan_state = Some(plan);
+        }
+
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
+        assert_eq!(
+            agent.state.lock().await.consecutive_mistakes,
+            1,
+            "the denied call must fail the batch"
+        );
+        {
+            let state = agent.state.lock().await;
+            let plan = state
+                .plan_state
+                .as_ref()
+                .expect("plan should remain present");
+            assert_eq!(
+                plan.steps[0].status,
+                crate::core::plan_state::PlanStepStatus::Failed,
+                "the omitted denial must not read as a finished step"
+            );
+            assert!(plan.paused);
+            assert!(!plan.complete);
+        }
+        let events = drain_output_events(&mut priority_rx, &mut rx);
+        assert!(events.iter().any(|event| {
+            matches!(event, OutputEvent::ErrorBox(message) if message.contains("Plan step 1/1 failed"))
+        }));
+        let history = agent.conversation_history.lock().await;
+        let stored = stored_tool_results(&history);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(
+            stored.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            assistant_tool_use_ids(&history),
+            "every stored result must carry its prepared call ID"
+        );
+        assert!(stored[1].1.contains("was denied"));
+    }
+
+    #[tokio::test]
+    async fn test_failed_command_with_completion_in_one_batch_continues() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::attempt_completion::AttemptCompletionHandler;
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+
+        let responses = vec![vec![
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_failed_command".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("execute_command".to_string()),
+                        arguments: Some(serde_json::json!({"commands": ["false"]}).to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+            ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some("call_early_completion".to_string()),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("attempt_completion".to_string()),
+                        arguments: Some(
+                            serde_json::json!({"result": "Everything completed successfully"})
+                                .to_string(),
+                        ),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            }),
+        ]];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority output receiver should be available");
+        let mut config = test_agent_config(provider, "test-failed-command-same-batch-completion");
+        config.output_writer = writer;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new().with_yolo(true)),
+        );
+        registry.register(
+            crate::core::tools::SnedTool::AttemptCompletion,
+            Arc::new(AttemptCompletionHandler::new()),
+        );
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        let result = agent.execute_turn().await;
+        assert!(
+            matches!(result, TurnResult::Continue),
+            "a failure elsewhere in the batch must not be hidden by a completion request"
+        );
+        assert_eq!(agent.state.lock().await.consecutive_mistakes, 1);
+        let events = drain_output_events(&mut priority_rx, &mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, OutputEvent::Completion(_))),
+            "no completion payload before the failure is addressed"
         );
     }
 
