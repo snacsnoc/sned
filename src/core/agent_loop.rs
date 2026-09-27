@@ -24,8 +24,8 @@ use crate::core::provider_retry::{
 };
 use crate::core::tools::SnedTool;
 use crate::core::tools::{
-    ToolContext, ToolFailureClass, ToolFailureMetadata, ToolRegistry, ToolRequiredNextStep,
-    coerce_command_array, coerce_string_array, tool_result_to_text,
+    ToolContext, ToolFailureClass, ToolFailureMetadata, ToolPublicationOutcome, ToolRegistry,
+    ToolRequiredNextStep, coerce_command_array, coerce_string_array, tool_result_to_text,
 };
 use crate::providers::{
     ApiStreamChunk, ApiStreamToolCall, AssistantContentBlock, MessageContent, MessageRole,
@@ -353,6 +353,7 @@ struct ToolExecutionOutput {
     metadata: Option<ToolFailureMetadata>,
     is_error: bool,
     hook_context: Vec<String>,
+    publication_outcomes: Vec<ToolPublicationOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +373,7 @@ impl ToolExecutionOutput {
             metadata,
             is_error: true,
             hook_context: Vec::new(),
+            publication_outcomes: Vec::new(),
         }
     }
 
@@ -381,6 +383,7 @@ impl ToolExecutionOutput {
             metadata: None,
             is_error: false,
             hook_context,
+            publication_outcomes: Vec::new(),
         }
     }
 
@@ -388,12 +391,14 @@ impl ToolExecutionOutput {
         text: String,
         metadata: Option<ToolFailureMetadata>,
         hook_context: Vec<String>,
+        publication_outcomes: Vec<ToolPublicationOutcome>,
     ) -> Self {
         Self {
             text,
             metadata,
             is_error: true,
             hook_context,
+            publication_outcomes,
         }
     }
 
@@ -3694,6 +3699,10 @@ impl AgentLoop {
         let mut completion_result: Option<String> = None;
         if !prepared_tool_calls.is_empty() {
             let mut edit_files: Vec<(String, i32, i32)> = Vec::new();
+            // Mutation bookkeeping derives from executed outcomes below,
+            // independent of presentation mode.
+            let mut files_created: Vec<String> = Vec::new();
+            let mut symbol_edited_paths: Vec<String> = Vec::new();
 
             // Print the complete dispatched call so the user can verify what the
             // model asked Sned to do (skip malformed tool calls with empty names).
@@ -4377,6 +4386,38 @@ impl AgentLoop {
                     Self::invalidate_changed_read_state(&self.state).await;
                 }
 
+                // Workspace effects derive from actual per-path outcomes, not
+                // from batch-summary text, the requested call count, or the
+                // presentation mode. A failed write is never counted as
+                // created; content applied without published anchors still
+                // changed the workspace and counts.
+                let content_changed = !result_output.is_error
+                    || result_output
+                        .publication_outcomes
+                        .iter()
+                        .any(|outcome| outcome.content_applied);
+                if content_changed && let Some(tool) = SnedTool::from_name(&tool_name) {
+                    match tool {
+                        SnedTool::WriteToFile => {
+                            files_created.extend(Self::extract_action_path(tool, &tool_params));
+                        }
+                        SnedTool::EditFile => {
+                            let (_, added, removed) =
+                                extract_edit_stats_detailed(&result_output.text);
+                            if added > 0 || removed > 0 {
+                                for path in &edit_file_path {
+                                    edit_files.push((path.display.clone(), added, removed));
+                                }
+                            }
+                        }
+                        SnedTool::ReplaceSymbol | SnedTool::RenameSymbol => {
+                            symbol_edited_paths
+                                .extend(Self::extract_action_path(tool, &tool_params));
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Display compact tool result in TTY mode
                 if !self.config.json_output {
                     // Hold lock across check-and-set to avoid TOCTOU race
@@ -4389,13 +4430,7 @@ impl AgentLoop {
                     let is_error = result_output.is_error;
 
                     if tool_name == "edit_file" {
-                        let (stats, added, removed) =
-                            extract_edit_stats_detailed(&result_output.text);
-                        for path in &edit_file_path {
-                            if added > 0 || removed > 0 {
-                                edit_files.push((path.display.clone(), added, removed));
-                            }
-                        }
+                        let (stats, _, _) = extract_edit_stats_detailed(&result_output.text);
                         let status = if is_error { "✗" } else { "✓" };
                         self.config
                             .output_writer
@@ -4677,9 +4712,14 @@ impl AgentLoop {
 
             // Summarize consumed read_file results after successful edit_file
             // This prevents ~22KB anchored file contents from accumulating as dead weight
-            if !edit_files.is_empty() {
-                let edited_paths: Vec<String> =
+            if !edit_files.is_empty()
+                || !files_created.is_empty()
+                || !symbol_edited_paths.is_empty()
+            {
+                let mut edited_paths: Vec<String> =
                     edit_files.iter().map(|(p, _, _)| p.clone()).collect();
+                edited_paths.extend(files_created.iter().cloned());
+                edited_paths.extend(symbol_edited_paths.iter().cloned());
                 let mut history = self.conversation_history.lock().await;
                 let mut known_read_paths = Vec::new();
                 for msg in history.iter() {
@@ -4748,10 +4788,7 @@ impl AgentLoop {
 
             // Print action digest summarizing what happened in this turn
             if !self.config.json_output && !prepared_tool_calls.is_empty() {
-                let files_created = prepared_tool_calls
-                    .iter()
-                    .filter(|prepared| prepared.tool_name == "write_to_file")
-                    .count();
+                let files_created = files_created.len();
                 let files_edited = edit_files
                     .iter()
                     .filter(|(_, added, removed)| *added > 0 || *removed > 0)
@@ -5472,6 +5509,7 @@ impl AgentLoop {
                         format!("Failed to prepare conversation history for condense: {error}"),
                         None,
                         hook_context,
+                        Vec::new(),
                     );
                 }
             };
@@ -5535,6 +5573,7 @@ impl AgentLoop {
                 format!("Error: {e}"),
                 e.metadata().cloned(),
                 hook_context,
+                e.publication_outcomes().unwrap_or(&[]).to_vec(),
             ),
         }
     }
@@ -7695,6 +7734,381 @@ mod tests {
         assert!(
             max_active.load(std::sync::atomic::Ordering::SeqCst) <= DEFAULT_TOOL_CONCURRENCY,
             "read batch must stay within the concurrency cap"
+        );
+    }
+
+    struct FailOnPathHandler {
+        fail_marker: &'static str,
+    }
+
+    impl crate::core::tools::ToolHandler for FailOnPathHandler {
+        fn execute(
+            &self,
+            _ctx: &ToolContext,
+            params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, crate::core::tools::ToolError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            let fail_marker = self.fail_marker;
+            Box::pin(async move {
+                let path = params
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if path.contains(fail_marker) {
+                    Err(crate::core::tools::ToolError::ExecutionFailed(format!(
+                        "write rejected for {path}"
+                    )))
+                } else {
+                    Ok(serde_json::Value::String(format!("created {path}")))
+                }
+            })
+        }
+
+        fn description(&self, _params: &serde_json::Value) -> String {
+            "fail on path".to_string()
+        }
+    }
+
+    struct EditStatsHandler;
+
+    impl crate::core::tools::ToolHandler for EditStatsHandler {
+        fn execute(
+            &self,
+            _ctx: &ToolContext,
+            _params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, crate::core::tools::ToolError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(serde_json::Value::String(
+                    "Applied 1 edit(s) successfully (+3, -1 lines)".to_string(),
+                ))
+            })
+        }
+
+        fn description(&self, _params: &serde_json::Value) -> String {
+            "edit stats".to_string()
+        }
+    }
+
+    struct PublicationFailureHandler {
+        content_applied: bool,
+    }
+
+    impl crate::core::tools::ToolHandler for PublicationFailureHandler {
+        fn execute(
+            &self,
+            _ctx: &ToolContext,
+            params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, crate::core::tools::ToolError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            let content_applied = self.content_applied;
+            Box::pin(async move {
+                let path = params
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("partial.txt")
+                    .to_string();
+                Err(
+                    crate::core::tools::ToolError::ExecutionFailedWithPublicationMetadata(
+                        "anchor publication failed".to_string(),
+                        crate::core::tools::ToolFailureMetadata {
+                            class: crate::core::tools::ToolFailureClass::StorageFailure,
+                            affected_paths: vec![path.clone()],
+                            required_next_step: None,
+                        },
+                        vec![crate::core::tools::ToolPublicationOutcome {
+                            path,
+                            content_applied,
+                            anchors_published: false,
+                        }],
+                    ),
+                )
+            })
+        }
+
+        fn description(&self, _params: &serde_json::Value) -> String {
+            "publication failure".to_string()
+        }
+    }
+
+    fn turn_kind(result: &TurnResult) -> &'static str {
+        match result {
+            TurnResult::Continue => "continue",
+            TurnResult::Complete => "complete",
+            TurnResult::Cancelled => "cancelled",
+            TurnResult::Error(_) => "error",
+        }
+    }
+
+    fn tool_result_texts(history: &[StorageMessage]) -> Vec<String> {
+        let mut texts = Vec::new();
+        for message in history {
+            if let MessageContent::UserBlocks(blocks) = &message.content {
+                for block in blocks {
+                    if let UserContentBlock::ToolResult(result) = block
+                        && let ToolResultContent::Text(text) = &result.content
+                    {
+                        texts.push(text.clone());
+                    }
+                }
+            }
+        }
+        texts
+    }
+
+    fn seed_read_result(history: &mut Vec<StorageMessage>, path: &str, body: &str) {
+        use crate::providers::{SharedContentFields, ToolResultBlock};
+        history.push(StorageMessage {
+            id: Some("seed-read".to_string()),
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                ToolResultBlock {
+                    tool_use_id: "seed-call".to_string(),
+                    content: ToolResultContent::Text(format!(
+                        "[File: {path}, Hash: seedhash] (2)\n{body}"
+                    )),
+                    shared: SharedContentFields {
+                        call_id: Some("seed-call".to_string()),
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: Some(1),
+        });
+    }
+
+    fn bookkeeping_agent(
+        responses: Vec<Vec<ApiStreamChunk>>,
+        json_output: bool,
+        writer: Option<crate::cli::output::OutputWriterArc>,
+    ) -> AgentLoop {
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::WriteToFile,
+            Arc::new(FailOnPathHandler {
+                fail_marker: "fail",
+            }),
+        );
+        registry.register(SnedTool::EditFile, Arc::new(EditStatsHandler));
+        let mut config = test_agent_config(provider, "bookkeeping");
+        config.json_output = json_output;
+        if let Some(writer) = writer {
+            config.output_writer = writer;
+        }
+        AgentLoop::new(config).with_tools(Arc::new(registry))
+    }
+
+    #[tokio::test]
+    async fn test_failed_write_not_counted_as_created() {
+        use serde_json::json;
+        let (tx, mut rx) = mpsc::channel(64);
+        let responses = vec![tool_call_chunks(&[
+            (
+                "w1",
+                "write_to_file",
+                json!({"path": "good.txt", "content": "ok"}),
+            ),
+            (
+                "w2",
+                "write_to_file",
+                json!({"path": "fail.txt", "content": "bad"}),
+            ),
+        ])];
+        let mut agent = bookkeeping_agent(
+            responses,
+            false,
+            Some(Arc::new(crate::cli::output::ChannelOutputWriter::new(tx))),
+        );
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
+        let rendered = drain_rendered_output(&mut rx);
+        let digest = rendered
+            .iter()
+            .find(|line| line.contains("file created"))
+            .unwrap_or_else(|| panic!("expected a created-files digest, got {rendered:?}"));
+        assert!(
+            digest.contains("1 file created"),
+            "failed write must not count as created, got {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_and_tty_modes_share_mutation_bookkeeping() {
+        use serde_json::json;
+        let batch = || {
+            vec![tool_call_chunks(&[
+                (
+                    "e1",
+                    "edit_file",
+                    json!({"files": [{"path": "edited.txt", "edits": []}]}),
+                ),
+                (
+                    "w1",
+                    "write_to_file",
+                    json!({"path": "fail.txt", "content": "bad"}),
+                ),
+            ])]
+        };
+        let mut outcomes = Vec::new();
+        for json_output in [false, true] {
+            let mut agent = bookkeeping_agent(batch(), json_output, None);
+            {
+                let mut history = agent.conversation_history.lock().await;
+                let seeded: Vec<StorageMessage> = Vec::new();
+                *history = seeded;
+                seed_read_result(&mut history, "edited.txt", "stale body");
+            }
+            let result = agent.execute_turn().await;
+            let history = agent.get_conversation_history().await;
+            let mistakes = agent.state.lock().await.consecutive_mistakes;
+            outcomes.push((
+                turn_kind(&result).to_string(),
+                tool_result_texts(&history),
+                mistakes,
+            ));
+        }
+        assert_eq!(
+            outcomes[0], outcomes[1],
+            "JSON and TTY modes must share history and accounting effects"
+        );
+        assert_eq!(outcomes[0].2, 1);
+    }
+
+    #[tokio::test]
+    async fn test_publication_failure_without_content_change_not_counted() {
+        use serde_json::json;
+        let (tx, mut rx) = mpsc::channel(64);
+        let responses = vec![tool_call_chunks(&[(
+            "w1",
+            "write_to_file",
+            json!({"path": "partial.txt", "content": "new"}),
+        )])];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::WriteToFile,
+            Arc::new(PublicationFailureHandler {
+                content_applied: false,
+            }),
+        );
+        let mut config = test_agent_config(provider, "publication-no-change");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            !rendered.iter().any(|line| line.contains("file created")),
+            "unchanged content must not count as created, got {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_content_applied_publication_failure_counts_as_created() {
+        use serde_json::json;
+        let (tx, mut rx) = mpsc::channel(64);
+        let responses = vec![tool_call_chunks(&[(
+            "w1",
+            "write_to_file",
+            json!({"path": "partial.txt", "content": "new"}),
+        )])];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::WriteToFile,
+            Arc::new(PublicationFailureHandler {
+                content_applied: true,
+            }),
+        );
+        let mut config = test_agent_config(provider, "publication-applied");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert_eq!(agent.state.lock().await.consecutive_mistakes, 1);
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            rendered.iter().any(|line| line.contains("1 file created")),
+            "applied content must count as created despite publication failure, got {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execution_wrapper_preserves_publication_outcomes() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let config = test_agent_config(provider, "publication-boundary");
+        let state = Arc::new(Mutex::new(TaskState::default()));
+        let context = Arc::new(ToolContext::new(
+            state,
+            None,
+            std::env::current_dir().unwrap(),
+            crate::core::file_editor::AnchorStateManager::new(),
+            false,
+            "publication-boundary".to_string(),
+            None,
+            true,
+            Arc::new(crate::cli::output::StderrOutputWriter),
+            false,
+        ));
+
+        let output = AgentLoop::execute_tool_with_hooks_internal(
+            &config,
+            None,
+            context,
+            "write_to_file",
+            &serde_json::json!({"path": "partial.txt", "content": "new"}),
+            Arc::new(PublicationFailureHandler {
+                content_applied: true,
+            }),
+            None,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+
+        assert!(output.is_error);
+        assert_eq!(
+            output.publication_outcomes,
+            vec![crate::core::tools::ToolPublicationOutcome {
+                path: "partial.txt".to_string(),
+                content_applied: true,
+                anchors_published: false,
+            }]
         );
     }
 
