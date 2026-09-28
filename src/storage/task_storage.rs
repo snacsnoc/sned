@@ -1070,19 +1070,6 @@ impl TaskStorage {
         }
     }
 
-    /// Write context history
-    pub fn write_context_history<T>(&self, history: &[T]) -> io::Result<()>
-    where
-        T: Serialize,
-    {
-        self.with_lock(|| {
-            let data = serde_json::to_string(history)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let file_path = self.task_dir.join(GlobalFileNames::CONTEXT_HISTORY);
-            crate::storage::disk::atomic_write_file(&file_path, &data)
-        })
-    }
-
     /// Read task metadata
     #[must_use]
     pub fn read_task_metadata(&self) -> TaskMetadata {
