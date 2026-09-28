@@ -493,6 +493,7 @@ impl Drop for AnchorCacheLock {
 impl AnchorStorage {
     /// Load anchor state from disk (~/.sned/data/cache/anchors.json)
     fn load(anchors_file: std::path::PathBuf) -> Self {
+        Self::migrate_legacy_to_shards(&anchors_file);
         let mut tasks = match std::fs::read_to_string(&anchors_file) {
             Ok(content) => {
                 match serde_json::from_str::<IndexMap<String, IndexMap<String, TrackedDocument>>>(
@@ -768,6 +769,64 @@ impl AnchorStorage {
             let json = serde_json::to_string_pretty(&tasks).map_err(std::io::Error::other)?;
             crate::storage::disk::atomic_write_file(cache_file, &json)?;
             Ok(true)
+        }
+    }
+
+    /// Move legacy single-file tasks into per-task shards once, then delete
+    /// the legacy file. Legacy content is prune-frozen (only whole tasks are
+    /// ever removed, never updated), so skipping tasks that already have a
+    /// shard can never clobber newer state. Any failure warns and keeps the
+    /// lazy behavior for the next load to retry.
+    fn migrate_legacy_to_shards(cache_file: &std::path::Path) {
+        if !cache_file.exists() {
+            return;
+        }
+        let Ok(_lock) = AnchorCacheLock::acquire(&cache_file.with_extension("json.lock")) else {
+            tracing::warn!("Failed to lock anchor cache; skipping eager legacy migration");
+            return;
+        };
+        let tasks = match Self::read_tasks(cache_file) {
+            Ok(tasks) => tasks,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                tracing::warn!("Failed to read legacy anchor cache for migration: {error}");
+                return;
+            }
+        };
+        for (task_id, documents) in &tasks {
+            if Self::shard_path(cache_file, task_id).exists() {
+                // A present but unreadable shard must not pin its legacy copy:
+                // refresh it from legacy so deleting below cannot strand it.
+                if Self::read_shard(&Self::shard_path(cache_file, task_id)).is_ok() {
+                    continue;
+                }
+            }
+            if let Err(error) = Self::write_task_documents(cache_file, task_id, documents) {
+                tracing::warn!("Failed to migrate anchor task {task_id}: {error}");
+                return;
+            }
+        }
+        let bytes = match std::fs::read(cache_file) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!("Failed to back up legacy anchor cache: {error}");
+                return;
+            }
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let mut backup = cache_file.as_os_str().to_owned();
+        backup.push(format!(".migrated-{timestamp}.bak"));
+        if let Err(error) =
+            crate::storage::disk::atomic_write_file_bytes(std::path::Path::new(&backup), &bytes)
+        {
+            tracing::warn!("Failed to back up legacy anchor cache: {error}");
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(cache_file) {
+            tracing::warn!("Failed to delete migrated legacy anchor cache: {error}");
         }
     }
 
@@ -3713,6 +3772,104 @@ mod tests {
             .unwrap()
             .anchors;
         assert_eq!(again, anchors);
+    }
+
+    #[test]
+    fn eager_migration_moves_every_legacy_task_into_shards_with_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let legacy = r#"{"task-a": {"a.rs": {"generation": 0, "hashes": [1], "anchors": ["Alpha§x"]}}, "task-b": {"b.rs": {"generation": 2, "hashes": [], "anchors": []}}}"#;
+        std::fs::write(&cache, legacy).unwrap();
+
+        // Loading migrates every legacy task into its own shard in one pass.
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+
+        for task in ["task-a", "task-b"] {
+            let bytes = std::fs::read(dir.path().join("anchor-tasks").join(format!("{task}.json")))
+                .unwrap();
+            let shard: TaskShard = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(shard.task_id, task);
+        }
+        assert!(!cache.exists());
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("bak"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), legacy.as_bytes());
+        let tasks = manager.storage().tasks.clone();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks["task-a"].contains_key("a.rs"));
+        assert!(tasks["task-b"].contains_key("b.rs"));
+    }
+
+    #[test]
+    fn eager_migration_rerun_keeps_newer_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        std::fs::write(
+            &cache,
+            r#"{"task-a": {"fresh.rs": {"generation": 0, "hashes": [7], "anchors": ["Alpha§y"]}}}"#,
+        )
+        .unwrap();
+        let _first = AnchorStateManager::with_cache_file(cache.clone());
+        assert!(!cache.exists());
+        let shard = dir.path().join("anchor-tasks").join("task-a.json");
+        let migrated = std::fs::read(&shard).unwrap();
+
+        // A stale legacy copy reappearing must not clobber the migrated shard.
+        std::fs::write(
+            &cache,
+            r#"{"task-a": {"stale.rs": {"generation": 0, "hashes": [], "anchors": []}}}"#,
+        )
+        .unwrap();
+        let second = AnchorStateManager::with_cache_file(cache.clone());
+
+        assert_eq!(std::fs::read(&shard).unwrap(), migrated);
+        assert!(!cache.exists());
+        let tasks = second.storage().tasks.clone();
+        assert!(tasks["task-a"].contains_key("fresh.rs"));
+        assert!(!tasks["task-a"].contains_key("stale.rs"));
+    }
+
+    #[test]
+    fn eager_migration_refreshes_unreadable_shard_from_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        std::fs::write(
+            &cache,
+            r#"{"task-a": {"fresh.rs": {"generation": 0, "hashes": [7], "anchors": []}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("anchor-tasks")).unwrap();
+        std::fs::write(
+            dir.path().join("anchor-tasks").join("task-a.json"),
+            "not-json",
+        )
+        .unwrap();
+
+        // The corrupt shard must not survive: legacy refreshes it instead of
+        // being skipped, so deleting legacy below strands nothing.
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+
+        let tasks = manager.storage().tasks.clone();
+        assert!(tasks["task-a"].contains_key("fresh.rs"));
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn eager_migration_without_legacy_file_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+
+        // Steady state has no legacy file, so loading must create nothing.
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+
+        assert!(manager.storage().tasks.is_empty());
+        assert!(!cache.exists());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 
     #[test]
