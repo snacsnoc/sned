@@ -354,6 +354,24 @@ def format_bytes(b):
         return f"{b / 1024:.2f} KB"
     return f"{b} B"
 
+# Same shim-skipping rule as analyze-dhat-heap.py: the leaf frame is
+# always an allocator, so top sites must name the caller beneath it.
+ALLOCATOR_FRAME_MARKERS = [
+    '<dhat::alloc', 'dhat::alloc', 'core::alloc::', 'alloc::alloc::',
+    'alloc::raw_vec::', 'alloc::vec::', 'alloc::slice::', 'alloc::boxed::',
+    'alloc::string::', 'globalalloc', 'exchange_malloc', '__rust_alloc',
+]
+
+def attributing_frame(frames):
+    for idx in frames:
+        frame_str = ftbl[idx] if idx < len(ftbl) else ""
+        if not any(m in frame_str.lower() for m in ALLOCATOR_FRAME_MARKERS):
+            return frame_str
+    if frames:
+        idx = frames[0]
+        return ftbl[idx] if idx < len(ftbl) else ""
+    return ""
+
 leak_ratio = (final_live / total_allocated * 100) if total_allocated > 0 else 0
 
 # Find top 5 allocations by final_live
@@ -399,13 +417,12 @@ for i, (idx, p) in enumerate(sorted_pps[:5]):
     final = p.get('gb', 0) + p.get('eb', 0)
     if final == 0:
         continue
-    
-    frame_idx = p['fs'][0] if p.get('fs') and len(p['fs']) > 0 else 0
-    frame_str = ftbl[frame_idx] if frame_idx < len(ftbl) else "unknown"
+
+    frame_str = attributing_frame(p.get('fs', [])) or "unknown"
     func_name = frame_str.split(': ', 1)[1].split(' (')[0] if ': ' in frame_str else frame_str
     if len(func_name) > 60:
         func_name = func_name[:57] + "..."
-    
+
     print(f"  {i+1}. {format_bytes(final):>12}  {func_name}")
 
 print()
@@ -413,16 +430,17 @@ print()
 # Categorize allocations
 categories = {'std_lib': 0, 'profiler': 0, 'runtime': 0, 'application': 0}
 for p in pps:
-    frame_idx = p['fs'][0] if p.get('fs') and len(p['fs']) > 0 else 0
-    frame_str = ftbl[frame_idx] if frame_idx < len(ftbl) else ""
+    frame_str = attributing_frame(p.get('fs', []))
     frame_lower = frame_str.lower()
-    
+
     final = p.get('gb', 0) + p.get('eb', 0)
-    
-    if any(x in frame_lower for x in ['<alloc::', 'alloc::alloc::global', 'alloc::boxed', 'box_assume_init', 'raw_vec']):
-        categories['std_lib'] += final
-    elif '<dhat' in frame_lower or 'dhat::' in frame_lower:
+
+    if 'dhat::' in frame_lower or '<dhat' in frame_lower:
         categories['profiler'] += final
+    elif 'sned::' in frame_lower or 'sned-' in frame_lower:
+        categories['application'] += final
+    elif any(x in frame_lower for x in ['<alloc::', 'alloc::alloc::global', 'alloc::boxed', 'box_assume_init', 'raw_vec']):
+        categories['std_lib'] += final
     elif any(x in frame_lower for x in ['tokio', 'regex', 'tracing', 'serde_json', 'hyper', 'reqwest', 'mio']):
         categories['runtime'] += final
     else:

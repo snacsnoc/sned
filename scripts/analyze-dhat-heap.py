@@ -16,26 +16,65 @@ def format_bytes(b):
         return f"{b / 1024:.2f} KB"
     return f"{b} B"
 
+# Frames that only move bytes for a real caller further down the stack.
+# dhat's first frame is always one of these allocator shims, so classifying
+# on it attributes every allocation to the profiler or the standard library.
+ALLOCATOR_FRAME_MARKERS = [
+    '<dhat::alloc',
+    'dhat::alloc',
+    'core::alloc::',
+    'alloc::alloc::',
+    'alloc::raw_vec::',
+    'alloc::vec::',
+    'alloc::slice::',
+    'alloc::boxed::',
+    'alloc::string::',
+    'globalalloc',
+    'exchange_malloc',
+    '__rust_alloc',
+]
+
+def attributing_frame(frames, ftbl):
+    """Return the first stack frame below the allocator shims.
+
+    Falls back to the leaf frame when the stack holds nothing else.
+    """
+    for idx in frames:
+        frame_str = ftbl[idx] if idx < len(ftbl) else ""
+        # Match case-insensitively: release symbols capitalize
+        # container paths (alloc::vec::Vec) while shims stay lowercase.
+        lowered = frame_str.lower()
+        if not any(m in lowered for m in ALLOCATOR_FRAME_MARKERS):
+            return frame_str
+    if frames:
+        idx = frames[0]
+        return ftbl[idx] if idx < len(ftbl) else ""
+    return ""
+
 def categorize_allocation(frame_str):
     """Categorize allocation by source based on frame string."""
     if not frame_str:
         return "unknown"
-    
+
     frame_lower = frame_str.lower()
-    
-    # Standard library (not leaks - these are Rust's allocator)
+
+    # Profiler's own bookkeeping (not leaks)
+    if 'dhat::' in frame_lower or '<dhat' in frame_lower:
+        return "profiler"
+
+    # This binary's own code (owns the retention decision)
+    if 'sned::' in frame_lower or 'sned-' in frame_lower:
+        return "application"
+
+    # Standard library allocator remnants (not leaks)
     if any(x in frame_lower for x in ['<alloc::', 'alloc::alloc::global', 'box_assume_init', 'raw_vec']):
         return "std_lib"
-    
-    # Profiler overhead (not leaks)
-    if '<dhat' in frame_lower or 'dhat::' in frame_lower:
-        return "profiler"
-    
+
     # Runtime infrastructure (expected to persist)
     if any(x in frame_lower for x in ['tokio', 'regex', 'tracing', 'mio', 'serde_json', 'hyper', 'reqwest']):
         return "runtime"
-    
-    # Your code or external libraries (potential leaks)
+
+    # External libraries (potential leaks)
     return "application"
 
 def extract_function_name(frame_str):
@@ -90,9 +129,9 @@ def analyze_dhat_heap(json_file):
     # Categorize allocations
     categories = defaultdict(list)
     for i, p in enumerate(pps):
-        frame_idx = p['fs'][0] if p.get('fs') else 0
-        frame_str = ftbl[frame_idx] if frame_idx < len(ftbl) else ""
-        
+        # Attribute to the caller, not the allocator shim at the leaf.
+        frame_str = attributing_frame(p.get('fs', []), ftbl)
+
         category = categorize_allocation(frame_str)
         categories[category].append({
             'index': i,
