@@ -15,6 +15,11 @@ fn main() {
         }
     };
 
+    // process::exit skips destructors, which would silently discard the
+    // dhat profile; drop the profiler first so it flushes its output.
+    #[cfg(feature = "dhat-heap")]
+    drop(_profiler);
+
     std::process::exit(exit_code);
 }
 

@@ -11,6 +11,9 @@
 #   --workload <name>   Workload to run: basic, edit, search, all (default: basic)
 #   --output <dir>      Output directory for reports (default: ./target/memory-profiles)
 #   --keep-json         Keep raw dhat-heap.json files (default: clean up)
+#   --base-url <url>    Provider base URL (default: $SNED_PROFILE_BASE_URL or Salad gateway)
+#   --model <id>        Model for agent workloads (default: $SNED_PROFILE_MODEL or qwen3.5-35b-a3b)
+#   --api-key <key>     Provider API key (default: $SNED_PROFILE_API_KEY or $SALAD_CLOUD_API_KEY)
 #   --help              Show this help
 
 set -euo pipefail
@@ -24,6 +27,10 @@ WORKLOAD="basic"
 OUTPUT_DIR="./target/memory-profiles"
 KEEP_JSON=false
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+# Agent workloads need a funded provider; default to the Salad gateway.
+PROFILE_BASE_URL="${SNED_PROFILE_BASE_URL:-https://ai.salad.cloud/v1}"
+PROFILE_MODEL="${SNED_PROFILE_MODEL:-qwen3.5-35b-a3b}"
+PROFILE_API_KEY="${SNED_PROFILE_API_KEY:-${SALAD_CLOUD_API_KEY:-}}"
 
 # Colors
 RED='\033[0;31m'
@@ -42,6 +49,9 @@ Options:
   --workload <name>   Workload to run: basic, edit, search, all (default: basic)
   --output <dir>      Output directory for reports (default: ./target/memory-profiles)
   --keep-json         Keep raw dhat-heap.json files (default: clean up)
+  --base-url <url>    Provider base URL (default: Salad gateway)
+  --model <id>        Model for agent workloads (default: qwen3.5-35b-a3b)
+  --api-key <key>     Provider API key (default: $SALAD_CLOUD_API_KEY)
   --help              Show this help
 
 Workloads:
@@ -78,6 +88,18 @@ while [[ $# -gt 0 ]]; do
             KEEP_JSON=true
             shift
             ;;
+        --base-url)
+            PROFILE_BASE_URL="$2"
+            shift 2
+            ;;
+        --model)
+            PROFILE_MODEL="$2"
+            shift 2
+            ;;
+        --api-key)
+            PROFILE_API_KEY="$2"
+            shift 2
+            ;;
         --help)
             show_help
             exit 0
@@ -98,6 +120,17 @@ case $WORKLOAD in
         echo -e "${RED}Error: Unknown workload '$WORKLOAD'${NC}"
         echo "Valid options: basic, edit, search, all"
         exit 1
+        ;;
+esac
+
+# Agent workloads need a funded provider key.
+case $WORKLOAD in
+    edit|search|all)
+        if [ -z "$PROFILE_API_KEY" ]; then
+            echo -e "${RED}Error: no provider API key for the '$WORKLOAD' workload${NC}"
+            echo "Set SALAD_CLOUD_API_KEY (or SNED_PROFILE_API_KEY), or pass --api-key <key>"
+            exit 1
+        fi
         ;;
 esac
 
@@ -141,8 +174,24 @@ echo -e "${BLUE}[2/4] Running workload: $WORKLOAD${NC}"
 echo ""
 
 run_basic_workload() {
-    echo "  Running: --help (initialization only)"
-    ./target/release/sned --help > /dev/null 2>&1 || true
+    # `config list` exercises startup plus config loading and returns
+    # normally; --help/--version exit inside clap, skipping dhat output.
+    echo "  Running: config list (initialization only)"
+    ./target/release/sned config list > /dev/null 2>&1 || true
+    collect_dhat basic
+}
+
+# dhat writes dhat-heap.json to the process CWD at clean exit only: a
+# timeout kill or crash leaves nothing. Capture each workload's output
+# immediately so one bad run cannot wipe out the others.
+collect_dhat() {
+    local name="$1"
+    if [ -f "dhat-heap.json" ]; then
+        mv "dhat-heap.json" "$RUN_DIR/dhat-${name}.json"
+        echo -e "${GREEN}  ✓ Captured heap profile for '$name'${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ No heap profile for '$name' (killed, crashed, or instant exit)${NC}"
+    fi
 }
 
 run_edit_workload() {
@@ -161,13 +210,19 @@ Line 4: The anchor system will hash each line
 Line 5: And track changes for incremental edits
 TESTFILE
 
-    # Run edit command (will fail but exercises the code paths)
-    cd "$temp_workspace"
-    timeout 10s "$REPO_ROOT/target/release/sned" \
+    # Run edit command against the profile provider (--yolo so approval
+    # prompts cannot stall the workload; the temp workspace is disposable).
+    # --cwd keeps the process in the repo root so dhat-heap.json lands where
+    # collect_dhat expects it instead of the deleted temp workspace.
+    timeout 120s "$REPO_ROOT/target/release/sned" --yolo \
+        --cwd "$temp_workspace" \
+        --base-url "$PROFILE_BASE_URL" \
+        --model "$PROFILE_MODEL" \
+        --api-key "$PROFILE_API_KEY" \
         "Edit line 3 to say 'MODIFIED LINE 3'" \
         2>&1 || true
-    cd "$REPO_ROOT"
-    
+    collect_dhat edit
+
     # Cleanup
     rm -rf "$temp_workspace"
 }
@@ -175,10 +230,15 @@ TESTFILE
 run_search_workload() {
     echo "  Running: File search and symbol indexing"
     
-    # Run search command (will fail but exercises code paths)
-    timeout 10s ./target/release/sned \
+    # Run search command against the profile provider (--yolo so approval
+    # prompts cannot stall the workload; the prompt is read-only)
+    timeout 120s ./target/release/sned --yolo \
+        --base-url "$PROFILE_BASE_URL" \
+        --model "$PROFILE_MODEL" \
+        --api-key "$PROFILE_API_KEY" \
         "Search for all Rust files in this project" \
         2>&1 || true
+    collect_dhat search
 }
 
 case $WORKLOAD in
@@ -209,13 +269,15 @@ echo ""
 echo -e "${GREEN}✓ Workload complete${NC}"
 echo ""
 
-# Check for dhat output
-Dhat_JSON="dhat-heap.json"
-if [ ! -f "$Dhat_JSON" ]; then
-    echo -e "${YELLOW}Warning: dhat-heap.json not found${NC}"
-    echo "The workload may not have triggered heap allocations."
+# Check for captured dhat output (one file per workload)
+shopt -s nullglob
+Dhat_FILES=("$RUN_DIR"/dhat-*.json)
+shopt -u nullglob
+if [ ${#Dhat_FILES[@]} -eq 0 ]; then
+    echo -e "${YELLOW}Warning: no heap profiles captured${NC}"
+    echo "No workload exited cleanly with dhat output."
     echo "Creating empty report..."
-        
+
         cat > "$RUN_DIR/summary.txt" << EOF
 Memory Profile Summary
 ======================
@@ -223,41 +285,49 @@ Timestamp: $TIMESTAMP
 Workload: $WORKLOAD
 Status: No allocations recorded
 
-dhat-heap.json was not generated. This could mean:
-1. The workload completed without heap allocations
-2. dhat was not properly initialized
-3. The program exited before dhat could write output
+No dhat output was captured. This could mean:
+1. A workload was killed by timeout (dhat only writes at clean exit)
+2. A workload crashed before exit
+3. dhat was not properly initialized
 
-Try running with --workload all for more comprehensive profiling.
+Re-run the failing workload on its own and check its exit status.
 EOF
     exit 0
 fi
 
-# Copy dhat output
-if [ "$KEEP_JSON" = true ]; then
-    cp "$Dhat_JSON" "$RUN_DIR/dhat-heap.json"
-    echo -e "${GREEN}✓ Saved dhat-heap.json${NC}"
-fi
+echo -e "${GREEN}Captured ${#Dhat_FILES[@]} heap profile(s)${NC}"
+echo ""
 
 # Analyze with Python script
 echo -e "${BLUE}[3/4] Analyzing heap allocations...${NC}"
-if "$SCRIPT_DIR/analyze-dhat-heap.sh" "$Dhat_JSON" > "$RUN_DIR/allocations.txt" 2>&1; then
-    echo -e "${GREEN}✓ Analysis complete${NC}"
-else
-    echo -e "${YELLOW}⚠ Analysis had warnings (see allocations.txt)${NC}"
-fi
+for WL_JSON in "${Dhat_FILES[@]}"; do
+    WL_NAME="$(basename "$WL_JSON" .json)"
+    WL_NAME="${WL_NAME#dhat-}"
+    if "$SCRIPT_DIR/analyze-dhat-heap.sh" "$WL_JSON" > "$RUN_DIR/allocations-${WL_NAME}.txt" 2>&1; then
+        echo -e "${GREEN}✓ Analysis complete ($WL_NAME)${NC}"
+    else
+        echo -e "${YELLOW}⚠ Analysis had warnings for $WL_NAME (see allocations-${WL_NAME}.txt)${NC}"
+    fi
+done
 echo ""
 
 # Generate summary report
 echo -e "${BLUE}[4/4] Generating summary report...${NC}"
 
-# Extract key metrics from dhat JSON
-python3 << PYTHON_SCRIPT > "$RUN_DIR/summary.txt"
+# Extract key metrics from each captured dhat JSON
+for WL_JSON in "${Dhat_FILES[@]}"; do
+    WL_NAME="$(basename "$WL_JSON" .json)"
+    WL_NAME="${WL_NAME#dhat-}"
+    WL_LABEL="$WL_NAME"
+    if [ "$WORKLOAD" = "all" ]; then
+        WL_LABEL="all/$WL_NAME"
+    fi
+python3 << PYTHON_SCRIPT > "$RUN_DIR/summary-${WL_NAME}.txt"
 import json
 import sys
 from datetime import datetime
 
-with open("$Dhat_JSON", 'r') as f:
+with open("$WL_JSON", 'r') as f:
     data = json.load(f)
 
 pps = data.get('pps', [])
@@ -289,7 +359,7 @@ print("  sned Memory Profile Summary")
 print("=" * 70)
 print()
 print(f"  Timestamp:    $TIMESTAMP")
-print(f"  Workload:     $WORKLOAD")
+print(f"  Workload:     $WL_LABEL")
 print(f"  Report Dir:   $RUN_DIR")
 print()
 print("📊 Overall Statistics")
@@ -382,26 +452,31 @@ if leak_ratio > 50:
 
 print()
 print("=" * 70)
-print("  Full analysis: allocations.txt")
-print("  Raw data:      dhat-heap.json (if --keep-json)")
+print(f"  Full analysis: allocations-$WL_NAME.txt")
+print(f"  Raw data:      dhat-$WL_NAME.json (if --keep-json)")
 print("=" * 70)
 PYTHON_SCRIPT
+done
 
-echo -e "${GREEN}✓ Summary report generated${NC}"
+echo -e "${GREEN}✓ Summary report(s) generated${NC}"
 echo ""
 
-# Show summary
+# Show summaries
 echo "=============================================="
-echo "  Summary"
+echo "  Summaries"
 echo "=============================================="
 echo ""
-cat "$RUN_DIR/summary.txt"
-echo ""
+for WL_JSON in "${Dhat_FILES[@]}"; do
+    WL_NAME="$(basename "$WL_JSON" .json)"
+    WL_NAME="${WL_NAME#dhat-}"
+    cat "$RUN_DIR/summary-${WL_NAME}.txt"
+    echo ""
+done
 
 # Cleanup
-if [ "$KEEP_JSON" = false ] && [ -f "$Dhat_JSON" ]; then
-    rm -f "$Dhat_JSON"
-    echo -e "${BLUE}Cleaned up dhat-heap.json (use --keep-json to retain)${NC}"
+if [ "$KEEP_JSON" = false ]; then
+    rm -f "$RUN_DIR"/dhat-*.json
+    echo -e "${BLUE}Cleaned up raw dhat JSON (use --keep-json to retain)${NC}"
 fi
 
 echo ""
@@ -410,14 +485,17 @@ echo "  Profile Complete"
 echo "=============================================="
 echo ""
 echo "  Reports saved to: $RUN_DIR/"
-echo "    - summary.txt     (this summary)"
-echo "    - allocations.txt (detailed breakdown)"
-if [ "$KEEP_JSON" = true ]; then
-    echo "    - dhat-heap.json  (raw data)"
-fi
+for WL_JSON in "${Dhat_FILES[@]}"; do
+    WL_NAME="$(basename "$WL_JSON" .json)"
+    WL_NAME="${WL_NAME#dhat-}"
+    echo "    - summary-${WL_NAME}.txt / allocations-${WL_NAME}.txt"
+    if [ "$KEEP_JSON" = true ]; then
+        echo "    - dhat-${WL_NAME}.json (raw data)"
+    fi
+done
 echo ""
 echo "  To view interactive dhat report:"
 echo "    1. Run with --keep-json"
 echo "    2. Open https://nnethercote.github.io/dhat-viewer/"
-echo "    3. Upload $RUN_DIR/dhat-heap.json"
+echo "    3. Upload a dhat-<workload>.json file from $RUN_DIR/"
 echo ""
