@@ -651,6 +651,18 @@ impl AnchorStorage {
         }
     }
 
+    /// Count tasks in the legacy cache file without parsing document values.
+    /// Eviction only needs the count, and skipping values keeps a megabyte
+    /// legacy file from being fully materialized on every save.
+    fn legacy_task_count(path: &std::path::Path) -> usize {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice::<IndexMap<String, serde::de::IgnoredAny>>(&bytes)
+                .map(|tasks| tasks.len())
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
     /// Directory holding per-task shard files next to the legacy cache file.
     /// Sharding keeps every durable read and write scoped to one task so cost
     /// follows the current task, not cross-session history.
@@ -776,9 +788,7 @@ impl AnchorStorage {
                 Some((mtime, path))
             })
             .collect();
-        let legacy_tasks = Self::read_tasks(cache_file)
-            .map(|tasks| tasks.len())
-            .unwrap_or(0);
+        let legacy_tasks = Self::legacy_task_count(cache_file);
         shards.sort_by(|a, b| b.0.cmp(&a.0));
         while shards.len() + legacy_tasks > MAX_TRACKED_TASKS {
             let Some((_, oldest)) = shards.pop() else {
@@ -3757,6 +3767,26 @@ mod tests {
             assert!(tasks.contains_key(&format!("new-{index}")));
         }
         assert_eq!(tasks["wide"].len(), MAX_TRACKED_FILES);
+    }
+
+    #[test]
+    fn legacy_task_count_matches_full_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        std::fs::write(
+            &cache,
+            r#"{"task-a": {"f": {"hashes": [], "anchors": []}}, "task-b": {"g": {"hashes": [], "anchors": []}}, "task-c": {}}"#,
+        )
+        .unwrap();
+
+        // Eviction only needs the count; it must agree with a full read
+        // without paying for document values.
+        assert_eq!(AnchorStorage::legacy_task_count(&cache), 3);
+        assert_eq!(AnchorStorage::read_tasks(&cache).unwrap().len(), 3);
+        assert_eq!(
+            AnchorStorage::legacy_task_count(&dir.path().join("missing.json")),
+            0
+        );
     }
 
     #[test]
