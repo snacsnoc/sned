@@ -420,20 +420,6 @@ print(f"  Free Count:         {free_count:,}")
 print(f"  Avg Alloc Size:     {format_bytes(total_allocated // allocation_count) if allocation_count > 0 else 'N/A'}")
 print()
 
-# Health assessment
-if leak_ratio < 5:
-    health = "✅ HEALTHY"
-    health_desc = "< 5% unfreed (normal)"
-elif leak_ratio < 20:
-    health = "⚠️  WARNING"
-    health_desc = f"{leak_ratio:.1f}% unfreed (review recommended)"
-else:
-    health = "🔴 CRITICAL"
-    health_desc = f"{leak_ratio:.1f}% unfreed (investigate immediately)"
-
-print(f"  Memory Health:      {health} ({health_desc})")
-print()
-
 print("📈 Top 5 Allocations by Final Live Bytes")
 print("-" * 70)
 
@@ -475,28 +461,7 @@ print("-" * 70)
 print(f"  Standard Library:   {format_bytes(categories['std_lib']):>12}  (Rust allocator - NOT leaks)")
 print(f"  Profiler Overhead:  {format_bytes(categories['profiler']):>12}  (dhat - NOT leaks)")
 print(f"  Runtime:            {format_bytes(categories['runtime']):>12}  (tokio/serde - expected)")
-print(f"  Application:        {format_bytes(categories['application']):>12}  (review if >1MB)")
-print()
-
-# Recommendations
-print("💡 Recommendations")
-print("-" * 70)
-
-if categories['application'] > 1048576:  # > 1MB
-    print(f"  🔴 Application has {format_bytes(categories['application'])} unfreed")
-    print("     → Review allocations.txt for specific allocation sites")
-    print("     → Check for: Arc cycles, missing Drop impls, global caches")
-elif categories['application'] > 102400:  # > 100KB
-    print(f"  🟡 Application has {format_bytes(categories['application'])} unfreed")
-    print("     → Monitor for growth over multiple runs")
-else:
-    print(f"  ✅ Application memory usage is healthy")
-
-if leak_ratio > 50:
-    print("  🔴 CRITICAL: >50% leak ratio indicates serious memory leak")
-    print("     → Run with tokio-console to check for task leaks")
-    print("     → Check channel sender/receiver lifecycle")
-
+print(f"  Application:        {format_bytes(categories['application']):>12}")
 print()
 print("=" * 70)
 print(f"  Full analysis: allocations-$WL_NAME.txt")
