@@ -159,7 +159,12 @@ fi
 echo -e "${BLUE}[1/4] Building with dhat-heap feature...${NC}"
 BUILD_LOG="$RUN_DIR/build.log"
 mkdir -p "$RUN_DIR"  # Ensure directory exists before tee
-if cargo build --features dhat-heap --release > "$BUILD_LOG" 2>&1; then
+# The release profile strips symbols, which leaves dhat frames unattributed
+# (every site reports as __mh_execute_header); keep debug info so the heap
+# report names the allocating functions without changing optimization.
+if cargo build --features dhat-heap --release \
+    --config 'profile.release.strip=false' \
+    --config 'profile.release.debug=1' > "$BUILD_LOG" 2>&1; then
     echo -e "${GREEN}✓ Build complete${NC}"
 else
     echo -e "${RED}Build failed! Check $BUILD_LOG${NC}"
