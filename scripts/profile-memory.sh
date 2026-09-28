@@ -14,6 +14,7 @@
 #   --base-url <url>    Provider base URL (default: $SNED_PROFILE_BASE_URL or Salad gateway)
 #   --model <id>        Model for agent workloads (default: $SNED_PROFILE_MODEL or qwen3.5-35b-a3b)
 #   --api-key <key>     Provider API key (default: $SNED_PROFILE_API_KEY or $SALAD_CLOUD_API_KEY)
+#   --timeout <secs>    Per-workload timeout for agent runs (default: 600)
 #   --help              Show this help
 
 set -euo pipefail
@@ -31,6 +32,10 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 PROFILE_BASE_URL="${SNED_PROFILE_BASE_URL:-https://ai.salad.cloud/v1}"
 PROFILE_MODEL="${SNED_PROFILE_MODEL:-qwen3.5-35b-a3b}"
 PROFILE_API_KEY="${SNED_PROFILE_API_KEY:-${SALAD_CLOUD_API_KEY:-}}"
+# Agent turns are the signal (cross-turn accumulation needs a long-lived
+# process), so the timeout must let the loop finish and exit cleanly;
+# a kill leaves no dhat output at all.
+PROFILE_TIMEOUT="${SNED_PROFILE_TIMEOUT:-600}"
 
 # Colors
 RED='\033[0;31m'
@@ -52,12 +57,13 @@ Options:
   --base-url <url>    Provider base URL (default: Salad gateway)
   --model <id>        Model for agent workloads (default: qwen3.5-35b-a3b)
   --api-key <key>     Provider API key (default: $SALAD_CLOUD_API_KEY)
+  --timeout <secs>    Per-workload timeout for agent runs (default: 600)
   --help              Show this help
 
 Workloads:
   basic    Simple command parsing and initialization
-  edit     File editing operations with anchor reconciliation
-  search   File search and symbol indexing
+  edit     Multi-step file editing with anchor reconciliation (several turns)
+  search   Multi-step file search and symbol indexing (several turns)
   all      Run all workloads sequentially
 
 Examples:
@@ -100,6 +106,10 @@ while [[ $# -gt 0 ]]; do
             PROFILE_API_KEY="$2"
             shift 2
             ;;
+        --timeout)
+            PROFILE_TIMEOUT="$2"
+            shift 2
+            ;;
         --help)
             show_help
             exit 0
@@ -131,6 +141,14 @@ case $WORKLOAD in
             echo "Set SALAD_CLOUD_API_KEY (or SNED_PROFILE_API_KEY), or pass --api-key <key>"
             exit 1
         fi
+        ;;
+esac
+
+# A non-numeric timeout would fail obscurely inside timeout(1).
+case $PROFILE_TIMEOUT in
+    ''|*[!0-9]*)
+        echo -e "${RED}Error: --timeout must be seconds as a number, got '$PROFILE_TIMEOUT'${NC}"
+        exit 1
         ;;
 esac
 
@@ -213,18 +231,22 @@ Line 2: It contains multiple lines of text
 Line 3: To simulate realistic editing operations
 Line 4: The anchor system will hash each line
 Line 5: And track changes for incremental edits
+Line 6: Extra content so later turns have more to reconcile
+Line 7: Final line of the fixture
 TESTFILE
 
     # Run edit command against the profile provider (--yolo so approval
     # prompts cannot stall the workload; the temp workspace is disposable).
     # --cwd keeps the process in the repo root so dhat-heap.json lands where
     # collect_dhat expects it instead of the deleted temp workspace.
-    timeout 120s "$REPO_ROOT/target/release/sned" --yolo \
+    # Multi-step prompt drives several agent turns in one process, which is
+    # what exposes cross-turn accumulation in the heap profile.
+    timeout "${PROFILE_TIMEOUT}s" "$REPO_ROOT/target/release/sned" --yolo \
         --cwd "$temp_workspace" \
         --base-url "$PROFILE_BASE_URL" \
         --model "$PROFILE_MODEL" \
         --api-key "$PROFILE_API_KEY" \
-        "Edit line 3 to say 'MODIFIED LINE 3'" \
+        "In test_edit.txt: (1) change line 3 to say 'MODIFIED LINE 3', (2) append a new line 8 saying 'APPENDED LINE 8', (3) change line 1 to say 'MODIFIED LINE 1'. Then report the final contents." \
         2>&1 || true
     collect_dhat edit
 
@@ -234,14 +256,16 @@ TESTFILE
 
 run_search_workload() {
     echo "  Running: File search and symbol indexing"
-    
+
     # Run search command against the profile provider (--yolo so approval
-    # prompts cannot stall the workload; the prompt is read-only)
-    timeout 120s ./target/release/sned --yolo \
+    # prompts cannot stall the workload; the prompt is read-only).
+    # Multi-step prompt drives several agent turns in one process, which is
+    # what exposes cross-turn accumulation in the heap profile.
+    timeout "${PROFILE_TIMEOUT}s" ./target/release/sned --yolo \
         --base-url "$PROFILE_BASE_URL" \
         --model "$PROFILE_MODEL" \
         --api-key "$PROFILE_API_KEY" \
-        "Search for all Rust files in this project" \
+        "Do these in order, reporting each result: (1) list all Rust files under src/storage, (2) find where persist_full_global_state is defined, (3) find all callers of persist_global_state. Then summarize." \
         2>&1 || true
     collect_dhat search
 }
