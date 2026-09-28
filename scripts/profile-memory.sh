@@ -207,10 +207,13 @@ run_basic_workload() {
 # dhat writes dhat-heap.json to the process CWD at clean exit only: a
 # timeout kill or crash leaves nothing. Capture each workload's output
 # immediately so one bad run cannot wipe out the others.
+# The edit workload runs with --cwd in a temp workspace, so its profile
+# lands there; an optional second argument names that directory.
 collect_dhat() {
     local name="$1"
-    if [ -f "dhat-heap.json" ]; then
-        mv "dhat-heap.json" "$RUN_DIR/dhat-${name}.json"
+    local src_dir="${2:-.}"
+    if [ -f "$src_dir/dhat-heap.json" ]; then
+        mv "$src_dir/dhat-heap.json" "$RUN_DIR/dhat-${name}.json"
         echo -e "${GREEN}  ✓ Captured heap profile for '$name'${NC}"
     else
         echo -e "${YELLOW}  ⚠ No heap profile for '$name' (killed, crashed, or instant exit)${NC}"
@@ -248,7 +251,7 @@ TESTFILE
         --api-key "$PROFILE_API_KEY" \
         "In test_edit.txt: (1) change line 3 to say 'MODIFIED LINE 3', (2) append a new line 8 saying 'APPENDED LINE 8', (3) change line 1 to say 'MODIFIED LINE 1'. Then report the final contents." \
         2>&1 || true
-    collect_dhat edit
+    collect_dhat edit "$temp_workspace"
 
     # Cleanup
     rm -rf "$temp_workspace"
