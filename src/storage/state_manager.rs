@@ -1242,11 +1242,25 @@ impl StateManager {
         keys: &HashMap<String, PendingGeneration>,
         history_operations: &BTreeMap<PendingGeneration, HistoryOperation>,
     ) -> io::Result<()> {
-        let local_state = self
-            .global_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        // Extract only pending keys under the read lock. Cloning the whole
+        // state here duplicates megabytes of task history on every persist
+        // just to read back a few pending values below.
+        let pending_values: HashMap<&str, serde_json::Value> = {
+            let local_state = self
+                .global_state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            keys.keys()
+                .filter_map(|key_name| {
+                    let key = key_name.parse::<GlobalStateKey>().ok()?;
+                    if key == GlobalStateKey::TaskHistory {
+                        return None;
+                    }
+                    key.get_json_value(&local_state)
+                        .map(|value| (key_name.as_str(), value))
+                })
+                .collect()
+        };
         let settings_dir = self.state_dir.join("..").join("settings");
         fs::create_dir_all(&settings_dir)?;
 
@@ -1275,8 +1289,8 @@ impl StateManager {
                 state
                     .task_history
                     .sort_by_key(|entry| std::cmp::Reverse(entry.ts));
-            } else if let Some(value) = key.get_json_value(&local_state) {
-                key.set_json_value(&mut state, value);
+            } else if let Some(value) = pending_values.get(key_name.as_str()) {
+                key.set_json_value(&mut state, value.clone());
             }
         }
 
