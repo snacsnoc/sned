@@ -6750,7 +6750,7 @@ edition = "2021"
     #[tokio::test]
     async fn test_staged_publication_failure_retains_content_without_anchors() {
         for generation_conflict in [false, true] {
-            let (_dir, ctx, mut params, path, cache) = staged_handler_fixture();
+            let (dir, ctx, mut params, path, cache) = staged_handler_fixture();
             let anchors = ctx
                 .anchor_mgr
                 .get_anchors(&path, Some("staged-handler"))
@@ -6766,7 +6766,11 @@ edition = "2021"
                     true,
                 ));
             } else {
-                handler.publication_cache_failure = Some(cache.clone());
+                handler.publication_cache_failure = Some(
+                    dir.path()
+                        .join("anchor-tasks")
+                        .join("staged-handler.json"),
+                );
             }
             let error = ToolHandler::execute(&handler, &ctx, params.clone())
                 .await
@@ -6819,7 +6823,10 @@ edition = "2021"
                 );
             } else {
                 assert_eq!(
-                    std::fs::read_to_string(cache).unwrap(),
+                    std::fs::read_to_string(
+                        dir.path().join("anchor-tasks").join("staged-handler.json")
+                    )
+                    .unwrap(),
                     "invalid cache JSON"
                 );
                 let retry = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
@@ -6840,8 +6847,12 @@ edition = "2021"
 
     #[tokio::test]
     async fn test_staged_corrupt_storage_requires_user_repair_even_with_reread_latch() {
-        let (_dir, ctx, params, path, cache) = staged_handler_fixture();
-        std::fs::write(&cache, "invalid cache JSON").unwrap();
+        let (dir, ctx, params, path, _) = staged_handler_fixture();
+        let shard = dir
+            .path()
+            .join("anchor-tasks")
+            .join("staged-handler.json");
+        std::fs::write(&shard, "invalid cache JSON").unwrap();
         for _ in 0..2 {
             let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params.clone())
                 .await
@@ -6856,7 +6867,7 @@ edition = "2021"
             assert!(!error.to_string().contains("Stale anchor detected"));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
             assert_eq!(
-                std::fs::read_to_string(&cache).unwrap(),
+                std::fs::read_to_string(&shard).unwrap(),
                 "invalid cache JSON"
             );
             assert!(
@@ -6871,10 +6882,11 @@ edition = "2021"
 
     #[tokio::test]
     async fn test_staged_noop_publication_failure_has_no_applied_claim_or_anchors() {
-        let (_dir, ctx, mut params, path, cache) = staged_handler_fixture();
+        let (dir, ctx, mut params, path, _) = staged_handler_fixture();
         params["files"][0]["edits"][0]["text"] = serde_json::json!("first");
         let mut handler = EditFileHandler::new();
-        handler.publication_cache_failure = Some(cache);
+        handler.publication_cache_failure =
+            Some(dir.path().join("anchor-tasks").join("staged-handler.json"));
         let error = ToolHandler::execute(&handler, &ctx, params)
             .await
             .unwrap_err();
@@ -6902,17 +6914,28 @@ edition = "2021"
     #[tokio::test]
     async fn test_staged_anchor_cache_atomic_write_failure_retains_applied_content() {
         let (dir, mut ctx, params, path, cache) = staged_handler_fixture();
-        // Both the cache and its lock fit NAME_MAX; the atomic-write suffix
-        // exceeds it. Reads and prewrite validation succeed, publication fails.
-        let long_cache = dir.path().join(format!("{}.json", "a".repeat(235)));
-        let before = std::fs::read(cache).unwrap();
-        std::fs::write(&long_cache, &before).unwrap();
-        ctx.anchor_mgr = AnchorStateManager::with_cache_file(long_cache.clone());
+        // Shard file names derive from the task id: a task id at NAME_MAX
+        // keeps reads and prewrite validation working while the atomic-write
+        // temp name no longer fits. Publication fails; content stays applied.
+        let long_task = "a".repeat(235);
+        let short_shard = dir.path().join("anchor-tasks").join("staged-handler.json");
+        let before = std::fs::read(&short_shard).unwrap();
+        let mut shard: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        shard["task_id"] = serde_json::Value::String(long_task.clone());
+        let long_shard = dir
+            .path()
+            .join("anchor-tasks")
+            .join(format!("{long_task}.json"));
+        std::fs::write(&long_shard, serde_json::to_vec(&shard).unwrap()).unwrap();
+        std::fs::remove_file(&short_shard).unwrap();
+        let before = std::fs::read(&long_shard).unwrap();
+        ctx.anchor_mgr = AnchorStateManager::with_cache_file(cache.clone());
+        ctx.task_id = long_task.clone();
         let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
             .await
             .unwrap_err();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed\nsecond\n");
-        assert_eq!(std::fs::read(long_cache).unwrap(), before);
+        assert_eq!(std::fs::read(&long_shard).unwrap(), before);
         assert_eq!(
             error.publication_outcomes().unwrap(),
             &[crate::core::tools::ToolPublicationOutcome {
@@ -6928,7 +6951,7 @@ edition = "2021"
         assert!(!error.to_string().contains('§'));
         assert!(
             ctx.anchor_mgr
-                .get_anchors(&path, Some("staged-handler"))
+                .get_anchors(&path, Some(&long_task))
                 .is_none()
         );
         let state = ctx.state.lock().await;
@@ -6938,8 +6961,12 @@ edition = "2021"
 
     #[tokio::test]
     async fn test_staged_invalid_mapping_rejected_without_reread_or_mutation() {
-        let (_dir, ctx, params, path, cache) = staged_handler_fixture();
-        let before = std::fs::read(&cache).unwrap();
+        let (dir, ctx, params, path, _) = staged_handler_fixture();
+        let shard = dir
+            .path()
+            .join("anchor-tasks")
+            .join("staged-handler.json");
+        let before = std::fs::read(&shard).unwrap();
         let anchors = ctx.anchor_mgr.get_anchors(&path, Some("staged-handler"));
         let mut handler = EditFileHandler::new();
         handler.invalid_provenance = true;
@@ -6952,7 +6979,7 @@ edition = "2021"
         );
         assert!(error.to_string().contains("transition validation failed"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
-        assert_eq!(std::fs::read(cache).unwrap(), before);
+        assert_eq!(std::fs::read(&shard).unwrap(), before);
         assert_eq!(
             ctx.anchor_mgr.get_anchors(&path, Some("staged-handler")),
             anchors
@@ -6982,8 +7009,12 @@ edition = "2021"
 
     #[tokio::test]
     async fn test_staged_output_verification_preserves_external_bytes_and_anchor_cache() {
-        let (_dir, ctx, params, path, cache) = staged_handler_fixture();
-        let before = std::fs::read(&cache).unwrap();
+        let (dir, ctx, params, path, _) = staged_handler_fixture();
+        let shard = dir
+            .path()
+            .join("anchor-tasks")
+            .join("staged-handler.json");
+        let before = std::fs::read(&shard).unwrap();
         let mut handler = EditFileHandler::new();
         handler.external_change_after_writes = Some((path.clone(), "external\r\n".into()));
         let error = ToolHandler::execute(&handler, &ctx, params)
@@ -6995,7 +7026,7 @@ edition = "2021"
             Some(ToolRequiredNextStep::ReadFile)
         );
         assert_eq!(std::fs::read(path).unwrap(), b"external\r\n");
-        assert_eq!(std::fs::read(cache).unwrap(), before);
+        assert_eq!(std::fs::read(&shard).unwrap(), before);
     }
 
     #[cfg(unix)]
@@ -7041,7 +7072,11 @@ edition = "2021"
             &last_lines,
             Some("write-failure-task"),
         );
-        let before_anchor_cache = std::fs::read(&anchor_cache).unwrap();
+        let anchor_shard = dir
+            .path()
+            .join("anchor-tasks")
+            .join("write-failure-task.json");
+        let before_anchor_cache = std::fs::read(&anchor_shard).unwrap();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let ctx = ToolContext::new(
             state.clone(),
@@ -7101,7 +7136,7 @@ edition = "2021"
             std::fs::read_to_string(&last_file_path).unwrap(),
             last_content
         );
-        assert_eq!(std::fs::read(anchor_cache).unwrap(), before_anchor_cache);
+        assert_eq!(std::fs::read(&anchor_shard).unwrap(), before_anchor_cache);
         for (path, anchors) in [
             (&first_file_path, first_anchors),
             (&failing_file_path, failing_anchors),
