@@ -16,6 +16,31 @@ use crate::storage::secrets::SecretsStore;
 const STATE_PERSIST_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 type PendingGeneration = u64;
 
+/// Default cap for retained task history entries (~5KB each on disk).
+const DEFAULT_TASK_HISTORY_LIMIT: usize = 200;
+/// Environment variable to configure the task history limit.
+const TASK_HISTORY_LIMIT_ENV: &str = "SNED_TASK_HISTORY_LIMIT";
+
+/// Bound on retained task history, so the settings file cannot grow forever.
+/// A corrupt or hostile value falls back to the default; zero keeps one entry
+/// instead of silently wiping all history.
+fn task_history_limit() -> usize {
+    std::env::var(TASK_HISTORY_LIMIT_ENV)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TASK_HISTORY_LIMIT)
+        .max(1)
+}
+
+/// Drop all but the newest history entries in place.
+fn enforce_task_history_limit(history: &mut Vec<HistoryItem>) {
+    let limit = task_history_limit();
+    if history.len() > limit {
+        history.sort_by_key(|entry| std::cmp::Reverse(entry.ts));
+        history.truncate(limit);
+    }
+}
+
 /// Cross-process guard for the shared Sned state directory.
 ///
 /// Atomic replacement protects individual files from partial writes, but it
@@ -556,7 +581,10 @@ impl StateManager {
         );
 
         // Load global state
-        let global_state = self.load_global_state()?;
+        let mut global_state = self.load_global_state()?;
+        // Files written before the cap existed may hold more entries;
+        // clamp on load so memory never carries the excess again.
+        enforce_task_history_limit(&mut global_state.task_history);
         *self
             .global_state
             .write()
@@ -651,7 +679,8 @@ impl StateManager {
     }
 
     /// Set task history in cache and mark for persistence
-    pub fn set_task_history(&self, history: Vec<HistoryItem>) {
+    pub fn set_task_history(&self, mut history: Vec<HistoryItem>) {
+        enforce_task_history_limit(&mut history);
         {
             self.global_state
                 .write()
@@ -673,6 +702,7 @@ impl StateManager {
         state.task_history.retain(|h| h.id != item.id);
         state.task_history.push(item.clone());
         state.task_history.sort_by_key(|b| std::cmp::Reverse(b.ts));
+        enforce_task_history_limit(&mut state.task_history);
 
         drop(state);
         let generation = self.next_pending_generation();
@@ -1293,6 +1323,10 @@ impl StateManager {
                 key.set_json_value(&mut state, value.clone());
             }
         }
+
+        // The on-disk copy predates the cap when it holds more entries;
+        // clamp the merged state so the written file converges downward.
+        enforce_task_history_limit(&mut state.task_history);
 
         self.persist_full_global_state(&state, &settings_dir)
     }
@@ -1935,6 +1969,57 @@ mod tests {
         assert!(!raw.contains('\n'), "persisted state must be single-line");
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["subagents_enabled"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn test_task_history_add_keeps_newest_at_limit() {
+        let manager = StateManager::new().unwrap();
+        for i in 0..(DEFAULT_TASK_HISTORY_LIMIT + 5) {
+            manager.add_task_to_history(HistoryItem {
+                id: format!("task-{i}"),
+                ts: i as i64,
+                task: format!("Task {i}"),
+                ..Default::default()
+            });
+        }
+
+        // Unbounded history is what grew the settings file past a megabyte;
+        // only the newest entries may survive.
+        let history = manager.get_task_history();
+        assert_eq!(history.len(), DEFAULT_TASK_HISTORY_LIMIT);
+        assert!(
+            history
+                .iter()
+                .any(|h| h.id == format!("task-{}", DEFAULT_TASK_HISTORY_LIMIT + 4))
+        );
+        assert!(!history.iter().any(|h| h.id == "task-0"));
+    }
+
+    #[test]
+    fn test_initialize_clamps_oversized_task_history() {
+        with_temp_data_dir(|| {
+            let settings_dir = crate::storage::disk::get_settings_dir();
+            fs::create_dir_all(&settings_dir).unwrap();
+            let history: Vec<HistoryItem> = (0..(DEFAULT_TASK_HISTORY_LIMIT + 5))
+                .map(|i| HistoryItem {
+                    id: format!("task-{i}"),
+                    ts: i as i64,
+                    task: format!("Task {i}"),
+                    ..Default::default()
+                })
+                .collect();
+            let mut state = serde_json::to_value(GlobalState::default()).unwrap();
+            state["task_history"] = serde_json::to_value(&history).unwrap();
+            fs::write(
+                settings_dir.join("global_settings.json"),
+                serde_json::to_string(&state).unwrap(),
+            )
+            .unwrap();
+
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+            assert_eq!(manager.get_task_history().len(), DEFAULT_TASK_HISTORY_LIMIT);
+        });
     }
 
     #[test]
