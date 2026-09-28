@@ -145,14 +145,17 @@ for path in paths:
             patterns[label] += retained
             pattern_example.setdefault(label, frame)
         if retained > 0:
-            # One row per attributing site; duplicate stacks share a row.
+            # One row per (attributing site, nearest sned frame) pair; bytes
+            # grouped by site alone would credit one sned frame with stacks
+            # that merely share a leaf allocator call.
             site = short_func(attr)
-            entry = sites.get(site)
+            key = (site, first_sned_frame(frames, ftbl))
+            entry = sites.get(key)
             if entry is None:
-                sites[site] = [retained, first_sned_frame(frames, ftbl)]
+                sites[key] = retained
             else:
-                entry[0] += retained
-    top = sorted(((total, site, sned) for site, (total, sned) in sites.items()),
+                sites[key] += retained
+    top = sorted(((total, site, sned) for (site, sned), total in sites.items()),
                  key=lambda entry: entry[0], reverse=True)
     results.append({
         "name": name, "total": total, "live": live,
