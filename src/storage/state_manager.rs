@@ -1289,7 +1289,9 @@ impl StateManager {
         state: &GlobalState,
         settings_dir: &Path,
     ) -> io::Result<()> {
-        let data = serde_json::to_string_pretty(state)
+        // Compact output: readers parse JSON either way, while pretty
+        // whitespace inflates every persist buffer and write for nothing.
+        let data = serde_json::to_string(state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let file_path = settings_dir.join("global_settings.json");
@@ -1892,6 +1894,33 @@ mod tests {
             serde_json::Value::Bool(true)
         );
         assert!(persisted.get("terminal_reuse_enabled").is_none());
+    }
+
+    #[test]
+    fn test_global_state_persist_writes_compact_json() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        let state_dir = data_dir.join("state");
+        let settings_dir = data_dir.join("settings");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&settings_dir).unwrap();
+
+        let mut manager = StateManager::new().unwrap();
+        manager.state_dir = state_dir;
+        manager.set_global_state_key(
+            GlobalStateKey::SubagentsEnabled,
+            serde_json::Value::Bool(true),
+        );
+        manager.persist().unwrap();
+
+        // Machine-read state pays whitespace and buffer costs for pretty
+        // output on every persist without gaining debuggability over jq.
+        // Key order is the struct's own, so compactness means single-line,
+        // not byte-equality with a re-serialized map.
+        let raw = fs::read_to_string(settings_dir.join("global_settings.json")).unwrap();
+        assert!(!raw.contains('\n'), "persisted state must be single-line");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["subagents_enabled"], serde_json::Value::Bool(true));
     }
 
     #[test]
