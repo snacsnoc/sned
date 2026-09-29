@@ -587,17 +587,7 @@ fn render_markdown_with_code_limit_timed(
                     current_spans.push(Span::styled(format!("`{}`", c.into_string()), style));
                 }
             }
-            Event::SoftBreak => {
-                flush_line(
-                    &mut out,
-                    &mut current_text,
-                    &mut current_spans,
-                    *is_first_line,
-                    prefix,
-                );
-                *is_first_line = false;
-            }
-            Event::HardBreak => {
+            Event::SoftBreak | Event::HardBreak => {
                 flush_line(
                     &mut out,
                     &mut current_text,

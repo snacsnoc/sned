@@ -342,24 +342,18 @@ impl PromptBuilder {
         );
 
         // Prioritize Project skills
-        let project_skills: Vec<&SkillMetadata> = self
+        let display_skills = self
             .context
             .skills
             .iter()
             .filter(|s| matches!(s.source, SkillSource::Project))
-            .collect();
-        let global_skills: Vec<&SkillMetadata> = self
-            .context
-            .skills
-            .iter()
-            .filter(|s| matches!(s.source, SkillSource::Global))
-            .collect();
-
-        let display_skills: Vec<&SkillMetadata> = project_skills
-            .into_iter()
-            .chain(global_skills)
-            .take(10)
-            .collect();
+            .chain(
+                self.context
+                    .skills
+                    .iter()
+                    .filter(|s| matches!(s.source, SkillSource::Global)),
+            )
+            .take(10);
 
         for skill in display_skills {
             section.push_str(&format!("- {}: {}\n", skill.name, skill.description));

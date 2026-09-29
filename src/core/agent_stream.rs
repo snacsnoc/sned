@@ -191,7 +191,8 @@ impl StreamAccumulator {
             self.substantive_output = true;
         }
         if text_chunk.signature.is_some() {
-            self.accumulated_text_signature = text_chunk.signature.clone();
+            self.accumulated_text_signature
+                .clone_from(&text_chunk.signature);
         }
         self.accumulated_text.push_str(&text_chunk.text);
         vec![StreamEvent::VisibleText(processed)]
@@ -218,7 +219,8 @@ impl StreamAccumulator {
         self.accumulated_reasoning
             .push_str(&reasoning_chunk.reasoning);
         if reasoning_chunk.signature.is_some() {
-            self.accumulated_signature = reasoning_chunk.signature.clone();
+            self.accumulated_signature
+                .clone_from(&reasoning_chunk.signature);
         }
         if let Some(redacted_data) = reasoning_chunk.redacted_data.clone() {
             self.accumulated_redacted_data.push(redacted_data);

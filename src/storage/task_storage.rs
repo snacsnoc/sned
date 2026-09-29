@@ -730,12 +730,10 @@ impl TaskStorage {
             if let MessageContent::AssistantBlocks(blocks) = &mut message.content {
                 for block in blocks {
                     if let AssistantContentBlock::Thinking(thinking) = block {
-                        let resolved = thinking
-                            .signature
-                            .clone()
-                            .or(thinking.shared.signature.clone());
-                        thinking.signature = resolved.clone();
-                        thinking.shared.signature = resolved;
+                        if thinking.signature.is_none() {
+                            thinking.signature = thinking.shared.signature.clone();
+                        }
+                        thinking.shared.signature.clone_from(&thinking.signature);
                     }
                 }
             }

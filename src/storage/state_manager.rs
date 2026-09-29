@@ -918,13 +918,13 @@ impl StateManager {
 
     /// Get task state for a specific task
     pub fn get_task_state(&self, task_id: &str, key: &str) -> Option<serde_json::Value> {
-        if let Some(value) = self
+        let cached = self
             .task_state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(task_id)
-            .and_then(|state| state.get(key).cloned())
-        {
+            .and_then(|state| state.get(key).cloned());
+        if let Some(value) = cached {
             return Some(value);
         }
 
