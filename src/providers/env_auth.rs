@@ -55,7 +55,7 @@ mod tests {
             "OPENROUTER_API_KEY",
         ];
         for var in &vars {
-            // SAFETY: single-threaded test; sequential env mutation
+            // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
             unsafe {
                 env::remove_var(var);
             }
@@ -64,20 +64,22 @@ mod tests {
 
     #[test]
     fn test_provider_detection() {
-        // Single sequential test to avoid parallel env var interference
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Test ANTHROPIC_API_KEY has highest priority
         clear_test_env_vars();
-        // SAFETY: single-threaded test; sequential env mutation
+        // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
         unsafe { env::set_var("ANTHROPIC_API_KEY", "sk-ant-test") };
-        // SAFETY: single-threaded test; sequential env mutation
+        // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
         unsafe { env::set_var("OPENAI_API_KEY", "sk-openai-test") };
         assert_eq!(get_provider_from_env(), Some("anthropic"));
 
         clear_test_env_vars();
 
         // Test OPENAI_API_KEY alone
-        // SAFETY: single-threaded test; sequential env mutation
+        // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
         unsafe { env::set_var("OPENAI_API_KEY", "sk-openai-test") };
         assert_eq!(get_provider_from_env(), Some("openai-native"));
 
@@ -100,7 +102,7 @@ mod tests {
 
         for (env_var, expected_provider) in test_cases {
             clear_test_env_vars();
-            // SAFETY: single-threaded test; sequential env mutation
+            // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
             unsafe { env::set_var(env_var, "test-key") };
             assert_eq!(
                 get_provider_from_env(),
@@ -114,21 +116,21 @@ mod tests {
 
         // Test special mappings
         // MINIMAX_CN_API_KEY maps to minimax
-        // SAFETY: single-threaded test; sequential env mutation
+        // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
         unsafe { env::set_var("MINIMAX_CN_API_KEY", "test-key") };
         assert_eq!(get_provider_from_env(), Some("minimax"));
 
         clear_test_env_vars();
 
         // Test OPENAI_API_BASE alone (should return None without OPENAI_API_KEY)
-        // SAFETY: single-threaded test; sequential env mutation
+        // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
         unsafe { env::set_var("OPENAI_API_BASE", "https://custom.example.com/v1") };
         assert_eq!(get_provider_from_env(), None);
 
         clear_test_env_vars();
 
         // Test OPENAI_API_BASE + OPENAI_API_KEY together
-        // SAFETY: single-threaded test; sequential env mutation
+        // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
         unsafe { env::set_var("OPENAI_API_BASE", "https://custom.example.com/v1") };
         unsafe { env::set_var("OPENAI_API_KEY", "sk-test") };
         assert_eq!(get_provider_from_env(), Some("openai"));

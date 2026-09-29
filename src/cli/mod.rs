@@ -2059,8 +2059,6 @@ mod tests {
     use super::*;
     use crate::providers::Provider;
     use clap::Parser;
-    use std::sync::Mutex;
-    static PROVIDER_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_validate_workspace_root_rejects_relative_path() {
@@ -2848,7 +2846,9 @@ mod tests {
         use crate::providers::env_auth::get_provider_from_env;
         use std::env;
 
-        let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Helper to clear test env vars
         fn clear_env() {
@@ -2919,7 +2919,9 @@ mod tests {
     fn test_create_provider_auto_detects_anthropic() {
         use std::env;
         {
-            let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = crate::test_support::env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let all_provider_vars = vec![
                 "ANTHROPIC_API_KEY",
                 "OPENAI_API_KEY",
@@ -3007,7 +3009,9 @@ mod tests {
     fn test_create_provider_anthropic_bails_when_key_unset() {
         use std::env;
         {
-            let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = crate::test_support::env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let all_provider_vars = vec![
                 "ANTHROPIC_API_KEY",
                 "OPENAI_API_KEY",
@@ -3089,7 +3093,9 @@ mod tests {
 
     #[test]
     fn test_create_provider_rejects_missing_keys_for_supported_providers() {
-        let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for env_var in [
             "GEMINI_API_KEY",
             "DEEPSEEK_API_KEY",
@@ -3097,7 +3103,7 @@ mod tests {
             "MINIMAX_API_KEY",
             "MINIMAX_CN_API_KEY",
         ] {
-            // SAFETY: provider environment mutation is serialized by PROVIDER_ENV_MUTEX.
+            // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
             unsafe { std::env::remove_var(env_var) };
         }
 
@@ -3125,7 +3131,9 @@ mod tests {
     fn test_create_provider_explicit_flag_takes_precedence() {
         use std::env;
         {
-            let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = crate::test_support::env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let all_provider_vars = vec![
                 "ANTHROPIC_API_KEY",
                 "OPENAI_API_KEY",
@@ -3274,7 +3282,7 @@ mod tests {
 
     #[test]
     fn test_create_provider_uses_stored_auth_secret() {
-        let _guard = PROVIDER_ENV_MUTEX
+        let _guard = crate::test_support::env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for env_var in [
@@ -3287,7 +3295,7 @@ mod tests {
             "MINIMAX_CN_API_KEY",
             "DEEPSEEK_API_KEY",
         ] {
-            // SAFETY: provider environment mutation is serialized by PROVIDER_ENV_MUTEX.
+            // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
             unsafe { std::env::remove_var(env_var) };
         }
 
@@ -3453,7 +3461,9 @@ mod tests {
 
     #[test]
     fn test_create_provider_openai_rejects_thinking() {
-        let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
         let cli = Cli::try_parse_from(["sned", "--provider", "openai", "--thinking"]).unwrap();
         let err = create_provider(&cli.task_opts, None).unwrap_err();
@@ -3497,7 +3507,9 @@ mod tests {
 
     #[test]
     fn test_create_provider_anthropic_rejects_reasoning_effort() {
-        let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
         let cli = Cli::try_parse_from([
             "sned",
@@ -3519,7 +3531,9 @@ mod tests {
 
     #[test]
     fn test_create_provider_openai_accepts_reasoning_effort_none() {
-        let _guard = PROVIDER_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("OPENAI_API_KEY", "test-key") };
         let cli = Cli::try_parse_from([
             "sned",
