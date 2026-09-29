@@ -463,8 +463,62 @@ struct TaskShard {
 #[derive(Debug)]
 struct AnchorStorage {
     tasks: IndexMap<String, IndexMap<String, TrackedDocument>>,
-    persisted_tasks: IndexMap<String, IndexMap<String, TrackedDocument>>,
+    /// Compare-and-swap baseline as document digests: the same change
+    /// detection as a full snapshot clone without duplicating every body.
+    persisted_fingerprints: IndexMap<String, HashMap<String, [u8; 32]>>,
     cache_file: std::path::PathBuf,
+}
+
+impl AnchorStorage {
+    /// Digest identifying a tracked document for compare-and-swap. Covers
+    /// exactly the derived-`PartialEq` field set, so digest equality and
+    /// `==` agree; the used-words set hashes sorted because its iteration
+    /// order is random.
+    fn fingerprint_document(document: &TrackedDocument) -> [u8; 32] {
+        use sha2::Digest;
+        fn push_str(hash: &mut sha2::Sha256, value: &str) {
+            hash.update((value.len() as u64).to_le_bytes());
+            hash.update(value.as_bytes());
+        }
+        let mut hash = sha2::Sha256::new();
+        hash.update(document.generation.to_le_bytes());
+        hash.update((document.hashes.len() as u64).to_le_bytes());
+        for value in &document.hashes {
+            hash.update(value.to_le_bytes());
+        }
+        hash.update((document.anchors.len() as u64).to_le_bytes());
+        for anchor in &document.anchors {
+            push_str(&mut hash, anchor);
+        }
+        for word in &document.used_words {
+            push_str(&mut hash, word);
+        }
+        let mut set: Vec<&String> = document.used_words_set.iter().collect();
+        set.sort();
+        hash.update((set.len() as u64).to_le_bytes());
+        for word in set {
+            push_str(&mut hash, word);
+        }
+        push_str(
+            &mut hash,
+            document.anchor_namespace.as_deref().unwrap_or(""),
+        );
+        hash.update(document.next_anchor_id.to_le_bytes());
+        for retired in &document.retired_anchors {
+            push_str(&mut hash, retired);
+        }
+        hash.finalize().into()
+    }
+
+    /// Digests for every document in a task, replacing a full snapshot clone.
+    fn fingerprint_task(
+        documents: &IndexMap<String, TrackedDocument>,
+    ) -> HashMap<String, [u8; 32]> {
+        documents
+            .iter()
+            .map(|(path, document)| (path.clone(), Self::fingerprint_document(document)))
+            .collect()
+    }
 }
 
 struct AnchorCacheLock(std::fs::File);
@@ -537,8 +591,12 @@ impl AnchorStorage {
             }
         }
         tracing::debug!("Loaded {} task(s) from anchor cache", tasks.len());
+        let persisted_fingerprints = tasks
+            .iter()
+            .map(|(task_id, documents)| (task_id.clone(), Self::fingerprint_task(documents)))
+            .collect();
         Self {
-            persisted_tasks: tasks.clone(),
+            persisted_fingerprints,
             tasks,
             cache_file: anchors_file,
         }
@@ -548,7 +606,7 @@ impl AnchorStorage {
     fn new() -> Self {
         Self {
             tasks: IndexMap::new(),
-            persisted_tasks: IndexMap::new(),
+            persisted_fingerprints: IndexMap::new(),
             cache_file: crate::storage::disk::get_data_dir().join("cache/anchors.json"),
         }
     }
@@ -577,7 +635,7 @@ impl AnchorStorage {
         let task_ids: Vec<String> = self
             .tasks
             .keys()
-            .chain(self.persisted_tasks.keys())
+            .chain(self.persisted_fingerprints.keys())
             .cloned()
             .collect::<HashSet<_>>()
             .into_iter()
@@ -591,26 +649,26 @@ impl AnchorStorage {
             if let Some(memory) = self.tasks.get(task_id) {
                 for (path, document) in memory {
                     let expected = self
-                        .persisted_tasks
+                        .persisted_fingerprints
                         .get(task_id)
                         .and_then(|files| files.get(path));
-                    if Some(document) == expected {
+                    if Some(Self::fingerprint_document(document)) == expected.copied() {
                         continue;
                     }
-                    if documents.get(path) == expected {
+                    if documents.get(path).map(Self::fingerprint_document) == expected.copied() {
                         task_changed = true;
                         documents.insert(path.clone(), document.clone());
                     }
                 }
             }
-            if let Some(persisted) = self.persisted_tasks.get(task_id) {
+            if let Some(persisted) = self.persisted_fingerprints.get(task_id) {
                 for (path, expected) in persisted {
                     if self
                         .tasks
                         .get(task_id)
                         .and_then(|files| files.get(path))
                         .is_none()
-                        && documents.get(path) == Some(expected)
+                        && documents.get(path).map(Self::fingerprint_document) == Some(*expected)
                     {
                         task_changed = true;
                         documents.shift_remove(path);
@@ -635,8 +693,8 @@ impl AnchorStorage {
                     let _ = Self::prune_legacy_task(anchors_file, task_id);
                 }
             }
-            self.persisted_tasks
-                .insert(task_id.clone(), documents.clone());
+            self.persisted_fingerprints
+                .insert(task_id.clone(), Self::fingerprint_task(&documents));
             self.tasks.insert(task_id.clone(), documents);
         }
         Self::evict_old_task_shards(anchors_file);
@@ -1489,8 +1547,8 @@ impl AnchorStateManager {
             files.shift_remove(absolute_path);
         }
         // Forget the baseline too, so a later save cannot queue a durable deletion.
-        if let Some(files) = storage.persisted_tasks.get_mut(task_id) {
-            files.shift_remove(absolute_path);
+        if let Some(files) = storage.persisted_fingerprints.get_mut(task_id) {
+            files.remove(absolute_path);
         }
     }
 
@@ -1590,8 +1648,8 @@ impl AnchorStateManager {
         // every decision path re-reads durable state anyway.
         for (task_id, documents) in durable {
             storage
-                .persisted_tasks
-                .insert(task_id.clone(), documents.clone());
+                .persisted_fingerprints
+                .insert(task_id.clone(), AnchorStorage::fingerprint_task(&documents));
             storage.tasks.insert(task_id, documents);
         }
         Ok(())
@@ -1646,9 +1704,10 @@ impl AnchorStateManager {
         }
         AnchorStorage::evict_old_task_shards(&storage.cache_file);
         // There are no fallible operations after durable replacement.
-        storage
-            .persisted_tasks
-            .insert(task_id.to_string(), documents.clone());
+        storage.persisted_fingerprints.insert(
+            task_id.to_string(),
+            AnchorStorage::fingerprint_task(&documents),
+        );
         storage.tasks.insert(task_id.to_string(), documents);
         Ok(())
     }
@@ -1733,8 +1792,8 @@ impl AnchorStateManager {
         let files = storage.tasks.entry(task_id.to_string()).or_default();
         files.insert(absolute_path.to_string(), document.clone());
 
-        if let Some(files) = storage.persisted_tasks.get_mut(task_id) {
-            files.shift_remove(absolute_path);
+        if let Some(files) = storage.persisted_fingerprints.get_mut(task_id) {
+            files.remove(absolute_path);
         }
         storage.save();
 
@@ -1819,10 +1878,13 @@ impl AnchorStateManager {
                     .or_default()
                     .insert(absolute_path.to_string(), document.clone());
                 storage
-                    .persisted_tasks
+                    .persisted_fingerprints
                     .entry(task_id.to_string())
                     .or_default()
-                    .insert(absolute_path.to_string(), document);
+                    .insert(
+                        absolute_path.to_string(),
+                        AnchorStorage::fingerprint_document(&document),
+                    );
             }
             let state = Self::get_task_state_mut(&mut storage, task_id);
             let tracked = state.get(absolute_path).cloned();
@@ -3924,6 +3986,129 @@ mod tests {
             assert!(tasks.contains_key(&format!("new-{index}")));
         }
         assert_eq!(tasks["wide"].len(), MAX_TRACKED_FILES);
+    }
+
+    #[test]
+    fn document_fingerprint_agrees_with_equality() {
+        use std::collections::{HashSet, VecDeque};
+        let base = TrackedDocument {
+            generation: 3,
+            hashes: vec![11, 22],
+            anchors: vec!["Alpha§x".to_string()],
+            used_words: VecDeque::from(["w1".to_string()]),
+            used_words_set: HashSet::from(["w1".to_string(), "w2".to_string()]),
+            anchor_namespace: Some("ns".to_string()),
+            next_anchor_id: 9,
+            retired_anchors: VecDeque::from(["old".to_string()]),
+        };
+        // Identical documents share a fingerprint; any field change alters it.
+        assert_eq!(
+            AnchorStorage::fingerprint_document(&base),
+            AnchorStorage::fingerprint_document(&base.clone())
+        );
+        let mut reordered_set = base.clone();
+        reordered_set.used_words_set = HashSet::from(["w2".to_string(), "w1".to_string()]);
+        assert_eq!(
+            AnchorStorage::fingerprint_document(&base),
+            AnchorStorage::fingerprint_document(&reordered_set)
+        );
+        let mut bumped = base.clone();
+        bumped.generation += 1;
+        assert_ne!(
+            AnchorStorage::fingerprint_document(&base),
+            AnchorStorage::fingerprint_document(&bumped)
+        );
+        let mut extended = base.clone();
+        extended.anchors.push("Beta§y".to_string());
+        assert_ne!(
+            AnchorStorage::fingerprint_document(&base),
+            AnchorStorage::fingerprint_document(&extended)
+        );
+    }
+
+    fn sample_document() -> TrackedDocument {
+        TrackedDocument {
+            generation: 1,
+            hashes: vec![7],
+            anchors: vec!["Alpha§x".to_string()],
+            used_words: std::collections::VecDeque::from(["w".to_string()]),
+            used_words_set: std::collections::HashSet::from(["w".to_string()]),
+            anchor_namespace: Some("ns".to_string()),
+            next_anchor_id: 2,
+            retired_anchors: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn seed_task(manager: &AnchorStateManager, task: &str) {
+        let mut storage = manager.storage();
+        storage.tasks.insert(
+            task.to_string(),
+            IndexMap::from([("f".to_string(), sample_document())]),
+        );
+    }
+
+    #[test]
+    fn unchanged_save_rewrites_no_shard_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        seed_task(&manager, "default");
+        manager.save();
+        let before: Vec<(std::path::PathBuf, Vec<u8>)> =
+            std::fs::read_dir(dir.path().join("anchor-tasks"))
+                .unwrap()
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect();
+        assert!(!before.is_empty());
+
+        // Nothing changed, so the comparison must skip every durable write.
+        manager.save();
+        for (path, bytes) in &before {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn reset_task_removes_its_shard_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        seed_task(&manager, "gone");
+        manager.save();
+        assert!(manager.storage().tasks.contains_key("gone"));
+
+        manager.reset(Some("gone"));
+        // Save re-adopts the touched task key, but its documents are gone.
+        assert!(manager.storage().tasks["gone"].is_empty());
+        let shard = dir.path().join("anchor-tasks").join("gone.json");
+        let gone = std::fs::read(&shard).ok();
+        assert!(
+            gone.is_none()
+                || serde_json::from_slice::<TaskShard>(&gone.unwrap())
+                    .unwrap()
+                    .documents
+                    .is_empty()
+        );
+    }
+
+    #[test]
+    fn clear_state_removes_path_from_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        seed_task(&manager, "tidy");
+        manager.save();
+
+        manager.clear_state("f", Some("tidy"));
+        let bytes = std::fs::read(dir.path().join("anchor-tasks").join("tidy.json")).unwrap();
+        assert!(
+            serde_json::from_slice::<TaskShard>(&bytes)
+                .unwrap()
+                .documents
+                .is_empty()
+        );
     }
 
     #[test]
