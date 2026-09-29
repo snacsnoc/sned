@@ -713,26 +713,26 @@ fn load_skill_from_md_file(
 
 /// Parse YAML frontmatter from markdown content
 /// Returns (frontmatter_map, body, had_frontmatter, parse_error)
-fn parse_yaml_frontmatter(content: &str) -> (serde_yml::Mapping, String, bool, Option<String>) {
+fn parse_yaml_frontmatter(content: &str) -> (serde_yaml::Mapping, String, bool, Option<String>) {
     let trimmed = content.trim_start();
 
     // Check for frontmatter delimiters
     if !trimmed.starts_with("---") {
-        return (serde_yml::Mapping::new(), content.to_string(), false, None);
+        return (serde_yaml::Mapping::new(), content.to_string(), false, None);
     }
 
     let rest = &trimmed[3..];
     let Some(end_pos) = rest.find("---") else {
-        return (serde_yml::Mapping::new(), content.to_string(), false, None);
+        return (serde_yaml::Mapping::new(), content.to_string(), false, None);
     };
 
     let yaml_str = &rest[..end_pos];
     let body = rest[end_pos + 3..].to_string();
 
-    match serde_yml::from_str::<serde_yml::Mapping>(yaml_str) {
+    match serde_yaml::from_str::<serde_yaml::Mapping>(yaml_str) {
         Ok(mapping) => (mapping, body, true, None),
         Err(e) => (
-            serde_yml::Mapping::new(),
+            serde_yaml::Mapping::new(),
             content.to_string(),
             true,
             Some(e.to_string()),
