@@ -371,8 +371,11 @@ mod tests {
         let settings_dir = data_dir.join("settings");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::create_dir_all(&settings_dir).unwrap();
+        let _env_lock = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let old_sned_dir = std::env::var_os("SNED_DIR");
-        // SAFETY: this test runs in isolation under the validation command.
+        // SAFETY: env_lock serializes process-environment mutation.
         unsafe {
             std::env::set_var("SNED_DIR", temp_dir.path());
         }
@@ -410,8 +413,11 @@ mod tests {
         let settings_dir = data_dir.join("settings");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::fs::create_dir_all(&settings_dir).unwrap();
+        let _env_lock = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let old_sned_dir = std::env::var_os("SNED_DIR");
-        // SAFETY: this test runs in isolation under the validation command.
+        // SAFETY: env_lock serializes process-environment mutation.
         unsafe {
             std::env::set_var("SNED_DIR", temp_dir.path());
         }

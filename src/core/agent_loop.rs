@@ -8377,12 +8377,15 @@ Irrespective of whether additional information or instructions are given, you ar
 
     #[tokio::test]
     async fn test_run_preserves_pending_cancellation_until_observed() {
+        use crate::test_support::env_lock;
+
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join("data");
         std::fs::create_dir_all(data_dir.join("state")).unwrap();
         std::fs::create_dir_all(data_dir.join("settings")).unwrap();
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let old_sned_dir = std::env::var_os("SNED_DIR");
-        // SAFETY: this test is intended to run with isolated validation commands.
+        // SAFETY: env_lock serializes process-environment mutation.
         unsafe {
             std::env::set_var("SNED_DIR", temp_dir.path());
         }
@@ -9634,13 +9637,16 @@ Irrespective of whether additional information or instructions are given, you ar
 
     #[tokio::test]
     async fn test_task_resume() {
+        use crate::test_support::env_lock;
         use std::env;
         use tempfile::TempDir;
 
         // Create a temp directory and set SNED_DIR to use it
         let temp_dir = TempDir::new().unwrap();
         let sned_dir = temp_dir.path().join(".sned");
-        // SAFETY: single-threaded test; sequential env mutation
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let previous_sned_dir = env::var_os("SNED_DIR");
+        // SAFETY: env_lock serializes process-environment mutation.
         unsafe {
             env::set_var("SNED_DIR", &sned_dir);
         }
@@ -9763,8 +9769,13 @@ Irrespective of whether additional information or instructions are given, you ar
         let loaded_empty = agent_empty.load_conversation_history().await;
         assert!(!loaded_empty, "Should not load history for empty task");
 
-        // SAFETY: single-threaded test; restoring env after test
-        unsafe { env::remove_var("SNED_DIR") };
+        // SAFETY: env_lock held; restoring the prior process environment.
+        unsafe {
+            match previous_sned_dir {
+                Some(value) => env::set_var("SNED_DIR", value),
+                None => env::remove_var("SNED_DIR"),
+            }
+        }
     }
 
     #[tokio::test]

@@ -130,18 +130,15 @@ fn collect_environment_metadata() -> crate::storage::task_storage::EnvironmentMe
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
     use tempfile::TempDir;
 
     // Static mutex to serialize tests that modify SNED_DIR.
-    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[tokio::test]
     async fn test_model_context_tracker_records_usage() {
-        // Acquire the mutex to prevent concurrent access with other tests
-        let mutex = TEST_MUTEX.get_or_init(|| Mutex::new(()));
-        let _guard = mutex.lock().unwrap();
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
 
         let temp = TempDir::new().unwrap();
         let task_id = format!("test-{}", std::process::id());
@@ -152,7 +149,7 @@ mod tests {
 
         // Override SNED_DIR for this test.
         let original_sned_dir = std::env::var("SNED_DIR").ok();
-        // SAFETY: single-threaded test; sequential env mutation
+        // SAFETY: env_lock serializes process-environment mutation.
         unsafe {
             std::env::set_var("SNED_DIR", temp.path().to_str().unwrap());
         }
@@ -188,9 +185,9 @@ mod tests {
     /// Verifies that the locking mechanism in update_metadata prevents data loss.
     #[test]
     fn test_concurrent_tracker_updates_not_clobbered() {
-        // Acquire the mutex to prevent concurrent access with other tests
-        let mutex = TEST_MUTEX.get_or_init(|| Mutex::new(()));
-        let _guard = mutex.lock().unwrap();
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
 
         let temp = TempDir::new().unwrap();
         let task_id = format!("test-concurrent-{}", std::process::id());
@@ -201,7 +198,7 @@ mod tests {
 
         // Override SNED_DIR for this test.
         let original_sned_dir = std::env::var("SNED_DIR").ok();
-        // SAFETY: single-threaded test; sequential env mutation
+        // SAFETY: env_lock serializes process-environment mutation.
         unsafe {
             std::env::set_var("SNED_DIR", temp.path().to_str().unwrap());
         }

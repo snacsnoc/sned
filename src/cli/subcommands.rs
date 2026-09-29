@@ -981,10 +981,8 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use std::collections::VecDeque;
     use std::fs;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    static AUTH_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn key_event(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -1120,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_run_auth_accepts_model_id_flag() {
-        let _guard = AUTH_ENV_MUTEX
+        let _guard = crate::test_support::env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
@@ -1133,7 +1131,7 @@ mod tests {
         fs::create_dir_all(&state_dir).unwrap();
 
         let original_sned_dir = std::env::var("SNED_DIR").ok();
-        // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
+        // SAFETY: env_lock serializes process-environment mutation.
         unsafe {
             std::env::set_var("SNED_DIR", temp.path().to_str().unwrap());
         }
@@ -1182,7 +1180,7 @@ mod tests {
 
     #[test]
     fn test_run_auth_accepts_baseurl_flag() {
-        let _guard = AUTH_ENV_MUTEX
+        let _guard = crate::test_support::env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().unwrap();
@@ -1195,7 +1193,7 @@ mod tests {
         fs::create_dir_all(&state_dir).unwrap();
 
         let original_sned_dir = std::env::var("SNED_DIR").ok();
-        // SAFETY: AUTH_ENV_MUTEX serializes process environment mutation.
+        // SAFETY: env_lock serializes process-environment mutation.
         unsafe {
             std::env::set_var("SNED_DIR", temp.path().to_str().unwrap());
         }
