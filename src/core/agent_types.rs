@@ -79,14 +79,10 @@ pub struct TaskState {
     pub running_command_pids: Vec<i32>,
     /// Whether we're waiting for the first chunk.
     pub is_waiting_for_first_chunk: bool,
-    /// Whether we've completed reading the stream.
-    pub did_complete_reading_stream: bool,
     /// Whether the model is in a reasoning/thinking phase (no displayable output yet).
     pub reasoning_active: bool,
     /// Whether we automatically retried a failed API request.
     pub did_automatically_retry_failed_api_request: bool,
-    /// Whether to use native tool calls.
-    pub use_native_tool_calls: bool,
     /// Current conversation history deleted range.
     pub conversation_history_deleted_range: Option<(usize, usize)>,
     /// Whether double-check completion is enabled (default: true).
@@ -155,8 +151,6 @@ pub struct TaskState {
     /// Maps absolute file path -> change stats (lines added/removed, action).
     pub session_file_changes:
         std::collections::HashMap<String, crate::core::agent_types::FileChangeStats>,
-    /// The last command executed (for session summary display).
-    pub last_executed_command: Option<String>,
     /// Exact file paths that must be re-read before the next edit attempt.
     pub must_reread_before_edit: HashSet<String>,
     /// Read turns per file path since its last mutation, including reads
@@ -216,10 +210,8 @@ impl Default for TaskState {
             checkpoint_cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             running_command_pids: Vec::new(),
             is_waiting_for_first_chunk: false,
-            did_complete_reading_stream: false,
             reasoning_active: false,
             did_automatically_retry_failed_api_request: false,
-            use_native_tool_calls: false,
             conversation_history_deleted_range: None,
             double_check_completion_enabled: true,
             double_check_completion_pending: false,
@@ -256,7 +248,6 @@ impl Default for TaskState {
             commands_executed: 0,
             turns_completed: 0,
             session_file_changes: std::collections::HashMap::with_capacity(8),
-            last_executed_command: None,
             must_reread_before_edit: HashSet::new(),
             consecutive_reads: std::collections::HashMap::new(),
             last_read_turn: std::collections::HashMap::new(),

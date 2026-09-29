@@ -572,12 +572,6 @@ impl MessageQueueHandle {
         self.queue.lock().await.len()
     }
 
-    /// Synchronous queue length (for use in the TUI main loop).
-    #[must_use]
-    pub fn try_queued_message_count(&self) -> Option<usize> {
-        self.queue.try_lock().ok().map(|q| q.len())
-    }
-
     /// Synchronously read the queue count and text previews for the TUI.
     #[must_use]
     pub fn try_queued_message_snapshot(&self, limit: usize) -> Option<(usize, Vec<String>)> {
@@ -7381,7 +7375,6 @@ Irrespective of whether additional information or instructions are given, you ar
         let state = TaskState::default();
         assert_eq!(state.consecutive_mistakes, 0);
         assert!(!state.is_cancelled);
-        assert!(!state.did_complete_reading_stream);
     }
 
     /// Read-loop decay: inspection tools MUST keep state alive. The

@@ -1102,7 +1102,6 @@ impl ExecuteCommandHandler {
             if let Some(ref state) = task_state {
                 let mut state = state.lock().await;
                 state.commands_executed = state.commands_executed.saturating_add(1);
-                state.last_executed_command = Some(cmd_str.clone());
             }
 
             let stdout = String::from_utf8_lossy(&output.stdout);
