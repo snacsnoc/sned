@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
@@ -212,9 +211,6 @@ pub enum ConfigFieldError {
     #[error("invalid value for key '{0}': expected {1}, got '{2}'")]
     InvalidValue(String, String, String),
 }
-
-/// Task state cache (per-task settings override)
-pub type TaskState = HashMap<String, serde_json::Value>;
 
 /// Workspace state cache (rule toggles, etc.)
 pub type WorkspaceState = HashMap<String, serde_json::Value>;
@@ -483,15 +479,11 @@ impl std::fmt::Display for GlobalStateKey {
 /// Key behaviors preserved:
 /// - In-memory cache for fast reads (no disk I/O on reads after init)
 /// - Async disk persistence with debouncing (1-second delay)
-/// - Separate persistence paths for global state, task state, secrets, workspace state
+/// - Separate persistence paths for global state, secrets, workspace state
 /// - Task history is stored in the shared global settings file
-/// - Per-task settings routed to task directories
 pub struct StateManager {
     /// Global state + settings cache
     global_state: RwLock<GlobalState>,
-
-    /// Task state cache (per-task settings)
-    task_state: RwLock<HashMap<String, TaskState>>,
 
     /// Secrets cache
     secrets: RwLock<HashMap<String, String>>,
@@ -503,7 +495,6 @@ pub struct StateManager {
     /// clear only the marker it actually wrote, preserving mutations that
     /// arrived while disk I/O was in progress.
     pending_global_keys: Mutex<HashMap<String, PendingGeneration>>,
-    pending_task_states: Mutex<HashMap<String, HashMap<String, PendingGeneration>>>,
     pending_secrets: Mutex<HashMap<String, PendingGeneration>>,
 
     /// Ordered history operations allow a process with stale in-memory
@@ -539,11 +530,9 @@ impl StateManager {
 
         Ok(Self {
             global_state: RwLock::new(GlobalState::default()),
-            task_state: RwLock::new(HashMap::with_capacity(8)),
             secrets: RwLock::new(HashMap::with_capacity(4)),
             workspace_state: RwLock::new(HashMap::with_capacity(8)),
             pending_global_keys: Mutex::new(HashMap::new()),
-            pending_task_states: Mutex::new(HashMap::with_capacity(4)),
             pending_secrets: Mutex::new(HashMap::new()),
             pending_history_operations: Mutex::new(BTreeMap::new()),
             next_pending_generation: AtomicU64::new(1),
@@ -614,9 +603,6 @@ impl StateManager {
             }
         }
 
-        // Task states load on first read instead of here: the tasks
-        // directory accumulates one subdirectory per session, so an eager
-        // scan makes every cold start linear in total history.
         Ok(())
     }
 
@@ -916,59 +902,6 @@ impl StateManager {
             .clone()
     }
 
-    /// Get task state for a specific task
-    pub fn get_task_state(&self, task_id: &str, key: &str) -> Option<serde_json::Value> {
-        let cached = self
-            .task_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(task_id)
-            .and_then(|state| state.get(key).cloned());
-        if let Some(value) = cached {
-            return Some(value);
-        }
-
-        let parsed = self.read_task_settings_with_backup(
-            &self
-                .state_dir
-                .join("..")
-                .join("tasks")
-                .join(task_id)
-                .join("settings.json"),
-        )?;
-        let task_state_map: HashMap<String, serde_json::Value> = parsed.into_iter().collect();
-        let value = task_state_map.get(key).cloned();
-        self.task_state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(task_id.to_string(), task_state_map);
-        value
-    }
-
-    /// Set task state for a specific task
-    pub fn set_task_state(&self, task_id: &str, key: &str, value: serde_json::Value) {
-        {
-            let mut task_states = self
-                .task_state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let task_state = task_states.entry(task_id.to_string()).or_default();
-            task_state.insert(key.to_string(), value);
-            drop(task_states);
-        }
-
-        let generation = self.next_pending_generation();
-        let mut pending = self
-            .pending_task_states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending
-            .entry(task_id.to_string())
-            .or_default()
-            .insert(key.to_string(), generation);
-        drop(pending);
-    }
-
     // ==================== Secrets ====================
 
     /// Get a secret
@@ -1096,25 +1029,6 @@ impl StateManager {
         }
     }
 
-    fn clear_task_pending(&self, snapshot: &HashMap<String, HashMap<String, PendingGeneration>>) {
-        let mut pending = self
-            .pending_task_states
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (task_id, keys) in snapshot {
-            if let Some(current_keys) = pending.get_mut(task_id) {
-                for (key, generation) in keys {
-                    if current_keys.get(key) == Some(generation) {
-                        current_keys.remove(key);
-                    }
-                }
-                if current_keys.is_empty() {
-                    pending.remove(task_id);
-                }
-            }
-        }
-    }
-
     fn clear_secret_pending(&self, snapshot: &HashMap<String, PendingGeneration>) {
         let mut pending = self
             .pending_secrets
@@ -1134,37 +1048,6 @@ impl StateManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for generation in snapshot.keys() {
             pending.remove(generation);
-        }
-    }
-
-    #[allow(clippy::unused_self)]
-    fn read_task_settings_with_backup(
-        &self,
-        file_path: &Path,
-    ) -> Option<serde_json::Map<String, Value>> {
-        match fs::read_to_string(file_path) {
-            Ok(contents) => match serde_json::from_str::<serde_json::Map<String, Value>>(&contents)
-            {
-                Ok(data) => Some(data),
-                Err(e) => {
-                    if let Ok(backup_path) = crate::storage::disk::create_backup(file_path) {
-                        tracing::warn!(
-                            file_path = %file_path.display(),
-                            backup_path = %backup_path.display(),
-                            error = %e,
-                            "Created backup of corrupted task settings JSON"
-                        );
-                    } else {
-                        tracing::warn!(
-                            file_path = %file_path.display(),
-                            error = %e,
-                            "Failed to parse task settings JSON and backup failed"
-                        );
-                    }
-                    None
-                }
-            },
-            Err(_) => None,
         }
     }
 
@@ -1197,20 +1080,6 @@ impl StateManager {
             self.persist_global_state(&global_keys, &history_operations)?;
             self.clear_global_pending(&global_keys);
             self.clear_history_pending(&history_operations);
-        }
-
-        // Persist task states
-        let task_states: HashMap<String, HashMap<String, PendingGeneration>> = {
-            let pending = self
-                .pending_task_states
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.clone()
-        };
-
-        if !task_states.is_empty() {
-            self.persist_task_states(&task_states)?;
-            self.clear_task_pending(&task_states);
         }
 
         // Persist secrets
@@ -1325,50 +1194,6 @@ impl StateManager {
 
         let file_path = settings_dir.join("global_settings.json");
         disk::atomic_write_file(&file_path, &data)?;
-        Ok(())
-    }
-
-    /// Persist task states to disk
-    fn persist_task_states(
-        &self,
-        task_states: &HashMap<String, HashMap<String, PendingGeneration>>,
-    ) -> io::Result<()> {
-        let states = self
-            .task_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-
-        for (task_id, keys) in task_states {
-            if let Some(task_state) = states.get(task_id) {
-                let task_dir = self.state_dir.join("..").join("tasks").join(task_id);
-                fs::create_dir_all(&task_dir)?;
-
-                // Read existing settings for read-merge-write (SM3 fix)
-                let file_path = task_dir.join("settings.json");
-                let mut existing_settings = if file_path.exists()
-                    && let Some(parsed) = self.read_task_settings_with_backup(&file_path)
-                {
-                    parsed
-                } else {
-                    serde_json::Map::new()
-                };
-
-                // Merge pending keys into existing settings
-                for key in keys.keys() {
-                    if let Some(value) = task_state.get(key) {
-                        existing_settings.insert(key.clone(), value.clone());
-                    }
-                }
-
-                if !existing_settings.is_empty() {
-                    let data = serde_json::to_string_pretty(&existing_settings)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    disk::atomic_write_file(&file_path, &data)?;
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -2108,84 +1933,6 @@ mod tests {
                 backup_content, corrupted_content,
                 "Backup should contain original corrupted content"
             );
-        });
-    }
-
-    #[test]
-    fn test_get_task_state_loads_from_disk_after_initialize() {
-        use std::fs;
-
-        with_temp_data_dir(|| {
-            let manager = StateManager::new().unwrap();
-            manager.initialize().unwrap();
-
-            let task_dir = crate::storage::disk::get_tasks_dir().join("task-lazy");
-            fs::create_dir_all(&task_dir).unwrap();
-            fs::write(task_dir.join("settings.json"), r#"{"mode":"act"}"#).unwrap();
-
-            assert_eq!(
-                manager.get_task_state("task-lazy", "mode"),
-                Some(serde_json::Value::String("act".into()))
-            );
-        });
-    }
-
-    #[test]
-    fn test_first_read_creates_backup_on_corrupt_task_settings() {
-        use std::fs;
-
-        with_temp_data_dir(|| {
-            let tasks_dir = crate::storage::disk::get_tasks_dir();
-            let task_dir = tasks_dir.join("task-a");
-            fs::create_dir_all(&task_dir).unwrap();
-
-            let settings_path = task_dir.join("settings.json");
-            let corrupted_content = r#"{"mode":"act""#;
-            fs::write(&settings_path, corrupted_content).unwrap();
-
-            let manager = StateManager::new().unwrap();
-            manager.initialize().unwrap();
-
-            let backup_path = settings_path.with_extension("json.bak");
-            assert!(!backup_path.exists(), "Startup must not scan task settings");
-            assert!(manager.get_task_state("task-a", "mode").is_none());
-            assert!(
-                backup_path.exists(),
-                "Backup file should be created for corrupted task settings"
-            );
-            let backup_content = fs::read_to_string(&backup_path).unwrap();
-            assert_eq!(backup_content, corrupted_content);
-        });
-    }
-
-    #[test]
-    fn test_persist_task_states_creates_backup_on_corrupt_task_settings() {
-        use std::fs;
-
-        with_temp_data_dir(|| {
-            let manager = StateManager::new().unwrap();
-            manager.initialize().unwrap();
-
-            let task_dir = crate::storage::disk::get_tasks_dir().join("task-a");
-            fs::create_dir_all(&task_dir).unwrap();
-            let settings_path = task_dir.join("settings.json");
-            let corrupted_content = r#"{"mode":"act""#;
-            fs::write(&settings_path, corrupted_content).unwrap();
-
-            manager.set_task_state("task-a", "mode", serde_json::Value::String("plan".into()));
-            manager.persist().unwrap();
-
-            let backup_path = settings_path.with_extension("json.bak");
-            assert!(
-                backup_path.exists(),
-                "Backup file should be created before overwriting corrupted task settings"
-            );
-            let backup_content = fs::read_to_string(&backup_path).unwrap();
-            assert_eq!(backup_content, corrupted_content);
-
-            let persisted: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-            assert_eq!(persisted["mode"], serde_json::Value::String("plan".into()));
         });
     }
 
