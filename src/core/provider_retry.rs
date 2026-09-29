@@ -219,7 +219,7 @@ fn retry_delay_for_error(
 }
 
 fn is_retryable_status_code(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 fn exponential_backoff_delay(retry_attempt: usize, retry_config: RetryConfig) -> Duration {
@@ -419,6 +419,15 @@ mod tests {
         );
         let delay = retry_delay_for_error(&error, 0, RetryConfig::default());
         assert!(delay.is_some(), "429 should be retryable");
+    }
+
+    #[test]
+    fn retry_api_error_with_529_overloaded() {
+        let error = ProviderError::ApiError(
+            "MiniMax POST https://api.minimax.io/v1/chat/completions failed: 529 <unknown status code> - {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}".to_string(),
+        );
+        let delay = retry_delay_for_error(&error, 0, RetryConfig::default());
+        assert!(delay.is_some(), "529 should be retryable");
     }
 
     #[test]
