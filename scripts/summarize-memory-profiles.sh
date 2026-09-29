@@ -109,7 +109,7 @@ def format_bytes(b):
 def pattern_evidence(stack, lowered):
     evidence = {}
     for orig, low in zip(stack, lowered):
-        if ("trackeddocument" in low and "clone" in low) or "anchorstorage::load" in low \
+        if ("trackeddocument" in low and "clone" in low) \
                 or ("indexmap" in low and "clone" in low):
             evidence.setdefault("whole-map clone", short_func(orig))
         if ("sned" in low and "persist" in low) or "save_checkpoint" in low \
