@@ -1528,7 +1528,7 @@ impl AgentLoop {
                     // Execute full abort sequence: TaskCancel hook, state save, resource cleanup
                     let cancellation_handler =
                         crate::core::cancellation::CancellationHandler::new(self.state.clone());
-                    if let Err(e) = cancellation_handler
+                    cancellation_handler
                         .abort_task(
                             self.deps
                                 .hook_manager
@@ -1538,19 +1538,7 @@ impl AgentLoop {
                             &self.config.task_id,
                             Some(&self.anchor_mgr),
                         )
-                        .await
-                    {
-                        error!(
-                            "Cancellation handler failed: {}. Attempting fallback cleanup.",
-                            e
-                        );
-                        // Fallback: at least save state to prevent data loss
-                        if let Err(save_e) =
-                            StateManager::persist_async(Arc::clone(&state_manager)).await
-                        {
-                            error!("Fallback state persist failed: {}", save_e);
-                        }
-                    }
+                        .await;
                     // Force-save conversation history to preserve turns that would
                     // otherwise be lost to the debounce window (W4)
                     if let Some(ref storage) = self.deps.task_storage {

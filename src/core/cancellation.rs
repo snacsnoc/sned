@@ -85,7 +85,7 @@ impl CancellationHandler {
         state_manager: Arc<StateManager>,
         task_id: &str,
         anchor_mgr: Option<&crate::core::file_editor::AnchorStateManager>,
-    ) -> Result<(), CancellationError> {
+    ) {
         // 1. Set abort flag
         {
             let mut state = self.state.lock().await;
@@ -192,8 +192,6 @@ impl CancellationHandler {
         }
 
         tracing::info!("Task abort sequence complete");
-
-        Ok(())
     }
 
     /// Checks if the task has been cancelled.
@@ -201,13 +199,6 @@ impl CancellationHandler {
         let state = self.state.lock().await;
         state.is_cancelled
     }
-}
-
-/// Errors during cancellation.
-#[derive(Debug, thiserror::Error)]
-pub enum CancellationError {
-    #[error("State save failed: {0}")]
-    StateError(String),
 }
 
 const FORCE_EXIT_WINDOW: Duration = Duration::from_secs(2);
@@ -390,14 +381,9 @@ mod tests {
 
         assert!(!handler.is_cancelled().await);
 
-        let result = handler
+        handler
             .abort_task(None, Arc::new(state_manager), "test-task", None)
             .await;
-        assert!(
-            result.is_ok(),
-            "abort_task should succeed: {:?}",
-            result.err()
-        );
 
         assert!(handler.is_cancelled().await);
 
@@ -411,14 +397,6 @@ mod tests {
                 None => std::env::remove_var("SNED_DIR"),
             }
         }
-    }
-
-    #[test]
-    fn test_cancellation_error_display() {
-        assert_eq!(
-            format!("{}", CancellationError::StateError("test".to_string())),
-            "State save failed: test"
-        );
     }
 
     #[tokio::test]
@@ -440,14 +418,9 @@ mod tests {
 
         let state_manager = crate::storage::state_manager::StateManager::new().unwrap();
 
-        let result = handler
+        handler
             .abort_task(None, Arc::new(state_manager), "test-task", None)
             .await;
-        assert!(
-            result.is_ok(),
-            "abort_task should succeed: {:?}",
-            result.err()
-        );
 
         assert!(
             handler.is_cancelled().await,
