@@ -403,21 +403,6 @@ mod edit_failure_reason_tests {
     }
 }
 
-impl FileEditorError {
-    /// Return an actionable display string with a suggestion for fixing the error.
-    #[must_use]
-    pub fn actionable_display(&self) -> String {
-        match self {
-            Self::AllEditsFailed { message } => {
-                let suggestion = "Check that the file content matches the anchors. \
-                     Re-read the file to get fresh anchors before editing.";
-                format!("{message}\n  Suggestion: {suggestion}")
-            }
-            _ => self.to_string(),
-        }
-    }
-}
-
 // ============================================================================
 // Constants
 // ============================================================================

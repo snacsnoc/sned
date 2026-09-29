@@ -739,11 +739,6 @@ impl CliOnlyCommand {
         matches!(self, Self::Clear)
     }
 
-    #[must_use]
-    pub fn is_reset_compact(&self) -> bool {
-        matches!(self, Self::ResetCompact)
-    }
-
     /// Returns true if this command can execute locally without the agent.
     #[must_use]
     pub fn is_local_command(&self) -> bool {
@@ -793,22 +788,6 @@ impl CliOnlyCommand {
         )
     }
 
-    /// Returns true if this is a plan command.
-    #[must_use]
-    pub fn is_plan_command(&self) -> bool {
-        matches!(
-            self,
-            Self::Plan(_)
-                | Self::Act
-                | Self::PlanPrompt(_)
-                | Self::PlanApprove
-                | Self::PlanPause
-                | Self::PlanResume
-                | Self::PlanAbort
-                | Self::PlanComplete
-                | Self::PlanFail
-        )
-    }
 }
 
 struct StaticCommandMatch<'a> {

@@ -1075,13 +1075,6 @@ impl ApprovalManager {
         self
     }
 
-    /// Set env auto-approve tool names (from SNED_AUTO_APPROVE env var).
-    #[must_use]
-    pub fn with_env_auto_approve(mut self, tools: HashSet<String>) -> Self {
-        self.env_auto_approve = tools;
-        self
-    }
-
     /// Get the user-safe commands list.
     #[must_use]
     pub fn get_user_safe_commands(&self) -> &Vec<String> {

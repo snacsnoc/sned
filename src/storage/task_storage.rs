@@ -1167,43 +1167,6 @@ impl TaskStorage {
         })
     }
 
-    /// Write conversation history as JSON for hook consumption
-    pub fn write_conversation_history_json<T>(
-        &self,
-        history: &[T],
-        timestamp: Option<i64>,
-    ) -> io::Result<String>
-    where
-        T: Serialize,
-    {
-        self.with_lock(|| {
-            let ts = timestamp.unwrap_or_else(|| {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64
-            });
-            let file_name = format!("conversation_history_{ts}.json");
-            let file_path = self.task_dir.join(&file_name);
-
-            let data = serde_json::to_string(history)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            crate::storage::disk::atomic_write_file(&file_path, &data)?;
-
-            Ok(file_path.to_string_lossy().to_string())
-        })
-    }
-
-    /// Clean up a temporary conversation history file
-    pub fn cleanup_conversation_history_file(&self, file_path: &str) -> io::Result<()> {
-        let path = Path::new(file_path);
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        Ok(())
-    }
-
     /// Acquire an exclusive lock on the task directory.
     ///
     /// Returns a LockGuard that automatically releases the lock when dropped.

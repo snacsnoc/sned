@@ -458,18 +458,6 @@ impl OutputEvent {
         )))
     }
 
-    pub fn error_or_success(text: impl Into<String>, is_error: bool) -> Self {
-        use crate::cli::tui::theme;
-        Self::Line(Line::from(Span::styled(
-            text.into(),
-            Style::default().fg(if is_error {
-                theme::error_fg()
-            } else {
-                theme::prompt_fg()
-            }),
-        )))
-    }
-
     pub fn bold(text: impl Into<String>) -> Self {
         use crate::cli::tui::theme;
         Self::Line(Line::from(Span::styled(text.into(), theme::bold_style())))
