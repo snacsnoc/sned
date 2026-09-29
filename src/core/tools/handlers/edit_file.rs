@@ -661,6 +661,32 @@ impl EditFileHandler {
         Ok(true)
     }
 
+    fn group_files_by_project(
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> HashMap<(PathBuf, ProjectType), Vec<PathBuf>> {
+        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> = HashMap::new();
+        for path in paths {
+            let project_type = DiagnosticsScanHandler::detect_project_type(&path);
+            let project_root = DiagnosticsScanHandler::find_ancestor_with_file(
+                &path,
+                if project_type == ProjectType::Rust {
+                    "Cargo.toml"
+                } else {
+                    "package.json"
+                },
+            )
+            .unwrap_or_else(|| {
+                path.parent()
+                    .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
+            });
+            files_by_project
+                .entry((project_root, project_type))
+                .or_default()
+                .push(path);
+        }
+        files_by_project
+    }
+
     fn apply_top_level_path_fallback(files: &mut [serde_json::Value], fallback_path: Option<&str>) {
         let Some(path) = fallback_path else {
             return;
@@ -2422,30 +2448,11 @@ impl EditFileHandler {
         }
 
         // Phase 3: Capture pre-save diagnostics for all files being edited
-        // Group files by (project_root, project_type) to handle mixed-language projects
-        let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> =
-            HashMap::with_capacity(prepared_batches.len());
-        for (batch, _, _) in &prepared_batches {
-            let path = PathBuf::from(&batch.absolute_path);
-            let project_type = DiagnosticsScanHandler::detect_project_type(&path);
-            let project_root = DiagnosticsScanHandler::find_ancestor_with_file(
-                &path,
-                if project_type == crate::core::tools::handlers::diagnostics_scan::ProjectType::Rust
-                {
-                    "Cargo.toml"
-                } else {
-                    "package.json"
-                },
-            )
-            .unwrap_or_else(|| {
-                path.parent()
-                    .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
-            });
-            files_by_project
-                .entry((project_root, project_type))
-                .or_default()
-                .push(path);
-        }
+        let files_by_project = Self::group_files_by_project(
+            prepared_batches
+                .iter()
+                .map(|(batch, _, _)| PathBuf::from(&batch.absolute_path)),
+        );
 
         // Run diagnostics in parallel across (project_root, project_type) groups
         let batch_diag_outputs =
@@ -2973,31 +2980,11 @@ impl EditFileHandler {
         > = std::collections::HashMap::with_capacity(successfully_edited_files.len());
 
         if any_pre_errors && !successfully_edited_files.is_empty() {
-            // Group successfully edited files by (project_root, project_type)
-            let mut files_by_project: HashMap<(PathBuf, ProjectType), Vec<PathBuf>> =
-                HashMap::with_capacity(successfully_edited_files.len());
-            for (abs_path, _) in &successfully_edited_files {
-                let path = PathBuf::from(abs_path);
-                let project_type = DiagnosticsScanHandler::detect_project_type(&path);
-                let project_root = DiagnosticsScanHandler::find_ancestor_with_file(
-                    &path,
-                    if project_type
-                        == crate::core::tools::handlers::diagnostics_scan::ProjectType::Rust
-                    {
-                        "Cargo.toml"
-                    } else {
-                        "package.json"
-                    },
-                )
-                .unwrap_or_else(|| {
-                    path.parent()
-                        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
-                });
-                files_by_project
-                    .entry((project_root, project_type))
-                    .or_default()
-                    .push(path);
-            }
+            let files_by_project = Self::group_files_by_project(
+                successfully_edited_files
+                    .iter()
+                    .map(|(abs_path, _)| PathBuf::from(abs_path)),
+            );
 
             // Run batch diagnostics once per (project_root, project_type) group
             let batch_diag_outputs =
