@@ -1140,13 +1140,29 @@ async fn native_workflow_oversized_anchor_read_exposes_revision_editing() {
     w.assert_bytes("x\n".repeat(300_000).as_bytes());
 }
 
+/// Address tasks by the id inside each shard so tests do not replicate
+/// filename sanitization.
+fn persisted_shard_task_ids(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir.join("anchor-tasks"))
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| {
+            let bytes = std::fs::read(entry.path()).ok()?;
+            serde_json::from_slice::<Value>(&bytes)
+                .ok()?
+                .get("task_id")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn native_workflow_restart_preserves_occurrence_history() {
     let mut w = Workflow::new(b"same\nsame\ntail\n");
     let a = w.read(None).await;
     let cache = w.dir.path().join("anchors.json");
-    let persisted: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
-    assert!(persisted.get(&w.ctx.task_id).is_some());
+    assert!(persisted_shard_task_ids(w.dir.path()).contains(&w.ctx.task_id));
     w.ctx.anchor_mgr = AnchorStateManager::with_cache_file(cache.clone());
     assert_eq!(w.read(None).await, a);
     w.edit(json!([{"anchor": a[0], "text": "different"}]))
@@ -1167,11 +1183,17 @@ async fn native_workflow_restart_preserves_occurrence_history() {
 async fn native_workflow_reread_republishes_missing_anchor_cache() {
     let w = Workflow::new(b"first\nsecond\n");
     let anchors = w.read(None).await;
-    let cache = w.dir.path().join("anchors.json");
-    std::fs::remove_file(&cache).unwrap();
+    // Drop the shards rather than the legacy path so the reread must still
+    // republish missing durable state.
+    for entry in std::fs::read_dir(w.dir.path().join("anchor-tasks"))
+        .unwrap()
+        .flatten()
+    {
+        std::fs::remove_file(entry.path()).unwrap();
+    }
 
     assert_eq!(w.read(None).await, anchors);
-    assert!(cache.exists());
+    assert!(persisted_shard_task_ids(w.dir.path()).contains(&w.ctx.task_id));
     w.edit(json!([{"anchor": anchors[0], "text": "updated"}]))
         .await
         .expect("a successful reread must restore durable anchor state");
