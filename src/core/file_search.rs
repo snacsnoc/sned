@@ -154,17 +154,6 @@ pub(crate) fn is_excluded_dir(name: &str) -> bool {
     )
 }
 
-#[must_use]
-pub fn check_ripgrep() -> bool {
-    std::process::Command::new("which")
-        .arg("rg")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 fn add_parent_dirs(relative_path: &str, dir_set: &mut std::collections::HashSet<String>) {
     let mut dir = Path::new(relative_path);
     while let Some(parent) = dir.parent() {
