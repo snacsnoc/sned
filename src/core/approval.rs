@@ -68,7 +68,9 @@ const SAFE_BASE_COMMANDS: &[&str] = &[
 
 const SAFE_GIT_SUBCOMMANDS: &[&str] = &["status", "log", "diff", "branch", "show", "remote"];
 
-const DANGEROUS_FIND_FLAGS: &[&str] = &["-delete", "-exec", "-execdir", "-ok", "-okdir"];
+const DANGEROUS_FIND_FLAGS: &[&str] = &[
+    "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf",
+];
 
 /// Commands that are always denied regardless of SNED_SAFE_COMMANDS or user approval.
 /// These cannot be whitelisted via environment variable.
@@ -333,6 +335,15 @@ impl CommandSafetyChecker {
                                 "git flag '{part}' is not allowed"
                             )));
                         }
+                    }
+                }
+                // diff/log/show share diff output machinery; --output (joined
+                // or separate form) redirects rendered output into a file.
+                for part in parts.iter().skip(2) {
+                    if part.to_lowercase().starts_with("--output") {
+                        return Err(CommandUnsafe::new(&format!(
+                            "git flag '{part}' is not allowed"
+                        )));
                     }
                 }
             } else if base_command == "find" {
@@ -2567,6 +2578,33 @@ mod tests {
         // Command substitution (already blocked)
         assert!(checker.is_safe("echo $(whoami)").is_err());
         assert!(checker.is_safe("echo `whoami`").is_err());
+    }
+
+    #[test]
+    fn test_deny_list_blocks_file_writing_output_flags() {
+        let checker = CommandSafetyChecker::new();
+
+        // git diff/log/show --output writes the rendered output to a file
+        assert!(checker.is_safe("git diff --output=/tmp/evil").is_err());
+        assert!(checker.is_safe("git diff --output /tmp/evil").is_err());
+        assert!(
+            checker
+                .is_safe("git diff --stat --output=/tmp/evil")
+                .is_err()
+        );
+        assert!(checker.is_safe("git log --output=/tmp/evil").is_err());
+        assert!(checker.is_safe("git show --output=/tmp/evil").is_err());
+
+        // GNU find file-writing actions
+        assert!(checker.is_safe("find . -fls /tmp/evil").is_err());
+        assert!(checker.is_safe("find . -fprint /tmp/evil").is_err());
+        assert!(checker.is_safe("find . -fprintf /tmp/evil '%p'").is_err());
+
+        // Controls: read-only forms stay allowed, rm stays denied
+        assert!(checker.is_safe("git diff HEAD").is_ok());
+        assert!(checker.is_safe("git log --oneline").is_ok());
+        assert!(checker.is_safe("find . -name '*.rs'").is_ok());
+        assert!(checker.is_safe("rm -rf /").is_err());
     }
 
     #[test]
