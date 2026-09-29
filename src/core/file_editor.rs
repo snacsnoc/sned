@@ -3781,7 +3781,7 @@ mod tests {
         let manager = AnchorStateManager::with_cache_file(cache.clone());
         let lines = split_content_lines("alpha\nbeta\n");
         let first_anchors = manager.reconcile("a.rs", &lines, Some("task-a"));
-        manager.reconcile("b.rs", &lines, Some("task-b"));
+        let _ = manager.reconcile("b.rs", &lines, Some("task-b"));
 
         // Each task's durable state lives in its own shard file, so later
         // reads never reparse unrelated tasks.
