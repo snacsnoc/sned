@@ -530,7 +530,6 @@ struct AnthropicMessage {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct AnthropicMessageDelta {
     stop_reason: Option<String>,
 }

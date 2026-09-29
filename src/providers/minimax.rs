@@ -706,7 +706,6 @@ struct OpenAIStreamPromptTokenDetails {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[allow(dead_code)]
 struct OpenAIStreamUsage {
     #[serde(default)]
     prompt_tokens: u32,
@@ -715,10 +714,6 @@ struct OpenAIStreamUsage {
     prompt_tokens_details: Option<OpenAIStreamPromptTokenDetails>,
     #[serde(rename = "prompt_cache_miss_tokens")]
     prompt_cache_miss_tokens: Option<u32>,
-    #[serde(default)]
-    total_tokens: u32,
-    #[serde(default)]
-    total_characters: u32,
 }
 
 #[derive(Debug, Deserialize)]

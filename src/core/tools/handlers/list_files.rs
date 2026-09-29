@@ -31,9 +31,7 @@ struct FileInfo {
 
 /// Result of listing files in a directory.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct ListFilesResult {
-    path: String,
     files: Vec<FileInfo>,
     hit_limit: bool,
     success: bool,
@@ -64,7 +62,6 @@ impl ListFilesHandler {
         // path sanitization is done by resolve_sanitized_path before handler is called)
         if !path_obj.exists() {
             return ListFilesResult {
-                path: path.to_string(),
                 files: Vec::new(),
                 hit_limit: false,
                 success: false,
@@ -84,7 +81,6 @@ impl ListFilesHandler {
             };
 
             return ListFilesResult {
-                path: path.to_string(),
                 files: vec![FileInfo {
                     path: path.to_string(),
                     is_directory: false,
@@ -114,7 +110,6 @@ impl ListFilesHandler {
             Ok(warning) => warning,
             Err(e) => {
                 return ListFilesResult {
-                    path: path.to_string(),
                     files: Vec::new(),
                     hit_limit: false,
                     success: false,
@@ -127,7 +122,6 @@ impl ListFilesHandler {
         };
 
         ListFilesResult {
-            path: path.to_string(),
             files,
             hit_limit,
             success: true,

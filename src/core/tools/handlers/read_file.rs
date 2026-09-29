@@ -87,7 +87,6 @@ pub(crate) fn record_complete_file_read(state: &mut TaskState, canonical_path: &
 
 /// Result of reading a single file.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct FileReadResult {
     path: String,
     /// Canonicalized absolute path (after tokio::fs::canonicalize).
