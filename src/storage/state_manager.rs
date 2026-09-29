@@ -614,48 +614,9 @@ impl StateManager {
             }
         }
 
-        // Load task states from disk (SM4 fix)
-        let tasks_dir = self.state_dir.join("..").join("tasks");
-        if tasks_dir.exists() {
-            let mut task_states = self
-                .task_state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut pending_task_states = self
-                .pending_task_states
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-            if let Ok(entries) = fs::read_dir(&tasks_dir) {
-                for entry in entries.flatten() {
-                    let task_dir = entry.path();
-                    if task_dir.is_dir()
-                        && let Some(task_id) = task_dir.file_name().and_then(|n| n.to_str())
-                    {
-                        let settings_path = task_dir.join("settings.json");
-                        if settings_path.exists()
-                            && let Some(parsed) =
-                                self.read_task_settings_with_backup(&settings_path)
-                        {
-                            // Convert Map to HashMap to match task_state type
-                            let task_state_map: HashMap<String, serde_json::Value> =
-                                parsed.into_iter().collect();
-                            task_states.insert(task_id.to_string(), task_state_map);
-                            // Mark all loaded keys as pending to ensure they're persisted
-                            let pending_keys =
-                                pending_task_states.entry(task_id.to_string()).or_default();
-                            for key in task_states.get(task_id).into_iter().flat_map(HashMap::keys)
-                            {
-                                pending_keys.insert(key.clone(), self.next_pending_generation());
-                            }
-                        }
-                    }
-                }
-            }
-            drop(task_states);
-            drop(pending_task_states);
-        }
-
+        // Task states load on first read instead of here: the tasks
+        // directory accumulates one subdirectory per session, so an eager
+        // scan makes every cold start linear in total history.
         Ok(())
     }
 
@@ -957,11 +918,31 @@ impl StateManager {
 
     /// Get task state for a specific task
     pub fn get_task_state(&self, task_id: &str, key: &str) -> Option<serde_json::Value> {
-        self.task_state
+        if let Some(value) = self
+            .task_state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(task_id)
             .and_then(|state| state.get(key).cloned())
+        {
+            return Some(value);
+        }
+
+        let parsed = self.read_task_settings_with_backup(
+            &self
+                .state_dir
+                .join("..")
+                .join("tasks")
+                .join(task_id)
+                .join("settings.json"),
+        )?;
+        let task_state_map: HashMap<String, serde_json::Value> = parsed.into_iter().collect();
+        let value = task_state_map.get(key).cloned();
+        self.task_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(task_id.to_string(), task_state_map);
+        value
     }
 
     /// Set task state for a specific task
@@ -2131,7 +2112,26 @@ mod tests {
     }
 
     #[test]
-    fn test_initialize_creates_backup_on_corrupt_task_settings() {
+    fn test_get_task_state_loads_from_disk_after_initialize() {
+        use std::fs;
+
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+
+            let task_dir = crate::storage::disk::get_tasks_dir().join("task-lazy");
+            fs::create_dir_all(&task_dir).unwrap();
+            fs::write(task_dir.join("settings.json"), r#"{"mode":"act"}"#).unwrap();
+
+            assert_eq!(
+                manager.get_task_state("task-lazy", "mode"),
+                Some(serde_json::Value::String("act".into()))
+            );
+        });
+    }
+
+    #[test]
+    fn test_first_read_creates_backup_on_corrupt_task_settings() {
         use std::fs;
 
         with_temp_data_dir(|| {
@@ -2147,13 +2147,14 @@ mod tests {
             manager.initialize().unwrap();
 
             let backup_path = settings_path.with_extension("json.bak");
+            assert!(!backup_path.exists(), "Startup must not scan task settings");
+            assert!(manager.get_task_state("task-a", "mode").is_none());
             assert!(
                 backup_path.exists(),
                 "Backup file should be created for corrupted task settings"
             );
             let backup_content = fs::read_to_string(&backup_path).unwrap();
             assert_eq!(backup_content, corrupted_content);
-            assert!(manager.get_task_state("task-a", "mode").is_none());
         });
     }
 
