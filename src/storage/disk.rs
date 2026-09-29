@@ -90,6 +90,8 @@ pub async fn wait_for_atomic_writes(timeout: Duration) -> bool {
 pub fn get_sned_dir() -> PathBuf {
     if let Ok(dir) = env::var("SNED_DIR") {
         PathBuf::from(dir)
+    } else if cfg!(test) {
+        env::temp_dir().join(format!("sned-test-{}", std::process::id()))
     } else {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -420,6 +422,19 @@ impl GlobalFileNames {
 mod tests {
     use super::*;
     use tokio::time::Duration;
+
+    #[test]
+    fn unit_tests_resolve_sned_dir_to_temp_by_default() {
+        if env::var_os("SNED_DIR").is_some() {
+            return;
+        }
+        let dir = get_sned_dir();
+        assert!(
+            dir.starts_with(env::temp_dir()),
+            "unit tests must not resolve to the real ~/.sned: got {}",
+            dir.display()
+        );
+    }
 
     #[tokio::test]
     async fn test_wait_for_atomic_writes_returns_when_idle() {
