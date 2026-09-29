@@ -386,14 +386,6 @@ impl PartialEq for VisualLayoutIndex {
 
 impl Eq for VisualLayoutIndex {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayoutEvictionError {
-    DirtyIndex,
-    WrongWidth,
-    InvalidOffsets,
-    UnexpectedStructure,
-}
-
 impl VisualLayoutIndex {
     fn active_len(&self) -> usize {
         self.entries.len().saturating_sub(self.front_entry)
@@ -464,18 +456,18 @@ impl VisualLayoutIndex {
         wrap_width: usize,
         output_len: usize,
         has_separator_after_front: bool,
-    ) -> Result<usize, LayoutEvictionError> {
+    ) -> Option<usize> {
         if self.dirty {
-            return Err(LayoutEvictionError::DirtyIndex);
+            return None;
         }
         if self.wrap_width != Some(wrap_width) {
-            return Err(LayoutEvictionError::WrongWidth);
+            return None;
         }
         if self.entries.len() != self.row_index.values.len()
             || self.output_entry_positions.len() != output_len
             || output_len == 0
         {
-            return Err(LayoutEvictionError::InvalidOffsets);
+            return None;
         }
         let first = self.front_entry;
         let first_entry = self.entries.get(first);
@@ -484,7 +476,7 @@ impl VisualLayoutIndex {
             || first_entry.map(|entry| entry.source)
                 != Some(LayoutSource::Output(self.base_output_index))
         {
-            return Err(LayoutEvictionError::UnexpectedStructure);
+            return None;
         }
 
         let separator_present =
@@ -498,7 +490,7 @@ impl VisualLayoutIndex {
                 && self.entries.get(first + 1).map(|entry| entry.source)
                     != Some(LayoutSource::Output(self.base_output_index + 1)))
         {
-            return Err(LayoutEvictionError::UnexpectedStructure);
+            return None;
         }
 
         let remove_count = 1 + usize::from(separator_present);
@@ -511,7 +503,7 @@ impl VisualLayoutIndex {
         self.base_output_index = self.base_output_index.saturating_add(1);
         self.front_entry = self.front_entry.saturating_add(remove_count);
         self.compact_if_needed();
-        Ok(removed_rows)
+        Some(removed_rows)
     }
 
     fn replace_output_rows(
@@ -519,25 +511,23 @@ impl VisualLayoutIndex {
         wrap_width: usize,
         output_index: usize,
         rows: usize,
-    ) -> Result<(), LayoutEvictionError> {
+    ) -> Option<()> {
         if !self.is_valid_for(wrap_width)
             || rows == 0
             || self.entries.len() != self.row_index.values.len()
         {
-            return Err(LayoutEvictionError::InvalidOffsets);
+            return None;
         }
-        let Some(&entry_index) = self.output_entry_positions.get(output_index) else {
-            return Err(LayoutEvictionError::UnexpectedStructure);
-        };
+        let &entry_index = self.output_entry_positions.get(output_index)?;
         if !matches!(
             self.entries.get(entry_index).map(|entry| entry.source),
             Some(LayoutSource::Output(_))
         ) {
-            return Err(LayoutEvictionError::UnexpectedStructure);
+            return None;
         }
         self.entries[entry_index].rows = rows;
         self.row_index.set(entry_index, rows);
-        Ok(())
+        Some(())
     }
 
     fn entry_start(&self, index: usize) -> usize {
@@ -619,11 +609,6 @@ struct PendingApproval {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectionPane {
-    Transcript,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SelectionPoint {
     output_line_index: usize,
     row_in_line: usize,
@@ -638,7 +623,6 @@ struct SelectionRowSource {
 
 #[derive(Debug, Clone)]
 struct TextSelection {
-    pane: SelectionPane,
     anchor: SelectionPoint,
     focus: SelectionPoint,
     click_target: Option<PathBuf>,
@@ -656,7 +640,6 @@ struct VisibleCell {
 
 #[derive(Debug, Clone)]
 struct SelectionSurface {
-    pane: SelectionPane,
     content_area: Rect,
     rows: Vec<Vec<VisibleCell>>,
     row_sources: Vec<Option<SelectionRowSource>>,
@@ -1710,15 +1693,16 @@ impl App {
                 Self::output_row_visual_rows(self.output_lines.front(), evicted_kind, wrap_width)
                     .saturating_add(usize::from(has_separator_after_front))
             };
-            let incremental_eviction_result = self.error_lines.is_empty().then(|| {
+            let incremental_eviction = self.error_lines.is_empty().then(|| {
                 self.visual_layout_index.evict_front_output(
                     wrap_width,
                     10_000,
                     has_separator_after_front,
                 )
             });
-            let incremental_eviction = incremental_eviction_result.and_then(Result::ok);
-            let evicted_rows = incremental_eviction.unwrap_or_else(fallback_evicted_rows);
+            let evicted_rows = incremental_eviction
+                .flatten()
+                .unwrap_or_else(fallback_evicted_rows);
             // Evict front line and buffer it for batched scrollback append.
             if let Some(line) = self.output_lines.front() {
                 let text = Self::line_to_string(line);
@@ -1751,16 +1735,10 @@ impl App {
                 }
             });
             if self.text_selection.as_ref().is_some_and(|selection| {
-                selection.pane == SelectionPane::Transcript
-                    && (selection.anchor.output_line_index == 0
-                        || selection.focus.output_line_index == 0)
+                selection.anchor.output_line_index == 0 || selection.focus.output_line_index == 0
             }) {
                 self.clear_text_selection();
-            } else if let Some(selection) = self
-                .text_selection
-                .as_mut()
-                .filter(|selection| selection.pane == SelectionPane::Transcript)
-            {
+            } else if let Some(selection) = self.text_selection.as_mut() {
                 selection.anchor.output_line_index -= 1;
                 selection.focus.output_line_index -= 1;
             }
@@ -1890,7 +1868,7 @@ impl App {
                     let layout_updated = self
                         .visual_layout_index
                         .replace_output_rows(wrap_width, index, replacement_rows)
-                        .is_ok();
+                        .is_some();
                     self.output_lines[index] = line;
                     self.needs_redraw = true;
                     self.cached_visible_window = None;
@@ -2784,7 +2762,6 @@ impl App {
         };
         let click_target = Self::surface_hyperlink_at(surface, row_index, column_index);
         self.text_selection = Some(TextSelection {
-            pane: surface.pane,
             anchor: point,
             focus: point,
             click_target,
@@ -2799,10 +2776,10 @@ impl App {
     /// Update the active selection. The caller can skip a redraw when this
     /// returns false, but the focus still tracks every drag event.
     pub(crate) fn extend_text_selection(&mut self, column: u16, row: u16, now: Instant) -> bool {
-        let Some(selection) = self.text_selection.as_ref() else {
+        if self.text_selection.is_none() {
             return false;
-        };
-        let Some(surface) = self.selection_surface(selection.pane) else {
+        }
+        let Some(surface) = self.selection_surface() else {
             self.text_selection = None;
             return false;
         };
@@ -2831,8 +2808,8 @@ impl App {
     /// frame. The event loop cannot access a Frame, so this intentionally
     /// copies exactly the content the user saw before releasing the mouse.
     pub(crate) fn finish_text_selection(&mut self, column: u16, row: u16) -> Option<String> {
-        let selection = self.text_selection.as_ref()?;
-        let Some(surface) = self.selection_surface(selection.pane) else {
+        self.text_selection.as_ref()?;
+        let Some(surface) = self.selection_surface() else {
             self.text_selection = None;
             return None;
         };
@@ -2872,7 +2849,7 @@ impl App {
         if selection.moved {
             return None;
         }
-        let surface = self.selection_surface(selection.pane)?;
+        let surface = self.selection_surface()?;
         let (row_index, column_index) = Self::normalize_surface_point(surface, column, row)?;
         Self::surface_hyperlink_at(surface, row_index, column_index)
             .filter(|target| selection.click_target.as_ref() == Some(target))
@@ -2884,10 +2861,8 @@ impl App {
             .find(|surface| Self::selection_area_contains(surface.content_area, column, row))
     }
 
-    fn selection_surface(&self, pane: SelectionPane) -> Option<&SelectionSurface> {
-        self.selection_surfaces
-            .iter()
-            .find(|surface| surface.pane == pane)
+    fn selection_surface(&self) -> Option<&SelectionSurface> {
+        self.selection_surfaces.first()
     }
 
     fn selection_area_contains(area: Rect, column: u16, row: u16) -> bool {
@@ -2953,7 +2928,7 @@ impl App {
         row: usize,
     ) -> Option<(usize, usize)> {
         let selection = self.text_selection.as_ref()?;
-        if selection.pane != surface.pane || row >= surface.rows.len() {
+        if row >= surface.rows.len() {
             return None;
         }
         let (start, end) = if (
@@ -3002,8 +2977,8 @@ impl App {
     }
 
     fn selected_text(&self) -> Option<String> {
-        let selection = self.text_selection.as_ref()?;
-        let surface = self.selection_surface(selection.pane)?;
+        self.text_selection.as_ref()?;
+        let surface = self.selection_surface()?;
         let mut rows = Vec::new();
         for row in 0..surface.rows.len() {
             let Some((start, end)) = self.selection_columns_for_row(surface, row) else {
@@ -3027,7 +3002,6 @@ impl App {
             .map(|area| {
                 self.snapshot_selection_surface(
                     buffer,
-                    SelectionPane::Transcript,
                     area,
                     self.transcript_selection_row_sources.as_slice(),
                 )
@@ -3035,7 +3009,7 @@ impl App {
             .into_iter()
             .collect();
         if self.text_selection.as_ref().is_some_and(|selection| {
-            let Some(surface) = self.selection_surface(selection.pane) else {
+            let Some(surface) = self.selection_surface() else {
                 return true;
             };
             !Self::surface_contains_selection_point(surface, selection.anchor)
@@ -3048,7 +3022,6 @@ impl App {
     fn snapshot_selection_surface(
         &self,
         buffer: &Buffer,
-        pane: SelectionPane,
         content_area: Rect,
         row_sources: &[Option<SelectionRowSource>],
     ) -> SelectionSurface {
@@ -3079,7 +3052,6 @@ impl App {
             rows.push(cells);
         }
         SelectionSurface {
-            pane,
             content_area,
             rows,
             row_sources: row_sources.to_vec(),
@@ -3117,10 +3089,10 @@ impl App {
     }
 
     fn apply_text_selection_overlay(&self, buffer: &mut Buffer) {
-        let Some(selection) = self.text_selection.as_ref() else {
+        if self.text_selection.is_none() {
             return;
-        };
-        let Some(surface) = self.selection_surface(selection.pane) else {
+        }
+        let Some(surface) = self.selection_surface() else {
             return;
         };
         for row in 0..surface.rows.len() {
@@ -5623,9 +5595,9 @@ mod tests {
             .expect("selection frame should render");
     }
 
-    fn selection_text_position(app: &App, pane: SelectionPane, text: &str) -> (u16, u16) {
+    fn selection_text_position(app: &App, text: &str) -> (u16, u16) {
         let surface = app
-            .selection_surface(pane)
+            .selection_surface()
             .expect("render should create a selection surface");
         for (row_index, row) in surface.rows.iter().enumerate() {
             for (column_index, cell) in row.iter().enumerate() {
@@ -5645,7 +5617,7 @@ mod tests {
         let mut app = App::new();
         app.push_plain("alpha beta");
         render_for_selection(&mut app);
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let (column, row) = selection_text_position(&app, "a");
         let now = Instant::now();
 
         assert!(app.begin_text_selection(column, row, now));
@@ -5668,7 +5640,7 @@ mod tests {
             .draw(|frame| app.render(frame))
             .expect("hyperlink frame should render");
 
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "x");
+        let (column, row) = selection_text_position(&app, "x");
         assert!(app.begin_text_selection(column, row, Instant::now()));
         assert_eq!(
             app.text_selection_click_target(column, row),
@@ -5697,7 +5669,7 @@ mod tests {
         ));
         render_for_selection(&mut app);
 
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "/");
+        let (column, row) = selection_text_position(&app, "/");
         assert!(app.begin_text_selection(column, row, Instant::now()));
         assert_eq!(
             app.text_selection_click_target(column + 1, row),
@@ -5713,7 +5685,7 @@ mod tests {
         ));
         render_for_selection(&mut app);
 
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "p");
+        let (column, row) = selection_text_position(&app, "p");
         assert!(app.begin_text_selection(column, row, Instant::now()));
 
         app.clear_output().expect("output should clear");
@@ -5738,7 +5710,7 @@ mod tests {
             .draw(|frame| app.render(frame))
             .expect("wrapped hyperlink frame should render");
 
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "Z");
+        let (column, row) = selection_text_position(&app, "Z");
         assert!(app.begin_text_selection(column, row, Instant::now()));
         assert_eq!(
             app.text_selection_click_target(column, row),
@@ -5777,7 +5749,7 @@ mod tests {
         render_for_selection(&mut app);
 
         for (symbol, target) in [("A", "/tmp/alpha-A"), ("B", "/tmp/bravo-B")] {
-            let (column, row) = selection_text_position(&app, SelectionPane::Transcript, symbol);
+            let (column, row) = selection_text_position(&app, symbol);
             assert!(app.begin_text_selection(column, row, Instant::now()));
             assert_eq!(
                 app.text_selection_click_target(column, row),
@@ -5792,7 +5764,7 @@ mod tests {
         let mut app = App::new();
         app.push_plain("alpha beta");
         render_for_selection(&mut app);
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let (column, row) = selection_text_position(&app, "a");
         let now = Instant::now();
 
         assert!(app.begin_text_selection(column, row, now));
@@ -5822,7 +5794,7 @@ mod tests {
         );
         assert!(app.set_pending_approval(request));
         render_for_selection(&mut app);
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let (column, row) = selection_text_position(&app, "a");
         let now = Instant::now();
 
         assert!(app.begin_text_selection(column, row, now));
@@ -5841,7 +5813,7 @@ mod tests {
             "Inspect the current behavior".to_string(),
         ]));
         render_for_selection(&mut app);
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let (column, row) = selection_text_position(&app, "a");
         let now = Instant::now();
 
         assert!(app.begin_text_selection(column, row, now));
@@ -5858,7 +5830,7 @@ mod tests {
         app.push_plain("transcript");
         app.push_completion_line(Line::from("done now"));
         render_for_selection(&mut app);
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "d");
+        let (column, row) = selection_text_position(&app, "d");
         let now = Instant::now();
 
         assert!(app.begin_text_selection(column, row, now));
@@ -5874,9 +5846,9 @@ mod tests {
         let mut app = App::new();
         app.push_plain("A界B");
         render_for_selection(&mut app);
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "界");
+        let (column, row) = selection_text_position(&app, "界");
         let selection_column = column.saturating_sub(
-            app.selection_surface(SelectionPane::Transcript)
+            app.selection_surface()
                 .expect("render should create a transcript selection surface")
                 .content_area
                 .x,
@@ -5907,7 +5879,7 @@ mod tests {
             .draw(|frame| app.render(frame))
             .expect("initial selection frame should render");
 
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "T");
+        let (column, row) = selection_text_position(&app, "T");
         let now = Instant::now();
         assert!(app.begin_text_selection(column, row, now));
         assert!(app.extend_text_selection(column + 5, row, now + Duration::from_millis(16)));
@@ -5918,7 +5890,7 @@ mod tests {
             .expect("streamed selection frame should render");
 
         let (updated_column, updated_row) =
-            selection_text_position(&app, SelectionPane::Transcript, "T");
+            selection_text_position(&app, "T");
         assert_ne!(updated_row, row);
         assert!(
             terminal
@@ -5941,7 +5913,7 @@ mod tests {
         let mut app = App::new();
         app.push_plain("alpha beta");
         render_for_selection(&mut app);
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let (column, row) = selection_text_position(&app, "a");
         let now = Instant::now();
 
         assert!(app.begin_text_selection(column, row, now));
@@ -5957,7 +5929,7 @@ mod tests {
         let mut app = App::new();
         app.push_plain("alpha beta");
         render_for_selection(&mut app);
-        let (column, row) = selection_text_position(&app, SelectionPane::Transcript, "a");
+        let (column, row) = selection_text_position(&app, "a");
         let now = Instant::now();
 
         assert!(app.begin_text_selection(column, row, now));
@@ -9096,6 +9068,7 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
     /// Test that the overflow count surfaced in the status bar
     /// matches the actual number of dropped events. The TUI main
     /// loop sets `app.output_overflow_count = output_writer.dropped_count()`
@@ -9206,7 +9179,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------
     // Regression tests for intentional design decisions (bug audit 2025-06)
     // ---------------------------------------------------------------------------
 
@@ -9598,10 +9570,7 @@ mod tests {
         };
         let before = index.clone();
 
-        assert_eq!(
-            index.evict_front_output(80, 2, true),
-            Err(LayoutEvictionError::InvalidOffsets)
-        );
+        assert_eq!(index.evict_front_output(80, 2, true), None);
         assert_eq!(index, before);
     }
 
