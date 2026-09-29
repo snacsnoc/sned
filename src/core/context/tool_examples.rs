@@ -19,7 +19,6 @@ EXAMPLE TOOL CALLS
 - complex run-only logic: tool=execute_command args={\"script\": \"...\", \"language\": \"python\"}
 - dependent shell statements: tool=execute_command args={\"commands\": [\"value='ready'\\nprintf '%s\\\\n' \\\"$value\\\"\"]} (each commands[] entry starts a fresh shell; keep assignment and use in one entry)
 - quoted multiline shell text: tool=execute_command args={\"commands\": [\"cat <<'EOF'\\nquoted \\\"value\\\"\\nEOF\"]} (preserve the `\\n` escapes and quoted heredoc delimiter)
-- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; snapshot anchors are inspection-only.
 - Delete a range: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"anchor\": \"First§// obsolete\", \"end_anchor\": \"Last§old_call();\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read; each selector is one line, never a pasted block).
 - edit_file uses text for replacement source without anchor prefixes; ordinary range deletion does not need the optional content field.
 - Use file tools for workspace changes. Use execute_command for inspection, builds, tests, and other execution; do not replace a file edit with shell redirection, a heredoc, or an ad-hoc Python/sed rewrite.
@@ -40,7 +39,6 @@ EXAMPLE TOOL CALLS
 - edit block (preferred): tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"old_text\": \"use std::io;\\n\\nfn main() {\", \"new_text\": \"use std::io;\\nuse std::fs;\\n\\nfn main() {\"}]}]} (each files[] item contains path and edits; copy 2-4 lines of source exactly; omit the NNN: line numbers and anchor prefixes; old_text must match exactly one block in the file)
 - edit anchored (fallback for single-line targeting): tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (anchor/edit_type/text belong inside edits[], never alongside path; copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
-- Batch independent edits from the same snapshot in one edit_file call. Unchanged tracked occurrences retain their anchors across edits. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; snapshot anchors are inspection-only.
 - Delete a range: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"anchor\": \"First§// obsolete\", \"end_anchor\": \"Last§old_call();\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read; each selector is one line, never a pasted block).
 - edit_file uses text for replacement source without anchor prefixes; ordinary range deletion does not need the optional content field.
 - retry after a stale or unknown edit anchor: call read_file again before retrying. Correct validation-only failures without rereading.
@@ -98,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn test_edit_examples_use_current_state_and_same_snapshot_batches() {
+    fn test_edit_examples_use_current_state_anchors() {
         for profile in [
             ToolProfile::CoreEdit,
             ToolProfile::Symbol,
@@ -108,9 +106,6 @@ mod tests {
             let examples = tool_examples_for_model(None, Some(profile)).unwrap();
             assert!(examples.contains("current tracked state"));
             assert!(examples.contains("anchor/edit_type/text belong inside edits[]"));
-            assert!(examples.contains("same snapshot in one edit_file call"));
-            assert!(examples.contains("ranged read's complete sha256 revision"));
-            assert!(examples.contains("snapshot anchors are inspection-only"));
             assert!(!examples.contains("Word§"));
             assert!(!examples.contains("immediately preceding"));
         }

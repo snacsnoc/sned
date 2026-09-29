@@ -159,10 +159,7 @@ impl PromptBuilder {
 
         if self.context.enable_parallel_tool_calling {
             prompt.push_str(
-                "- Prefer batching independent work in one response unless the task requires sequential execution.\n",
-            );
-            prompt.push_str(
-                "- Prefer batching independent tool calls unless the task requires sequential execution; edits within one file can share one edit_file call with edits based on the same snapshot.\n",
+                "- Prefer batching independent work in one response unless the task requires sequential execution; edits within one file can share one edit_file call with edits based on the same snapshot.\n",
             );
         }
         if !self.context.enable_parallel_tool_calling {
@@ -591,6 +588,26 @@ mod tests {
 
         // Should not have custom instructions section when no rules/instructions exist
         assert!(!prompt.contains("USER'S CUSTOM INSTRUCTIONS"));
+    }
+
+    #[test]
+    fn test_validate_profile_prompt_stays_compact() {
+        let context = SystemPromptContext {
+            enable_parallel_tool_calling: true,
+            tool_profile: Some(ToolProfile::Validate),
+            model_id: Some("qwen3.5-35b-a3b".to_string()),
+            ..Default::default()
+        };
+        let prompt = PromptBuilder::new(context).build();
+        eprintln!("validate prompt bytes: {}", prompt.len());
+        assert!(prompt.contains("same snapshot in one `edit_file` call"));
+        assert!(prompt.contains("ranged read's complete sha256 revision"));
+        assert!(prompt.contains("snapshot anchors are inspection-only"));
+        assert!(
+            prompt.len() < 8850,
+            "validate prompt is {} bytes, budget 8850",
+            prompt.len()
+        );
     }
 
     #[test]

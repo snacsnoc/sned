@@ -305,7 +305,7 @@ pub fn edit_file_schema() -> ToolSchema {
 pub fn execute_command_schema() -> ToolSchema {
     ToolSchema {
         name: "execute_command",
-        description: "Executes CLI commands or scripts. Use commands as a literal JSON array of strings for simple sequences, not a string containing an array. Each commands[] entry runs in a fresh shell, so variables, cd, and other shell state do not persist between entries or tool calls; keep dependent statements in one multiline entry or use script. Use script for complex run-only logic. Use file tools for workspace changes rather than shell redirection, heredocs, or ad-hoc Python/sed rewrites. Provide exactly one of {commands, script}.",
+        description: "Executes CLI commands or scripts. Use commands as a literal JSON array of strings for simple sequences, not a string containing an array. Use script for complex run-only logic. Use file tools for workspace changes rather than shell redirection, heredocs, or ad-hoc Python/sed rewrites. Provide exactly one of {commands, script}.",
         parameters: vec![
             ToolParameter {
                 name: "commands",
@@ -1471,8 +1471,8 @@ mod tests {
             core_bytes
         );
         assert!(
-            validate_bytes < 10000,
-            "Validate should be under 10000 bytes: got {}",
+            validate_bytes < 9350,
+            "Validate should be under 9350 bytes: got {}",
             validate_bytes
         );
         assert!(
