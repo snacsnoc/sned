@@ -101,10 +101,9 @@ pub fn identical_content_indices(lines: &[String]) -> Vec<Vec<usize>> {
         .collect()
 }
 
-/// Formats a clean anchor plus source line. Duplicate-location arguments are
-/// retained for existing callers; occurrence identity is carried by the prefix.
+/// Formats a clean anchor plus source line.
 #[must_use]
-pub fn format_line_with_hash(content: &str, anchor: &str, _identical_at: &[usize]) -> String {
+pub fn format_line_with_hash(content: &str, anchor: &str) -> String {
     format!("{anchor}{ANCHOR_DELIMITER}{content}")
 }
 
@@ -129,17 +128,6 @@ pub fn strip_line_number_gutter(line: &str) -> &str {
     LINE_NUMBER_GUTTER_REGEX
         .find(line)
         .map_or(line, |m| &line[m.end()..])
-}
-
-/// Compatibility wrapper; line offsets do not affect occurrence prefixes.
-#[must_use]
-pub fn format_line_with_hash_with_offset(
-    content: &str,
-    anchor: &str,
-    identical_at: &[usize],
-    _line_number_offset: usize,
-) -> String {
-    format_line_with_hash(content, anchor, identical_at)
 }
 
 /// Splits a raw anchor string into anchor word and content.
@@ -338,17 +326,8 @@ mod tests {
 
     #[test]
     fn test_format_line_with_hash() {
-        assert_eq!(
-            format_line_with_hash("content", "Apple", &[]),
-            "Apple§content"
-        );
-        assert_eq!(format_line_with_hash("dup", "Apple", &[3, 7]), "Apple§dup");
-        let nine: Vec<usize> = (2..=10).collect();
-        assert_eq!(format_line_with_hash("dup", "Apple", &nine), "Apple§dup");
-        assert_eq!(
-            format_line_with_hash_with_offset("dup", "Apple", &[1, 4], 10),
-            "Apple§dup"
-        );
+        assert_eq!(format_line_with_hash("content", "Apple"), "Apple§content");
+        assert_eq!(format_line_with_hash("dup", "Apple"), "Apple§dup");
     }
 
     #[test]
@@ -393,8 +372,8 @@ mod tests {
 
     #[test]
     fn test_blank_duplicate_lines_are_not_annotated() {
-        assert_eq!(format_line_with_hash("", "Blank", &[2, 4]), "Blank§");
-        assert_eq!(format_line_with_hash("  ", "Blank", &[2, 4]), "Blank§  ");
+        assert_eq!(format_line_with_hash("", "Blank"), "Blank§");
+        assert_eq!(format_line_with_hash("  ", "Blank"), "Blank§  ");
     }
 
     #[test]
