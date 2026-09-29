@@ -533,7 +533,13 @@ fn exact_qwen_model_profile(model_id: &str) -> Option<QwenModelProfile> {
             supports_images: Some(true),
             supports_reasoning: Some(true),
         },
-        "qwen3.7-max" | "qwen3.6-flash" => QwenModelProfile {
+        "qwen3.7-max" => QwenModelProfile {
+            context_window: Some(1_000_000),
+            max_tokens: Some(65_536),
+            supports_images: Some(false),
+            supports_reasoning: Some(true),
+        },
+        "qwen3.6-flash" => QwenModelProfile {
             context_window: Some(1_000_000),
             max_tokens: Some(32_768),
             supports_images: Some(false),
@@ -1548,7 +1554,7 @@ mod tests {
             ("qwen3.6-plus", 1_000_000, 65_536, true, true),
             ("qwen3.7-plus", 1_000_000, 65_536, true, true),
             ("qwen3.6-flash", 1_000_000, 32_768, false, true),
-            ("qwen3.7-max", 1_000_000, 32_768, false, true),
+            ("qwen3.7-max", 1_000_000, 65_536, false, true),
             ("qwen3-coder-plus", 1_000_000, 32_768, false, false),
             ("qwen3-coder-next", 262_144, 32_768, false, false),
             ("qwen3-max-2026-01-23", 262_144, 32_768, false, true),
