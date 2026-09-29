@@ -11,10 +11,6 @@ pub enum CliError {
     /// Configuration error (missing API key, invalid config)
     #[error("{0}")]
     Config(String),
-
-    /// Wrapped anyhow error (defaults to EXIT_ERROR)
-    #[error("{0}")]
-    Anyhow(#[from] anyhow::Error),
 }
 
 impl CliError {
@@ -23,7 +19,6 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Config(_) => crate::exit_codes::EXIT_CONFIG,
-            Self::Anyhow(_) => crate::exit_codes::EXIT_ERROR,
         }
     }
 
