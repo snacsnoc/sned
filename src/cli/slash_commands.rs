@@ -34,6 +34,7 @@ enum SlashCommandId {
     Model,
     Act,
     Plan,
+    PlanStatus,
     PlanApprove,
     PlanPause,
     PlanResume,
@@ -381,6 +382,17 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         category: SlashCommandCategory::Plan,
         requires_args: false,
         requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::PlanStatus,
+        name: "plan status",
+        aliases: &[],
+        description: "Show the current plan and its step states",
+        usage: "/plan status",
+        detail: "Prints the active plan's status summary and step list. Equivalent to `/plan` with no arguments.",
+        category: SlashCommandCategory::Plan,
+        requires_args: false,
+        requirement: CommandRequirement::PlanExists,
     },
     SlashCommandSpec {
         id: SlashCommandId::PlanApprove,
@@ -881,6 +893,7 @@ fn cli_command_from_match(matched: &StaticCommandMatch<'_>) -> Option<CliOnlyCom
         SlashCommandId::Model => Some(CliOnlyCommand::ModelSwitch(args.to_string())),
         SlashCommandId::Act => Some(CliOnlyCommand::Act),
         SlashCommandId::Plan => CliOnlyCommand::parse_plan_with_args(args),
+        SlashCommandId::PlanStatus => CliOnlyCommand::parse_plan_with_args("status"),
         SlashCommandId::PlanApprove => Some(CliOnlyCommand::PlanApprove),
         SlashCommandId::PlanPause => Some(CliOnlyCommand::PlanPause),
         SlashCommandId::PlanResume => Some(CliOnlyCommand::PlanResume),
@@ -2440,6 +2453,20 @@ mod tests {
         let result = get_cli_only_command("/plan abort");
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), CliOnlyCommand::PlanAbort));
+    }
+
+    #[test]
+    fn test_parse_cli_only_plan_status() {
+        assert!(matches!(
+            get_cli_only_command("/plan status"),
+            Some(CliOnlyCommand::Plan(PlanSubcommand::Status))
+        ));
+
+        // Bare `/plan` with no task description is the same view.
+        assert!(matches!(
+            get_cli_only_command("/plan"),
+            Some(CliOnlyCommand::Plan(PlanSubcommand::Status))
+        ));
     }
 
     #[test]

@@ -476,6 +476,7 @@ pub struct ConfigOptions {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum ConfigAction {
+    /// Set a config key to a value
     Set {
         #[arg(value_name = "key=value")]
         assignment: String,
