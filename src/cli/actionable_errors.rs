@@ -192,7 +192,8 @@ pub fn unsupported_language(language: &str) -> ActionableError {
     ActionableError::with_suggestion(
         format!("Unsupported language: {language}"),
         "Supported languages: python, python3, node, javascript, bash, sh, zsh. \
-         For other languages, use execute_command with the appropriate interpreter.",
+         To run a different interpreter, pass the invocation through the `commands` \
+         parameter instead of `script`.",
     )
 }
 
@@ -264,6 +265,17 @@ mod tests {
         let err = command_exit_code("grep pattern file.txt", Some(2));
         assert!(err.suggestion.as_ref().unwrap().contains("usage errors"));
         assert!(err.suggestion.as_ref().unwrap().contains("command syntax"));
+    }
+
+    #[test]
+    fn test_unsupported_language_points_at_commands_parameter() {
+        let err = unsupported_language("ruby");
+        let suggestion = err.suggestion.as_ref().unwrap();
+        assert!(suggestion.contains("python, python3, node, javascript, bash, sh, zsh"));
+        // The model reaches this error from inside execute_command, so telling
+        // it to use execute_command would be circular advice.
+        assert!(!suggestion.contains("use execute_command"));
+        assert!(suggestion.contains("`commands`"));
     }
 
     #[test]
