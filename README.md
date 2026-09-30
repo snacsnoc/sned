@@ -46,7 +46,7 @@ export RUSTC_WRAPPER=sccache
 sned "fix the bug" --act
 sned "explain this module"
 sned --continue
-sned --task-id <id>
+sned --session-id <id>
 ```
 
 Provider examples:
@@ -219,10 +219,11 @@ Hard-denied commands include:
 ```text
 rm, dd, mkfs, curl, wget, nc, ncat, netcat, ssh, sudo,
 chmod, chown, kill, killall, reboot, shutdown, poweroff,
-insmod, rmmod, modprobe, apt-get, yum, dnf, apt
+insmod, rmmod, modprobe, apt-get, yum, dnf, apt,
+eval, exec, source
 ```
 
-`--yolo` does not bypass the hard deny list.
+`--yolo` skips the approval gate entirely, including the hard deny list.
 
 ### environment sandbox
 
@@ -260,14 +261,29 @@ export SNED_ALLOW_ENV="API_KEY,AWS_ACCESS_KEY_ID,MY_CUSTOM_VAR"
 |---|---|---|
 | `SNED_ALLOW_ENV` | Comma-separated env vars to pass through sandbox | none |
 | `SNED_SAFE_COMMANDS` | Comma-separated commands to auto-approve | none |
+| `SNED_AUTO_APPROVE` | Comma-separated tool names to auto-approve at the lowest priority | none |
+| `SNED_APPROVAL_DENY` | Deny every approval prompt; the value is not read | unset |
 | `SNED_STREAM_OUTPUT_LINES` | Live streaming output line limit | `20` |
 | `SNED_RESPONSE_HEADERS_TIMEOUT_SECS` | Streaming response-header timeout | `30` |
 | `SNED_NON_STREAM_RESPONSE_TIMEOUT_SECS` | Buffered response-header timeout | `600` |
 | `SNED_SSE_FIRST_BYTE_TIMEOUT_SECS` | Optional time allowed before the first SSE bytes; unset or `0` disables the guard; invalid values fail the request | disabled |
 | `SNED_SSE_INACTIVITY_TIMEOUT_SECS` | Optional maximum quiet period between SSE reads; unset or `0` disables the guard; invalid values fail the request | disabled |
 | `SNED_OPENAI_CUMULATIVE_TEXT_STREAM` | Normalize cumulative text snapshots from a non-conforming OpenAI-compatible SSE endpoint | unset |
+| `SNED_MAX_RETRIES` | Provider retry attempts | `3` |
+| `SNED_RETRY_BASE_DELAY_MS` | Base retry backoff delay | `1000` |
+| `SNED_RETRY_MAX_DELAY_MS` | Maximum retry backoff delay | `10000` |
 | `SNED_MOUSE_SCROLL_LINES` | Lines scrolled per mouse-wheel step | `3` |
+| `SNED_DISABLE_MOUSE` | Disable mouse capture; set to any value, including `0` | unset |
 | `SNED_COMMAND_OUTPUT_LIMIT` | Command output truncation limit in bytes | `10240` |
+| `SNED_MAX_FILE_READ_SIZE` | Largest file eligible for line-range reads, in bytes; capped at 100MB | `524288` |
+| `SNED_MAX_FETCH_RESPONSE_SIZE` | Web fetch response body cap in bytes; capped at 100MB | `1048576` |
+| `SNED_SUBAGENT_OUTPUT_LIMIT` | Per-subagent output truncation limit in bytes; capped at 64MB | `1048576` |
+| `SNED_AGENT_MAX_QUEUED_MESSAGES` | Queued user messages before new ones are dropped | `1000` |
+| `SNED_HISTORY_LINES` | Retained interactive input history entries | `10000` |
+| `SNED_TASK_HISTORY_LIMIT` | Retained session history entries | `200` |
+| `SNED_AUTO_PURGE_DAYS` | Delete transcripts older than this many days on interactive startup | unset |
+| `SNED_REQUIRE_KEYCHAIN` | Fail instead of storing secrets outside the OS keychain; set to any value | unset |
+| `SNED_FSYNC` | `fsync` on atomic writes, for crash safety at a 5-50ms cost per write | `false` |
 | `SNED_SEARCH_TIMEOUT_SECS` | File search timeout | `30` |
 | `SNED_FETCH_TIMEOUT_SECS` | Web fetch timeout | `30` |
 | `SNED_HOOK_TIMEOUT_MS` | Hook execution timeout | `10000` |
@@ -285,9 +301,7 @@ export SNED_ALLOW_ENV="API_KEY,AWS_ACCESS_KEY_ID,MY_CUSTOM_VAR"
 | OpenAI | `OPENAI_API_KEY` |
 | Minimax | `MINIMAX_API_KEY` |
 | DeepSeek | `DEEPSEEK_API_KEY` |
-| Groq | `GROQ_API_KEY` |
 | OpenRouter | `OPENROUTER_API_KEY` |
-| XAI | `XAI_API_KEY` |
 
 Custom OpenAI-compatible endpoint:
 
