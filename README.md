@@ -223,7 +223,7 @@ insmod, rmmod, modprobe, apt-get, yum, dnf, apt,
 eval, exec, source
 ```
 
-`--yolo` skips the approval gate entirely, including the hard deny list.
+`--yolo` skips the approval prompt and the command allowlist, but never the hard deny list.
 
 ### environment sandbox
 
