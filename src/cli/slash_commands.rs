@@ -2461,8 +2461,6 @@ mod tests {
             get_cli_only_command("/plan status"),
             Some(CliOnlyCommand::Plan(PlanSubcommand::Status))
         ));
-
-        // Bare `/plan` with no task description is the same view.
         assert!(matches!(
             get_cli_only_command("/plan"),
             Some(CliOnlyCommand::Plan(PlanSubcommand::Status))
