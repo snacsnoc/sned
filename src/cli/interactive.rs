@@ -8748,6 +8748,253 @@ mod tests {
     }
 
     #[test]
+    fn test_drain_output_long_output_keeps_approval_panel_visible() {
+        use crate::cli::output::{OutputEvent, OutputWriter};
+        use ratatui::Terminal;
+
+        let (tx, mut rx) = mpsc::channel(20);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            41,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\nExecute this tool?",
+        );
+        writer.emit(OutputEvent::ApprovalRequested(request));
+
+        let mut app = App::new();
+        app.set_content_width(80);
+        // Cross the 10k output eviction limit: the panel is not part of the
+        // output buffers, so eviction must not remove it with the backlog.
+        for index in 0..10_100 {
+            app.push_plain(format!("history line {index:05}"));
+        }
+
+        drain_output_for_test_with_lanes(&mut approval_rx, &mut priority_rx, &mut rx, &mut app);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect();
+
+        assert!(app.has_pending_approval());
+        assert!(
+            rows.iter().any(|row| row.contains("Execute this tool?")),
+            "approval panel must remain visible after long output evicts the backlog"
+        );
+    }
+
+    #[test]
+    fn test_approval_panel_survives_resize() {
+        use ratatui::Terminal;
+
+        let _lock = crate::core::approval::approval_test_guard();
+        let (request, _response_rx) = crate::core::approval::approval_request_for_test(
+            42,
+            "Approval required · execute_command",
+            "🔧 Tool: execute_command\nExecute this tool?",
+        );
+
+        let mut app = App::new();
+        app.set_content_width(80);
+        assert!(app.set_pending_approval(request));
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+        assert!(
+            rows_contain_execute_prompt(&terminal),
+            "panel visible before resize"
+        );
+
+        terminal
+            .resize(ratatui::layout::Rect::new(0, 0, 120, 40))
+            .expect("resize should succeed");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render after resize should succeed");
+        assert!(
+            rows_contain_execute_prompt(&terminal),
+            "approval panel must remain visible after resize"
+        );
+    }
+
+    fn rows_contain_execute_prompt(terminal: &ratatui::Terminal<TestBackend>) -> bool {
+        let buffer = terminal.backend().buffer().clone();
+        let width = buffer.area.width as usize;
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .any(|row| row.contains("Execute this tool?"))
+    }
+
+    #[tokio::test]
+    async fn test_command_side_effect_waits_for_approval_response() {
+        use crate::core::agent_types::{AgentConfig, AgentMode, TaskState};
+        use crate::core::approval::{
+            ApprovalManager, ApprovalResult, override_approval_input_for_test,
+            override_approval_timeout_for_test,
+        };
+        use crate::core::file_editor::AnchorStateManager;
+        use crate::core::tools::execution::{PreparedToolCall, ToolBatchInputs};
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+        use crate::core::tools::{SnedTool, ToolContext, ToolRegistry};
+        use ratatui::Terminal;
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let _guard = crate::core::approval::approval_test_guard();
+        // A sibling test may have left the deny override in the process env.
+        let _env_lock = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("SNED_APPROVAL_DENY") };
+        let _input = override_approval_input_for_test();
+        // A short prompt timeout turns a stalled test into a clean failure
+        // instead of a five-minute hang.
+        let _timeout = override_approval_timeout_for_test(Duration::from_secs(10));
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("approved-marker");
+        assert!(!marker.exists());
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let writer = ChannelOutputWriter::new(tx);
+        let mut approval_rx = writer
+            .take_approval_rx()
+            .expect("approval receiver should be available");
+        let mut priority_rx = writer
+            .take_priority_rx()
+            .expect("priority receiver should be available");
+        let writer: crate::cli::output::OutputWriterArc = std::sync::Arc::new(writer);
+
+        let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
+        let approval_manager = Arc::new(tokio::sync::Mutex::new(ApprovalManager::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new()),
+        );
+
+        let tool_context = Arc::new(ToolContext::new(
+            state.clone(),
+            Some(approval_manager.clone()),
+            dir.path().to_path_buf(),
+            AnchorStateManager::new(),
+            false,
+            "approval-ordering".to_string(),
+            None,
+            false,
+            writer.clone(),
+            false,
+        ));
+
+        let inputs = ToolBatchInputs {
+            mode: AgentMode::Act,
+            state,
+            tool_profile: None,
+            registry: Some(Arc::new(registry)),
+            approval_manager: Some(approval_manager),
+            output_writer: writer,
+            interactive_mode: true,
+            tool_context,
+            hook_manager: None,
+            config: AgentConfig::default(),
+            conversation_history: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            task_storage: None,
+            scoped_rules_added: false,
+            parallel_enabled: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let prepared = vec![PreparedToolCall {
+            tool_call: crate::providers::ApiStreamToolCall {
+                call_id: None,
+                function: crate::providers::ApiStreamToolCallFunction {
+                    id: None,
+                    name: None,
+                    arguments: None,
+                },
+                signature: None,
+            },
+            tool_id: "approval-ordering-1".to_string(),
+            tool_name: "execute_command".to_string(),
+            parsed_args: Ok(serde_json::json!({
+                "commands": [format!("touch {}", marker.display())],
+            })),
+        }];
+
+        let mut app = App::new();
+        app.set_content_width(80);
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("terminal should initialize");
+
+        let batch = tokio::spawn(async move {
+            crate::core::tools::execution::execute_tool_batch(&prepared, inputs).await
+        });
+
+        // The prompt blocks in a separate task until the response arrives,
+        // so drain until the panel is pending on the app.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.has_pending_approval() {
+            assert!(
+                Instant::now() < deadline,
+                "approval request never became visible"
+            );
+            drain_output_for_test_with_lanes(&mut approval_rx, &mut priority_rx, &mut rx, &mut app);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            !marker.exists(),
+            "command must not run while the approval is pending"
+        );
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+        assert!(
+            rows_contain_execute_prompt(&terminal),
+            "approval panel must be rendered while the command waits"
+        );
+
+        assert!(
+            app.resolve_pending_approval(ApprovalResult::Approved)
+                .is_some()
+        );
+
+        let output = batch.await.expect("batch task should not panic");
+        let outcome = output.outcomes.first().expect("one tool outcome");
+        assert!(
+            !outcome.output.is_error,
+            "approved command should execute: {:?}",
+            outcome.output.text
+        );
+        assert!(
+            marker.exists(),
+            "command side effect must happen after approval"
+        );
+    }
+
+    #[test]
     fn test_drain_output_priority_lane_preserves_queued_prompt_under_stress() {
         use crate::cli::output::{OutputEvent, OutputWriter};
 
