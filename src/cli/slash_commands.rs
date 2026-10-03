@@ -1534,6 +1534,12 @@ pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
         },
         ModelPickerEntry {
             provider: "minimax",
+            model_id: "MiniMax-M3.1-Flash-Preview",
+            label: "MiniMax-M3.1-Flash-Preview",
+            description: "MiniMax M3.1 Flash Preview",
+        },
+        ModelPickerEntry {
+            provider: "minimax",
             model_id: "minimax-m3",
             label: "minimax-m3",
             description: "MiniMax M3",
@@ -2816,6 +2822,7 @@ mod tests {
             "claude-opus-5",
             "claude-sonnet-5",
             "gpt-5.6-sol",
+            "MiniMax-M3.1-Flash-Preview",
             "minimax-m3",
             "gemini-3.6-flash",
             "anthropic/claude-sonnet-5",

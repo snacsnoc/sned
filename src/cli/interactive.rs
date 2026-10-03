@@ -635,7 +635,17 @@ async fn activate_model_switch(
     task_opts: &TaskOptions,
     state_manager: &crate::storage::state_manager::StateManager,
 ) {
-    let mut temp_opts = task_opts.clone();
+    let mut temp_opts =
+        match crate::cli::normalize_minimax_body_overrides(task_opts, &request.provider) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                app.show_notification(
+                    format!("Failed to create provider: {error}"),
+                    NotificationKind::Error,
+                );
+                return;
+            }
+        };
     temp_opts.provider = Some(request.provider.clone());
     temp_opts.model = Some(request.model_id.clone());
     temp_opts.api_key = explicit_api_key;
@@ -653,6 +663,8 @@ async fn activate_model_switch(
             sess.task_opts.provider = Some(request.provider.clone());
             sess.task_opts.model = Some(request.model_id.clone());
             sess.task_opts.api_key = temp_opts.api_key;
+            sess.task_opts.reasoning_effort = temp_opts.reasoning_effort;
+            sess.task_opts.extra_body = temp_opts.extra_body;
 
             app.provider_name.clone_from(&request.provider);
             app.model_name.clone_from(&request.model_id);

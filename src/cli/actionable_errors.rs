@@ -164,6 +164,15 @@ pub fn provider_error(error: &crate::providers::ProviderError) -> ActionableErro
         } => "You've hit a rate limit or quota. Wait a moment and retry, or check your \
               provider dashboard for usage limits."
             .to_string(),
+        ProviderError::InvalidRequest(message)
+            if message
+                .to_ascii_lowercase()
+                .contains("requires adaptive thinking") =>
+        {
+            "MiniMax rejected disabled thinking. Use --reasoning-effort low, medium, high, xhigh, or max \
+              with MiniMax-M3.1-Flash-Preview; `none` is not accepted."
+                .to_string()
+        }
         ProviderError::InvalidRequest(_) => {
             "The provider rejected this request. Check the model name with `/model` or verify \
              the provider configuration."
@@ -312,6 +321,17 @@ mod tests {
         let suggestion = err.suggestion.as_ref().unwrap();
         assert!(suggestion.contains("`/model`"));
         assert!(!suggestion.contains("`/models`"));
+    }
+
+    #[test]
+    fn test_provider_adaptive_thinking_error_recommends_valid_effort() {
+        let err = provider_error(&crate::providers::ProviderError::InvalidRequest(
+            "model \"MiniMax-M3.1-Flash-Preview\" requires adaptive thinking".to_string(),
+        ));
+        let suggestion = err.suggestion.as_ref().unwrap();
+        assert!(suggestion.contains("--reasoning-effort"));
+        assert!(suggestion.contains("max"));
+        assert!(!suggestion.contains("`/model`"));
     }
 
     #[test]

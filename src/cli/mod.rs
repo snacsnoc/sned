@@ -212,6 +212,7 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 impl ReasoningEffort {
@@ -223,6 +224,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Xhigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }
@@ -307,7 +309,7 @@ pub struct TaskOptions {
     #[arg(long, hide_short_help = true)]
     pub config: Option<String>,
 
-    /// Set thinking token budget. Supported by Anthropic Claude 4, Gemini 2.5, and MiniMax.
+    /// Set thinking token budget. Supported by Anthropic Claude 4 and Gemini 2.5.
     /// Defaults to 1024 if flag is present without value.
     #[arg(
         long,
@@ -319,7 +321,8 @@ pub struct TaskOptions {
     )]
     pub thinking: Option<Option<String>>,
 
-    /// Set a provider-supported reasoning level (OpenAI-compatible, OpenRouter, Gemini 3).
+    /// Set a provider-supported reasoning level. MiniMax supports reasoning
+    /// effort only for MiniMax-M3.1-Flash-Preview.
     #[arg(long, value_enum, conflicts_with = "thinking", hide_short_help = true)]
     pub reasoning_effort: Option<ReasoningEffort>,
 
@@ -850,6 +853,66 @@ fn overridden_model_info(
     })
 }
 
+fn normalize_minimax_body_overrides(
+    options: &TaskOptions,
+    provider_name: &str,
+) -> anyhow::Result<TaskOptions> {
+    let mut normalized = options.clone();
+    if provider_name != "minimax" {
+        return Ok(normalized);
+    }
+
+    let Some(raw) = normalized.extra_body.clone() else {
+        return Ok(normalized);
+    };
+    let mut extra_body = parse_extra_body(Some(&raw))?.unwrap_or_default();
+    let Some(raw_effort): Option<serde_json::Value> = extra_body.remove("reasoning_effort") else {
+        normalized.extra_body = if extra_body.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&extra_body)?)
+        };
+        return Ok(normalized);
+    };
+    let Some(effort) = raw_effort.as_str() else {
+        anyhow::bail!(
+            "MiniMax reasoning effort in --extra-body must be a string: low, medium, high, xhigh, or max."
+        );
+    };
+    let inherited = match effort.to_ascii_lowercase().as_str() {
+        "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        "xhigh" => ReasoningEffort::Xhigh,
+        "max" => ReasoningEffort::Max,
+        "none" => {
+            anyhow::bail!(
+                "MiniMax does not accept reasoning effort \"none\". Supported: low, medium, high, xhigh, max."
+            );
+        }
+        _ => {
+            anyhow::bail!(
+                "Unsupported MiniMax reasoning effort '{effort}'. Supported: low, medium, high, xhigh, max."
+            );
+        }
+    };
+    if let Some(current) = normalized.reasoning_effort.as_ref() {
+        if current != &inherited {
+            anyhow::bail!(
+                "--reasoning-effort conflicts with reasoning_effort in --extra-body. Use one source for MiniMax thinking depth."
+            );
+        }
+    } else {
+        normalized.reasoning_effort = Some(inherited);
+    }
+    normalized.extra_body = if extra_body.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&extra_body)?)
+    };
+    Ok(normalized)
+}
+
 fn parse_extra_body(
     extra_body: Option<&str>,
 ) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
@@ -1034,6 +1097,9 @@ pub(crate) fn create_provider(
         provider_name
     };
 
+    let normalized_opts = normalize_minimax_body_overrides(task_opts, &provider_name)?;
+    let task_opts = &normalized_opts;
+
     if was_auto_detected && !task_opts.json {
         tracing::info!("Auto-detected provider: {}", provider_name);
     }
@@ -1066,6 +1132,16 @@ pub(crate) fn create_provider(
         crate::storage::state_manager::StateManager::global_state_snapshot,
     );
 
+    if provider_name == "minimax"
+        && let Some(extra_body) = extra_body.as_ref()
+    {
+        let mut unsupported_keys: Vec<&str> = extra_body.keys().map(String::as_str).collect();
+        unsupported_keys.sort_unstable();
+        anyhow::bail!(
+            "MiniMax accepts reasoning effort only through --reasoning-effort. Unsupported --extra-body keys: {}.",
+            unsupported_keys.join(", ")
+        );
+    }
     if extra_body.is_some()
         && !matches!(
             provider_name.as_str(),
@@ -1131,12 +1207,29 @@ pub(crate) fn create_provider(
                      The MiniMax API does not expose a thinking token budget."
                 );
             }
-            if task_opts.reasoning_effort.is_some() {
-                anyhow::bail!("--reasoning-effort is not supported by MiniMax.");
-            }
             let default_model = model_id
                 .or_else(|| stored_state.act_mode_api_model_id.clone())
                 .unwrap_or_else(|| "MiniMax-M3".to_string());
+            let minimax_reasoning_effort = match task_opts.reasoning_effort.as_ref() {
+                None => None,
+                Some(effort) => {
+                    if !crate::providers::minimax::MinimaxProvider::supports_reasoning_effort(
+                        &default_model,
+                    ) {
+                        anyhow::bail!(
+                            "--reasoning-effort is supported only for MiniMax model '{current}'; '{default_model}' does not accept it.",
+                            current =
+                                crate::providers::minimax::MinimaxProvider::FLASH_PREVIEW_MODEL_ID
+                        );
+                    }
+                    if matches!(effort, ReasoningEffort::None) {
+                        anyhow::bail!(
+                            "--reasoning-effort none is rejected by MiniMax-M3.1-Flash-Preview, which requires adaptive thinking."
+                        );
+                    }
+                    Some(effort.as_provider_str().to_string())
+                }
+            };
             let api_line = if std::env::var("MINIMAX_CN_API_KEY").is_ok() {
                 Some("china".to_string())
             } else {
@@ -1164,6 +1257,7 @@ pub(crate) fn create_provider(
                             crate::providers::ModelInfo::default(),
                             task_opts.context_window,
                         ),
+                        reasoning_effort: minimax_reasoning_effort,
                     },
                 )?,
             ))
@@ -1285,6 +1379,11 @@ pub(crate) fn create_provider(
                 anyhow::bail!(
                     "--thinking is not supported by Gemini model '{default_model}'. \
                      This model uses --reasoning-effort (thinking level), not a token budget."
+                );
+            }
+            if matches!(task_opts.reasoning_effort, Some(ReasoningEffort::Max)) {
+                anyhow::bail!(
+                    "--reasoning-effort max is supported only by MiniMax-M3.1-Flash-Preview."
                 );
             }
             if task_opts.reasoning_effort.is_some()
@@ -2354,6 +2453,12 @@ mod tests {
     fn parse_reasoning_effort_flag() {
         let cli = Cli::try_parse_from(["sned", "--reasoning-effort", "high", "test"]).unwrap();
         assert_eq!(cli.task_opts.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn parse_reasoning_effort_accepts_max() {
+        let cli = Cli::try_parse_from(["sned", "--reasoning-effort", "max", "test"]).unwrap();
+        assert_eq!(cli.task_opts.reasoning_effort, Some(ReasoningEffort::Max));
     }
 
     #[test]
@@ -3441,11 +3546,34 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_minimax_rejects_reasoning_effort() {
+    fn test_create_provider_minimax_accepts_reasoning_effort_on_flash_preview() {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let cli = Cli::try_parse_from([
+                "sned",
+                "--provider",
+                "minimax",
+                "--model",
+                "MiniMax-M3.1-Flash-Preview",
+                "--api-key",
+                "test-key",
+                "--reasoning-effort",
+                effort,
+            ])
+            .unwrap();
+            create_provider(&cli.task_opts, None).unwrap_or_else(|error| {
+                panic!("MiniMax M3.1 should accept --reasoning-effort {effort}: {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn test_create_provider_minimax_rejects_reasoning_effort_on_older_models() {
         let cli = Cli::try_parse_from([
             "sned",
             "--provider",
             "minimax",
+            "--model",
+            "MiniMax-M2.7",
             "--api-key",
             "test-key",
             "--reasoning-effort",
@@ -3455,9 +3583,159 @@ mod tests {
         let err = create_provider(&cli.task_opts, None).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("--reasoning-effort is not supported by MiniMax"),
+            msg.contains("--reasoning-effort is supported only for MiniMax model"),
             "got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_create_provider_minimax_rejects_reasoning_effort_none() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "minimax",
+            "--model",
+            "MiniMax-M3.1-Flash-Preview",
+            "--api-key",
+            "test-key",
+            "--reasoning-effort",
+            "none",
+        ])
+        .unwrap();
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--reasoning-effort none is rejected"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_create_provider_gemini_rejects_reasoning_effort_max() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "gemini",
+            "--model",
+            "gemini-3.6-flash",
+            "--api-key",
+            "test-key",
+            "--reasoning-effort",
+            "max",
+        ])
+        .unwrap();
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("--reasoning-effort max is supported only by MiniMax-M3.1-Flash-Preview"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_minimax_body_overrides_promotes_inherited_effort() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "minimax",
+            "--model",
+            "MiniMax-M3.1-Flash-Preview",
+            "--api-key",
+            "test-key",
+            "--extra-body",
+            "{\"reasoning_effort\":\"medium\"}",
+        ])
+        .unwrap();
+        let normalized = normalize_minimax_body_overrides(&cli.task_opts, "minimax").unwrap();
+        assert_eq!(normalized.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(normalized.extra_body, None);
+        create_provider(&normalized, None).unwrap();
+    }
+
+    #[test]
+    fn test_normalize_minimax_body_overrides_names_unsupported_keys() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "minimax",
+            "--model",
+            "MiniMax-M3.1-Flash-Preview",
+            "--api-key",
+            "test-key",
+            "--extra-body",
+            "{\"reasoning_effort\":\"medium\",\"unknown_key\":true}",
+        ])
+        .unwrap();
+        let normalized = normalize_minimax_body_overrides(&cli.task_opts, "minimax").unwrap();
+        assert_eq!(normalized.reasoning_effort, Some(ReasoningEffort::Medium));
+        let err = create_provider(&normalized, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown_key"), "got: {msg}");
+        assert!(
+            msg.contains("--reasoning-effort"),
+            "switch errors should name the supported alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_minimax_body_overrides_rejects_conflicting_effort() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "minimax",
+            "--model",
+            "MiniMax-M3.1-Flash-Preview",
+            "--api-key",
+            "test-key",
+            "--reasoning-effort",
+            "high",
+            "--extra-body",
+            "{\"reasoning_effort\":\"medium\"}",
+        ])
+        .unwrap();
+        let err = normalize_minimax_body_overrides(&cli.task_opts, "minimax").unwrap_err();
+        assert!(
+            format!("{err}").contains("conflicts with reasoning_effort"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_provider_minimax_names_unsupported_extra_body() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--provider",
+            "minimax",
+            "--model",
+            "MiniMax-M3.1-Flash-Preview",
+            "--api-key",
+            "test-key",
+            "--extra-body",
+            "{\"unsupported_key\":true}",
+        ])
+        .unwrap();
+        let err = create_provider(&cli.task_opts, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unsupported_key"), "got: {msg}");
+        assert!(msg.contains("--reasoning-effort"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_custom_minimax_url_without_provider_uses_generic_openai() {
+        let cli = Cli::try_parse_from([
+            "sned",
+            "--base-url",
+            "https://api.minimax.io/v1",
+            "--model",
+            "MiniMax-M3.1-Flash-Preview",
+            "--api-key",
+            "test-key",
+            "--extra-body",
+            "{\"reasoning_effort\":\"medium\"}",
+        ])
+        .unwrap();
+        let provider = create_provider(&cli.task_opts, None).unwrap();
+        assert_eq!(provider.name(), "openai");
     }
 
     #[test]
