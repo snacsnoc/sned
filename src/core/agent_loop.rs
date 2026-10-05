@@ -418,6 +418,17 @@ fn snipped_code_block_hint() -> &'static str {
     "  ... [snipped from streamed display; use /full]"
 }
 
+/// Split newline-terminated lines off a streaming buffer, retaining any
+/// trailing partial line for the next chunk. Byte-safe: `\n` is ASCII, so
+/// every split point is a char boundary even inside multibyte text.
+fn take_complete_lines(buffer: &mut String) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(pos) = buffer.find('\n') {
+        lines.push(buffer.drain(..=pos).collect());
+    }
+    lines
+}
+
 fn message_queue_max_len() -> usize {
     std::env::var(MESSAGE_QUEUE_MAX_LEN_ENV)
         .ok()
@@ -2346,6 +2357,7 @@ impl AgentLoop {
             let mut first_chunk_received = false;
             let mut tool_call_detected = false;
             let mut display_buffer = String::new();
+            let mut reasoning_buffer = String::new();
             let mut in_code_block = false;
             let mut code_block_lang = String::new();
             let mut code_block_buffer: Vec<String> = Vec::new();
@@ -2555,13 +2567,24 @@ impl AgentLoop {
                             reasoning_chunks = reasoning_chunks.saturating_add(1);
                             self.record_first_reasoning_chunk_time().await;
                             if !self.config.json_output && !reasoning.is_empty() {
-                                self.config
-                                    .output_writer
-                                    .emit(OutputEvent::ReasoningChunk(reasoning));
+                                reasoning_buffer.push_str(&reasoning);
+                                let complete = take_complete_lines(&mut reasoning_buffer).concat();
+                                if !complete.is_empty() {
+                                    self.config
+                                        .output_writer
+                                        .emit(OutputEvent::ReasoningChunk(complete));
+                                }
                             }
                         }
                         StreamEvent::PrepareToolCall { name, .. } => {
                             if !self.config.json_output {
+                                if !reasoning_buffer.is_empty() {
+                                    self.config.output_writer.emit(
+                                        OutputEvent::ReasoningChunk(std::mem::take(
+                                            &mut reasoning_buffer,
+                                        )),
+                                    );
+                                }
                                 if !tool_call_detected {
                                     self.config.output_writer.flush();
                                     tool_call_detected = true;
@@ -2678,6 +2701,11 @@ impl AgentLoop {
                 }
             } else if !self.config.json_output {
                 self.config.output_writer.flush();
+            }
+            if !reasoning_buffer.is_empty() && !self.config.json_output {
+                self.config.output_writer.emit(OutputEvent::ReasoningChunk(
+                    std::mem::take(&mut reasoning_buffer),
+                ));
             }
 
             // Wait for stream to complete
@@ -8874,7 +8902,24 @@ Irrespective of whether additional information or instructions are given, you ar
                 _ => None,
             })
             .collect();
-        assert_eq!(reasoning, ["first thought\n\nthird"]);
+        // Display events are line-granular: token fragments stay buffered
+        // until a newline or stream end, so no partial line is ever
+        // rendered. Full text is preserved across the two events.
+        assert_eq!(reasoning, ["first thought\n\n", "third"]);
+    }
+
+    #[test]
+    fn test_take_complete_lines_buffers_partial_multibyte_tail() {
+        let mut buffer = String::from("Hi ");
+        buffer.push_str("你好");
+        assert!(take_complete_lines(&mut buffer).is_empty());
+        assert_eq!(buffer, "Hi 你好");
+        buffer.push_str("!\nNext ");
+        assert_eq!(take_complete_lines(&mut buffer), ["Hi 你好!\n"]);
+        assert_eq!(buffer, "Next ");
+        buffer.push_str("line\n");
+        assert_eq!(take_complete_lines(&mut buffer), ["Next line\n"]);
+        assert!(buffer.is_empty());
     }
 
     #[tokio::test]
