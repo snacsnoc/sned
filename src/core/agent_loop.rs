@@ -2579,11 +2579,9 @@ impl AgentLoop {
                         StreamEvent::PrepareToolCall { name, .. } => {
                             if !self.config.json_output {
                                 if !reasoning_buffer.is_empty() {
-                                    self.config.output_writer.emit(
-                                        OutputEvent::ReasoningChunk(std::mem::take(
-                                            &mut reasoning_buffer,
-                                        )),
-                                    );
+                                    self.config.output_writer.emit(OutputEvent::ReasoningChunk(
+                                        std::mem::take(&mut reasoning_buffer),
+                                    ));
                                 }
                                 if !tool_call_detected {
                                     self.config.output_writer.flush();
@@ -2703,9 +2701,11 @@ impl AgentLoop {
                 self.config.output_writer.flush();
             }
             if !reasoning_buffer.is_empty() && !self.config.json_output {
-                self.config.output_writer.emit(OutputEvent::ReasoningChunk(
-                    std::mem::take(&mut reasoning_buffer),
-                ));
+                self.config
+                    .output_writer
+                    .emit(OutputEvent::ReasoningChunk(std::mem::take(
+                        &mut reasoning_buffer,
+                    )));
             }
 
             // Wait for stream to complete
