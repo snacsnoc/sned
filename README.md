@@ -1,36 +1,82 @@
 # sned
 
-sned is a Rust CLI for working with LLMs on a codebase.
+sned is a Rust CLI for working with LLMs on a codebase. Use prompt inline (`sned "fix the bug"`) for one shot runs, or the TUI for a full session with streaming output, tool calls, and slash commands.
 
-It is built around hash-anchored edits, AST-aware tools, multi-file patching, provider swapping, Qwen-specific tool prompting, and a shadow git repo the model can use for undo.
+It is built around hash-anchored edits, tree-sitter tools, multi-file patching, provider swapping, Qwen-specific tool prompting, and a shadow git repo the model can use for undo.
 
-Models should not blindly patch text they have not recently read. sned hashes the lines it shows to the model, checks those hashes before writing, and rejects stale edits instead of guessing.
+Models should not blindly patch text they have not recently read. sned hashes the lines it shows the model, checks those hashes before writing, and rejects stale edits instead of guessing.
 
-For larger changes, sned can batch edits across files, use tree-sitter for symbol-level work, and track accepted agent turns in a separate `.sned/.git-agent/` shadot git repo. 
+For larger changes, sned batches edits across files, does symbol-level work through tree-sitter, and tracks accepted agent turns in a separate `.sned/.git-agent/` shadow git repo.
 
-On Apple Silicon, Sned used 93–97% less peak memory than OpenCode in same-model runs. [See the table](#benchmark-results).
+On Apple Silicon, sned used 93–97% less peak memory than OpenCode in same-model runs. [See the table](#benchmark-results).
+
+![sned model picker showing available providers and models - high contrast mode](https://geekness.eu/sites/default/files/hc-08-modelpicker.svg)
+
+## Quick start
+
+Grab the latest release binary for your favourite platform (Linux, macOS, FreeBSD):
+
+https://github.com/snacsnoc/sned/releases/
+
+Or build from source:
+
+```bash
+cargo build --release
+./target/release/sned --help
+```
+
+Point sned at a model. If you already have an API key in the environment, pass a provider and model:
+
+```bash
+export ANTHROPIC_API_KEY=sk-xxx      # or GEMINI_API_KEY, OPENAI_API_KEY, MINIMAX_API_KEY, ...
+sned "fix the bug" --provider anthropic --model claude-sonnet-5
+```
+
+If you use your own OpenAI-compatible endpoint, pass a base URL instead:
+
+```bash
+sned "fix the bug" \
+  --base-url "https://your-endpoint/v1" \
+  --model qwen3-coder \
+  --api-key "apikeygoeshere"
+```
+
+Those run one shot and exit. To keep a session going, run `sned` with no prompt to open the TUI:
+
+```bash
+sned
+```
+
+## TUI
+
+The TUI is the main client for model streaming and interaction. You can apply pressure to your keyboard's keys, and send abritrary text.
+
+
+![sned file picker opened with the at key, listing project files- high contrast mode](https://geekness.eu/sites/default/files/hc-07-filepicker.svg)
+
+- Slash commands autocomplete. `Tab` or `Enter` accepts partial matches, so `/pl` resolves to `/plan`.
+- `@` opens a file picker over the project tree.
+- Reasoning is shown without dumping raw token noise into the view.
+- For the saftey adverse people, `--yolo` skips approval prompts here too.
 
 ## Build
 
+Debug build:
+
 ```bash
 cargo build
-# non-interactive
-./target/debug/sned "fix the bug"
-
-# TUI
-sned --base-url "https://your-custom-endpoint/v1" --model qwen3.6-27b --api-key "apikeygoeshere 
 ```
 
 Default parsers:
 
 ```text
-rust, javascript, python, typescript, go
+rust, javascript, python, typescript, go, swift, c, cpp
 ```
 
 More parsers:
 
 ```bash
-cargo build --features "lang-c,lang-cpp,lang-ruby,lang-java,lang-php,lang-swift"
+cargo build --features "lang-c-sharp,lang-ruby,lang-java,lang-php"
 ```
 
 Faster rebuilds:
@@ -47,21 +93,6 @@ sned "fix the bug" --act
 sned "explain this module"
 sned --continue
 sned --session-id <id>
-```
-
-Provider examples:
-
-```bash
-sned "fix the bug" --provider anthropic --model <model>
-
-sned "fix the bug" \
-  --api-key sk-xxx \
-  --base-url https://example.com/v1 \
-  --model qwen3-coder
-
-export OPENAI_API_KEY=sk-xxx
-export OPENAI_API_BASE=https://example.com/v1
-sned --model qwen3-coder
 ```
 
 Other useful flags:
@@ -104,27 +135,25 @@ When the model reads a file, sned records a hash for each line it saw. When it s
 
 This is there because line-based patching falls apart once the file moves under you.
 
-Anchors are cached across restarts in:
-
 Anchors survive restarts:
 
 ```text
 ~/.sned/data/cache/anchors.json
 ```
 
-### AST-native precision
+### tree-sitter tools
 
 For supported languages, symbol work goes through tree-sitter.
 
-A rename is not a text replacement. It operates on code symbols, so renaming `foo` should not rewrite comments, strings, or unrelated names that happen to contain `foo`.
+Renaming `foo` rewrites the symbol itself. Comments, strings, and unrelated names that happen to contain `foo` are left alone.
 
 Default language support:
 
 ```text
-rust, javascript, python, typescript, go
+rust, javascript, python, typescript, go, swift, c, cpp
 ```
 
-Extra language support is feature-gated to keep the default binary smaller.
+`c-sharp`, `ruby`, `java`, and `php` are feature gated to keep the default binary smaller, run your own build to include.
 
 ### multi-file batching
 
@@ -206,15 +235,13 @@ Workspace hooks are opt-in.
 
 ### command safety
 
-Commands run through an approval gate.
-
-Safe commands can be auto-approved for the session. Risky commands require review. Some commands are hard-denied.
+Commands go through an approval gate before they run. Safe ones can be auto-approved for the session, everything else asks first:
 
 ```bash
 export SNED_SAFE_COMMANDS="npm,pnpm,yarn,cargo,make"
 ```
 
-Hard-denied commands include:
+Some commands are never allowed, whatever is in `SNED_SAFE_COMMANDS`:
 
 ```text
 rm, dd, mkfs, curl, wget, nc, ncat, netcat, ssh, sudo,
@@ -223,12 +250,16 @@ insmod, rmmod, modprobe, apt-get, yum, dnf, apt,
 eval, exec, source
 ```
 
-`--yolo` skips the approval gate entirely, including the hard deny list. It is
-the full opt-out: a hard-denied command runs without asking.
+Nothing runs until you answer. The panel shows the exact command, and `↑`/`↓` expands it for review:
+
+![sned approval panel holding a command until you answer](https://geekness.eu/sites/default/files/approval-panel-normal.svg)
+
+`--yolo` skips the approval gate entirely, including the hard deny list, so a
+hard-denied command runs without asking.
 
 ### environment sandbox
 
-Model-run commands get a filtered environment.
+When the model runs a command, it does not inherit your shell environment for safety. sned passes through an allowlist of ordinary variables, so your API keys and tokens stay out of reach unless you opt in.
 
 Allowed by default:
 
@@ -247,14 +278,6 @@ export SNED_ALLOW_ENV="API_KEY,AWS_ACCESS_KEY_ID,MY_CUSTOM_VAR"
 ```
 
 `SNED_*` internal vars are dropped.
-
-## interactive mode
-
-- Slash commands autocomplete.
-- `Tab` or `Enter` accepts partial matches like `/pl` -> `/plan`.
-- Reasoning state is shown without dumping token noise into the main view.
-- Context usage lives in the status bar.
-- `--export <path>` writes the transcript even if the turn errors.
 
 ## env vars
 
