@@ -48,15 +48,23 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    pub fn new(config: OpenRouterConfig) -> Result<Self> {
-        let provider_sort = config.provider_sort;
+    fn attribution_headers() -> HashMap<String, String> {
         let mut custom_headers = HashMap::with_capacity(4);
-        custom_headers.insert("HTTP-Referer".to_string(), "https://sned.run".to_string());
-        custom_headers.insert("X-Title".to_string(), "Sned".to_string());
+        custom_headers.insert(
+            "HTTP-Referer".to_string(),
+            "https://geekness.eu/sned".to_string(),
+        );
+        custom_headers.insert("X-OpenRouter-Title".to_string(), "Sned".to_string());
         custom_headers.insert(
             "X-OpenRouter-Categories".to_string(),
             "cli-agent,ide-extension".to_string(),
         );
+        custom_headers
+    }
+
+    pub fn new(config: OpenRouterConfig) -> Result<Self> {
+        let provider_sort = config.provider_sort;
+        let custom_headers = Self::attribution_headers();
 
         let openai_config = OpenAiConfig {
             api_key: config.api_key,
@@ -430,6 +438,26 @@ mod tests {
         };
         let provider = OpenRouterProvider::new(config).unwrap();
         assert_eq!(provider.name(), "openrouter");
+    }
+
+    #[test]
+    fn test_openrouter_sends_app_attribution_headers() {
+        let headers = OpenRouterProvider::attribution_headers();
+
+        assert_eq!(
+            headers.get("HTTP-Referer").map(String::as_str),
+            Some("https://geekness.eu/sned")
+        );
+        assert_eq!(
+            headers.get("X-OpenRouter-Title").map(String::as_str),
+            Some("Sned")
+        );
+        assert!(!headers.contains_key("X-Title"));
+        assert!(
+            headers
+                .get("X-OpenRouter-Categories")
+                .is_some_and(|categories| categories.contains("cli-agent"))
+        );
     }
 
     #[test]
