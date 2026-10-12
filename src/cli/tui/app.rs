@@ -15,6 +15,7 @@ use ratatui::{
     widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -35,6 +36,9 @@ const SCROLLBACK_ROTATE_LINE_TARGET: usize = 9_000;
 const SCROLLBACK_ROTATE_BYTE_TARGET: u64 = 3_670_016;
 const SCROLLBACK_ROTATE_KEEP_FLOOR: usize = 100;
 const MAX_PASTED_INPUT_BYTES: usize = 4 * 1024 * 1024;
+/// Reasoning text is display-only (never re-sent to providers), so a long
+/// thinking line folds to an ellipsis instead of flooding the transcript.
+const MAX_REASONING_LINE_CHARS: usize = 240;
 const MAX_FOLDED_PASTE_CHUNKS: usize = 256;
 const ASYNC_LAYOUT_REFLOW_THRESHOLD: usize = 512;
 const STATUS_NOTIFICATION_DURATION: Duration = Duration::from_secs(4);
@@ -1815,6 +1819,13 @@ impl App {
         self.push_stream_group(lines_to_push, kind);
     }
 
+    fn shorten_reasoning_line(line: &str) -> Cow<'_, str> {
+        match line.char_indices().nth(MAX_REASONING_LINE_CHARS) {
+            Some((end, _)) => Cow::Owned(format!("{}…", &line[..end])),
+            None => Cow::Borrowed(line),
+        }
+    }
+
     pub fn push_reasoning_chunk(&mut self, chunk: &str) {
         for segment in chunk.split_inclusive('\n') {
             let complete = segment.ends_with('\n');
@@ -1822,7 +1833,10 @@ impl App {
             let content = content.strip_suffix('\r').unwrap_or(content);
             self.reasoning_partial_line.push_str(content);
             let line = Line::from(Span::styled(
-                format!("  Ɵ {}", self.reasoning_partial_line),
+                format!(
+                    "  Ɵ {}",
+                    Self::shorten_reasoning_line(&self.reasoning_partial_line)
+                ),
                 Style::default().fg(crate::cli::tui::theme::accent()).add_modifier(
                     crate::cli::tui::theme::reasoning_modifier_for(
                         crate::cli::tui::theme::high_contrast(),
@@ -7954,6 +7968,49 @@ mod tests {
         let style = app.output_lines[0].spans[0].style;
         assert_eq!(style.fg, Some(crate::cli::tui::theme::accent()));
         assert!(style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn test_long_reasoning_line_folds_to_ellipsis() {
+        let mut app = App::new();
+        app.set_content_width(80);
+
+        let anchor_dump = format!("Crawler§{}", "x".repeat(300));
+        app.push_reasoning_chunk(&anchor_dump);
+        app.push_reasoning_chunk("\n");
+        app.finish_reasoning_stream();
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert_eq!(rendered.len(), 1);
+        let text = &rendered[0];
+        assert!(
+            text.starts_with("  Ɵ Crawler§"),
+            "keeps the line start: {text}"
+        );
+        assert!(text.ends_with('…'), "folds the tail: {text}");
+        assert!(
+            text.chars().count() <= "  Ɵ ".chars().count() + MAX_REASONING_LINE_CHARS + 1,
+            "stays within the cap: {text}"
+        );
+
+        let mut short_app = App::new();
+        short_app.set_content_width(80);
+        short_app.push_reasoning_chunk("short thought\n");
+        short_app.finish_reasoning_stream();
+        let short: Vec<String> = short_app
+            .output_lines
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(short, ["  Ɵ short thought"]);
+
+        assert_eq!(
+            App::shorten_reasoning_line(&format!("é{}", "x".repeat(300)))
+                .chars()
+                .count(),
+            MAX_REASONING_LINE_CHARS + 1,
+            "cuts on a char boundary, never mid-grapheme bytes"
+        );
     }
 
     #[test]
