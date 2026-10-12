@@ -2907,6 +2907,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_hard_denied_command_fails_without_spawning() {
+        let handler = ExecuteCommandHandler::new();
+        let workspace_root = tempfile::tempdir().unwrap();
+        let marker = workspace_root.path().join("deny-gate-marker");
+        std::fs::write(&marker, "present").unwrap();
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let params = serde_json::json!({
+            "commands": [format!("rm {}", marker.display())],
+        });
+
+        let err = handler
+            .execute_without_state(
+                Some(workspace_root.path()),
+                params,
+                None,
+                false,
+                false,
+                None,
+                None,
+                false,
+                &output_writer,
+            )
+            .await
+            .expect_err("hard-denied command must fail before spawning");
+
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("permanently denied"),
+            "expected hard-deny error, got: {err_text}"
+        );
+        assert!(
+            marker.exists(),
+            "denied command must not spawn: marker file was deleted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "present",
+            "denied command must leave marker contents untouched"
+        );
+    }
+
     #[test]
     fn test_sandbox_allows_base_vars() {
         let (env, report) = ExecuteCommandHandler::build_sandbox_env(None);
