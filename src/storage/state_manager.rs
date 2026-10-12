@@ -548,17 +548,36 @@ impl StateManager {
         self.state_dir.join("persistence.lock")
     }
 
-    /// Initialize the state manager from disk.
-    /// Loads global state, task history, secrets, and workspace state.
-    /// Cleans up orphaned atomic write temp files older than 24 hours.
-    pub fn initialize(&self) -> io::Result<()> {
-        let _disk_lock = StatePersistenceLock::acquire(&self.persistence_lock_path())?;
+    /// Marker recording the last orphan-temp sweep; its mtime is the signal.
+    fn orphan_sweep_marker(&self) -> PathBuf {
+        self.state_dir.join(".last_orphan_sweep")
+    }
 
+    /// Sweep orphaned temp files from crashed atomic writes, at most once per
+    /// interval. The sweep stats every file in the settings and tasks dirs
+    /// (tens of thousands on real state), so running it on every startup
+    /// makes launch latency grow with state size. Any error falls back to
+    /// sweeping, preserving the old behavior.
+    fn maybe_sweep_orphaned_temp_files(&self) {
+        const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_hours(24);
+        let marker = self.orphan_sweep_marker();
+        let fresh = fs::metadata(&marker)
+            .and_then(|metadata| metadata.modified())
+            .map(|mtime| {
+                std::time::SystemTime::now()
+                    .duration_since(mtime)
+                    .map(|age| age < SWEEP_INTERVAL)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if fresh {
+            return;
+        }
         // Clean up orphaned temp files from crashed atomic writes
         let settings_dir = self.state_dir.join("..").join("settings");
         let _ = crate::storage::disk::cleanup_orphaned_temp_files(
             &settings_dir,
-            std::time::Duration::from_hours(24), // 24 hours
+            SWEEP_INTERVAL, // 24 hours
         );
 
         // TaskStorage uses atomic_write_file too; orphaned .tmp.*.json
@@ -566,8 +585,19 @@ impl StateManager {
         let tasks_dir = self.state_dir.join("..").join("tasks");
         let _ = crate::storage::disk::cleanup_orphaned_temp_files(
             &tasks_dir,
-            std::time::Duration::from_hours(24), // 24 hours
+            SWEEP_INTERVAL, // 24 hours
         );
+        let _ = fs::write(&marker, b"");
+    }
+
+    /// Initialize the state manager from disk.
+    /// Loads global state, task history, secrets, and workspace state.
+    /// Sweeps orphaned atomic write temp files older than 24 hours, at most
+    /// once per 24 hours (see `maybe_sweep_orphaned_temp_files`).
+    pub fn initialize(&self) -> io::Result<()> {
+        let _disk_lock = StatePersistenceLock::acquire(&self.persistence_lock_path())?;
+
+        self.maybe_sweep_orphaned_temp_files();
 
         // Load global state
         let mut global_state = self.load_global_state()?;
@@ -1799,6 +1829,58 @@ mod tests {
                 .any(|h| h.id == format!("task-{}", DEFAULT_TASK_HISTORY_LIMIT + 4))
         );
         assert!(!history.iter().any(|h| h.id == "task-0"));
+    }
+
+    #[cfg(unix)]
+    fn set_mtime_hours_ago(path: &Path, hours_ago: i64) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let old = std::time::SystemTime::now()
+            - std::time::Duration::from_secs((hours_ago * 3600) as u64);
+        let secs = old.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as libc::time_t;
+        let times = [
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+        ];
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let ret = unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(ret, 0, "utimensat must succeed in test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_initialize_sweeps_orphans_only_without_fresh_marker() {
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            let data_dir = crate::storage::disk::get_data_dir();
+            let marker = data_dir.join("state").join(".last_orphan_sweep");
+            let tasks_dir = data_dir.join("tasks");
+            fs::create_dir_all(&tasks_dir).unwrap();
+            let old_tmp = tasks_dir.join("stale.tmp.1.json");
+            fs::write(&old_tmp, "{}").unwrap();
+            set_mtime_hours_ago(&old_tmp, 25);
+
+            manager.initialize().unwrap();
+            assert!(
+                !old_tmp.exists(),
+                "stale sweep must delete old orphan temp files"
+            );
+            assert!(marker.exists(), "sweep must record its run");
+
+            fs::write(&old_tmp, "{}").unwrap();
+            set_mtime_hours_ago(&old_tmp, 25);
+            manager.initialize().unwrap();
+            assert!(
+                old_tmp.exists(),
+                "fresh sweep marker must skip the directory walk"
+            );
+        });
     }
 
     #[test]
