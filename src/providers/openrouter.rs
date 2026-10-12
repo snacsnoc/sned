@@ -487,6 +487,112 @@ mod tests {
         }
     }
 
+    fn cache_test_messages() -> Vec<crate::providers::StorageMessage> {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields,
+            StorageMessage, TextContentBlock, UserContentBlock,
+        };
+        fn user_text(text: &str) -> StorageMessage {
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![UserContentBlock::Text(
+                    TextContentBlock {
+                        text: text.to_string(),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    },
+                )]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            }
+        }
+        fn assistant_text(text: &str) -> StorageMessage {
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::Text(
+                    TextContentBlock {
+                        text: text.to_string(),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    },
+                )]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            }
+        }
+        vec![
+            user_text("first question"),
+            assistant_text("an answer"),
+            user_text("follow-up question"),
+        ]
+    }
+
+    fn openrouter_provider_for_cache_test(model_id: &str) -> OpenRouterProvider {
+        OpenRouterProvider::new(OpenRouterConfig {
+            api_key: "test-key".to_string(),
+            model_id: model_id.to_string(),
+            model_info: Some(get_openrouter_model_info(model_id)),
+            provider_sort: None,
+            reasoning_effort: None,
+            extra_body: None,
+            provider_name: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_openrouter_cacheable_model_marks_stable_prefix() {
+        let provider = openrouter_provider_for_cache_test("anthropic/claude-sonnet-4.5");
+        let mut request = test_request();
+        request.messages = cache_test_messages();
+        let body = provider.build_request_body_for_test(&request).unwrap();
+
+        let messages = body["messages"].as_array().unwrap();
+        let system_content = messages[0]["content"]
+            .as_array()
+            .expect("system content must be parts when caching");
+        assert_eq!(system_content[0]["cache_control"]["type"], "ephemeral");
+
+        let user_messages: Vec<_> = messages.iter().filter(|m| m["role"] == "user").collect();
+        assert_eq!(user_messages.len(), 2);
+        let first_serialized = serde_json::to_string(user_messages[0]).unwrap();
+        assert!(
+            !first_serialized.contains("cache_control"),
+            "only the last user message may carry a breakpoint: {first_serialized}"
+        );
+        let last_content = user_messages[1]["content"]
+            .as_array()
+            .expect("last user content must be parts when caching");
+        assert_eq!(
+            last_content.last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn test_openrouter_non_cacheable_model_sends_no_breakpoints() {
+        let provider = openrouter_provider_for_cache_test("qwen/qwen3.6-plus");
+        let mut request = test_request();
+        request.messages = cache_test_messages();
+        let body = provider.build_request_body_for_test(&request).unwrap();
+
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains("cache_control"),
+            "non-cache model must not emit breakpoints: {serialized}"
+        );
+    }
+
     #[test]
     fn test_openrouter_provider_name() {
         let config = OpenRouterConfig {

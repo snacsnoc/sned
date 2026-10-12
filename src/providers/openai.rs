@@ -245,6 +245,61 @@ impl OpenAiProvider {
             }));
         }
 
+        // Ephemeral cache breakpoints for the stable prompt prefix, mirroring
+        // the native Anthropic converter (system prompt plus the last user
+        // message). Only fires on an explicit per-model opt-in: a configured
+        // `model_info` asserting `supports_prompt_cache`. The Official
+        // endpoint is excluded on purpose — OpenAI automatic caching needs no
+        // breakpoints, and unknown fields risk a strict-validator rejection.
+        let supports_cache = self.config.endpoint_kind == OpenAiEndpointKind::Compatible
+            && self
+                .config
+                .model_info
+                .as_ref()
+                .is_some_and(|info| info.base.supports_prompt_cache);
+        if supports_cache {
+            if let Some(system) = messages.first_mut()
+                && system.get("role").and_then(|r| r.as_str()) == Some("system")
+                && let Some(system) = system.as_object_mut()
+                && let Some(text) = system.get("content").and_then(|c| c.as_str())
+            {
+                let text = text.to_string();
+                system.insert(
+                    "content".to_string(),
+                    json!([{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": {"type": "ephemeral"},
+                    }]),
+                );
+            }
+            if let Some(last_user) = messages
+                .iter_mut()
+                .rfind(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                && let Some(last_user) = last_user.as_object_mut()
+            {
+                if let Some(text) = last_user.get("content").and_then(|c| c.as_str()) {
+                    let text = text.to_string();
+                    last_user.insert(
+                        "content".to_string(),
+                        json!([{
+                            "type": "text",
+                            "text": text,
+                            "cache_control": {"type": "ephemeral"},
+                        }]),
+                    );
+                } else if let Some(parts) =
+                    last_user.get_mut("content").and_then(|c| c.as_array_mut())
+                    && let Some(last_text) = parts
+                        .iter_mut()
+                        .rfind(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    && let Some(last_text) = last_text.as_object_mut()
+                {
+                    last_text.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
+                }
+            }
+        }
+
         // Post-process: convert tool_use content blocks to OpenAI tool_calls format.
         // `convert_assistant_blocks` emits Anthropic-style `{"type":"tool_use",...}`
         // content parts, but OpenAI API expects a top-level `tool_calls` array with
@@ -3176,6 +3231,64 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["max_tokens"], 128_000);
         assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn test_official_endpoint_never_sends_cache_breakpoints() {
+        // OpenAI automatic caching needs no breakpoints, and unknown fields
+        // risk a strict-validator rejection: cache-flagged models on the
+        // Official endpoint must stay breakpoint-free.
+        let config = OpenAiConfig {
+            api_key: "test-key".to_string(),
+            base_url: None,
+            model_id: "gpt-4.1".to_string(),
+            model_info: Some(get_openai_model_info("gpt-4.1")),
+            reasoning_effort: None,
+            extra_body: None,
+            custom_headers: None,
+            endpoint_kind: OpenAiEndpointKind::Official,
+            stream: true,
+            provider_name: Some("openai".to_string()),
+        };
+        assert!(
+            config
+                .model_info
+                .as_ref()
+                .is_some_and(|m| m.base.supports_prompt_cache)
+        );
+        let provider = OpenAiProvider::new(config).unwrap();
+        let request = ProviderRequest {
+            system_prompt: "You are a helpful assistant.".to_string(),
+            messages: vec![
+                crate::providers::StorageMessage {
+                    id: None,
+                    role: crate::providers::MessageRole::User,
+                    content: crate::providers::MessageContent::Text("first".to_string()),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+                crate::providers::StorageMessage {
+                    id: None,
+                    role: crate::providers::MessageRole::User,
+                    content: crate::providers::MessageContent::Text("follow-up".to_string()),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+            ],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        let body = provider.build_request_body(&request).unwrap();
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains("cache_control"),
+            "Official endpoint must not emit breakpoints: {serialized}"
+        );
     }
 
     #[test]
