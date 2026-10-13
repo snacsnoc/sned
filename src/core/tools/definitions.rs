@@ -117,7 +117,7 @@ pub fn read_file_schema() -> ToolSchema {
                 name: "end_line",
                 required: false,
                 param_type: "integer",
-                description: "Last line (default EOF). Pair with start_line; the read window is [start_line, end_line] inclusive. Omit both to read to EOF.",
+                description: "Last line (default EOF); inclusive with start_line.",
                 items: None,
                 extra: None,
             },
@@ -125,7 +125,7 @@ pub fn read_file_schema() -> ToolSchema {
                 name: "refresh",
                 required: false,
                 param_type: "boolean",
-                description: "Set true to receive the requested lines again even when the same unchanged lines are already visible from an earlier read. Defaults to false.",
+                description: "Re-receive already-visible lines (default false).",
                 items: None,
                 extra: None,
             },
@@ -223,7 +223,7 @@ pub fn search_files_schema() -> ToolSchema {
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
-        description: "Edit existing files; does not create files. Each files[] item must contain path and edits. Put anchor, edit_type, text, start_line, end_line, and expected_text inside an edits[] item, never directly alongside path. Use exact anchors from reads or successful edits. Batch independent edits from one snapshot. Untouched tracked anchors remain valid. For oversized files, use the complete sha256 revision from a ranged read with start_line/end_line/expected_text; Sned streams a same-directory atomic replacement. Failures withhold that file; other anchored files may apply. Reread only when recovery metadata requires it. Use write_to_file to create/full-rewrite.",
+        description: "Edit existing files; does not create files. Each files[] item must contain path and edits. Put anchor, edit_type, text, start_line, end_line, and expected_text inside an edits[] item, never directly alongside path. Use exact anchors from reads or successful edits. Untouched tracked anchors remain valid. For oversized files, use the complete sha256 revision from a ranged read with start_line/end_line/expected_text. Failures withhold that file; other anchored files may apply. Reread only when recovery metadata requires it. Use write_to_file to create/full-rewrite.",
         parameters: vec![ToolParameter {
             name: "files",
             required: true,
@@ -238,7 +238,7 @@ pub fn edit_file_schema() -> ToolSchema {
                     },
                     "expected_file_hash": {
                         "type": "string",
-                        "description": "Optional sha256:<digest> from large ranged read. Submit one file with line-range selectors (start_line + expected_text) instead of anchors."
+                        "description": "Optional sha256:<digest> from large ranged read. Use with line-range selectors instead of anchors."
                     },
                     "edits": {
                         "type": "array",
@@ -248,7 +248,7 @@ pub fn edit_file_schema() -> ToolSchema {
                             "properties": {
                                 "old_text": {
                                     "type": "string",
-                                    "description": "Exact unique block of source lines to replace. Replaces matching block with 'new_text' without anchors. Omit read-output 'NNN: ' line-number prefixes."
+                                    "description": "Exact unique block of source lines to replace. Replaced with 'new_text' without anchors. Omit read-output 'NNN: ' line-number prefixes."
                                 },
                                 "new_text": {
                                     "type": "string",
@@ -275,7 +275,7 @@ pub fn edit_file_schema() -> ToolSchema {
                                 "end_line": {
                                     "type": "integer",
                                     "minimum": 1,
-                                    "description": "1-based inclusive end line; use only with expected_file_hash (revision-checked mode). Ignored when editing by anchor."
+                                    "description": "1-based inclusive end line; use only with expected_file_hash. Ignored when editing by anchor."
                                 },
                                 "expected_text": {
                                     "type": "string",
@@ -305,13 +305,13 @@ pub fn edit_file_schema() -> ToolSchema {
 pub fn execute_command_schema() -> ToolSchema {
     ToolSchema {
         name: "execute_command",
-        description: "Executes CLI commands or scripts. Use commands as a literal JSON array of strings for simple sequences, not a string containing an array. Use script for complex run-only logic. Use file tools for workspace changes rather than shell redirection, heredocs, or ad-hoc Python/sed rewrites. Provide exactly one of {commands, script}.",
+        description: "Executes CLI commands or scripts. Use commands for simple sequences, script for complex run-only logic. Use file tools for workspace changes rather than shell redirection, heredocs, or ad-hoc Python/sed rewrites. Provide exactly one of {commands, script}.",
         parameters: vec![
             ToolParameter {
                 name: "commands",
                 required: false,
                 param_type: "array",
-                description: "A literal JSON array of CLI command strings to execute in sequence. Each entry runs in a fresh shell; variables, cd, and other shell state do not persist between entries or tool calls. Keep dependent statements in one multiline entry or use script. Do not encode the array as a string.",
+                description: "CLI command strings to execute in sequence. Each entry runs in a fresh shell; variables, cd, and other shell state do not persist between entries or tool calls. Keep dependent statements in one multiline entry or use script. Do not encode the array as a string.",
                 items: Some(serde_json::json!({"type": "string"})),
                 extra: None,
             },
@@ -319,7 +319,7 @@ pub fn execute_command_schema() -> ToolSchema {
                 name: "script",
                 required: false,
                 param_type: "string",
-                description: "A script to execute for complex run-only logic or non-shell languages. Use write_to_file or edit_file for workspace file changes.",
+                description: "A script to execute for complex run-only logic or non-shell languages.",
                 items: None,
                 extra: None,
             },
@@ -327,7 +327,7 @@ pub fn execute_command_schema() -> ToolSchema {
                 name: "language",
                 required: false,
                 param_type: "string",
-                description: "The language of the script (e.g., 'bash', 'python', 'node'). Defaults to 'bash'.",
+                description: "Language of the script; e.g. 'bash', 'python', 'node'. Defaults to 'bash'.",
                 items: None,
                 extra: None,
             },
@@ -415,7 +415,7 @@ pub fn plan_mode_respond_schema() -> ToolSchema {
 pub fn get_function_schema() -> ToolSchema {
     ToolSchema {
         name: "get_function",
-        description: "Get function/method code with editable anchors for languages enabled in this build (Swift requires the lang-swift feature). For unsupported files use search_files or existing read_file content. Identical snapshots reuse identities; mandatory read_file recovery stays required. Above 5000 source lines, anchors expire after any edit. Oversized files are inspection-only.",
+        description: "Get function/method code with editable anchors for languages enabled in this build (Swift requires the lang-swift feature). For unsupported files use search_files or existing read_file content. Identical snapshots reuse identities; read_file recovery is still required. Above 5000 source lines, anchors expire after any edit. Oversized files are inspection-only.",
         parameters: vec![
             ToolParameter {
                 name: "path",
@@ -441,7 +441,7 @@ pub fn get_function_schema() -> ToolSchema {
 pub fn get_file_skeleton_schema() -> ToolSchema {
     ToolSchema {
         name: "get_file_skeleton",
-        description: "Get definitions/signatures with anchors for shown lines. Identical snapshots reuse identities; mandatory read_file recovery stays required. Above 5000 source lines, anchors expire after any edit. Oversized files are inspection-only.",
+        description: "Get definitions/signatures with anchors for shown lines. Identical snapshots reuse identities; read_file recovery is still required. Above 5000 source lines, anchors expire after any edit. Oversized files are inspection-only.",
         parameters: vec![ToolParameter {
             name: "path",
             required: true,
@@ -525,7 +525,7 @@ pub fn replace_symbol_schema() -> ToolSchema {
 pub fn rename_symbol_schema() -> ToolSchema {
     ToolSchema {
         name: "rename_symbol",
-        description: "Rename all AST-resolved occurrences in specified files/directories. Prefer for symbol renames.",
+        description: "Rename all AST-resolved occurrences in specified files/directories.",
         parameters: vec![
             ToolParameter {
                 name: "paths",
@@ -559,7 +559,7 @@ pub fn rename_symbol_schema() -> ToolSchema {
 pub fn use_subagents_schema() -> ToolSchema {
     ToolSchema {
         name: "use_subagents",
-        description: "Run between one and five focused in-process subagents in parallel. Each subagent gets its own prompt and returns a comprehensive research result. Default timeout is 300 seconds. Particularly effective for investigating multiple independent paths simultaneously without consuming your context window.",
+        description: "Run between one and five focused subagents in parallel. Each subagent gets its own prompt and returns a comprehensive research result. Use for investigating multiple independent paths simultaneously without consuming your context window.",
         parameters: vec![
             ToolParameter {
                 name: "prompt_1",
@@ -581,7 +581,7 @@ pub fn use_subagents_schema() -> ToolSchema {
                 name: "prompt_3",
                 required: false,
                 param_type: "string",
-                description: "Optional third subagent prompt.",
+                description: "Third subagent prompt.",
                 items: None,
                 extra: None,
             },
@@ -589,7 +589,7 @@ pub fn use_subagents_schema() -> ToolSchema {
                 name: "prompt_4",
                 required: false,
                 param_type: "string",
-                description: "Optional fourth subagent prompt.",
+                description: "Fourth subagent prompt.",
                 items: None,
                 extra: None,
             },
@@ -597,7 +597,7 @@ pub fn use_subagents_schema() -> ToolSchema {
                 name: "prompt_5",
                 required: false,
                 param_type: "string",
-                description: "Optional fifth subagent prompt.",
+                description: "Fifth subagent prompt.",
                 items: None,
                 extra: None,
             },
@@ -605,7 +605,7 @@ pub fn use_subagents_schema() -> ToolSchema {
                 name: "timeout",
                 required: false,
                 param_type: "integer",
-                description: "Optional timeout in seconds for each subagent. Defaults to 300 seconds.",
+                description: "Timeout in seconds for each subagent (default 300).",
                 items: None,
                 extra: None,
             },
@@ -613,7 +613,7 @@ pub fn use_subagents_schema() -> ToolSchema {
                 name: "max_turns",
                 required: false,
                 param_type: "integer",
-                description: "Optional maximum number of turns for each subagent.",
+                description: "Maximum turns for each subagent.",
                 items: None,
                 extra: None,
             },
@@ -658,12 +658,12 @@ pub fn list_skills_schema() -> ToolSchema {
 pub fn diagnostics_scan_schema() -> ToolSchema {
     ToolSchema {
         name: "diagnostics_scan",
-        description: "Runs diagnostics (linter and syntax checks) on the specified files and returns the results. This is useful for checking if recent changes introduced any errors or for getting a summary of existing problems in specific files.",
+        description: "Runs diagnostics (linter and syntax checks) on the specified files and returns the results.",
         parameters: vec![ToolParameter {
             name: "paths",
             required: true,
             param_type: "array",
-            description: "An array of relative paths to the files to scan.",
+            description: "Relative paths of files to scan.",
             items: Some(serde_json::json!({"type": "string"})),
             extra: None,
         }],
@@ -1466,23 +1466,28 @@ mod tests {
             write_bytes
         );
         assert!(
-            core_bytes < 8000,
-            "CoreEdit should be under 8000 bytes: got {}",
+            core_bytes < 7150,
+            "CoreEdit should be under 7150 bytes: got {}",
             core_bytes
         );
         assert!(
-            validate_bytes < 9350,
-            "Validate should be under 9350 bytes: got {}",
+            validate_bytes < 8650,
+            "Validate should be under 8650 bytes: got {}",
             validate_bytes
         );
         assert!(
-            symbol_bytes < 10000,
-            "Symbol should be under 10000 bytes: got {}",
+            symbol_bytes < 8700,
+            "Symbol should be under 8700 bytes: got {}",
             symbol_bytes
         );
         assert!(
             full_bytes > 10000,
             "Full should be over 10000 bytes: got {}",
+            full_bytes
+        );
+        assert!(
+            full_bytes < 14000,
+            "Full should be under 14000 bytes: got {}",
             full_bytes
         );
 
