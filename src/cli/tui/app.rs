@@ -962,6 +962,9 @@ pub struct App {
     /// Whether the model is currently in a reasoning/thinking phase (no displayable output yet).
     /// Drives the prompt border while the model is busy.
     pub reasoning_active: bool,
+    /// Whether thinking text is shown in the transcript. Hash anchors are
+    /// always stripped from thinking display; hiding skips the lines entirely.
+    pub show_thinking: bool,
     reasoning_partial_line: String,
     /// Manual scroll offset (top-of-viewport line index)
     pub scroll_offset: usize,
@@ -1488,6 +1491,7 @@ impl App {
             followup_prompt_scroll_pending: false,
             cancellation_cleanup: None,
             reasoning_active: false,
+            show_thinking: true,
             reasoning_partial_line: String::new(),
             scroll_offset: 0,
             scroll_mode: ScrollMode::Auto,
@@ -1826,17 +1830,32 @@ impl App {
         }
     }
 
+    /// Flips thinking display and reports the new state for a status notice.
+    pub fn toggle_thinking_display(&mut self) -> &'static str {
+        self.show_thinking = !self.show_thinking;
+        if self.show_thinking {
+            "Thinking display: shown"
+        } else {
+            "Thinking display: hidden"
+        }
+    }
+
     pub fn push_reasoning_chunk(&mut self, chunk: &str) {
+        if !self.show_thinking {
+            return;
+        }
         for segment in chunk.split_inclusive('\n') {
             let complete = segment.ends_with('\n');
             let content = segment.strip_suffix('\n').unwrap_or(segment);
             let content = content.strip_suffix('\r').unwrap_or(content);
             self.reasoning_partial_line.push_str(content);
+            // Anchor ids are machine metadata for edit_file, useless to a
+            // reader: drop the `id§` prefix, keep the quoted source text.
+            // Applied to the accumulated partial line so a chunk split
+            // mid-anchor still converges once the line completes.
+            let visible = crate::core::hash_utils::strip_hashes(&self.reasoning_partial_line);
             let line = Line::from(Span::styled(
-                format!(
-                    "  Ɵ {}",
-                    Self::shorten_reasoning_line(&self.reasoning_partial_line)
-                ),
+                format!("  Ɵ {}", Self::shorten_reasoning_line(&visible)),
                 Style::default().fg(crate::cli::tui::theme::accent()).add_modifier(
                     crate::cli::tui::theme::reasoning_modifier_for(
                         crate::cli::tui::theme::high_contrast(),
@@ -7971,11 +7990,50 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_display_strips_anchor_ids() {
+        let mut app = App::new();
+        app.set_content_width(80);
+
+        app.push_reasoning_chunk("abcdef12§    let x = 1;\n");
+        app.push_reasoning_chunk("plain prose with a § symbol stays\n");
+        app.finish_reasoning_stream();
+
+        let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
+        assert_eq!(rendered, ["  Ɵ     let x = 1;", "  Ɵ plain prose with a § symbol stays"]);
+    }
+
+    #[test]
+    fn test_hidden_thinking_stores_nothing() {
+        let mut app = App::new();
+        app.set_content_width(80);
+        app.show_thinking = false;
+
+        app.push_reasoning_chunk("some thought\n");
+        app.finish_reasoning_stream();
+
+        assert!(app.output_lines.is_empty());
+        assert!(app
+            .turn_stream_entries
+            .iter()
+            .all(|(_, kind)| *kind != StreamKind::Reasoning));
+    }
+
+    #[test]
+    fn test_thinking_toggle_flips_and_reports() {
+        let mut app = App::new();
+        assert!(app.show_thinking);
+        assert_eq!(app.toggle_thinking_display(), "Thinking display: hidden");
+        assert!(!app.show_thinking);
+        assert_eq!(app.toggle_thinking_display(), "Thinking display: shown");
+        assert!(app.show_thinking);
+    }
+
+    #[test]
     fn test_long_reasoning_line_folds_to_ellipsis() {
         let mut app = App::new();
         app.set_content_width(80);
 
-        let anchor_dump = format!("Crawler§{}", "x".repeat(300));
+        let anchor_dump = format!("LongLine{}", "x".repeat(300));
         app.push_reasoning_chunk(&anchor_dump);
         app.push_reasoning_chunk("\n");
         app.finish_reasoning_stream();
@@ -7984,7 +8042,7 @@ mod tests {
         assert_eq!(rendered.len(), 1);
         let text = &rendered[0];
         assert!(
-            text.starts_with("  Ɵ Crawler§"),
+            text.starts_with("  Ɵ LongLine"),
             "keeps the line start: {text}"
         );
         assert!(text.ends_with('…'), "folds the tail: {text}");

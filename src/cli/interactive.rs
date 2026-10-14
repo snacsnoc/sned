@@ -3163,6 +3163,18 @@ async fn handle_key_event_inner(
         return Ok(None);
     }
 
+    // Ctrl+T - toggle thinking display (no confirmation; reversible)
+    if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if !app.has_pending_approval() {
+            let notice = app.toggle_thinking_display();
+            app.push_styled(
+                notice,
+                Style::default().fg(crate::cli::tui::theme::accent()),
+            );
+        }
+        return Ok(None);
+    }
+
     // Ctrl+L - clear output screen (with confirmation)
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.clear_text_selection();
@@ -6350,6 +6362,7 @@ pub async fn run_interactive_shell_inner(
     // Reload in case history was written by another session
     app.history.reload();
     app.slash_command_track_changes = task_opts.track_changes;
+    app.show_thinking = !task_opts.hide_thinking;
 
     refresh_session_handles(&mut app, &session, &queue_handle, &state_handle, &task_opts).await;
 
@@ -12609,6 +12622,7 @@ mod tests {
             double_check_completion: false,
             auto_condense: true,
             no_token_display: false,
+            hide_thinking: false,
             subagents: false,
             is_subagent: false,
             user_agent: None,
@@ -13287,6 +13301,7 @@ mod tests {
             double_check_completion: false,
             auto_condense: true,
             no_token_display: false,
+            hide_thinking: false,
             subagents: false,
             is_subagent: false,
             user_agent: None,
@@ -13950,6 +13965,7 @@ mod tests {
             double_check_completion: false,
             auto_condense: true,
             no_token_display: false,
+            hide_thinking: false,
             subagents: false,
             is_subagent: false,
             user_agent: None,
@@ -14089,6 +14105,7 @@ mod tests {
             double_check_completion: false,
             auto_condense: true,
             no_token_display: false,
+            hide_thinking: false,
             subagents: false,
             is_subagent: false,
             user_agent: None,
@@ -14220,6 +14237,7 @@ mod tests {
             double_check_completion: false,
             auto_condense: true,
             no_token_display: false,
+            hide_thinking: false,
             subagents: false,
             is_subagent: false,
             user_agent: None,
@@ -14361,6 +14379,7 @@ mod tests {
             double_check_completion: false,
             auto_condense: true,
             no_token_display: false,
+            hide_thinking: false,
             subagents: false,
             is_subagent: false,
             user_agent: None,
@@ -14487,6 +14506,7 @@ mod tests {
             double_check_completion: false,
             auto_condense: true,
             no_token_display: false,
+            hide_thinking: false,
             subagents: false,
             is_subagent: false,
             user_agent: None,
@@ -14616,6 +14636,7 @@ mod tests {
             double_check_completion: false,
             auto_condense: true,
             no_token_display: false,
+            hide_thinking: false,
             subagents: false,
             is_subagent: false,
             user_agent: None,

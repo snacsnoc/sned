@@ -346,6 +346,11 @@ pub struct TaskOptions {
     #[arg(long, hide_short_help = true)]
     pub no_token_display: bool,
 
+    /// Hide the agent's thinking prose (the dim reasoning stream) in the TUI transcript.
+    /// Unlike --no-token-display (per-turn cost summary), this hides the monologue itself.
+    #[arg(long, hide_short_help = true)]
+    pub hide_thinking: bool,
+
     /// Enable subagents for the session. Default disabled
     #[arg(long, hide_short_help = true)]
     pub subagents: bool,
@@ -1844,6 +1849,7 @@ async fn build_task_components(
                 .unwrap_or(true),
         use_auto_condense: task_opts.auto_condense,
         show_token_usage: !task_opts.no_token_display,
+        show_thinking: !task_opts.hide_thinking,
         json_output: task_opts.json,
         max_turns: 100,
         max_consecutive_mistakes,
@@ -2481,6 +2487,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_hide_thinking_flag() {
+        let cli = Cli::try_parse_from(["sned", "--hide-thinking", "test"]).unwrap();
+        assert!(cli.task_opts.hide_thinking);
+    }
+
+    #[test]
+    fn parse_thinking_display_default() {
+        let cli = Cli::try_parse_from(["sned", "test"]).unwrap();
+        assert!(!cli.task_opts.hide_thinking);
+    }
+
+    #[test]
     fn parse_no_checkpoints_flag() {
         let cli = Cli::try_parse_from(["sned", "--no-checkpoints", "test"]).unwrap();
         assert!(cli.task_opts.no_checkpoints);
@@ -3088,6 +3106,7 @@ mod tests {
                 double_check_completion: false,
                 auto_condense: true,
                 no_token_display: false,
+                hide_thinking: false,
                 subagents: false,
                 is_subagent: false,
                 user_agent: None,
@@ -3166,6 +3185,7 @@ mod tests {
                 double_check_completion: false,
                 auto_condense: true,
                 no_token_display: false,
+                hide_thinking: false,
                 subagents: false,
                 is_subagent: false,
                 user_agent: None,
@@ -3298,6 +3318,7 @@ mod tests {
                 double_check_completion: false,
                 auto_condense: true,
                 no_token_display: false,
+                hide_thinking: false,
                 subagents: false,
                 is_subagent: false,
                 user_agent: None,

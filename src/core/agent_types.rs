@@ -290,6 +290,7 @@ impl Default for AgentConfig {
             enable_checkpoints: false,
             use_auto_condense: true,
             show_token_usage: false,
+            show_thinking: true,
             json_output: false,
             max_turns: 100,
             max_consecutive_mistakes: Some(DEFAULT_MAX_CONSECUTIVE_MISTAKES),
@@ -321,6 +322,8 @@ pub struct AgentConfig {
     pub use_auto_condense: bool,
     /// Whether to show token usage after each turn.
     pub show_token_usage: bool,
+    /// Whether thinking text is shown in the TUI transcript.
+    pub show_thinking: bool,
     /// Whether to emit machine-readable JSON output.
     pub json_output: bool,
     /// Maximum number of turns.

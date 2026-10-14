@@ -708,7 +708,13 @@ impl OutputWriter for StderrOutputWriter {
             }
             OutputEvent::ReasoningChunk(chunk) => {
                 for segment in chunk.split_inclusive('\n') {
-                    eprint!("  Ɵ {segment}");
+                    let text = segment.strip_suffix('\n').unwrap_or(segment);
+                    let visible = crate::core::hash_utils::strip_hashes(text);
+                    if segment.ends_with('\n') {
+                        eprintln!("  Ɵ {visible}");
+                    } else {
+                        eprint!("  Ɵ {visible}");
+                    }
                 }
                 if !chunk.ends_with('\n') {
                     eprintln!();
