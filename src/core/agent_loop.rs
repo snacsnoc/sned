@@ -6662,6 +6662,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_consecutive_turn_requests_keep_stable_prefix() {
+        // Cached prefixes only hit when the shared head of the request is
+        // identical across turns; per-turn churn there silently disables
+        // provider prompt caching.
+        fn text_turn(text: &str) -> Vec<ApiStreamChunk> {
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: text.to_string(),
+                id: None,
+                signature: None,
+            })]
+        }
+        let responses = vec![text_turn("first"), text_turn("second")];
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured)),
+        ));
+        let (tx, _rx) = mpsc::channel(64);
+        let mut config = test_agent_config(provider, "prefix-stability");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+        agent.execute_turn().await;
+        agent.execute_turn().await;
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 2, "expected two turns, got {captured:?}");
+        let (first, second) = (&captured[0], &captured[1]);
+        assert_eq!(
+            second.system_prompt, first.system_prompt,
+            "system prompt must not churn between turns"
+        );
+        assert_eq!(
+            second.tools, first.tools,
+            "tool definitions must not churn between turns"
+        );
+        assert!(
+            second.messages.len() > first.messages.len(),
+            "second turn must extend history, got {} then {}",
+            first.messages.len(),
+            second.messages.len()
+        );
+        assert_eq!(
+            &second.messages[..first.messages.len()],
+            &first.messages[..],
+            "shared message prefix must stay identical for prompt caching"
+        );
+    }
+
+    #[tokio::test]
     async fn test_digest_omits_denied_command() {
         use crate::core::approval::ApprovalManager;
         use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
