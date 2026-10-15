@@ -444,6 +444,16 @@ struct TaskShard {
     documents: IndexMap<String, TrackedDocument>,
 }
 
+/// Decoded task shard plus the file identity it was read from. Writers
+/// replace shards atomically, so a mtime/length mismatch means the cache
+/// is stale; a stat failure also counts as stale and re-reads fail closed.
+#[derive(Debug, Clone)]
+struct CachedShard {
+    mtime: std::time::SystemTime,
+    len: u64,
+    documents: IndexMap<String, TrackedDocument>,
+}
+
 /// Global anchor state storage.
 #[derive(Debug)]
 struct AnchorStorage {
@@ -451,6 +461,9 @@ struct AnchorStorage {
     /// Compare-and-swap baseline as document digests: the same change
     /// detection as a full snapshot clone without duplicating every body.
     persisted_fingerprints: IndexMap<String, HashMap<String, [u8; 32]>>,
+    /// Per-task durable decodes, validated by shard file identity so a
+    /// reconcile does not re-parse its task shard on every call.
+    durable_shards: HashMap<String, CachedShard>,
     cache_file: std::path::PathBuf,
 }
 
@@ -583,6 +596,7 @@ impl AnchorStorage {
         Self {
             persisted_fingerprints,
             tasks,
+            durable_shards: HashMap::new(),
             cache_file: anchors_file,
         }
     }
@@ -592,13 +606,19 @@ impl AnchorStorage {
         Self {
             tasks: IndexMap::new(),
             persisted_fingerprints: IndexMap::new(),
+            durable_shards: HashMap::new(),
             cache_file: crate::storage::disk::get_data_dir().join("cache/anchors.json"),
         }
     }
 
+    #[cfg(test)]
+    fn cached_task_ids(&self) -> Vec<String> {
+        self.durable_shards.keys().cloned().collect()
+    }
+
     /// Save anchor state to disk
     fn save(&mut self) {
-        let anchors_file = &self.cache_file;
+        let anchors_file = self.cache_file.clone();
         let cache_dir = anchors_file
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -626,7 +646,7 @@ impl AnchorStorage {
             .into_iter()
             .collect();
         for task_id in &task_ids {
-            let Ok(mut documents) = Self::read_task_documents(anchors_file, task_id) else {
+            let Ok(mut documents) = self.read_task_documents_cached(task_id) else {
                 tracing::warn!("Failed to reload anchor cache; preserving existing state");
                 return;
             };
@@ -668,21 +688,22 @@ impl AnchorStorage {
             // state. Avoid rewriting durable bytes when this manager has
             // nothing to publish.
             if task_changed {
-                if let Err(e) = Self::write_task_documents(anchors_file, task_id, &documents) {
+                if let Err(e) = self.write_task_documents_cached(task_id, &documents) {
                     tracing::warn!("Failed to save anchor cache: {}", e);
                     return;
                 }
                 if anchors_file.exists() {
                     // Best effort: a prune failure leaves the legacy copy in
                     // place and the shard still wins on read.
-                    let _ = Self::prune_legacy_task(anchors_file, task_id);
+                    let _ = Self::prune_legacy_task(&anchors_file, task_id);
                 }
             }
             self.persisted_fingerprints
                 .insert(task_id.clone(), Self::fingerprint_task(&documents));
             self.tasks.insert(task_id.clone(), documents);
         }
-        Self::evict_old_task_shards(anchors_file);
+        Self::evict_old_task_shards(&anchors_file);
+        self.forget_missing_shards();
     }
 
     fn read_tasks(
@@ -760,6 +781,81 @@ impl AnchorStorage {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// File identity for cache validation: mtime plus length. Any failure
+    /// counts as stale so the caller re-reads instead of trusting the cache.
+    fn shard_identity(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    /// Read one task's durable documents, reusing the decoded shard while
+    /// its file identity is unchanged. External writers replace shards
+    /// atomically, so an identity mismatch always refreshes; a missing
+    /// shard falls back to the legacy file without caching, exactly like
+    /// [`Self::read_task_documents`].
+    fn read_task_documents_cached(
+        &mut self,
+        task_id: &str,
+    ) -> std::io::Result<IndexMap<String, TrackedDocument>> {
+        let shard = Self::shard_path(&self.cache_file, task_id);
+        if let Some((mtime, len)) = Self::shard_identity(&shard)
+            && let Some(cached) = self.durable_shards.get(task_id)
+            && cached.mtime == mtime
+            && cached.len == len
+        {
+            return Ok(cached.documents.clone());
+        }
+        let documents = Self::read_task_documents(&self.cache_file, task_id)?;
+        if shard.exists() {
+            // Refresh only when the shard itself supplied the documents;
+            // the stat above raced a concurrent write otherwise.
+            if let Some((mtime, len)) = Self::shard_identity(&shard) {
+                self.durable_shards.insert(
+                    task_id.to_string(),
+                    CachedShard {
+                        mtime,
+                        len,
+                        documents: documents.clone(),
+                    },
+                );
+            }
+        } else {
+            self.durable_shards.remove(task_id);
+        }
+        Ok(documents)
+    }
+
+    /// Write one task's shard and refresh its cache entry from the bytes
+    /// just published, so the next durable read needs no re-parse.
+    fn write_task_documents_cached(
+        &mut self,
+        task_id: &str,
+        documents: &IndexMap<String, TrackedDocument>,
+    ) -> std::io::Result<()> {
+        let cache_file = self.cache_file.clone();
+        Self::write_task_documents(&cache_file, task_id, documents)?;
+        let shard = Self::shard_path(&cache_file, task_id);
+        if let Some((mtime, len)) = Self::shard_identity(&shard) {
+            self.durable_shards.insert(
+                task_id.to_string(),
+                CachedShard {
+                    mtime,
+                    len,
+                    documents: documents.clone(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Drop cache entries whose shard files are gone (eviction or external
+    /// deletion). Presence alone never populates: the next read re-parses.
+    fn forget_missing_shards(&mut self) {
+        let cache_file = self.cache_file.clone();
+        self.durable_shards
+            .retain(|task_id, _| Self::shard_path(&cache_file, task_id).exists());
     }
 
     /// Write one task's shard, creating the shard directory on demand.
@@ -1328,13 +1424,14 @@ impl AnchorStateManager {
         let lines = split_content_lines(&normalized);
         let hashes = compute_hashes(&lines);
         let (memory_expected, expected) = {
-            let storage = self.storage();
+            let mut storage = self.storage();
             let memory = storage
                 .tasks
                 .get(task_id)
                 .and_then(|files| files.get(absolute_path))
                 .cloned();
-            let disk = AnchorStorage::read_task_documents(&storage.cache_file, task_id)
+            let disk = storage
+                .read_task_documents_cached(task_id)
                 .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?
                 .get(absolute_path)
                 .cloned();
@@ -1560,9 +1657,9 @@ impl AnchorStateManager {
         let mut durable: HashMap<String, IndexMap<String, TrackedDocument>> = HashMap::new();
         for transition in transitions {
             if !durable.contains_key(&transition.task_id) {
-                let documents =
-                    AnchorStorage::read_task_documents(&storage.cache_file, &transition.task_id)
-                        .map_err(persistence)?;
+                let documents = storage
+                    .read_task_documents_cached(&transition.task_id)
+                    .map_err(persistence)?;
                 durable.insert(transition.task_id.clone(), documents);
             }
         }
@@ -1621,13 +1718,15 @@ impl AnchorStateManager {
             }
         }
         for (task_id, documents) in &durable {
-            AnchorStorage::write_task_documents(&storage.cache_file, task_id, documents)
+            storage
+                .write_task_documents_cached(task_id, documents)
                 .map_err(persistence)?;
             if storage.cache_file.exists() {
                 let _ = AnchorStorage::prune_legacy_task(&storage.cache_file, task_id);
             }
         }
-        AnchorStorage::evict_old_task_shards(&storage.cache_file);
+        AnchorStorage::evict_old_task_shards(&storage.cache_file.clone());
+        storage.forget_missing_shards();
         // There are no fallible operations after durable replacement.
         // Memory adopts the merged state for the published tasks only;
         // every decision path re-reads durable state anyway.
@@ -1668,8 +1767,9 @@ impl AnchorStateManager {
         std::fs::create_dir_all(cache_dir).map_err(persistence)?;
         let _lock = AnchorCacheLock::acquire(&storage.cache_file.with_extension("json.lock"))
             .map_err(persistence)?;
-        let mut documents =
-            AnchorStorage::read_task_documents(&storage.cache_file, task_id).map_err(persistence)?;
+        let mut documents = storage
+            .read_task_documents_cached(task_id)
+            .map_err(persistence)?;
         let memory = storage
             .tasks
             .get(task_id)
@@ -1682,12 +1782,14 @@ impl AnchorStateManager {
         }
         documents.shift_remove(absolute_path);
         documents.insert(absolute_path.to_string(), document.clone());
-        AnchorStorage::write_task_documents(&storage.cache_file, task_id, &documents)
+        storage
+            .write_task_documents_cached(task_id, &documents)
             .map_err(persistence)?;
         if storage.cache_file.exists() {
             let _ = AnchorStorage::prune_legacy_task(&storage.cache_file, task_id);
         }
-        AnchorStorage::evict_old_task_shards(&storage.cache_file);
+        AnchorStorage::evict_old_task_shards(&storage.cache_file.clone());
+        storage.forget_missing_shards();
         // There are no fallible operations after durable replacement.
         storage.persisted_fingerprints.insert(
             task_id.to_string(),
@@ -1782,7 +1884,8 @@ impl AnchorStateManager {
         }
         storage.save();
 
-        let durable = AnchorStorage::read_task_documents(&storage.cache_file, task_id)?
+        let durable = storage
+            .read_task_documents_cached(task_id)?
             .get(absolute_path)
             .cloned();
         if durable.as_ref() == Some(document) {
@@ -1845,8 +1948,9 @@ impl AnchorStateManager {
         // A corrupt or unreadable cache fails closed; only a missing file
         // counts as an empty cache. Swallowing this read would let a stale
         // manager report success for anchors that were never published.
-        let cache_file = self.storage().cache_file.clone();
-        let durable_document = AnchorStorage::read_task_documents(&cache_file, task_id)
+        let durable_document = self
+            .storage()
+            .read_task_documents_cached(task_id)
             .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?
             .get(absolute_path)
             .cloned();
@@ -3702,6 +3806,83 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&shard).unwrap(), bytes);
         assert_eq!(second.storage().tasks, memory);
+    }
+
+    #[test]
+    fn durable_shard_cache_reuses_task_documents_until_external_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        let lines = split_content_lines("alpha\nbeta\n");
+        manager
+            .reconcile_checked("file", &lines, Some("cache"))
+            .unwrap();
+
+        assert!(
+            manager
+                .storage()
+                .cached_task_ids()
+                .iter()
+                .any(|id| id == "cache"),
+            "reconcile must populate the shard cache"
+        );
+
+        // An external writer (second manager) replacing the shard must be
+        // adopted on the next durable read, not shadowed by the cache.
+        let second = AnchorStateManager::with_cache_file(cache);
+        let changed = split_content_lines("alpha\nGAMMA\n");
+        second
+            .reconcile_checked("file", &changed, Some("cache"))
+            .unwrap();
+        let adopted = manager
+            .observe_snapshot("file", "alpha\nGAMMA\n", Some("cache"))
+            .unwrap();
+        let expected = second
+            .observe_snapshot("file", "alpha\nGAMMA\n", Some("cache"))
+            .unwrap();
+        assert_eq!(adopted.lines, expected.lines);
+        assert_eq!(adopted.anchors, expected.anchors);
+        assert_eq!(adopted.generation, expected.generation);
+        assert!(
+            manager
+                .storage()
+                .cached_task_ids()
+                .iter()
+                .any(|id| id == "cache"),
+            "adoption must refresh the shard cache"
+        );
+    }
+
+    #[test]
+    fn durable_shard_cache_forgets_evicted_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        let lines = split_content_lines("alpha\nbeta\n");
+        manager
+            .reconcile_checked("file", &lines, Some("cache"))
+            .unwrap();
+        assert!(
+            manager
+                .storage()
+                .cached_task_ids()
+                .iter()
+                .any(|id| id == "cache")
+        );
+
+        // Deleting the shard file (eviction or external deletion) must drop
+        // the entry: the next read falls back to an empty cache, never to
+        // documents that no longer exist on disk.
+        std::fs::remove_file(dir.path().join("anchor-tasks").join("cache.json")).unwrap();
+        manager.save();
+        assert!(manager.storage().cached_task_ids().is_empty());
+        let reread = manager
+            .observe_snapshot("file", "alpha\nbeta\n", Some("cache"))
+            .unwrap();
+        assert_eq!(
+            reread.lines,
+            vec!["alpha".to_string(), "beta".to_string(), String::new()]
+        );
     }
 
     #[test]
