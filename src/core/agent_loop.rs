@@ -65,8 +65,9 @@ use crate::core::plan_state::PlanStepStatus;
 use crate::core::stream_parsing::{extract_response_text, split_model_output};
 use crate::core::tool_output::{
     extract_edit_stats_detailed, format_heat_map, format_heat_map_plain, format_tool_call_lines,
-    format_tool_call_lines_with_raw_arguments, format_tool_result, format_tool_result_digest,
-    path_from_read_file_header, strip_tool_result_anchors, summarize_matching_sections,
+    format_tool_call_lines_verbose, format_tool_call_lines_with_raw_arguments, format_tool_result,
+    format_tool_result_digest, path_from_read_file_header, strip_tool_result_anchors,
+    summarize_matching_sections,
 };
 
 const MAX_EDIT_RESULT_DISPLAY_LINES: usize = 10;
@@ -3049,8 +3050,8 @@ impl AgentLoop {
             // denied, malformed, or otherwise rejected before dispatch.
             let mut commands_executed: usize = 0;
 
-            // Print the complete dispatched call so the user can verify what the
-            // model asked Sned to do (skip malformed tool calls with empty names).
+            // One summary row per call; --verbose restores the full dump.
+            // Skip malformed tool calls with empty names.
             if !self.config.json_output {
                 for prepared in &prepared_tool_calls {
                     let tool_name = prepared.tool_name.as_str();
@@ -3061,7 +3062,13 @@ impl AgentLoop {
                     }
 
                     let call_lines = match &prepared.parsed_args {
-                        Ok(tool_params) => format_tool_call_lines(tool_name, tool_params),
+                        Ok(tool_params) => {
+                            if self.config.verbose {
+                                format_tool_call_lines_verbose(tool_name, tool_params)
+                            } else {
+                                format_tool_call_lines(tool_name, tool_params)
+                            }
+                        }
                         Err(parse_error) => format_tool_call_lines_with_raw_arguments(
                             tool_name,
                             prepared.tool_call.function.arguments.as_deref(),
@@ -3236,6 +3243,37 @@ impl AgentLoop {
                             &result_output.text,
                             is_error,
                             if is_error { error_fg() } else { prompt_fg() },
+                            prompt_fg(),
+                        );
+                        for line in digest_lines {
+                            let mut style = Style::default();
+                            if let Some(color) = line.fg {
+                                style = style.fg(color);
+                            }
+                            if line.dim {
+                                style = style.add_modifier(Modifier::DIM);
+                            }
+                            self.config
+                                .output_writer
+                                .emit(OutputEvent::tool_output_line(line.text, style));
+                        }
+                    } else if !is_error
+                        && !self.config.verbose
+                        && matches!(
+                            tool_name.as_str(),
+                            "read_file" | "list_files" | "search_files"
+                        )
+                    {
+                        // One digest row; the full body already lives in
+                        // history and exports. Errors keep full text below
+                        // so diagnostics stay visible. Guarded by `!is_error`,
+                        // so this path is never red.
+                        let digest_lines = format_tool_result_digest(
+                            &tool_name,
+                            &tool_params,
+                            &result_output.text,
+                            false,
+                            prompt_fg(),
                             prompt_fg(),
                         );
                         for line in digest_lines {
@@ -5257,6 +5295,7 @@ mod tests {
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -5980,16 +6019,16 @@ mod tests {
             "streamed tool start should have one preparation notice: {output:?}"
         );
         assert!(
-            output
-                .iter()
-                .filter(|line| line.contains("▶ write_to_file"))
-                .count()
-                == 1,
-            "completed tool call should have one full call display: {output:?}"
+            output.iter().filter(|line| line.contains("▶")).count() == 1,
+            "completed tool call should have one summary display: {output:?}"
         );
         assert!(
-            output.iter().any(|line| line.contains("\"content\"")),
-            "completed tool call should show its arguments: {output:?}"
+            output.iter().any(|line| line.contains("tetris.c")),
+            "completed tool call should name its target: {output:?}"
+        );
+        assert!(
+            !output.iter().any(|line| line.contains("\"content\"")),
+            "raw arguments must stay out of the transcript: {output:?}"
         );
     }
 
@@ -6541,6 +6580,84 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("📝") && line.contains("1 command run")),
             "executed command must appear in digest, got {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_result_collapses_to_digest_line() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+        use serde_json::json;
+        // Temp dir inside the workspace so path authorization grants the read.
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("probe.txt");
+        std::fs::write(&path, "alpha\nbeta\nGAMMA-UNIQUE-CONTENT\n").unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let responses = vec![tool_call_chunks(&[(
+            "c1",
+            "read_file",
+            json!({"paths": [path.to_string_lossy()]}),
+        )])];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        let mut config = test_agent_config(provider, "digest-read");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            rendered.iter().any(|line| line.contains("✓ read")),
+            "collapsed read digest must appear, got {rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("GAMMA-UNIQUE-CONTENT")),
+            "file content must not flood the transcript, got {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verbose_read_result_shows_full_content() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+        use serde_json::json;
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("verbose-probe.txt");
+        std::fs::write(&path, "alpha\nbeta\nGAMMA-VERBOSE-CONTENT\n").unwrap();
+        let responses = vec![tool_call_chunks(&[(
+            "c1",
+            "read_file",
+            json!({"paths": [path.to_string_lossy()]}),
+        )])];
+        let (tx, mut rx) = mpsc::channel(64);
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        let mut config = test_agent_config(provider, "digest-read-verbose");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        config.verbose = true;
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("GAMMA-VERBOSE-CONTENT")),
+            "verbose must restore full read content, got {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("\"paths\"")),
+            "verbose must restore full call arguments, got {rendered:?}"
         );
     }
 
@@ -8711,6 +8828,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 1,
             max_consecutive_mistakes: Some(3),
@@ -8765,6 +8883,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 1,
             max_consecutive_mistakes: Some(3),
@@ -8806,6 +8925,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 1,
             max_consecutive_mistakes: Some(3),
@@ -8938,6 +9058,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 2,
             max_consecutive_mistakes: Some(3),
@@ -9577,6 +9698,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -9753,6 +9875,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -9804,6 +9927,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -9944,6 +10068,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -9992,6 +10117,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10033,6 +10159,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10179,6 +10306,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10220,6 +10348,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10262,6 +10391,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10310,6 +10440,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10388,6 +10519,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10479,6 +10611,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10567,6 +10700,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10626,6 +10760,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10683,6 +10818,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -10722,6 +10858,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -11052,9 +11189,12 @@ Irrespective of whether additional information or instructions are given, you ar
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!tool_call.is_empty(), "search tool call should be visible");
-        assert!(tool_call.contains("search_files"));
-        assert!(tool_call.contains("format_tool_call_lines"));
+        assert!(tool_call.contains("searched"));
         assert!(tool_call.contains("src/core/tool_output.rs"));
+        assert!(
+            !tool_call.contains("format_tool_call_lines"),
+            "raw arguments must stay out of the transcript: {tool_call}"
+        );
 
         let tool_output = events
             .iter()
@@ -11065,12 +11205,12 @@ Irrespective of whether additional information or instructions are given, you ar
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            tool_output.contains("src/core/tool_output.rs:"),
-            "raw search match was hidden from the TUI: {tool_output}"
+            tool_output.contains("searched"),
+            "collapsed search digest was hidden from the TUI: {tool_output}"
         );
         assert!(
-            tool_output.contains("format_tool_call_lines"),
-            "raw search result was hidden from the TUI: {tool_output}"
+            !tool_output.contains("format_tool_call_lines"),
+            "raw search matches must stay out of the TUI: {tool_output}"
         );
     }
 
@@ -11416,6 +11556,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -11464,6 +11605,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -11534,6 +11676,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: true,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -13265,6 +13408,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -13325,6 +13469,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -13396,6 +13541,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -13487,6 +13633,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -13599,6 +13746,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -13794,6 +13942,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),
@@ -13874,6 +14023,7 @@ Irrespective of whether additional information or instructions are given, you ar
             use_auto_condense: false,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 10,
             max_consecutive_mistakes: Some(3),

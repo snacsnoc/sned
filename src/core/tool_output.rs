@@ -33,11 +33,25 @@ pub fn edit_failure_details(result: &str) -> Vec<String> {
 
 /// Format a dispatched tool call for the interactive transcript.
 ///
-/// The full argument object is intentionally shown so the user can verify
-/// what the model asked Sned to do, rather than only seeing a path/count
-/// summary after the fact.
+/// Collapsed to one summary row: full payloads flood the transcript, hiding
+/// edits among reads. Malformed calls keep their raw dump via
+/// [`format_tool_call_lines_with_raw_arguments`] since diagnosing provider
+/// output needs the original text.
 #[must_use]
 pub fn format_tool_call_lines(tool_name: &str, params: &serde_json::Value) -> Vec<String> {
+    let summary = format_tool_summary(tool_name, params);
+    // Summaries without a path (or unknown tools) carry no `▶` marker;
+    // the transcript groups call rows by that marker, so restore it.
+    if summary.trim_start().starts_with('▶') {
+        vec![summary]
+    } else {
+        vec![format!("  ▶ {}", summary.trim_start())]
+    }
+}
+
+/// Pre-collapse argument dump, kept for `--verbose`.
+#[must_use]
+pub fn format_tool_call_lines_verbose(tool_name: &str, params: &serde_json::Value) -> Vec<String> {
     let serialized = serde_json::to_string_pretty(params)
         .unwrap_or_else(|error| format!("<unable to serialize arguments: {error}>"));
     let mut lines = vec![format!("  ▶ {tool_name}")];
@@ -702,19 +716,30 @@ mod tests {
     }
 
     #[test]
-    fn test_format_tool_call_lines_shows_all_arguments() {
+    fn test_format_tool_call_lines_collapses_to_summary() {
         let params = serde_json::json!({
-            "path": ".",
+            "path": "src/core",
             "regex": "global_skills",
             "file_pattern": "*.rs",
         });
         let lines = format_tool_call_lines("search_files", &params);
-        let rendered = lines.join("\n");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("▶"), "got {lines:?}");
+        assert!(lines[0].contains("searched"), "got {lines:?}");
+        assert!(lines[0].contains("src/core"), "got {lines:?}");
+        assert!(!lines[0].contains("global_skills"), "got {lines:?}");
+    }
 
+    #[test]
+    fn test_format_tool_call_lines_verbose_shows_all_arguments() {
+        let params = serde_json::json!({
+            "path": "src/core",
+            "regex": "global_skills",
+        });
+        let lines = format_tool_call_lines_verbose("search_files", &params);
+        let rendered = lines.join("\n");
         assert!(rendered.contains("▶ search_files"));
-        assert!(rendered.contains("\"path\": \".\""));
         assert!(rendered.contains("\"regex\": \"global_skills\""));
-        assert!(rendered.contains("\"file_pattern\": \"*.rs\""));
     }
 
     #[test]

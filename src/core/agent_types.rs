@@ -291,6 +291,7 @@ impl Default for AgentConfig {
             use_auto_condense: true,
             show_token_usage: false,
             show_thinking: true,
+            verbose: false,
             json_output: false,
             max_turns: 100,
             max_consecutive_mistakes: Some(DEFAULT_MAX_CONSECUTIVE_MISTAKES),
@@ -324,6 +325,9 @@ pub struct AgentConfig {
     pub show_token_usage: bool,
     /// Whether thinking text is shown in the TUI transcript.
     pub show_thinking: bool,
+    /// Verbose transcript: full tool arguments and full read-shaped results
+    /// instead of the collapsed one-line forms.
+    pub verbose: bool,
     /// Whether to emit machine-readable JSON output.
     pub json_output: bool,
     /// Maximum number of turns.

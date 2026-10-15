@@ -1850,6 +1850,7 @@ async fn build_task_components(
         use_auto_condense: task_opts.auto_condense,
         show_token_usage: !task_opts.no_token_display,
         show_thinking: !task_opts.hide_thinking,
+        verbose: task_opts.verbose,
         json_output: task_opts.json,
         max_turns: 100,
         max_consecutive_mistakes,
