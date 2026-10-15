@@ -168,6 +168,9 @@ impl MinimaxProvider {
             "messages": messages,
             "stream": true,
         });
+        // MiniMax omits the usage block from stream chunks unless asked,
+        // which blinds token accounting and cache-hit observation.
+        body["stream_options"] = json!({"include_usage": true});
 
         if let Some(max_tokens) = request
             .max_tokens
@@ -1757,6 +1760,9 @@ mod tests {
         let body = provider.build_request_body(&request).unwrap();
         assert_eq!(body["model"], "MiniMax-M2.7");
         assert_eq!(body["stream"], true);
+        // Streaming responses carry no usage block unless explicitly asked;
+        // without this sned records zero tokens and can never observe cache hits.
+        assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(
