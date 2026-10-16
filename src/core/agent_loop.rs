@@ -2986,7 +2986,16 @@ impl AgentLoop {
                     && !self.config.interactive_mode;
                 let plan_active = self.plan_execution_active().await;
 
-                if (first_turn_direct_answer || text_only_turns > 1) && !plan_active {
+                let did_tool_work = history.iter().any(|message| {
+                    matches!(&message.content, MessageContent::UserBlocks(blocks)
+                        if blocks
+                            .iter()
+                            .any(|block| matches!(block, UserContentBlock::ToolResult(_))))
+                });
+
+                if (first_turn_direct_answer || did_tool_work || text_only_turns > 1)
+                    && !plan_active
+                {
                     text_only_completes_task = true;
                 } else if text_only_turns == 1 {
                     if let Some(profile) = self.deps.tool_profile
@@ -6705,6 +6714,42 @@ mod tests {
             &second.messages[..first.messages.len()],
             &first.messages[..],
             "shared message prefix must stay identical for prompt caching"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_text_after_tool_work_completes_without_completion_tool() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+        use serde_json::json;
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("probe.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+        let responses = vec![
+            tool_call_chunks(&[("c1", "read_file", json!({"paths": [path_str]}))]),
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "Done: the file contains alpha and beta.".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured)),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        let config = test_agent_config(provider, "text-after-work-completes");
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(
+            matches!(agent.execute_turn().await, TurnResult::Complete),
+            "a summary after real tool work must end the task, not cost another round trip"
+        );
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            2,
+            "no third request may be spent re-asking for attempt_completion"
         );
     }
 
