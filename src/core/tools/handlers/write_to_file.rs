@@ -382,6 +382,20 @@ impl ToolHandler for WriteToFileHandler {
             match result {
                 Ok(_) => {
                     ctx.invalidate_edit_context(&resolved_path).await;
+                    // The rewrite replaced every byte; without re-tracking,
+                    // the next edit_file call rejects itself as stale.
+                    let written_lines = crate::core::file_editor::split_content_lines(&content);
+                    if let Err(error) = ctx.anchor_mgr.reconcile_checked(
+                        resolved_path.to_string_lossy().as_ref(),
+                        &written_lines,
+                        Some(ctx.task_id.as_str()),
+                    ) {
+                        tracing::warn!(
+                            path = %path,
+                            error = %error,
+                            "write_to_file: anchor re-track failed"
+                        );
+                    }
                     let file_context_metadata = {
                         let mut state = ctx.state.lock().await;
                         state.consecutive_mistakes = 0;

@@ -10234,3 +10234,40 @@ edition = "2021"
         );
     }
 }
+    }
+
+    #[tokio::test]
+    async fn test_edit_after_full_rewrite_does_not_demand_reread() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, _) =
+            setup_test_file("alpha\nbeta\ngamma\n", "edit-after-rewrite").await;
+        let ctx = ctx_for_dir(&dir, "edit-after-rewrite");
+
+        let write = ToolHandler::execute(
+            &crate::core::tools::handlers::write_to_file::WriteToFileHandler::new(),
+            &ctx,
+            serde_json::json!({"path": "test.txt", "content": "alpha\nBETA\ngamma\n"}),
+        )
+        .await;
+        assert!(write.is_ok(), "{write:?}");
+
+        let edit = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "files": [{
+                    "path": "test.txt",
+                    "edits": [{"old_text": "gamma", "new_text": "GAMMA"}]
+                }]
+            }),
+        )
+        .await;
+        let output = edit.expect("edit after the session's own rewrite must not go stale");
+        assert!(
+            output.to_string().contains("1 edit(s) applied"),
+            "{output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "alpha\nBETA\nGAMMA\n"
+        );
