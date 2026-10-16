@@ -91,6 +91,8 @@ pub struct TaskState {
     pub double_check_completion_pending: bool,
     /// Consecutive assistant turns that returned text without tool calls.
     pub text_only_turns: u32,
+    pub last_tool_batch_signature: Option<String>,
+    pub identical_tool_batch_streak: u32,
     /// Whether strict plan mode is enabled (default: true).
     pub strict_plan_mode_enabled: bool,
     /// File context tracker for stale context warnings.
@@ -216,6 +218,8 @@ impl Default for TaskState {
             double_check_completion_enabled: true,
             double_check_completion_pending: false,
             text_only_turns: 0,
+            last_tool_batch_signature: None,
+            identical_tool_batch_streak: 0,
             strict_plan_mode_enabled: true,
             file_context_tracker: crate::core::context::trackers::FileContextTracker::new(),
             last_api_req_info: None,

@@ -3049,6 +3049,7 @@ impl AgentLoop {
         // Provider tool-call order must remain stable even when independent work overlaps.
         let mut tool_failure_count = 0usize;
         let mut completion_result: Option<String> = None;
+        let mut identical_batch_streak: u32 = 0;
         if !prepared_tool_calls.is_empty() {
             let mut edit_files: Vec<(String, i32, i32)> = Vec::new();
             // Mutation bookkeeping derives from executed outcomes below,
@@ -3123,6 +3124,29 @@ impl AgentLoop {
             // Track tool execution statistics for consecutive_mistakes tracking
             let tools_called = batch_output.tools_called;
             tool_failure_count = batch_output.tool_failure_count;
+
+            let all_executed = batch_output
+                .outcomes
+                .iter()
+                .all(|outcome| outcome.executed);
+            identical_batch_streak = if all_executed {
+                let signature =
+                    crate::core::tools::execution::tool_batch_signature(&prepared_tool_calls);
+                let mut state = self.state.lock().await;
+                if state.last_tool_batch_signature.as_deref() == Some(signature.as_str()) {
+                    state.identical_tool_batch_streak =
+                        state.identical_tool_batch_streak.saturating_add(1);
+                } else {
+                    state.last_tool_batch_signature = Some(signature);
+                    state.identical_tool_batch_streak = 0;
+                }
+                state.identical_tool_batch_streak
+            } else {
+                let mut state = self.state.lock().await;
+                state.last_tool_batch_signature = None;
+                state.identical_tool_batch_streak = 0;
+                0
+            };
 
             // Phase 3: Collect results in order, then push as ONE StorageMessage
             let mut tool_result_blocks: Vec<UserContentBlock> = Vec::new();
@@ -3393,6 +3417,18 @@ impl AgentLoop {
                     metrics: None,
                     ts: Some(chrono::Utc::now().timestamp_millis() as u64),
                 });
+                if identical_batch_streak == 2 {
+                    history.push(StorageMessage {
+                        id: Some(Self::next_message_id(&self.message_counter)),
+                        role: MessageRole::User,
+                        content: MessageContent::Text(String::from(
+                            "You have run the identical tool call three times in a row. If you repeat it again the session will stop. Change approach, or finish with a summary of what is done and what is blocked.",
+                        )),
+                        model_info: None,
+                        metrics: None,
+                        ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                    });
+                }
             }
 
             // Track consecutive mistakes for tool failures (denied approval, parse error, etc.)
@@ -3801,6 +3837,12 @@ impl AgentLoop {
                 self.emit_turn_result_event(true).await;
             }
             TurnResult::Complete
+        } else if identical_batch_streak >= 3 {
+            self.emit_turn_end("").await;
+            TurnResult::Error(
+                "Stopped: the model repeated the identical tool call after being warned."
+                    .to_string(),
+            )
         } else {
             // Same turn-end signal for the "more turns coming" branch.
             let markdown_text = response_text.as_deref().unwrap_or("");
@@ -6750,6 +6792,42 @@ mod tests {
             captured.lock().unwrap().len(),
             2,
             "no third request may be spent re-asking for attempt_completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_identical_tool_calls_warn_then_stop() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+        use serde_json::json;
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("loop.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let path_str = path.to_string_lossy().to_string();
+        let call = tool_call_chunks(&[("c1", "read_file", json!({"paths": [path_str]}))]);
+        let responses = vec![call.clone(), call.clone(), call.clone(), call];
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured)),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        let config = test_agent_config(provider, "identical-call-loop");
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        {
+            let history = agent.conversation_history.lock().await;
+            let warned = history.iter().any(|message| match &message.content {
+                MessageContent::Text(text) => text.contains("identical tool call"),
+                _ => false,
+            });
+            assert!(warned, "third identical call must warn the model");
+        }
+        let stopped = agent.execute_turn().await;
+        assert!(
+            matches!(&stopped, TurnResult::Error(message) if message.contains("identical tool call")),
+            "fourth identical call must stop the session, got {stopped:?}"
         );
     }
 

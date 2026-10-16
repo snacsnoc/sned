@@ -1177,6 +1177,23 @@ pub(crate) async fn execute_tool_batch(
 // One outcome per prepared call, immediate or executed: preflight
 // failures (denied, malformed, unknown, deferred) participate
 // before any statistics, completion, or plan decision.
+/// Batch identity for loop detection; malformed calls keep raw arguments
+/// so distinct broken payloads never read as one repeated call.
+pub(crate) fn tool_batch_signature(calls: &[PreparedToolCall]) -> String {
+    calls
+        .iter()
+        .map(|prepared| match &prepared.parsed_args {
+            Ok(args) => format!("{}:{args}", prepared.tool_name),
+            Err(_) => format!(
+                "{}:<malformed:{}>",
+                prepared.tool_name,
+                prepared.tool_call.function.arguments.as_deref().unwrap_or("")
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn collect_ordered_outcomes(
     tool_tasks: Vec<ToolTask>,
     mut result_map: HashMap<usize, ToolExecutionOutput>,
@@ -1235,6 +1252,43 @@ mod tests {
             edit_file_paths: vec![],
             tool_params: serde_json::Value::Null,
         }
+    }
+
+    fn prepared_call(name: &str, args: Option<&str>, parsed: Result<serde_json::Value, &str>) -> PreparedToolCall {
+        PreparedToolCall {
+            tool_call: crate::providers::ApiStreamToolCall {
+                call_id: Some("c1".to_string()),
+                function: crate::providers::ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some(name.to_string()),
+                    arguments: args.map(str::to_string),
+                },
+                signature: None,
+            },
+            tool_id: "c1".to_string(),
+            tool_name: name.to_string(),
+            parsed_args: parsed.map_err(str::to_string),
+        }
+    }
+
+    #[test]
+    fn tool_batch_signature_distinguishes_distinct_malformed_payloads() {
+        let first = prepared_call("read_file", Some("{bad one"), Err("parse"));
+        let second = prepared_call("read_file", Some("{bad two"), Err("parse"));
+        assert_ne!(tool_batch_signature(&[first]), tool_batch_signature(&[second]));
+        let repeat = prepared_call("read_file", Some("{bad one"), Err("parse"));
+        assert_eq!(
+            tool_batch_signature(&[prepared_call("read_file", Some("{bad one"), Err("parse"))]),
+            tool_batch_signature(&[repeat])
+        );
+    }
+
+    #[test]
+    fn tool_batch_signature_matches_identical_valid_calls() {
+        let args = serde_json::json!({"paths": ["a.txt"]});
+        let first = prepared_call("read_file", None, Ok(args.clone()));
+        let second = prepared_call("read_file", None, Ok(args));
+        assert_eq!(tool_batch_signature(&[first]), tool_batch_signature(&[second]));
     }
 
     #[test]
