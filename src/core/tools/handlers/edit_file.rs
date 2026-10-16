@@ -4602,7 +4602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edit_file_exact_block_mode_reports_whitespace_trimmed_match() {
+    async fn test_edit_file_exact_block_mode_applies_whitespace_trimmed_match() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "        work()\n";
         let (dir, file_path, _) = setup_test_file(content, "exact-block-whitespace").await;
@@ -4619,9 +4619,45 @@ mod tests {
         });
 
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
-        let err = result.expect_err("whitespace mismatch must be rejected with helpful error");
-        assert!(err.to_string().contains("trimming whitespace"), "{err}");
-        assert_eq!(std::fs::read_to_string(file_path).unwrap(), content);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "    done()\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_after_full_rewrite_does_not_demand_reread() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (dir, file_path, _) =
+            setup_test_file("alpha\nbeta\ngamma\n", "edit-after-rewrite").await;
+        let ctx = ctx_for_dir(&dir, "edit-after-rewrite");
+
+        let write = ToolHandler::execute(
+            &crate::core::tools::handlers::write_to_file::WriteToFileHandler::new(),
+            &ctx,
+            serde_json::json!({"path": "test.txt", "content": "alpha\nBETA\ngamma\n"}),
+        )
+        .await;
+        assert!(write.is_ok(), "{write:?}");
+
+        let edit = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "files": [{
+                    "path": "test.txt",
+                    "edits": [{"old_text": "gamma", "new_text": "GAMMA"}]
+                }]
+            }),
+        )
+        .await;
+        let output = edit.expect("edit after the session's own rewrite must not go stale");
+        assert!(
+            output.to_string().contains("1 edit(s) applied"),
+            "{output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "alpha\nBETA\nGAMMA\n"
+        );
     }
 
     #[tokio::test]
@@ -7344,7 +7380,7 @@ edition = "2021"
     }
 
     #[tokio::test]
-    async fn test_same_file_whitespace_failure_does_not_latch_reread() {
+    async fn test_same_file_whitespace_match_does_not_latch_reread() {
         let _guard = TEST_MUTEX.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("ws.txt");
@@ -7377,17 +7413,15 @@ edition = "2021"
             ]
         }]});
 
-        let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params)
-            .await
-            .expect_err("a failed edit must still fail the overall request");
-        let output = error.to_string();
+        let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
+        let output = result.expect("whitespace-trimmed edit must succeed").to_string();
         assert!(
-            output.contains("1 edit(s) applied"),
-            "valid edit must apply, got: {output}"
+            output.contains("2 edit(s) applied"),
+            "both edits must apply, got: {output}"
         );
         assert_eq!(
             std::fs::read_to_string(&file_path).unwrap(),
-            "changed\n  second\n"
+            "changed\nSECOND\n"
         );
         assert!(
             !state
@@ -7395,7 +7429,7 @@ edition = "2021"
                 .await
                 .must_reread_before_edit
                 .contains(&crate::core::tools::canonical_path_key(&file_path)),
-            "whitespace failures resolve against untouched lines; a forced re-read would be a wasted turn, got: {output}"
+            "whitespace matches resolve against untouched lines; a forced re-read would be a wasted turn, got: {output}"
         );
     }
 
@@ -10234,40 +10268,3 @@ edition = "2021"
         );
     }
 }
-    }
-
-    #[tokio::test]
-    async fn test_edit_after_full_rewrite_does_not_demand_reread() {
-        let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, _) =
-            setup_test_file("alpha\nbeta\ngamma\n", "edit-after-rewrite").await;
-        let ctx = ctx_for_dir(&dir, "edit-after-rewrite");
-
-        let write = ToolHandler::execute(
-            &crate::core::tools::handlers::write_to_file::WriteToFileHandler::new(),
-            &ctx,
-            serde_json::json!({"path": "test.txt", "content": "alpha\nBETA\ngamma\n"}),
-        )
-        .await;
-        assert!(write.is_ok(), "{write:?}");
-
-        let edit = ToolHandler::execute(
-            &EditFileHandler::new(),
-            &ctx,
-            serde_json::json!({
-                "files": [{
-                    "path": "test.txt",
-                    "edits": [{"old_text": "gamma", "new_text": "GAMMA"}]
-                }]
-            }),
-        )
-        .await;
-        let output = edit.expect("edit after the session's own rewrite must not go stale");
-        assert!(
-            output.to_string().contains("1 edit(s) applied"),
-            "{output}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(file_path).unwrap(),
-            "alpha\nBETA\nGAMMA\n"
-        );

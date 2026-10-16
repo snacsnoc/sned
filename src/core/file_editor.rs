@@ -2453,6 +2453,15 @@ impl EditExecutor {
                         } else {
                             Vec::new()
                         };
+                        if trimmed_matches.len() == 1 {
+                            let line_idx = trimmed_matches[0];
+                            resolved_edits.push(ResolvedEdit {
+                                line_idx,
+                                end_idx: line_idx + old_lines.len() - 1,
+                                edit: edit.clone(),
+                            });
+                            continue;
+                        }
                         let error = if trimmed_matches.is_empty() {
                             "Exact block replacement failed: 'old_text' was not found in the file. Ensure the quoted lines match the current file contents exactly.".to_string()
                         } else {
@@ -5505,6 +5514,65 @@ mod tests {
         assert!(failed.is_empty(), "guttered old_text must resolve: {failed:?}");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].line_idx, 0);
+    }
+
+    #[test]
+    fn test_block_mode_tolerates_whitespace_only_mismatch() {
+        let executor = EditExecutor::new();
+        let lines = vec![
+            "fn main() {".to_string(),
+            "        let x = 1;".to_string(),
+            "        let y = 2;".to_string(),
+            "}".to_string(),
+        ];
+        let hashes = vec![
+            "H0".to_string(),
+            "H1".to_string(),
+            "H2".to_string(),
+            "H3".to_string(),
+        ];
+        let edit = Edit {
+            anchor: String::new(),
+            end_anchor: None,
+            edit_type: "replace".to_string(),
+            text: "    let x = 10;\n    let y = 2;".to_string(),
+            content: None,
+            old_text: Some("    let x = 1;\n    let y = 2;".to_string()),
+        };
+        let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
+        assert!(
+            failed.is_empty(),
+            "whitespace-only mismatch must resolve: {failed:?}"
+        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!((resolved[0].line_idx, resolved[0].end_idx), (1, 2));
+    }
+
+    #[test]
+    fn test_block_mode_rejects_ambiguous_whitespace_match() {
+        let executor = EditExecutor::new();
+        let lines = vec![
+            "    let x = 1;".to_string(),
+            "    foo();".to_string(),
+            "        let x = 1;".to_string(),
+        ];
+        let hashes = vec!["H0".to_string(), "H1".to_string(), "H2".to_string()];
+        let edit = Edit {
+            anchor: String::new(),
+            end_anchor: None,
+            edit_type: "replace".to_string(),
+            text: "let x = 9;".to_string(),
+            content: None,
+            old_text: Some("let x = 1;".to_string()),
+        };
+        let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
+        assert!(resolved.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0].error.contains("trimming whitespace"),
+            "{:?}",
+            failed[0].error
+        );
     }
 
     #[test]
