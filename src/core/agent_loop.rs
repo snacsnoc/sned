@@ -30,7 +30,7 @@ use crate::core::tools::{ToolContext, ToolFailureClass, ToolRegistry, ToolRequir
 use crate::providers::{
     ApiStreamChunk, AssistantContentBlock, MessageContent, MessageRole, Provider, ProviderRequest,
     RedactedThinkingBlock, SharedContentFields, StorageMessage, TextContentBlock, ThinkingBlock,
-    ToolResultContent, ToolResultContentBlock, ToolUseBlock, UserContentBlock,
+    ToolResultBlock, ToolResultContent, ToolResultContentBlock, ToolUseBlock, UserContentBlock,
 };
 use crate::providers::{ProviderError, Providers};
 use crate::storage::global_state::HistoryItem;
@@ -1923,6 +1923,7 @@ impl AgentLoop {
             // of every message/tool-result per turn.
             let mut conversation_guard = self.conversation_history.lock().await;
             compact_old_tool_results(&mut conversation_guard);
+            close_dangling_tool_calls(&mut conversation_guard);
             let original_history_len = conversation_guard.len();
             let result = context_manager::get_new_context_messages_and_metadata(
                 &conversation_guard,
@@ -4736,6 +4737,68 @@ fn truncate_thinking_text(thinking: &mut String, token_limit: usize) {
     }
 }
 
+/// Strict providers reject a tool call with no following result.
+fn close_dangling_tool_calls(history: &mut Vec<StorageMessage>) {
+    let mut insertions: Vec<(usize, StorageMessage)> = Vec::new();
+    for (index, message) in history.iter().enumerate() {
+        let MessageContent::AssistantBlocks(blocks) = &message.content else {
+            continue;
+        };
+        let mut open: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContentBlock::ToolUse(tool) => Some(tool.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        if open.is_empty() {
+            continue;
+        }
+        for later in history.iter().skip(index + 1) {
+            let MessageContent::UserBlocks(blocks) = &later.content else {
+                continue;
+            };
+            for block in blocks {
+                if let UserContentBlock::ToolResult(result) = block {
+                    open.retain(|id| *id != result.tool_use_id);
+                }
+            }
+        }
+        if open.is_empty() {
+            continue;
+        }
+        let blocks = open
+            .iter()
+            .map(|id| {
+                UserContentBlock::ToolResult(ToolResultBlock {
+                    tool_use_id: (*id).to_string(),
+                    content: ToolResultContent::Text(
+                        "Tool execution was interrupted before it produced output. Assume no reliable outcome.".to_string(),
+                    ),
+                    shared: SharedContentFields {
+                        call_id: Some((*id).to_string()),
+                        signature: None,
+                    },
+                })
+            })
+            .collect();
+        insertions.push((
+            index + 1,
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(blocks),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ));
+    }
+    for (index, message) in insertions.into_iter().rev() {
+        history.insert(index, message);
+    }
+}
+
 /// Compacts older tool results in the conversation history, preserving
 /// the most recent `RECENT_TO_PRESERVE` reads and shell outputs in full.
 /// Stale bulk output costs tokens on every later turn without adding new
@@ -6792,6 +6855,85 @@ mod tests {
             captured.lock().unwrap().len(),
             2,
             "no third request may be spent re-asking for attempt_completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_tool_call_gets_synthetic_result_in_next_request() {
+        use crate::providers::{
+            AssistantContentBlock, MessageContent, MessageRole, SharedContentFields,
+            StorageMessage, ToolUseBlock, UserContentBlock,
+        };
+        use serde_json::json;
+        fn user_text(text: &str) -> StorageMessage {
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text(text.to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            }
+        }
+        let shared = || SharedContentFields {
+            call_id: None,
+            signature: None,
+        };
+        let responses = vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+            text: "Understood, I will not run it.".to_string(),
+            id: None,
+            signature: None,
+        })]];
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured)),
+        ));
+        let config = test_agent_config(provider, "dangling-tool-call");
+        let mut agent = AgentLoop::new(config);
+        {
+            let mut history = agent.conversation_history.lock().await;
+            history.push(user_text("run the game"));
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                    ToolUseBlock {
+                        id: "c1".to_string(),
+                        name: "execute_command".to_string(),
+                        input: json!({"commands": ["./tetris"]}),
+                        shared: shared(),
+                        reasoning_details: None,
+                    },
+                )]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+            history.push(user_text("no dont run it"));
+        }
+        let _ = agent.execute_turn().await;
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let messages = &captured[0].messages;
+        let call_idx = messages
+            .iter()
+            .position(|message| match &message.content {
+                MessageContent::AssistantBlocks(blocks) => blocks.iter().any(|block| {
+                    matches!(block, AssistantContentBlock::ToolUse(tool) if tool.id == "c1")
+                }),
+                _ => false,
+            })
+            .expect("assistant tool call must be sent");
+        let follows = messages.get(call_idx + 1).expect("call must be followed");
+        let closed = match &follows.content {
+            MessageContent::UserBlocks(blocks) => blocks.iter().any(|block| {
+                matches!(block, UserContentBlock::ToolResult(result) if result.tool_use_id == "c1")
+            }),
+            _ => false,
+        };
+        assert!(
+            closed,
+            "interrupted call must be closed by a synthetic result before user text: {messages:?}"
         );
     }
 
