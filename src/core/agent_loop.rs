@@ -4807,7 +4807,7 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
     const RECENT_TO_PRESERVE: usize = 2;
     const MIN_BYTES_TO_COMPACT: usize = 1000;
 
-    let bytes_before = tool_result_text_bytes(history);
+    let bytes_before = tool_result_text_bytes(history) + tool_call_arg_bytes(history);
 
     let mut tool_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -4938,15 +4938,75 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
         }
     }
 
+    // Old call arguments ride along verbatim on every later turn even
+    // though only their outcomes matter now. Collapse large ones the
+    // same way, keeping ids and names so result linkage survives.
+    for (index, message) in history.iter_mut().enumerate() {
+        if newest_tool_use_index.is_some_and(|cutoff| index >= cutoff) {
+            continue;
+        }
+        if message.role != MessageRole::Assistant {
+            continue;
+        }
+        let MessageContent::AssistantBlocks(blocks) = &mut message.content else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            let AssistantContentBlock::ToolUse(tool_use) = block else {
+                continue;
+            };
+            if tool_use.input.to_string().len() <= MIN_BYTES_TO_COMPACT {
+                continue;
+            }
+            let mut collapsed = serde_json::Map::new();
+            collapsed.insert("_compacted".to_string(), serde_json::Value::Bool(true));
+            // edit_file normalizes args to {"files": [...]} without a
+            // top-level path, so fall back to the first file entry.
+            let path = tool_use
+                .input
+                .get("path")
+                .filter(|p| p.is_string())
+                .or_else(|| {
+                    tool_use
+                        .input
+                        .get("files")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|files| files.first())
+                        .and_then(|file| file.get("path"))
+                        .filter(|p| p.is_string())
+                });
+            if let Some(path) = path {
+                collapsed.insert("path".to_string(), path.clone());
+            }
+            tool_use.input = serde_json::Value::Object(collapsed);
+        }
+    }
+
     // One line per turn keeps every debug log a running record of what
     // compaction actually saved, so future sessions measure themselves.
-    let bytes_after = tool_result_text_bytes(history);
+    let bytes_after = tool_result_text_bytes(history) + tool_call_arg_bytes(history);
     tracing::debug!(
         bytes_before,
         bytes_after,
         saved = bytes_before.saturating_sub(bytes_after),
         "history compaction collapsed stale tool results"
     );
+}
+
+fn tool_call_arg_bytes(history: &[StorageMessage]) -> usize {
+    history
+        .iter()
+        .filter(|msg| msg.role == MessageRole::Assistant)
+        .filter_map(|msg| match &msg.content {
+            MessageContent::AssistantBlocks(blocks) => Some(blocks),
+            _ => None,
+        })
+        .flat_map(|blocks| blocks.iter())
+        .filter_map(|block| match block {
+            AssistantContentBlock::ToolUse(tool_use) => Some(tool_use.input.to_string().len()),
+            _ => None,
+        })
+        .sum()
 }
 
 fn tool_result_text_bytes(history: &[StorageMessage]) -> usize {
@@ -6917,11 +6977,13 @@ mod tests {
         let messages = &captured[0].messages;
         let call_idx = messages
             .iter()
-            .position(|message| match &message.content {
+            .position(|message| {
+                match &message.content {
                 MessageContent::AssistantBlocks(blocks) => blocks.iter().any(|block| {
                     matches!(block, AssistantContentBlock::ToolUse(tool) if tool.id == "c1")
                 }),
                 _ => false,
+            }
             })
             .expect("assistant tool call must be sent");
         let follows = messages.get(call_idx + 1).expect("call must be followed");
@@ -6934,6 +6996,57 @@ mod tests {
         assert!(
             closed,
             "interrupted call must be closed by a synthetic result before user text: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_third_request_collapses_old_call_arguments() {
+        let big_content = "x".repeat(5000);
+        let responses = vec![
+            tool_call_chunks(&[(
+                "c1",
+                "write_to_file",
+                serde_json::json!({"path": "big.c", "content": big_content}),
+            )]),
+            tool_call_chunks(&[("c2", "read_file", serde_json::json!({"paths": ["big.c"]}))]),
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "Done.".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured)),
+        ));
+        let (tx, _rx) = mpsc::channel(64);
+        let mut config = test_agent_config(provider, "call-args-collapse");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::WriteToFile,
+            Arc::new(StaticResultHandler("written")),
+        );
+        registry.register(
+            SnedTool::ReadFile,
+            Arc::new(StaticResultHandler("read back")),
+        );
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let _ = agent.execute_turn().await;
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 3);
+        let third = serde_json::to_string(&captured[2].messages).unwrap();
+        assert!(
+            !third.contains(&"x".repeat(5000)),
+            "old call content must not ride along"
+        );
+        assert!(third.contains("_compacted"), "collapsed call must say so");
+        assert!(third.contains("\"c1\""), "call id linkage must survive");
+        assert!(
+            third.contains("written"),
+            "tool result must survive alongside"
         );
     }
 
@@ -12771,6 +12884,186 @@ Irrespective of whether additional information or instructions are given, you ar
         );
         assert!(file1_text.starts_with("[File: file1.rs, Hash: abc12345] (100 lines total)"));
         assert!(file1_text.contains("Earlier read content"));
+    }
+
+    fn assistant_call_msg(id: &str, name: &str, input: serde_json::Value) -> StorageMessage {
+        StorageMessage {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                crate::providers::ToolUseBlock {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input,
+                    shared: crate::providers::SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                    reasoning_details: None,
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }
+    }
+
+    fn call_input(msg: &StorageMessage) -> serde_json::Value {
+        match &msg.content {
+            MessageContent::AssistantBlocks(blocks) => match &blocks[0] {
+                AssistantContentBlock::ToolUse(tool) => tool.input.clone(),
+                _ => panic!("Expected ToolUse"),
+            },
+            _ => panic!("Expected AssistantBlocks"),
+        }
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_collapses_large_call_arguments() {
+        let mut history = vec![
+            assistant_call_msg(
+                "c1",
+                "write_to_file",
+                serde_json::json!({"path": "big.c", "content": "x".repeat(5000)}),
+            ),
+            assistant_call_msg("c2", "read_file", serde_json::json!({"paths": ["a.txt"]})),
+        ];
+
+        compact_old_tool_results(&mut history);
+
+        let old_input = call_input(&history[0]);
+        assert_eq!(
+            old_input.get("_compacted"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(
+            !old_input.to_string().contains(&"x".repeat(5000)),
+            "old 5KB call body must be gone"
+        );
+        let new_input = call_input(&history[1]);
+        assert_eq!(new_input["paths"], serde_json::json!(["a.txt"]));
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_preserves_call_id_and_name() {
+        let mut history = vec![
+            assistant_call_msg(
+                "call-9",
+                "edit_file",
+                serde_json::json!({"path": "f.c", "edits": ["y".repeat(2000)]}),
+            ),
+            assistant_call_msg("c2", "read_file", serde_json::json!({"paths": ["a.txt"]})),
+        ];
+
+        compact_old_tool_results(&mut history);
+
+        match &history[0].content {
+            MessageContent::AssistantBlocks(blocks) => match &blocks[0] {
+                AssistantContentBlock::ToolUse(tool) => {
+                    assert_eq!(tool.id, "call-9");
+                    assert_eq!(tool.name, "edit_file");
+                }
+                _ => panic!("Expected ToolUse"),
+            },
+            _ => panic!("Expected AssistantBlocks"),
+        }
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_keeps_small_call_arguments() {
+        let mut history = vec![
+            assistant_call_msg(
+                "c1",
+                "execute_command",
+                serde_json::json!({"commands": ["cc -o tetris tetris.c"]}),
+            ),
+            assistant_call_msg("c2", "read_file", serde_json::json!({"paths": ["a.txt"]})),
+        ];
+
+        compact_old_tool_results(&mut history);
+
+        assert_eq!(
+            call_input(&history[0])["commands"],
+            serde_json::json!(["cc -o tetris tetris.c"])
+        );
+    }
+
+    fn tool_result_msg(id: &str, text: &str) -> StorageMessage {
+        StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                crate::providers::ToolResultBlock {
+                    tool_use_id: id.to_string(),
+                    content: crate::providers::ToolResultContent::Text(text.to_string()),
+                    shared: crate::providers::SharedContentFields {
+                        call_id: None,
+                        signature: None,
+                    },
+                },
+            )]),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_keeps_path_from_both_call_shapes() {
+        let mut history = vec![
+            assistant_call_msg(
+                "c1",
+                "write_to_file",
+                serde_json::json!({"path": "big.c", "content": "x".repeat(5000)}),
+            ),
+            assistant_call_msg(
+                "c2",
+                "edit_file",
+                serde_json::json!({"files": [{"path": "f.c", "edits": ["y".repeat(2000)]}]}),
+            ),
+            assistant_call_msg("c3", "read_file", serde_json::json!({"paths": ["a.txt"]})),
+        ];
+
+        compact_old_tool_results(&mut history);
+
+        assert_eq!(call_input(&history[0])["path"], "big.c");
+        assert_eq!(
+            call_input(&history[1])["path"],
+            "f.c",
+            "files-shaped edit args must keep their path too"
+        );
+    }
+
+    #[test]
+    fn test_close_then_compact_repairs_dangling_call_once() {
+        let mut history = vec![assistant_call_msg(
+            "c1",
+            "write_to_file",
+            serde_json::json!({"path": "big.c", "content": "x".repeat(5000)}),
+        )];
+
+        compact_old_tool_results(&mut history);
+        close_dangling_tool_calls(&mut history);
+        assert_eq!(history.len(), 2, "interrupted call must be closed");
+        assert_eq!(
+            call_input(&history[0])["content"].as_str().map(str::len),
+            Some(5000),
+            "newest call must stay intact on its own turn"
+        );
+
+        history.push(assistant_call_msg(
+            "c2",
+            "read_file",
+            serde_json::json!({"paths": ["big.c"]}),
+        ));
+        history.push(tool_result_msg("c2", "read back"));
+        compact_old_tool_results(&mut history);
+        close_dangling_tool_calls(&mut history);
+        assert_eq!(history.len(), 4, "repair must not run twice");
+        assert!(
+            call_input(&history[0]).get("_compacted").is_some(),
+            "superseded call must collapse"
+        );
     }
 
     #[test]
