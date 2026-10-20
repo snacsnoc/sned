@@ -136,6 +136,7 @@ fn auth_environment_variable(provider: &str) -> &'static str {
         "gemini" => "GEMINI_API_KEY",
         "minimax" => "MINIMAX_API_KEY",
         "deepseek" => "DEEPSEEK_API_KEY",
+        "nvidia" => "NVIDIA_API_KEY",
         _ => "API_KEY",
     }
 }
@@ -811,7 +812,7 @@ pub fn run_auth(opts: AuthOptions) -> anyhow::Result<()> {
                     "Could not auto-detect provider. Use --provider to specify one.",
                 );
                 eprintln!(
-                    "Supported providers: anthropic, openai, openai-native, openrouter, gemini, minimax, deepseek"
+                    "Supported providers: anthropic, openai, openai-native, openrouter, gemini, minimax, deepseek, nvidia"
                 );
                 return Ok(());
             }
@@ -1111,7 +1112,7 @@ mod tests {
         assert_eq!(base_url_state_key("openrouter"), "open_router_base_url");
         assert_eq!(base_url_state_key("gemini"), "gemini_base_url");
         assert_eq!(base_url_state_key("lite_llm"), "lite_llm_base_url");
-        for provider in ["openai", "openai-native", "deepseek", "minimax"] {
+        for provider in ["openai", "openai-native", "deepseek", "minimax", "nvidia"] {
             assert_eq!(base_url_state_key(provider), "open_ai_base_url");
         }
     }

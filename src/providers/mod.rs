@@ -10,6 +10,7 @@ pub mod gemini;
 pub mod gemini_format;
 pub mod minimax;
 pub mod mock;
+pub mod nvidia;
 pub mod openai;
 pub mod openrouter;
 
@@ -18,6 +19,7 @@ pub use deepseek::DeepSeekProvider;
 pub use gemini::GeminiProvider;
 pub use minimax::MinimaxProvider;
 pub use mock::MockProvider;
+pub use nvidia::NvidiaProvider;
 pub use openai::OpenAiProvider;
 pub use openrouter::OpenRouterProvider;
 
@@ -1227,6 +1229,7 @@ pub enum Providers {
     DeepSeek(DeepSeekProvider),
     Gemini(GeminiProvider),
     Minimax(MinimaxProvider),
+    Nvidia(NvidiaProvider),
     OpenRouter(OpenRouterProvider),
     Mock(MockProvider),
     RetryTest(RetryTestProvider),
@@ -1291,6 +1294,7 @@ impl Provider for Providers {
             Self::DeepSeek(p) => p.create_message(request).await,
             Self::Gemini(p) => p.create_message(request).await,
             Self::Minimax(p) => p.create_message(request).await,
+            Self::Nvidia(p) => p.create_message(request).await,
             Self::OpenRouter(p) => p.create_message(request).await,
             Self::Mock(p) => p.create_message(request).await,
             Self::RetryTest(p) => p.create_message(request).await,
@@ -1310,6 +1314,7 @@ impl Provider for Providers {
             Self::DeepSeek(p) => p.get_model(),
             Self::Gemini(p) => p.get_model(),
             Self::Minimax(p) => p.get_model(),
+            Self::Nvidia(p) => p.get_model(),
             Self::OpenRouter(p) => p.get_model(),
             Self::Mock(p) => p.get_model(),
             Self::RetryTest(p) => p.get_model(),
@@ -1329,6 +1334,7 @@ impl Provider for Providers {
             Self::DeepSeek(p) => p.name(),
             Self::Gemini(p) => p.name(),
             Self::Minimax(p) => p.name(),
+            Self::Nvidia(p) => p.name(),
             Self::OpenRouter(p) => p.name(),
             Self::Mock(p) => p.name(),
             Self::RetryTest(p) => p.name(),
@@ -1348,6 +1354,7 @@ impl Provider for Providers {
             Self::DeepSeek(p) => p.preoutput_policy(),
             Self::Gemini(p) => p.preoutput_policy(),
             Self::Minimax(p) => p.preoutput_policy(),
+            Self::Nvidia(p) => p.preoutput_policy(),
             Self::OpenRouter(p) => p.preoutput_policy(),
             Self::Mock(p) => p.preoutput_policy(),
             Self::RetryTest(p) => p.preoutput_policy(),

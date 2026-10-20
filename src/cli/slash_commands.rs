@@ -1575,6 +1575,12 @@ pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
             description: "DeepSeek Chat",
         },
         ModelPickerEntry {
+            provider: "nvidia",
+            model_id: "meta/llama-3.1-8b-instruct",
+            label: "llama-3.1-8b-instruct",
+            description: "NVIDIA NIM Llama 3.1 8B",
+        },
+        ModelPickerEntry {
             provider: "openrouter",
             model_id: "anthropic/claude-sonnet-5",
             label: "anthropic/claude-sonnet-5",
@@ -2807,6 +2813,7 @@ mod tests {
         assert!(providers.contains(&"minimax"));
         assert!(providers.contains(&"gemini"));
         assert!(providers.contains(&"deepseek"));
+        assert!(providers.contains(&"nvidia"));
         assert!(providers.contains(&"openrouter"));
     }
 

@@ -11,6 +11,7 @@ pub(crate) const PROVIDER_API_KEY_ENV_VARS: &[(&str, &[&str])] = &[
     ("gemini", &["GEMINI_API_KEY"]),
     ("minimax", &["MINIMAX_API_KEY", "MINIMAX_CN_API_KEY"]),
     ("deepseek", &["DEEPSEEK_API_KEY"]),
+    ("nvidia", &["NVIDIA_API_KEY"]),
 ];
 
 /// Get the best provider based on available environment variables.
@@ -53,6 +54,7 @@ mod tests {
             "MINIMAX_CN_API_KEY",
             "DEEPSEEK_API_KEY",
             "OPENROUTER_API_KEY",
+            "NVIDIA_API_KEY",
         ];
         for var in &vars {
             // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
@@ -98,6 +100,7 @@ mod tests {
             ("GEMINI_API_KEY", "gemini"),
             ("MINIMAX_API_KEY", "minimax"),
             ("DEEPSEEK_API_KEY", "deepseek"),
+            ("NVIDIA_API_KEY", "nvidia"),
         ];
 
         for (env_var, expected_provider) in test_cases {

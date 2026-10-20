@@ -192,7 +192,7 @@ pub(crate) fn calculate_context_tokens(
     provider_name: &str,
 ) -> u64 {
     let cache_tokens = match provider_name {
-        "openai" | "minimax" | "deepseek" | "openrouter" => cache_reads.unwrap_or(0) as u64,
+        "openai" | "minimax" | "deepseek" | "openrouter" | "nvidia" => cache_reads.unwrap_or(0) as u64,
         _ => cache_writes.unwrap_or(0) as u64 + cache_reads.unwrap_or(0) as u64,
     };
 

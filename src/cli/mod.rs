@@ -271,6 +271,7 @@ pub struct TaskOptions {
             clap::builder::PossibleValue::new("gemini"),
             clap::builder::PossibleValue::new("minimax"),
             clap::builder::PossibleValue::new("deepseek"),
+            clap::builder::PossibleValue::new("nvidia"),
             clap::builder::PossibleValue::new("mock").hide(true),
         ])
     )]
@@ -948,6 +949,7 @@ pub(crate) fn runtime_provider_secret_key(provider_name: &str) -> Option<&'stati
         "gemini" => Some("geminiApiKey"),
         "minimax" => Some("minimaxApiKey"),
         "deepseek" => Some("deepSeekApiKey"),
+        "nvidia" => Some("nvidiaApiKey"),
         _ => None,
     }
 }
@@ -969,6 +971,7 @@ pub(crate) fn runtime_provider_api_key_available(
         "gemini" => &["GEMINI_API_KEY"][..],
         "minimax" => &["MINIMAX_CN_API_KEY", "MINIMAX_API_KEY"][..],
         "deepseek" => &["DEEPSEEK_API_KEY"][..],
+        "nvidia" => &["NVIDIA_API_KEY"][..],
         _ => return None,
     };
     let secret_key = runtime_provider_secret_key(provider_name)?;
@@ -1053,6 +1056,7 @@ fn provider_from_state(
         ("gemini", "geminiApiKey"),
         ("minimax", "minimaxApiKey"),
         ("deepseek", "deepSeekApiKey"),
+        ("nvidia", "nvidiaApiKey"),
     ] {
         if state_manager
             .get_secret(secret_key)
@@ -1089,6 +1093,7 @@ pub(crate) fn create_provider(
              \x1b[36m  GEMINI_API_KEY\x1b[0m          - Google Gemini\n\
              \x1b[36m  OPENROUTER_API_KEY\x1b[0m      - OpenRouter\n\
              \x1b[36m  DEEPSEEK_API_KEY\x1b[0m       - DeepSeek\n\
+             \x1b[36m  NVIDIA_API_KEY\x1b[0m         - NVIDIA NIM\n\
              \n\
              Or use --provider with --api-key/--base-url, or run sned auth --provider <name>"
         );
@@ -1150,7 +1155,7 @@ pub(crate) fn create_provider(
     if extra_body.is_some()
         && !matches!(
             provider_name.as_str(),
-            "openai" | "openai-native" | "openrouter" | "deepseek"
+            "openai" | "openai-native" | "openrouter" | "deepseek" | "nvidia"
         )
     {
         anyhow::bail!("--extra-body is only supported by OpenAI-compatible providers.");
@@ -1447,6 +1452,42 @@ pub(crate) fn create_provider(
                         model_id: model_id_str,
                         model_info: Some(deepseek_model_info),
                         extra_body,
+                    },
+                )?,
+            ))
+        }
+        "nvidia" => {
+            if task_opts.reasoning_effort.is_some() {
+                anyhow::bail!("--reasoning-effort is not supported by NVIDIA.");
+            }
+            if task_opts.thinking.is_some() {
+                anyhow::bail!("--thinking is not supported by NVIDIA.");
+            }
+            let api_key = api_key_from_sources(
+                task_opts,
+                state_manager,
+                &["NVIDIA_API_KEY"],
+                "nvidiaApiKey",
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "NVIDIA_API_KEY is not set. \
+                     Set the environment variable, use --api-key, or run sned auth --provider nvidia."
+                )
+            })?;
+            let model_id_str =
+                model_id.unwrap_or_else(|| "meta/llama-3.1-8b-instruct".to_string());
+            let mut nvidia_model_info =
+                crate::providers::nvidia::get_nvidia_model_info(&model_id_str);
+            apply_context_window_override(&mut nvidia_model_info.base, task_opts.context_window);
+            Arc::new(crate::providers::Providers::Nvidia(
+                crate::providers::nvidia::NvidiaProvider::new(
+                    crate::providers::nvidia::NvidiaConfig {
+                        api_key,
+                        model_id: model_id_str,
+                        model_info: Some(nvidia_model_info),
+                        extra_body,
+                        base_url: task_opts.base_url.clone(),
                     },
                 )?,
             ))
@@ -2985,6 +3026,7 @@ mod tests {
                 "DEEPSEEK_API_KEY",
                 "MINIMAX_API_KEY",
                 "MINIMAX_CN_API_KEY",
+                "NVIDIA_API_KEY",
                 "MISTRAL_API_KEY",
                 "MOONSHOT_API_KEY",
                 "ZAI_API_KEY",
@@ -3055,6 +3097,7 @@ mod tests {
                 "DEEPSEEK_API_KEY",
                 "MINIMAX_API_KEY",
                 "MINIMAX_CN_API_KEY",
+                "NVIDIA_API_KEY",
                 "MISTRAL_API_KEY",
                 "MOONSHOT_API_KEY",
                 "HF_TOKEN",
@@ -3146,6 +3189,7 @@ mod tests {
                 "DEEPSEEK_API_KEY",
                 "MINIMAX_API_KEY",
                 "MINIMAX_CN_API_KEY",
+                "NVIDIA_API_KEY",
                 "MISTRAL_API_KEY",
                 "MOONSHOT_API_KEY",
                 "HF_TOKEN",
@@ -3269,6 +3313,7 @@ mod tests {
                 "DEEPSEEK_API_KEY",
                 "MINIMAX_API_KEY",
                 "MINIMAX_CN_API_KEY",
+                "NVIDIA_API_KEY",
                 "MISTRAL_API_KEY",
                 "MOONSHOT_API_KEY",
                 "HF_TOKEN",
@@ -3422,6 +3467,7 @@ mod tests {
             "MINIMAX_API_KEY",
             "MINIMAX_CN_API_KEY",
             "DEEPSEEK_API_KEY",
+            "NVIDIA_API_KEY",
         ] {
             // SAFETY: provider environment mutation is serialized by crate::test_support::env_lock().
             unsafe { std::env::remove_var(env_var) };
