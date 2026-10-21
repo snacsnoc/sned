@@ -1808,15 +1808,15 @@ impl AnchorStateManager {
     #[cfg(test)]
     #[must_use]
     pub fn new() -> Self {
-        static TEST_CACHE: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
-            tempfile::Builder::new()
-                .prefix("sned-anchor-test-")
-                .tempdir()
-                .expect("create isolated anchor test cache")
-                .keep()
-                .join("anchors.json")
-        });
-        Self::with_cache_file(TEST_CACHE.clone())
+        // Parallel tests reuse task ids, so a shared cache file turns
+        // their saves into lost-update races on the same shards.
+        let cache = tempfile::Builder::new()
+            .prefix("sned-anchor-test-")
+            .tempdir()
+            .expect("create isolated anchor test cache")
+            .keep()
+            .join("anchors.json");
+        Self::with_cache_file(cache)
     }
 
     /// Keeps independent sessions/tests from sharing a process-global cache location.
@@ -4646,6 +4646,17 @@ mod tests {
         // All anchors should be unique
         let unique: HashSet<_> = anchors.iter().collect();
         assert_eq!(unique.len(), anchors.len());
+    }
+
+    #[test]
+    fn test_anchor_managers_do_not_share_test_cache() {
+        let first = AnchorStateManager::new();
+        let second = AnchorStateManager::new();
+        assert_ne!(
+            first.storage().cache_file,
+            second.storage().cache_file,
+            "managers must not race on one process-global cache file"
+        );
     }
 
     #[test]

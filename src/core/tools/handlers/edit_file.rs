@@ -4408,9 +4408,8 @@ mod tests {
     #[tokio::test]
     async fn test_edit_file_accepts_verified_multiline_anchor_block() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("before\nfirst\nsecond\nthird\nafter\n", "anchor-block").await;
-        let ctx = ctx_for_dir(&dir, "anchor-block");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("before\nfirst\nsecond\nthird\nafter\n", "anchor-block").await;
         let block = format!(
             "{}§first\n{}§second\n{}§third\n",
             anchors[1], anchors[2], anchors[3]
@@ -4430,9 +4429,8 @@ mod tests {
     #[tokio::test]
     async fn test_edit_file_accepts_top_level_path_and_stringified_edits_with_plain_continuations() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("before\nfirst\n    second\n\nthird\nafter\n", "plain-anchor-block").await;
-        let ctx = ctx_for_dir(&dir, "plain-anchor-block");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("before\nfirst\n    second\n\nthird\nafter\n", "plain-anchor-block").await;
         let edits = serde_json::json!([{
             "anchor": format!("{}§first\n    second\n\nthird", anchors[1]),
             "text": "replacement"
@@ -4448,8 +4446,7 @@ mod tests {
     async fn test_edit_file_rejects_mismatched_plain_continuation_without_writing() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "before\nfirst\nsecond\nafter\n";
-        let (dir, file_path, anchors) = setup_test_file(content, "plain-anchor-mismatch").await;
-        let ctx = ctx_for_dir(&dir, "plain-anchor-mismatch");
+        let (dir, file_path, anchors, ctx) = setup_test_ctx(content, "plain-anchor-mismatch").await;
         let params = serde_json::json!({
             "path": "test.txt",
             "edits": [{"anchor": format!("{}§first\nchanged", anchors[1]), "text": "replacement"}]
@@ -4474,9 +4471,8 @@ mod tests {
     #[tokio::test]
     async fn test_edit_file_accepts_multiline_anchor_block_ending_with_empty_logical_line() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("first\nsecond\n", "anchor-block-trailing-empty").await;
-        let ctx = ctx_for_dir(&dir, "anchor-block-trailing-empty");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("first\nsecond\n", "anchor-block-trailing-empty").await;
         let block = format!("{}§first\n{}§second\n{}§\n", anchors[0], anchors[1], anchors[2]);
         let params = serde_json::json!({
             "files": [{"path": "test.txt", "edits": [{"anchor": block, "text": "replacement"}]}]
@@ -4490,9 +4486,8 @@ mod tests {
     #[tokio::test]
     async fn test_edit_file_accepts_multiline_anchor_and_end_anchor_blocks() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("start\nkeep\nend\nafter\n", "selector-blocks").await;
-        let ctx = ctx_for_dir(&dir, "selector-blocks");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("start\nkeep\nend\nafter\n", "selector-blocks").await;
         let params = serde_json::json!({
             "files": [{
                 "path": "test.txt",
@@ -4513,8 +4508,7 @@ mod tests {
     async fn test_edit_file_exact_block_mode_replaces_multiline_braces() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "func test() {\n    lock.withLock {\n        work()\n}\n";
-        let (dir, file_path, _) = setup_test_file(content, "exact-block-braces").await;
-        let ctx = ctx_for_dir(&dir, "exact-block-braces");
+        let (dir, file_path, _, ctx) = setup_test_ctx(content, "exact-block-braces").await;
 
         let params = serde_json::json!({
             "files": [{
@@ -4538,8 +4532,7 @@ mod tests {
     async fn test_edit_file_exact_block_mode_at_file_level() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "let a = 1\nlet b = 2\n";
-        let (dir, file_path, _) = setup_test_file(content, "exact-block-file-level").await;
-        let ctx = ctx_for_dir(&dir, "exact-block-file-level");
+        let (dir, file_path, _, ctx) = setup_test_ctx(content, "exact-block-file-level").await;
 
         let params = serde_json::json!({
             "files": [{
@@ -4561,8 +4554,7 @@ mod tests {
     async fn test_edit_file_exact_block_mode_top_level_normalized() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "first\nsecond\n";
-        let (dir, file_path, _) = setup_test_file(content, "exact-block-top-level").await;
-        let ctx = ctx_for_dir(&dir, "exact-block-top-level");
+        let (dir, file_path, _, ctx) = setup_test_ctx(content, "exact-block-top-level").await;
 
         let params = serde_json::json!({
             "path": "test.txt",
@@ -4582,8 +4574,7 @@ mod tests {
     async fn test_edit_file_exact_block_mode_rejects_ambiguous_occurrences() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "    }\n    }\n";
-        let (dir, file_path, _) = setup_test_file(content, "exact-block-ambiguous").await;
-        let ctx = ctx_for_dir(&dir, "exact-block-ambiguous");
+        let (dir, file_path, _, ctx) = setup_test_ctx(content, "exact-block-ambiguous").await;
 
         let params = serde_json::json!({
             "files": [{
@@ -4605,8 +4596,7 @@ mod tests {
     async fn test_edit_file_exact_block_mode_applies_whitespace_trimmed_match() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "        work()\n";
-        let (dir, file_path, _) = setup_test_file(content, "exact-block-whitespace").await;
-        let ctx = ctx_for_dir(&dir, "exact-block-whitespace");
+        let (dir, file_path, _, ctx) = setup_test_ctx(content, "exact-block-whitespace").await;
 
         let params = serde_json::json!({
             "files": [{
@@ -4626,9 +4616,8 @@ mod tests {
     #[tokio::test]
     async fn test_edit_after_full_rewrite_does_not_demand_reread() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, _) =
-            setup_test_file("alpha\nbeta\ngamma\n", "edit-after-rewrite").await;
-        let ctx = ctx_for_dir(&dir, "edit-after-rewrite");
+        let (dir, file_path, _, ctx) =
+            setup_test_ctx("alpha\nbeta\ngamma\n", "edit-after-rewrite").await;
 
         let write = ToolHandler::execute(
             &crate::core::tools::handlers::write_to_file::WriteToFileHandler::new(),
@@ -4664,8 +4653,7 @@ mod tests {
     async fn test_edit_file_exact_block_mode_handles_trailing_newlines_in_old_and_new_text() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "header\nline 1\nline 2\nfooter\n";
-        let (dir, file_path, _) = setup_test_file(content, "exact-block-newlines").await;
-        let ctx = ctx_for_dir(&dir, "exact-block-newlines");
+        let (dir, file_path, _, ctx) = setup_test_ctx(content, "exact-block-newlines").await;
 
         let params = serde_json::json!({
             "files": [{
@@ -4689,8 +4677,7 @@ mod tests {
     async fn test_edit_file_exact_block_mode_old_text_longer_than_file_does_not_panic() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "only one line\n";
-        let (dir, file_path, _) = setup_test_file(content, "exact-block-longer").await;
-        let ctx = ctx_for_dir(&dir, "exact-block-longer");
+        let (dir, file_path, _, ctx) = setup_test_ctx(content, "exact-block-longer").await;
 
         let params = serde_json::json!({
             "files": [{
@@ -4712,8 +4699,7 @@ mod tests {
     async fn test_edit_file_exact_block_mode_rejects_empty_old_text() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "some content\n";
-        let (dir, file_path, _) = setup_test_file(content, "exact-block-empty").await;
-        let ctx = ctx_for_dir(&dir, "exact-block-empty");
+        let (dir, file_path, _, ctx) = setup_test_ctx(content, "exact-block-empty").await;
 
         let params = serde_json::json!({
             "files": [{
@@ -4734,8 +4720,7 @@ mod tests {
     #[tokio::test]
     async fn test_edit_file_repairs_stringified_file_entry_edits() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) = setup_test_file("old\n", "stringified-edits").await;
-        let ctx = ctx_for_dir(&dir, "stringified-edits");
+        let (dir, file_path, anchors, ctx) = setup_test_ctx("old\n", "stringified-edits").await;
         let edits = format!(
             "[{{\"anchor\":\"{}§old\",\"text\":\"new\"}}]",
             anchors[0]
@@ -4766,8 +4751,7 @@ mod tests {
     async fn test_edit_file_rejects_mismatched_line_in_anchor_block() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "before\nfirst\nsecond\nthird\nafter\n";
-        let (dir, file_path, anchors) = setup_test_file(content, "anchor-block-mismatch").await;
-        let ctx = ctx_for_dir(&dir, "anchor-block-mismatch");
+        let (dir, file_path, anchors, ctx) = setup_test_ctx(content, "anchor-block-mismatch").await;
         let block = format!(
             "{}§first\n{}§second\n{}§third",
             anchors[1], anchors[4], anchors[3]
@@ -4784,8 +4768,7 @@ mod tests {
     #[tokio::test]
     async fn test_edit_file_accepts_stringified_paths_alias() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) = setup_test_file("old\n", "paths-alias").await;
-        let ctx = ctx_for_dir(&dir, "paths-alias");
+        let (dir, file_path, anchors, ctx) = setup_test_ctx("old\n", "paths-alias").await;
         let files = serde_json::json!([{
             "path": "test.txt",
             "edits": [{"anchor": format!("{}§old", anchors[0]), "text": "new"}]
@@ -4800,8 +4783,7 @@ mod tests {
     #[tokio::test]
     async fn test_edit_file_accepts_literal_array_paths_alias() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) = setup_test_file("old\n", "paths-array-alias").await;
-        let ctx = ctx_for_dir(&dir, "paths-array-alias");
+        let (dir, file_path, anchors, ctx) = setup_test_ctx("old\n", "paths-array-alias").await;
         let params = serde_json::json!({
             "paths": [{
                 "path": "test.txt",
@@ -4817,9 +4799,8 @@ mod tests {
     #[tokio::test]
     async fn test_edit_file_accepts_multiline_anchor_with_crlf() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("first\nsecond\nthird\nafter\n", "anchor-crlf").await;
-        let ctx = ctx_for_dir(&dir, "anchor-crlf");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("first\nsecond\nthird\nafter\n", "anchor-crlf").await;
         // The file on disk has LF, but the client/model payload sends CRLF inside the anchor block
         let block = format!("{}§first\r\nsecond\r\nthird\r\n", anchors[0]);
         let params = serde_json::json!({
@@ -4837,9 +4818,8 @@ mod tests {
     #[tokio::test]
     async fn test_edit_file_rejects_plain_continuation_anchor_for_insertion() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("first\nsecond\n", "anchor-plain-insertion").await;
-        let ctx = ctx_for_dir(&dir, "anchor-plain-insertion");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("first\nsecond\n", "anchor-plain-insertion").await;
         let block = format!("{}§first\nsecond", anchors[0]);
         let params = serde_json::json!({
             "files": [{
@@ -6591,7 +6571,7 @@ edition = "2021"
             state,
             None,
             dir.path().to_path_buf(),
-            AnchorStateManager::new(),
+            anchor_mgr,
             false,
             "test-task".to_string(),
             None,
@@ -7879,10 +7859,9 @@ edition = "2021"
         let raw_content = "line 1\nline 2\n";
         std::fs::write(&file_path, raw_content).unwrap();
 
-        let prep_anchor_mgr = AnchorStateManager::new();
+        let anchor_mgr = AnchorStateManager::new();
         let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
-        let anchors =
-            prep_anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("noop-task"));
+        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("noop-task"));
 
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
@@ -7890,7 +7869,7 @@ edition = "2021"
             state.clone(),
             None,
             dir.path().to_path_buf(),
-            AnchorStateManager::new(),
+            anchor_mgr,
             false,
             "noop-task".to_string(),
             None,
@@ -7955,10 +7934,10 @@ edition = "2021"
         let raw_content = "alpha\nbeta\n";
         std::fs::write(&file_path, raw_content).unwrap();
 
-        let prep_anchor_mgr = AnchorStateManager::new();
+        let anchor_mgr = AnchorStateManager::new();
         let lines: Vec<String> = crate::core::file_editor::split_content_lines(raw_content);
         let anchors =
-            prep_anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("occurrence-task"));
+            anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("occurrence-task"));
 
         let handler = EditFileHandler::new();
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
@@ -7966,7 +7945,7 @@ edition = "2021"
             state.clone(),
             None,
             dir.path().to_path_buf(),
-            AnchorStateManager::new(),
+            anchor_mgr,
             false,
             "occurrence-task".to_string(),
             None,
@@ -8009,9 +7988,8 @@ edition = "2021"
         let dup_raw_content = "alpha\nbeta\nalpha\n";
         std::fs::write(&dup_file_path, dup_raw_content).unwrap();
 
-        let dup_prep_mgr = AnchorStateManager::new();
         let dup_lines: Vec<String> = crate::core::file_editor::split_content_lines(dup_raw_content);
-        let dup_anchors = dup_prep_mgr.reconcile(
+        let dup_anchors = ctx.anchor_mgr.reconcile(
             dup_file_path.to_str().unwrap(),
             &dup_lines,
             Some("occurrence-task"),
@@ -8201,14 +8179,13 @@ edition = "2021"
         let file_path = dir.path().join("default-edit-type.txt");
         let raw_content = "before\nafter\n";
         std::fs::write(&file_path, raw_content).unwrap();
-        let anchor_mgr = AnchorStateManager::new();
+        let ctx = ctx_for_dir(&dir, "default-edit-type-task");
         let lines = crate::core::file_editor::split_content_lines(raw_content);
-        let anchors = anchor_mgr.reconcile(
+        let anchors = ctx.anchor_mgr.reconcile(
             file_path.to_str().unwrap(),
             &lines,
             Some("default-edit-type-task"),
         );
-        let ctx = ctx_for_dir(&dir, "default-edit-type-task");
         let params = serde_json::json!({
             "files": [{
                 "path": "default-edit-type.txt",
@@ -8517,14 +8494,13 @@ edition = "2021"
         let content = "\nstatic int show_window(void) {\n";
         std::fs::write(&file_path, content).unwrap();
         let handler = EditFileHandler::new();
-        let anchor_mgr = AnchorStateManager::new();
+        let ctx = ctx_for_dir(&dir, "multiline-anchor-task");
         let lines = crate::core::file_editor::split_content_lines(content);
-        let anchors = anchor_mgr.reconcile(
+        let anchors = ctx.anchor_mgr.reconcile(
             file_path.to_str().unwrap(),
             &lines,
             Some("multiline-anchor-task"),
         );
-        let ctx = ctx_for_dir(&dir, "multiline-anchor-task");
         let params = serde_json::json!({
             "files": [{
                 "path": "multiline.c",
@@ -9019,9 +8995,8 @@ edition = "2021"
     #[tokio::test]
     async fn test_mixed_edit_failures_preserve_model_visible_recovery_categories() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, _file_path, anchors) =
-            setup_test_file("first\n  spaced\nthird\n", "mixed-failures").await;
-        let ctx = ctx_for_dir(&dir, "mixed-failures");
+        let (dir, _file_path, anchors, ctx) =
+            setup_test_ctx("first\n  spaced\nthird\n", "mixed-failures").await;
 
         let params = serde_json::json!({
             "files": [{
@@ -9193,19 +9168,28 @@ edition = "2021"
     // error message — never a silent rejection that wastes a round-trip.
     // =====================================================================
 
-    /// Helper: create a temp file, reconcile anchors, return (dir, file_path, anchors).
-    /// The caller must keep `dir` alive for the duration of the test.
-    async fn setup_test_file(
+    /// Helper: temp dir + reconciled file + context sharing one anchor
+    /// manager, so the edit sees the setup's anchors without relying on
+    /// a process-global cache shared with other tests. The caller must
+    /// keep `dir` alive for the duration of the test.
+    async fn setup_test_ctx(
         content: &str,
         task_id: &str,
-    ) -> (tempfile::TempDir, std::path::PathBuf, Vec<String>) {
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Vec<String>,
+        ToolContext,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
         std::fs::write(&file_path, content).unwrap();
-        let anchor_mgr = AnchorStateManager::new();
+        let ctx = ctx_for_dir(&dir, task_id);
         let lines = crate::core::file_editor::split_content_lines(content);
-        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some(task_id));
-        (dir, file_path, anchors)
+        let anchors = ctx
+            .anchor_mgr
+            .reconcile(file_path.to_str().unwrap(), &lines, Some(task_id));
+        (dir, file_path, anchors, ctx)
     }
 
     /// Helper: build a ToolContext for a temp dir.
@@ -9232,9 +9216,8 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_path_inside_edit_object_accepted() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("line 1\nline 2\nline 3\n", "sim-path-inside").await;
-        let ctx = ctx_for_dir(&dir, "sim-path-inside");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("line 1\nline 2\nline 3\n", "sim-path-inside").await;
 
         let anchor = format!("{}§line 2", anchors[1]);
         // Exact structure from prompt 2 msg_23 (Claude) — path inside edit object
@@ -9313,9 +9296,8 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_end_anchor_at_file_entry_level_accepted() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("line 1\nline 2\nline 3\n", "sim-end-anchor").await;
-        let ctx = ctx_for_dir(&dir, "sim-end-anchor");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("line 1\nline 2\nline 3\n", "sim-end-anchor").await;
 
         let anchor = format!("{}§line 1", anchors[0]);
         let end_anchor = format!("{}§line 2", anchors[1]);
@@ -9353,9 +9335,8 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_anchor_at_file_entry_alongside_edits_accepted() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("line 1\nline 2\nline 3\n", "sim-anchor-sibling").await;
-        let ctx = ctx_for_dir(&dir, "sim-anchor-sibling");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("line 1\nline 2\nline 3\n", "sim-anchor-sibling").await;
 
         let anchor = format!("{}§line 2", anchors[1]);
         // Exact structure from prompt 5 msg_9 (model puts anchor at file-entry level
@@ -9541,12 +9522,11 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_replace_near_end_of_file_with_trailing_newline() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) = setup_test_file(
+        let (dir, file_path, anchors, ctx) = setup_test_ctx(
             "def add(a, b):\n    return a + b\n\ndef divide(a, b):\n    return a / b\n",
             "sim-trailing-nl",
         )
         .await;
-        let ctx = ctx_for_dir(&dir, "sim-trailing-nl");
 
         // Replace the last function (near the end of a file that ends with \n)
         let anchor = format!("{}§    return a / b", anchors[4]);
@@ -9581,9 +9561,8 @@ edition = "2021"
     #[tokio::test]
     async fn test_edit_file_preserves_trailing_newlines_in_replacement_text() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("line 1\nline 2", "replacement-trailing-newlines").await;
-        let ctx = ctx_for_dir(&dir, "replacement-trailing-newlines");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("line 1\nline 2", "replacement-trailing-newlines").await;
         let params = serde_json::json!({
             "files": [{
                 "path": "test.txt",
@@ -9615,12 +9594,11 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_two_edits_same_file_one_call() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) = setup_test_file(
+        let (dir, file_path, anchors, ctx) = setup_test_ctx(
             "def format_result(result):\n    return f\"{result:.4f}\"\n\ndef log_operation(a, b):\n    print(f\"{a} + {b}\")\n",
             "sim-two-edits",
         )
         .await;
-        let ctx = ctx_for_dir(&dir, "sim-two-edits");
 
         let anchor1 = format!("{}§    return f\"{{result:.4f}}\"", anchors[1]);
         let anchor2 = format!("{}§def log_operation(a, b):", anchors[3]);
@@ -9663,9 +9641,8 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_duplicate_file_entries_merged() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("line 1\nline 2\nline 3\n", "sim-dup-entries").await;
-        let ctx = ctx_for_dir(&dir, "sim-dup-entries");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("line 1\nline 2\nline 3\n", "sim-dup-entries").await;
 
         let anchor1 = format!("{}§line 1", anchors[0]);
         let anchor2 = format!("{}§line 2", anchors[1]);
@@ -9721,12 +9698,11 @@ edition = "2021"
         // old anchor. We simulate the non-unique case by reusing the
         // anchor word from line 0 against line 1 (which shares the
         // content "duplicate line").
-        let (dir, _file_path, anchors) = setup_test_file(
+        let (dir, _file_path, anchors, ctx) = setup_test_ctx(
             "duplicate line\nduplicate line\nunique line\n",
             "sim-collision",
         )
         .await;
-        let ctx = ctx_for_dir(&dir, "sim-collision");
 
         let anchor = format!("{}§duplicate line", anchors[0]);
         let params = serde_json::json!({
@@ -9759,12 +9735,11 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_three_edits_same_file_one_call() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) = setup_test_file(
+        let (dir, file_path, anchors, ctx) = setup_test_ctx(
             "line A\nline B\nline C\nline D\nline E\n",
             "sim-three-edits",
         )
         .await;
-        let ctx = ctx_for_dir(&dir, "sim-three-edits");
 
         let anchor1 = format!("{}§line A", anchors[0]);
         let anchor2 = format!("{}§line C", anchors[2]);
@@ -9818,9 +9793,8 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_empty_replacement_text_deletes_anchor_line() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("keep this\nremove this\nkeep this too\n", "sim-empty-text").await;
-        let ctx = ctx_for_dir(&dir, "sim-empty-text");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("keep this\nremove this\nkeep this too\n", "sim-empty-text").await;
 
         let anchor = format!("{}§remove this", anchors[1]);
         let params = serde_json::json!({
@@ -9851,12 +9825,11 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_missing_text_with_string_content_is_rejected_without_mutation() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) = setup_test_file(
+        let (dir, file_path, anchors, ctx) = setup_test_ctx(
             "keep this\nremove this\nkeep this too\n",
             "sim-missing-text",
         )
         .await;
-        let ctx = ctx_for_dir(&dir, "sim-missing-text");
 
         let anchor = format!("{}§remove this", anchors[1]);
         let params = serde_json::json!({
@@ -9884,12 +9857,11 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_string_content_with_text_is_rejected_without_mutation() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) = setup_test_file(
+        let (dir, file_path, anchors, ctx) = setup_test_ctx(
             "keep this\nreplace this\nkeep this too\n",
             "sim-string-content",
         )
         .await;
-        let ctx = ctx_for_dir(&dir, "sim-string-content");
 
         let anchor = format!("{}§replace this", anchors[1]);
         let params = serde_json::json!({
@@ -9918,12 +9890,11 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_non_string_text_is_rejected_without_mutation() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) = setup_test_file(
+        let (dir, file_path, anchors, ctx) = setup_test_ctx(
             "keep this\nreplace this\nkeep this too\n",
             "sim-non-string-text",
         )
         .await;
-        let ctx = ctx_for_dir(&dir, "sim-non-string-text");
 
         let anchor = format!("{}§replace this", anchors[1]);
         let params = serde_json::json!({
@@ -9951,9 +9922,8 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_whitespace_anchor_mismatch() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, _file_path, anchors) =
-            setup_test_file("  indented line  \n", "sim-whitespace").await;
-        let ctx = ctx_for_dir(&dir, "sim-whitespace");
+        let (dir, _file_path, anchors, ctx) =
+            setup_test_ctx("  indented line  \n", "sim-whitespace").await;
 
         // Anchor text has different whitespace than actual file content
         let anchor = format!("{}§indented line", anchors[0]);
@@ -9985,9 +9955,8 @@ edition = "2021"
     #[tokio::test]
     async fn model_sim_annotated_duplicate_anchor_is_accepted() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, _) =
-            setup_test_file("dup line\nmid line\ndup line\n", "sim-annotated-anchor-dup").await;
-        let ctx = ctx_for_dir(&dir, "sim-annotated-anchor-dup");
+        let (dir, file_path, _, ctx) =
+            setup_test_ctx("dup line\nmid line\ndup line\n", "sim-annotated-anchor-dup").await;
         let handler = EditFileHandler::new();
         let read_handler = crate::core::tools::handlers::read_file::ReadFileHandler::new();
 
@@ -10041,8 +10010,8 @@ edition = "2021"
     async fn model_sim_insert_before_ambiguous_anchor_does_not_apply() {
         let _guard = TEST_MUTEX.lock().await;
         let original = "keep top\n    \"\"\",\nmid line\n    \"\"\",\nkeep bottom\n";
-        let (dir, file_path, _anchors) = setup_test_file(original, "sim-insert-ambiguous").await;
-        let ctx = ctx_for_dir(&dir, "sim-insert-ambiguous");
+        let (dir, file_path, _anchors, ctx) =
+            setup_test_ctx(original, "sim-insert-ambiguous").await;
 
         // Two `""",` lines exist; the model picks a `""",` content
         // without quoting a unique anchor word, so the resolver hits
@@ -10178,9 +10147,8 @@ edition = "2021"
     #[tokio::test]
     async fn test_edit_file_anchor_edit_ignores_included_expected_file_hash() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors) =
-            setup_test_file("line 1\nline 2\nline 3\n", "hash-ignored").await;
-        let ctx = ctx_for_dir(&dir, "hash-ignored");
+        let (dir, file_path, anchors, ctx) =
+            setup_test_ctx("line 1\nline 2\nline 3\n", "hash-ignored").await;
 
         let params = serde_json::json!({
             "files": [{
@@ -10218,8 +10186,8 @@ edition = "2021"
         // validation with a clear error rather than silently being treated as
         // a revision-checked edit.
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, _file_path, anchors) = setup_test_file("line 1\nline 2\n", "mixed-batch").await;
-        let ctx = ctx_for_dir(&dir, "mixed-batch");
+        let (dir, _file_path, anchors, ctx) =
+            setup_test_ctx("line 1\nline 2\n", "mixed-batch").await;
 
         let params = serde_json::json!({
             "files": [{
@@ -10244,9 +10212,8 @@ edition = "2021"
     #[tokio::test]
     async fn test_edit_file_null_expected_file_hash_routes_to_anchor() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, _file_path, anchors) =
-            setup_test_file("line 1\nline 2\n", "null-hash-test").await;
-        let ctx = ctx_for_dir(&dir, "null-hash-test");
+        let (dir, _file_path, anchors, ctx) =
+            setup_test_ctx("line 1\nline 2\n", "null-hash-test").await;
 
         let params = serde_json::json!({
             "files": [{
