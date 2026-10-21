@@ -43,6 +43,7 @@ const MAX_FOLDED_PASTE_CHUNKS: usize = 256;
 const ASYNC_LAYOUT_REFLOW_THRESHOLD: usize = 512;
 const STATUS_NOTIFICATION_DURATION: Duration = Duration::from_secs(4);
 const PICKER_MAX_VISIBLE_ROWS: usize = 8;
+const TRANSCRIPT_RIGHT_PADDING: u16 = 1;
 const OSC8_PREFIX: &str = "\x1b]8;;";
 const HYPERLINK_MARKER_RED: u8 = 0xFE;
 static NEXT_PASTE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -112,13 +113,17 @@ pub enum BlockKind {
 fn block_kind_accent_style(kind: BlockKind) -> Style {
     match kind {
         BlockKind::Model => Style::default().fg(theme::accent()),
-        BlockKind::ToolHeader => Style::default().fg(theme::tool_call_fg()),
+        BlockKind::ToolHeader => Style::default()
+            .fg(theme::tool_call_fg())
+            .add_modifier(Modifier::BOLD),
         BlockKind::ToolOutput | BlockKind::CommandOutput => Style::default().fg(theme::status_fg()),
-        BlockKind::CommandHeader => Style::default().fg(theme::info_fg()),
+        BlockKind::CommandHeader => Style::default()
+            .fg(theme::info_fg())
+            .add_modifier(Modifier::BOLD),
         BlockKind::Reasoning => Style::default()
             .fg(theme::accent())
             .add_modifier(Modifier::DIM),
-        BlockKind::UserPrompt => Style::default().fg(theme::echo_fg()),
+        BlockKind::UserPrompt => Style::default().fg(theme::user_marker_fg()),
         BlockKind::BlockingPrompt => Style::default().fg(theme::warning_fg()),
         BlockKind::Completion => Style::default().fg(theme::success_fg()),
         BlockKind::Error => Style::default().fg(theme::error_fg()),
@@ -1456,11 +1461,13 @@ impl App {
         true
     }
 
-    fn approval_panel_height(&self) -> u16 {
+    fn approval_panel_height(&self, input_width: u16) -> u16 {
         let Some(pending) = self.pending_approval.as_ref() else {
             return 0;
         };
-        let wrap_width = self.last_wrap_width().saturating_sub(3).max(1);
+        // Input blocks use two border cells and one cell reserved for the
+        // approval detail scrollbar; transcript padding does not apply here.
+        let wrap_width = usize::from(input_width).saturating_sub(3).max(1);
         let detail_rows = pending
             .lines
             .iter()
@@ -3156,14 +3163,12 @@ impl App {
         }
     }
 
-    fn selection_content_area(area: Rect, reserve_scrollbar: bool) -> Option<Rect> {
+    fn selection_content_area(area: Rect) -> Option<Rect> {
         let mut content = area.inner(ratatui::layout::Margin {
             horizontal: 1,
             vertical: 1,
         });
-        if reserve_scrollbar {
-            content.width = content.width.saturating_sub(1);
-        }
+        content.width = content.width.saturating_sub(TRANSCRIPT_RIGHT_PADDING);
         (content.width > 0 && content.height > 0).then_some(content)
     }
 
@@ -3840,8 +3845,10 @@ impl App {
     }
 
     fn content_wrap_width(content_width: usize) -> usize {
-        // 2 chars consumed by block borders.
-        content_width.saturating_sub(2).max(1)
+        // 2 chars consumed by block borders and one by transcript padding.
+        content_width
+            .saturating_sub(2 + usize::from(TRANSCRIPT_RIGHT_PADDING))
+            .max(1)
     }
 
     fn line_visual_rows(line: &Line<'_>, wrap_width: usize) -> usize {
@@ -4133,11 +4140,45 @@ impl App {
                 }
             },
         );
+        if kind == BlockKind::UserPrompt {
+            Self::style_user_prompt_marker(&mut line);
+        }
+        if matches!(kind, BlockKind::ToolHeader | BlockKind::CommandHeader) {
+            line.style = line.style.add_modifier(Modifier::BOLD);
+            if kind == BlockKind::CommandHeader && line.style.fg.is_none() {
+                line.style = line.style.fg(theme::info_fg());
+            }
+        }
         if kind != BlockKind::Separator {
             line.spans
                 .insert(0, Span::styled("│", block_kind_accent_style(kind)));
         }
         line
+    }
+
+    fn style_user_prompt_marker(line: &mut Line<'static>) {
+        let Some(first_span) = line.spans.first() else {
+            return;
+        };
+        let content = first_span.content.as_ref();
+        let marker_len = if content.starts_with("│ ❯") {
+            "│ ❯".len()
+        } else if content.starts_with("│   ") {
+            "│".len()
+        } else if content.starts_with('❯') {
+            "❯".len()
+        } else {
+            return;
+        };
+        let span = line.spans.remove(0);
+        let content = span.content.into_owned();
+        let (marker, body) = content.split_at(marker_len);
+        let marker_style = span.style.fg(theme::user_marker_fg());
+        line.spans
+            .insert(0, Span::styled(marker.to_string(), marker_style));
+        if !body.is_empty() {
+            line.spans.insert(1, Span::styled(body.to_string(), span.style));
+        }
     }
 
     fn line_contains_osc8(line: &Line<'_>) -> bool {
@@ -4523,7 +4564,7 @@ impl App {
             Constraint::Min(1),
             Constraint::Length(self.queued_preview_height()),
             Constraint::Length(1),
-            Constraint::Length(self.render_input_height()),
+            Constraint::Length(self.render_input_height_for_width(main_area.width)),
         ])
         .areas(main_area);
 
@@ -4770,9 +4811,9 @@ impl App {
         self.has_pending_approval() || crate::core::approval::is_any_followup_question_active()
     }
 
-    fn render_input_height(&self) -> u16 {
+    fn render_input_height_for_width(&self, input_width: u16) -> u16 {
         if self.has_pending_approval() {
-            self.approval_panel_height()
+            self.approval_panel_height(input_width)
         } else if self.has_blocking_prompt() {
             (BLOCKING_PROMPT_INPUT_VISIBLE_LINES as u16) + 2
         } else {
@@ -4847,17 +4888,17 @@ impl App {
         let left_width = UnicodeWidthStr::width(required_left.as_str());
         let right_budget = total_width.saturating_sub(leading_width + left_width + 1);
         let mut right_segments: Vec<(String, bool)> = Vec::new();
-        if let Some((tokens, window)) = self.context_usage {
-            right_segments.push((format_context_usage(tokens, window), false));
-        }
-        if let Some(elapsed) = self.elapsed {
-            right_segments.push((format!("⏱ {}", format_duration(elapsed)), false));
-        }
         if self.output_overflow {
             right_segments.push((
                 format!("⚠ {} dropped", self.output_overflow_count),
                 true,
             ));
+        }
+        if let Some((tokens, window)) = self.context_usage {
+            right_segments.push((format_context_usage(tokens, window), false));
+        }
+        if let Some(elapsed) = self.elapsed {
+            right_segments.push((format!("⏱ {}", format_duration(elapsed)), false));
         }
         if self.scroll_mode == ScrollMode::Manual && self.unseen_output_count > 0 {
             right_segments.push((format!("↑ {} new", self.unseen_output_count), false));
@@ -4965,7 +5006,7 @@ impl App {
         self.restore_pending_manual_viewport_after_reflow(wrap_width);
         let output_rows = self.total_visual_rows(wrap_width);
         self.transcript_selection_area =
-            Self::selection_content_area(output_area, output_rows > content_height);
+            Self::selection_content_area(output_area);
         let scroll_y = self.resolved_output_scroll_y_for(wrap_width, output_rows, content_height);
         let (start_idx, visible_count, visible_scroll_y) =
             self.visible_output_window(wrap_width, scroll_y, content_height);
@@ -4994,7 +5035,12 @@ impl App {
                 .wrap(Wrap { trim: false })
                 .scroll((Self::terminal_scroll_offset(visible_scroll_y), 0))
                 .block(
-                    theme::border_block(title).padding(ratatui::widgets::Padding::new(0, 0, 0, 0)),
+                    theme::border_block(title).padding(ratatui::widgets::Padding::new(
+                        0,
+                        TRANSCRIPT_RIGHT_PADDING,
+                        0,
+                        0,
+                    )),
                 );
             frame.render_widget(output, output_area);
         }
@@ -5011,8 +5057,8 @@ impl App {
             frame.render_stateful_widget(
                 Scrollbar::default()
                     .orientation(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(Some("↑"))
-                    .end_symbol(Some("↓"))
+                    .begin_symbol(None)
+                    .end_symbol(None)
                     .style(theme::scrollbar_style())
                     .thumb_style(theme::scrollbar_thumb_style()),
                 output_area.inner(ratatui::layout::Margin {
@@ -5647,12 +5693,52 @@ mod tests {
         );
         assert_eq!(
             block_kind_accent_style(BlockKind::UserPrompt).fg,
-            Some(theme::echo_fg())
+            Some(theme::user_marker_fg())
         );
         assert_eq!(
             block_kind_accent_style(BlockKind::BlockingPrompt).fg,
             Some(theme::warning_fg())
         );
+    }
+
+    #[test]
+    fn header_rows_preserve_semantic_text_styles() {
+        let mut app = App::new();
+        app.push_output_with_kind(
+            Line::from("Running: cargo check"),
+            BlockKind::CommandHeader,
+        );
+        let rows = app.collect_output_rows_range(0, 1, app.last_wrap_width());
+        assert_eq!(rows[0].style.fg, Some(theme::info_fg()));
+        assert!(rows[0].style.add_modifier.contains(Modifier::BOLD));
+
+        app.push_output_with_kind(Line::from("▶ read_file"), BlockKind::ToolHeader);
+        let rows = app.collect_output_rows_range(1, 1, app.last_wrap_width());
+        assert!(rows[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rows[0].spans[0].style.fg, Some(theme::tool_call_fg()));
+    }
+
+    #[test]
+    fn user_prompt_marker_is_distinct_from_prompt_body() {
+        let line = Line::from(Span::styled(
+            "❯ inspect the project",
+            Style::default()
+                .fg(theme::echo_fg())
+                .add_modifier(Modifier::BOLD),
+        ));
+        let mut targets = Vec::new();
+        let rendered = App::output_row_for_render(
+            Some(&line),
+            BlockKind::UserPrompt,
+            &mut targets,
+        );
+
+        assert_eq!(rendered.spans[0].style.fg, Some(theme::user_marker_fg()));
+        assert_eq!(rendered.spans[1].content, "❯");
+        assert_eq!(rendered.spans[1].style.fg, Some(theme::user_marker_fg()));
+        assert_eq!(rendered.spans[2].content, " inspect the project");
+        assert_eq!(rendered.spans[2].style.fg, Some(theme::echo_fg()));
+        assert!(rendered.spans[2].style.add_modifier.contains(Modifier::BOLD));
     }
 
     fn rendered_rows(buffer: &Buffer) -> Vec<String> {
@@ -5669,7 +5755,7 @@ mod tests {
             .area
             .height
             .saturating_sub(1)
-            .saturating_sub(app.render_input_height()) as usize;
+            .saturating_sub(app.render_input_height_for_width(buffer.area.width)) as usize;
         rendered_rows(buffer)
             .into_iter()
             .take(output_height)
@@ -5715,6 +5801,40 @@ mod tests {
             app.finish_text_selection(column + 4, row),
             Some("alpha".to_string())
         );
+    }
+
+    #[test]
+    fn test_scrollable_transcript_keeps_rightmost_text_selectable() {
+        let backend = TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        let line = "abcdefghijklmnopqrstu";
+        for _ in 0..20 {
+            app.push_output_with_kind(Line::from(line), BlockKind::Separator);
+        }
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("scrollable transcript should render");
+
+        let area = app
+            .transcript_selection_area
+            .expect("transcript selection area should be available");
+        let column = area.x.saturating_add(area.width).saturating_sub(1);
+        let row = area.y.saturating_add(area.height).saturating_sub(1);
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((column, row))
+                .expect("rightmost text cell should exist")
+                .symbol(),
+            "u"
+        );
+        let now = Instant::now();
+        assert!(app.begin_text_selection(column.saturating_sub(1), row, now));
+        app.extend_text_selection(column, row, now + Duration::from_millis(20));
+        assert_eq!(app.finish_text_selection(column, row), Some("tu".to_string()));
     }
 
     #[test]
@@ -6262,7 +6382,7 @@ mod tests {
 
         assert_eq!(app.output_lines.len(), 10_000);
         assert_eq!(app.scroll_mode, ScrollMode::Manual);
-        assert_eq!(app.scroll_offset, 41);
+        assert_eq!(app.scroll_offset, 40);
         assert_eq!(app.unseen_output_count, 1);
 
         let wrap_width = app.last_wrap_width();
@@ -6275,7 +6395,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("manual viewport should contain a transcript row");
-        assert!(App::line_to_string(&first_visible).contains("line 42"));
+        assert!(App::line_to_string(&first_visible).contains("line 25"));
     }
 
     #[test]
@@ -6688,6 +6808,28 @@ mod tests {
     }
 
     #[test]
+    fn approval_height_uses_unpadded_input_width() {
+        let mut app = App::new();
+        let details = "x".repeat(36);
+        let (response_tx, _response_rx) = std::sync::mpsc::channel();
+        let request = crate::core::approval::ApprovalRequest::new(
+            2,
+            "Approval required".to_string(),
+            details,
+            vec![crate::core::approval::ApprovalChoice::new(
+                'y',
+                "Run once",
+                crate::core::approval::ApprovalResult::Approved,
+            )],
+            response_tx,
+        );
+        assert!(app.set_pending_approval(request));
+
+        // The input detail width is 40 - 2 border cells - 1 scrollbar cell.
+        assert_eq!(app.approval_panel_height(40), 4);
+    }
+
+    #[test]
     fn test_set_pending_approval_drops_overlay_payload() {
         let mut app = App::new();
         app.picker_active = true;
@@ -6960,7 +7102,7 @@ mod tests {
         );
         assert!(app.set_pending_approval(request));
 
-        assert!(app.render_input_height() > 3);
+        assert!(app.render_input_height_for_width(60) > 3);
 
         terminal
             .draw(|frame| app.render(frame))
@@ -7715,14 +7857,13 @@ mod tests {
             .chunks(width)
             .map(|row| row.last().expect("every row has a right edge").symbol())
             .collect::<Vec<_>>();
-        let end_arrow = right_edge
+        let bottom_thumb = right_edge
             .iter()
-            .position(|symbol| *symbol == "↓")
-            .expect("bottom scrollbar arrow should render");
-        assert_eq!(
-            right_edge[end_arrow.saturating_sub(1)],
-            "█",
-            "bottom scrollbar thumb should touch the end arrow"
+            .rposition(|symbol| *symbol == "█")
+            .expect("bottom scrollbar thumb should render");
+        assert!(
+            bottom_thumb < right_edge.len().saturating_sub(1),
+            "bottom scrollbar thumb must remain inside the transcript border"
         );
 
         app.scroll_lines(-isize::MAX);
@@ -7736,14 +7877,14 @@ mod tests {
             .chunks(width)
             .map(|row| row.last().expect("every row has a right edge").symbol())
             .collect::<Vec<_>>();
-        let start_arrow = right_edge
+        let top_thumb = right_edge
             .iter()
-            .position(|symbol| *symbol == "↑")
-            .expect("top scrollbar arrow should render");
+            .position(|symbol| *symbol == "█")
+            .expect("top scrollbar thumb should render");
         assert_eq!(
-            right_edge[start_arrow + 1],
-            "█",
-            "top scrollbar thumb should touch the start arrow"
+            top_thumb,
+            1,
+            "top scrollbar thumb should start below the transcript border"
         );
     }
 
@@ -7885,7 +8026,7 @@ mod tests {
         let width = terminal.backend().buffer().area.width as usize;
         let rows = rendered_rows(terminal.backend().buffer());
         let allowed = [
-            '│', '╭', '╮', '╰', '╯', '─', '↑', '↓', '█', '║', ' ',
+            '│', '┌', '┐', '└', '┘', '╭', '╮', '╰', '╯', '─', '█', '║', ' ',
         ];
         for (row_idx, row) in rows.iter().enumerate() {
             let chars: Vec<char> = row.chars().collect();
@@ -7897,6 +8038,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_render_unbroken_tokens_wrap_at_transcript_width() {
+        let token = "0123456789abcdefghijklmnopqrstuv";
+        let backend = TestBackend::new(24, 12);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut app = App::new();
+        app.push_output_with_kind(Line::from(token), BlockKind::Separator);
+
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("unbroken token should render");
+
+        let area = app
+            .transcript_selection_area
+            .expect("transcript content area should be available");
+        let buffer = terminal.backend().buffer();
+        let rendered = (area.y..area.y.saturating_add(area.height))
+            .flat_map(|row| {
+                (area.x..area.x.saturating_add(area.width)).map(move |column| {
+                    buffer
+                        .cell((column, row))
+                        .map_or_else(String::new, |cell| cell.symbol().to_owned())
+                })
+            })
+            .filter(|symbol| !symbol.trim().is_empty())
+            .collect::<String>();
+
+        assert_eq!(rendered, token);
     }
 
     #[test]
@@ -7920,7 +8091,7 @@ mod tests {
                     terminal.backend().buffer().area.width as usize;
                 let rows = rendered_rows(terminal.backend().buffer());
                 let allowed = [
-                    '│', '╭', '╮', '╰', '╯', '─', '↑', '↓', '█', '║', ' ',
+                    '│', '┌', '┐', '└', '┘', '╭', '╮', '╰', '╯', '─', '█', '║', ' ',
                 ];
                 for (row_idx, row) in rows.iter().enumerate() {
                     let chars: Vec<char> = row.chars().collect();

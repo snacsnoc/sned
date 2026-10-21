@@ -165,6 +165,12 @@ pub fn echo_fg() -> Color {
     current().echo_fg
 }
 
+/// User prompt marker and transcript rail color.
+#[must_use]
+pub fn user_marker_fg() -> Color {
+    current().input_idle_fg
+}
+
 /// Success color for completed work and approval-ready input.
 #[must_use]
 pub fn success_fg() -> Color {
@@ -219,20 +225,20 @@ pub fn picker_selected_fg() -> Color {
     current().picker_selected_fg
 }
 
-/// Create a styled block with rounded borders and the theme's border color.
+/// Create a styled transcript block with plain borders and the theme's border color.
 ///
 /// # Arguments
 /// * `title` - The title to display on the block (left-aligned)
 ///
 /// # Returns
 /// A `Block` with:
-/// - Rounded border type
-/// - DarkGray border color
+/// - Plain border type
+/// - Theme border color
 /// - The provided title
 pub fn border_block(title: impl Into<String>) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Plain)
         .border_style(Style::default().fg(border_fg()))
         .title(title.into())
 }
