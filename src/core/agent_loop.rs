@@ -4799,15 +4799,24 @@ fn close_dangling_tool_calls(history: &mut Vec<StorageMessage>) {
     }
 }
 
+/// What one compaction pass removed, so callers and tests can observe
+/// it without parsing debug logs. `collapsed` counts segments (one per
+/// result text or call body), not tool calls.
+struct CompactionSummary {
+    collapsed: usize,
+    bytes_saved: usize,
+}
+
 /// Compacts older tool results in the conversation history, preserving
 /// the most recent `RECENT_TO_PRESERVE` reads and shell outputs in full.
 /// Stale bulk output costs tokens on every later turn without adding new
 /// information, so earlier large results collapse to a placeholder.
-fn compact_old_tool_results(history: &mut [StorageMessage]) {
+fn compact_old_tool_results(history: &mut [StorageMessage]) -> CompactionSummary {
     const RECENT_TO_PRESERVE: usize = 2;
     const MIN_BYTES_TO_COMPACT: usize = 1000;
 
     let bytes_before = tool_result_text_bytes(history) + tool_call_arg_bytes(history);
+    let mut collapsed = 0;
 
     let mut tool_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -4909,27 +4918,33 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
 
             match &mut tr.content {
                 ToolResultContent::Text(text) => {
-                    if is_read_result {
-                        compact_single_read_text(text, MIN_BYTES_TO_COMPACT);
+                    let did_collapse = if is_read_result {
+                        compact_single_read_text(text, MIN_BYTES_TO_COMPACT)
                     } else if is_search_result {
-                        compact_single_search_text(text, MIN_BYTES_TO_COMPACT);
+                        compact_single_search_text(text, MIN_BYTES_TO_COMPACT)
                     } else if is_edit_result {
-                        compact_single_edit_text(text, MIN_BYTES_TO_COMPACT);
+                        compact_single_edit_text(text, MIN_BYTES_TO_COMPACT)
                     } else {
-                        compact_single_shell_text(text, MIN_BYTES_TO_COMPACT);
+                        compact_single_shell_text(text, MIN_BYTES_TO_COMPACT)
+                    };
+                    if did_collapse {
+                        collapsed += 1;
                     }
                 }
                 ToolResultContent::Blocks(b) => {
                     for cb in b.iter_mut() {
                         if let ToolResultContentBlock::Text { text } = cb {
-                            if is_read_result {
-                                compact_single_read_text(text, MIN_BYTES_TO_COMPACT);
+                            let did_collapse = if is_read_result {
+                                compact_single_read_text(text, MIN_BYTES_TO_COMPACT)
                             } else if is_search_result {
-                                compact_single_search_text(text, MIN_BYTES_TO_COMPACT);
+                                compact_single_search_text(text, MIN_BYTES_TO_COMPACT)
                             } else if is_edit_result {
-                                compact_single_edit_text(text, MIN_BYTES_TO_COMPACT);
+                                compact_single_edit_text(text, MIN_BYTES_TO_COMPACT)
                             } else {
-                                compact_single_shell_text(text, MIN_BYTES_TO_COMPACT);
+                                compact_single_shell_text(text, MIN_BYTES_TO_COMPACT)
+                            };
+                            if did_collapse {
+                                collapsed += 1;
                             }
                         }
                     }
@@ -4955,11 +4970,14 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
             let AssistantContentBlock::ToolUse(tool_use) = block else {
                 continue;
             };
+            if tool_use.input.get("_compacted").is_some() {
+                continue;
+            }
             if tool_use.input.to_string().len() <= MIN_BYTES_TO_COMPACT {
                 continue;
             }
-            let mut collapsed = serde_json::Map::new();
-            collapsed.insert("_compacted".to_string(), serde_json::Value::Bool(true));
+            let mut compacted = serde_json::Map::new();
+            compacted.insert("_compacted".to_string(), serde_json::Value::Bool(true));
             // edit_file normalizes args to {"files": [...]} without a
             // top-level path, so fall back to the first file entry.
             let path = tool_use
@@ -4976,21 +4994,28 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) {
                         .filter(|p| p.is_string())
                 });
             if let Some(path) = path {
-                collapsed.insert("path".to_string(), path.clone());
+                compacted.insert("path".to_string(), path.clone());
             }
-            tool_use.input = serde_json::Value::Object(collapsed);
+            tool_use.input = serde_json::Value::Object(compacted);
+            collapsed += 1;
         }
     }
 
     // One line per turn keeps every debug log a running record of what
     // compaction actually saved, so future sessions measure themselves.
     let bytes_after = tool_result_text_bytes(history) + tool_call_arg_bytes(history);
+    let summary = CompactionSummary {
+        collapsed,
+        bytes_saved: bytes_before.saturating_sub(bytes_after),
+    };
     tracing::debug!(
         bytes_before,
         bytes_after,
-        saved = bytes_before.saturating_sub(bytes_after),
+        collapsed = summary.collapsed,
+        saved = summary.bytes_saved,
         "history compaction collapsed stale tool results"
     );
+    summary
 }
 
 fn tool_call_arg_bytes(history: &[StorageMessage]) -> usize {
@@ -5035,9 +5060,17 @@ fn tool_result_text_bytes(history: &[StorageMessage]) -> usize {
         .sum()
 }
 
-fn compact_single_shell_text(text: &mut String, min_bytes: usize) {
+/// Placeholder tag shared by every collapsed result. Compaction skips
+/// text that already carries it, so a second pass reports zero instead
+/// of recounting (a long first line can keep collapsed text oversized).
+const COLLAPSED_MARKER: &str = "collapsed to save context space";
+
+fn compact_single_shell_text(text: &mut String, min_bytes: usize) -> bool {
+    if text.contains(COLLAPSED_MARKER) {
+        return false;
+    }
     if text.len() <= min_bytes {
-        return;
+        return false;
     }
 
     let header_end = text.find('\n').unwrap_or(text.len());
@@ -5052,6 +5085,7 @@ fn compact_single_shell_text(text: &mut String, min_bytes: usize) {
         total_lines,
         total_bytes
     );
+    true
 }
 
 fn is_read_result_text(text: &str) -> bool {
@@ -5062,9 +5096,12 @@ fn is_read_result_text(text: &str) -> bool {
         || text.starts_with("[Context pruned:")
 }
 
-fn compact_single_read_text(text: &mut String, min_bytes: usize) {
+fn compact_single_read_text(text: &mut String, min_bytes: usize) -> bool {
+    if text.contains(COLLAPSED_MARKER) {
+        return false;
+    }
     if text.len() <= min_bytes {
-        return;
+        return false;
     }
 
     let header_end = text
@@ -5085,11 +5122,15 @@ fn compact_single_read_text(text: &mut String, min_bytes: usize) {
         total_lines,
         total_bytes
     );
+    true
 }
 
-fn compact_single_edit_text(text: &mut String, min_bytes: usize) {
+fn compact_single_edit_text(text: &mut String, min_bytes: usize) -> bool {
+    if text.contains(COLLAPSED_MARKER) {
+        return false;
+    }
     if text.len() <= min_bytes {
-        return;
+        return false;
     }
 
     let header_end = text.find('\n').unwrap_or(text.len());
@@ -5106,11 +5147,15 @@ fn compact_single_edit_text(text: &mut String, min_bytes: usize) {
         total_lines,
         total_bytes
     );
+    true
 }
 
-fn compact_single_search_text(text: &mut String, min_bytes: usize) {
+fn compact_single_search_text(text: &mut String, min_bytes: usize) -> bool {
+    if text.contains(COLLAPSED_MARKER) {
+        return false;
+    }
     if text.len() <= min_bytes {
-        return;
+        return false;
     }
 
     let header_end = text.find('\n').unwrap_or(text.len());
@@ -5125,6 +5170,7 @@ fn compact_single_search_text(text: &mut String, min_bytes: usize) {
         total_lines,
         total_bytes
     );
+    true
 }
 
 #[cfg(test)]
@@ -13032,6 +13078,77 @@ Irrespective of whether additional information or instructions are given, you ar
             "f.c",
             "files-shaped edit args must keep their path too"
         );
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_reports_summary() {
+        let mut history = vec![
+            assistant_call_msg(
+                "c0",
+                "write_to_file",
+                serde_json::json!({"path": "big.c", "content": "x".repeat(5000)}),
+            ),
+            tool_result_msg("c0", "written"),
+        ];
+        for n in 1..=4 {
+            history.push(assistant_call_msg(
+                &format!("s{n}"),
+                "execute_command",
+                serde_json::json!({"commands": ["true"]}),
+            ));
+            history.push(tool_result_msg(
+                &format!("s{n}"),
+                &format!("first line\n{}", "y".repeat(5000)),
+            ));
+        }
+
+        let summary = compact_old_tool_results(&mut history);
+        assert_eq!(summary.collapsed, 2);
+        assert!(
+            summary.bytes_saved >= 8000,
+            "one 5KB call body plus one 5KB result must register bulk savings, got {}",
+            summary.bytes_saved
+        );
+        assert!(call_input(&history[0]).get("_compacted").is_some());
+        assert_eq!(
+            serde_json::to_string(&history)
+                .unwrap()
+                .matches("collapsed to save context space")
+                .count(),
+            1,
+            "exactly one result body must collapse"
+        );
+
+        let quiet = compact_old_tool_results(&mut history);
+        assert_eq!(quiet.collapsed, 0);
+        assert_eq!(quiet.bytes_saved, 0);
+    }
+
+    #[test]
+    fn test_compact_old_tool_results_does_not_recount_collapsed_results() {
+        let mut history = Vec::new();
+        for n in 1..=4 {
+            let body = if n == 1 {
+                "z".repeat(5000)
+            } else {
+                format!("first line\n{}", "y".repeat(5000))
+            };
+            history.push(assistant_call_msg(
+                &format!("s{n}"),
+                "execute_command",
+                serde_json::json!({"commands": ["true"]}),
+            ));
+            history.push(tool_result_msg(&format!("s{n}"), &body));
+        }
+
+        let first = compact_old_tool_results(&mut history);
+        assert_eq!(first.collapsed, 1);
+        let second = compact_old_tool_results(&mut history);
+        assert_eq!(
+            second.collapsed, 0,
+            "already-collapsed output must not count again"
+        );
+        assert_eq!(second.bytes_saved, 0);
     }
 
     #[test]
