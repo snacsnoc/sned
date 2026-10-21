@@ -624,6 +624,7 @@ enum Action {
     },
     ModelSwitch(PendingModelSwitch),
     ModelApiKeySubmitted(PendingModelSwitch, String),
+    SetReasoningEffort(crate::cli::ReasoningEffort),
     PlanApprove,
 }
 
@@ -691,7 +692,6 @@ async fn request_model_switch(
     supplied_api_key: Option<String>,
     app: &mut App,
     session: &Arc<Mutex<InteractiveSession>>,
-    task_opts: &TaskOptions,
     agent_busy: &Arc<AtomicBool>,
 ) {
     if agent_busy.load(Ordering::Relaxed) {
@@ -702,11 +702,12 @@ async fn request_model_switch(
         return;
     }
 
-    let (state_manager, remembered_api_key) = {
+    let (state_manager, remembered_api_key, task_opts) = {
         let sess = session.lock().await;
         (
             Arc::clone(&sess.state_manager),
             sess.provider_api_key(&request.provider),
+            sess.task_opts.clone(),
         )
     };
     let explicit_api_key = supplied_api_key.or(remembered_api_key);
@@ -736,10 +737,112 @@ async fn request_model_switch(
         explicit_api_key,
         app,
         session,
-        task_opts,
+        &task_opts,
         state_manager.as_ref(),
     )
     .await;
+}
+
+async fn request_reasoning_effort(
+    effort: crate::cli::ReasoningEffort,
+    app: &mut App,
+    session: &Arc<Mutex<InteractiveSession>>,
+    agent_busy: &Arc<AtomicBool>,
+) {
+    if agent_busy.load(Ordering::Relaxed) {
+        app.show_notification(
+            "Agent is busy. Wait for it to finish before changing reasoning effort.",
+            NotificationKind::Warning,
+        );
+        return;
+    }
+
+    let (provider_name, model_id, task_opts, state_manager) = {
+        let sess = session.lock().await;
+        let agent = sess.agent_loop().await;
+        let provider = agent.get_provider();
+        (
+            sess.task_opts
+                .provider
+                .clone()
+                .unwrap_or_else(|| provider.name().to_string()),
+            provider.get_model().id,
+            sess.task_opts.clone(),
+            Arc::clone(&sess.state_manager),
+        )
+    };
+
+    let mut updated_opts =
+        match crate::cli::normalize_minimax_body_overrides(&task_opts, &provider_name) {
+            Ok(options) => options,
+            Err(error) => {
+                app.show_notification(
+                    format!("Failed to set reasoning effort: {error}"),
+                    NotificationKind::Error,
+                );
+                return;
+            }
+        };
+    updated_opts.provider = Some(provider_name.clone());
+    updated_opts.model = Some(model_id.clone());
+    updated_opts.reasoning_effort = Some(effort.clone());
+
+    match crate::cli::create_provider(&updated_opts, Some(&state_manager)) {
+        Ok(new_provider) => {
+            let mut sess = session.lock().await;
+            {
+                let mut agent = sess.agent_loop().await;
+                agent.set_provider(new_provider).await;
+            }
+            sess.task_opts.provider = Some(provider_name.clone());
+            sess.task_opts.model = Some(model_id.clone());
+            sess.task_opts.reasoning_effort = Some(effort.clone());
+            sess.task_opts.extra_body = updated_opts.extra_body;
+            app.provider_name.clone_from(&provider_name);
+            app.model_name.clone_from(&model_id);
+            app.needs_redraw = true;
+            app.show_notification(
+                format!(
+                    "Reasoning effort set to {} for {}/{}",
+                    effort.as_provider_str(),
+                    provider_name,
+                    model_id
+                ),
+                NotificationKind::Success,
+            );
+        }
+        Err(error) => {
+            app.show_notification(
+                format!("Failed to set reasoning effort: {error}"),
+                NotificationKind::Error,
+            );
+        }
+    }
+}
+
+fn supported_reasoning_efforts(
+    task_opts: &TaskOptions,
+    provider_name: &str,
+    model_id: &str,
+    state_manager: &crate::storage::state_manager::StateManager,
+) -> Vec<crate::cli::ReasoningEffort> {
+    let Ok(normalized) = crate::cli::normalize_minimax_body_overrides(task_opts, provider_name)
+    else {
+        return Vec::new();
+    };
+
+    <crate::cli::ReasoningEffort as clap::ValueEnum>::value_variants()
+        .iter()
+        .filter_map(|effort| {
+            let mut candidate = normalized.clone();
+            candidate.provider = Some(provider_name.to_string());
+            candidate.model = Some(model_id.to_string());
+            candidate.reasoning_effort = Some(effort.clone());
+            crate::cli::create_provider(&candidate, Some(state_manager))
+                .ok()
+                .map(|_| effort.clone())
+        })
+        .collect()
 }
 
 async fn refresh_slash_command_entries(
@@ -796,6 +899,12 @@ fn clear_model_picker(app: &mut App) {
     app.model_picker_selected = 0;
 }
 
+fn clear_reasoning_effort_picker(app: &mut App) {
+    app.reasoning_effort_picker_active = false;
+    app.reasoning_effort_picker_selected = 0;
+    app.reasoning_effort_picker_options.clear();
+}
+
 fn resolve_interactive_model_input(
     text: &str,
     skills: &[crate::core::context::instructions::SkillMetadata],
@@ -834,6 +943,7 @@ fn clear_input_overlays(app: &mut App) {
     clear_mention_search(app, true);
     close_slash_command_mode(app);
     clear_model_picker(app);
+    clear_reasoning_effort_picker(app);
 }
 
 /// Drop a pending model switch and its input. Both Esc and Ctrl+C cancel
@@ -2330,6 +2440,7 @@ async fn refresh_input_completions(
     // The model picker is not driven by arbitrary input text. Once the user
     // edits the prompt, it is no longer a valid overlay for that input.
     clear_model_picker(app);
+    clear_reasoning_effort_picker(app);
     if app.slash_command_help_active {
         app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
             &app.slash_command_all_entries,
@@ -2758,6 +2869,7 @@ async fn handle_key_event_inner(
         && !app.slash_command_active
         && !app.slash_command_help_active
         && !app.model_picker_active
+        && !app.reasoning_effort_picker_active
         && !is_followup_question_active(task_id)
         && app
             .plan_state_cache
@@ -2927,6 +3039,17 @@ async fn handle_key_event_inner(
         return Ok(Some(Action::ModelSwitch(request)));
     }
 
+    let efforts = app.reasoning_effort_picker_options.clone();
+    if app.reasoning_effort_picker_active
+        && !efforts.is_empty()
+        && (key.code == KeyCode::Tab
+            || (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT)))
+    {
+        let effort = efforts[app.reasoning_effort_picker_selected.min(efforts.len() - 1)].clone();
+        clear_reasoning_effort_picker(app);
+        return Ok(Some(Action::SetReasoningEffort(effort)));
+    }
+
     if app.picker_active && !app.picker_results.is_empty() {
         let text = app.input.lines().join("\n");
         let cursor = textarea_cursor_byte_offset(app.input.lines(), app.input.cursor());
@@ -3089,7 +3212,8 @@ async fn handle_key_event_inner(
     let on_first_input_line = cursor_row == 0;
     let on_last_input_line = cursor_row.saturating_add(1) >= app.input.lines().len();
     let can_navigate_history =
-        key.modifiers.is_empty() && !app.picker_active && !app.model_picker_active;
+        key.modifiers.is_empty() && !app.picker_active && !app.model_picker_active
+            && !app.reasoning_effort_picker_active;
 
     if key.code == KeyCode::Up && can_navigate_history && on_first_input_line {
         if !app.history.is_navigating() {
@@ -3143,9 +3267,31 @@ async fn handle_key_event_inner(
         }
     }
 
+    if app.reasoning_effort_picker_active && !efforts.is_empty() {
+        if key.code == KeyCode::Up {
+            app.reasoning_effort_picker_selected =
+                app.reasoning_effort_picker_selected.saturating_sub(1);
+            return Ok(None);
+        }
+        if key.code == KeyCode::Down {
+            app.reasoning_effort_picker_selected =
+                (app.reasoning_effort_picker_selected + 1).min(efforts.len() - 1);
+            return Ok(None);
+        }
+    }
+
     // Escape key - dismiss model picker
     if key.code == KeyCode::Esc && app.model_picker_active {
         clear_model_picker(app);
+        return Ok(None);
+    }
+
+    if key.code == KeyCode::Esc && app.reasoning_effort_picker_active {
+        clear_reasoning_effort_picker(app);
+        return Ok(None);
+    }
+
+    if app.reasoning_effort_picker_active {
         return Ok(None);
     }
 
@@ -3407,7 +3553,7 @@ async fn handle_cli_only_command(
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     queue_handle: &Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>>,
-    task_opts: &TaskOptions,
+    _task_opts: &TaskOptions,
     auto_approve: bool,
 ) -> anyhow::Result<bool> {
     use crate::cli::slash_commands::{
@@ -3426,6 +3572,15 @@ async fn handle_cli_only_command(
     if agent_busy.load(Ordering::Relaxed) && matches!(&cli_cmd, CliOnlyCommand::ModelSwitch(_)) {
         app.show_notification(
             "Agent is busy. Wait for it to finish before switching models.",
+            NotificationKind::Warning,
+        );
+        return Ok(false);
+    }
+
+    if agent_busy.load(Ordering::Relaxed) && matches!(&cli_cmd, CliOnlyCommand::ReasoningEffort(_))
+    {
+        app.show_notification(
+            "Agent is busy. Wait for it to finish before changing reasoning effort.",
             NotificationKind::Warning,
         );
         return Ok(false);
@@ -3584,10 +3739,70 @@ async fn handle_cli_only_command(
                 None,
                 app,
                 session,
-                task_opts,
                 agent_busy,
             )
             .await;
+            return Ok(false);
+        }
+        CliOnlyCommand::ReasoningEffort(argument) => {
+            if argument.trim().is_empty() {
+                let (provider_name, model_id, task_opts, state_manager) = {
+                    let sess = session.lock().await;
+                    let agent = sess.agent_loop().await;
+                    let provider = agent.get_provider();
+                    (
+                        sess.task_opts
+                            .provider
+                            .clone()
+                            .unwrap_or_else(|| provider.name().to_string()),
+                        provider.get_model().id,
+                        sess.task_opts.clone(),
+                        Arc::clone(&sess.state_manager),
+                    )
+                };
+                let Ok(normalized) =
+                    crate::cli::normalize_minimax_body_overrides(&task_opts, &provider_name)
+                else {
+                    app.push_plain("Could not determine the active reasoning effort.");
+                    return Ok(false);
+                };
+                let efforts = supported_reasoning_efforts(
+                    &normalized,
+                    &provider_name,
+                    &model_id,
+                    state_manager.as_ref(),
+                );
+                if efforts.is_empty() {
+                    app.push_plain(format!(
+                        "No reasoning effort levels are supported by {provider_name}/{model_id}."
+                    ));
+                    return Ok(false);
+                }
+                clear_input_overlays(app);
+                app.reasoning_effort_picker_selected = normalized
+                    .reasoning_effort
+                    .as_ref()
+                    .and_then(|current| efforts.iter().position(|effort| effort == current))
+                    .unwrap_or(0);
+                app.reasoning_effort_picker_options = efforts;
+                app.reasoning_effort_picker_active = true;
+                return Ok(false);
+            }
+
+            let mut values = argument.split_whitespace();
+            let value = values.next().unwrap_or_default();
+            let effort = if values.next().is_none() {
+                <crate::cli::ReasoningEffort as clap::ValueEnum>::from_str(value, true).ok()
+            } else {
+                None
+            };
+            let Some(effort) = effort else {
+                app.push_plain(
+                    "Usage: /effort [none|low|medium|high|xhigh|max] (omit the value to open the picker)",
+                );
+                return Ok(false);
+            };
+            request_reasoning_effort(effort, app, session, agent_busy).await;
             return Ok(false);
         }
         CliOnlyCommand::ResetCompact => {
@@ -5661,7 +5876,8 @@ async fn run_main_loop(
                         };
                         let overlays_open = app.picker_active
                             || app.slash_command_active
-                            || app.model_picker_active;
+                            || app.model_picker_active
+                            || app.reasoning_effort_picker_active;
                         // Only cancelling the agent or idling arms the quit
                         // timer; dismissing overlays never does.
                         match decide_ctrl_c(
@@ -5727,10 +5943,13 @@ async fn run_main_loop(
                                     None,
                                     app,
                                     &session,
-                                    task_opts,
                                     &agent_busy,
                                 )
                                 .await;
+                                continue;
+                            }
+                            Action::SetReasoningEffort(effort) => {
+                                request_reasoning_effort(effort, app, &session, &agent_busy).await;
                                 continue;
                             }
                             Action::ModelApiKeySubmitted(request, api_key) => {
@@ -5773,7 +5992,6 @@ async fn run_main_loop(
                                     Some(api_key),
                                     app,
                                     &session,
-                                    task_opts,
                                     &agent_busy,
                                 )
                                 .await;
@@ -11392,6 +11610,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reasoning_effort_picker_selection_returns_selected_level() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.reasoning_effort_picker_active = true;
+        app.reasoning_effort_picker_selected = 3;
+        app.reasoning_effort_picker_options =
+            <crate::cli::ReasoningEffort as clap::ValueEnum>::value_variants().to_vec();
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+
+        assert!(matches!(
+            action,
+            Some(Action::SetReasoningEffort(
+                crate::cli::ReasoningEffort::High
+            ))
+        ));
+        assert!(!app.reasoning_effort_picker_active);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_model_api_key_submission_is_masked_and_not_echoed() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -12710,6 +12960,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_effort_command_rebuilds_active_provider_with_selected_effort() -> anyhow::Result<()>
+    {
+        let mut task_opts = retry_test_task_opts();
+        task_opts.provider = Some("openrouter".to_string());
+        task_opts.model = Some("openai/gpt-5.4".to_string());
+        task_opts.api_key = Some("sk-test123".to_string());
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts,
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+
+        request_reasoning_effort(
+            crate::cli::ReasoningEffort::High,
+            &mut app,
+            &session,
+            &agent_busy,
+        )
+        .await;
+
+        let sess = session.lock().await;
+        assert_eq!(
+            sess.task_opts.reasoning_effort,
+            Some(crate::cli::ReasoningEffort::High)
+        );
+        let agent = sess.agent_loop().await;
+        let provider = agent.get_provider();
+        assert_eq!(provider.name(), "openrouter");
+        assert_eq!(provider.get_model().id, "openai/gpt-5.4");
+        let crate::providers::Providers::OpenRouter(openrouter) = provider.as_ref() else {
+            panic!("expected OpenRouter provider");
+        };
+        let request = crate::providers::ProviderRequest {
+            system_prompt: "You are helpful.".to_string(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+        let body = openrouter.build_request_body_for_test(&request)?;
+        assert_eq!(body["reasoning_effort"], "high");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_model_switch_preserves_selected_effort() -> anyhow::Result<()> {
+        let mut task_opts = retry_test_task_opts();
+        task_opts.provider = Some("openrouter".to_string());
+        task_opts.model = Some("openai/gpt-5.4".to_string());
+        task_opts.api_key = Some("sk-test123".to_string());
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts,
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+
+        request_reasoning_effort(
+            crate::cli::ReasoningEffort::High,
+            &mut app,
+            &session,
+            &agent_busy,
+        )
+        .await;
+        request_model_switch(
+            PendingModelSwitch {
+                provider: "openrouter".to_string(),
+                model_id: "openai/gpt-5.6".to_string(),
+            },
+            None,
+            &mut app,
+            &session,
+            &agent_busy,
+        )
+        .await;
+
+        assert_eq!(
+            session.lock().await.task_opts.reasoning_effort,
+            Some(crate::cli::ReasoningEffort::High)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_effort_picker_uses_normalized_minimax_effort() -> anyhow::Result<()> {
+        let mut task_opts = retry_test_task_opts();
+        task_opts.provider = Some("minimax".to_string());
+        task_opts.model = Some("MiniMax-M3.1-Flash-Preview".to_string());
+        task_opts.api_key = Some("test-key".to_string());
+        task_opts.extra_body = Some(r#"{"reasoning_effort":"medium"}"#.to_string());
+        let session = InteractiveSession::build_with_writer(
+            task_opts,
+            RootOnlyOptions {
+                session_id: None,
+                continue_session: false,
+            },
+            None,
+        )
+        .await?;
+        let state_manager = Arc::clone(&session.state_manager);
+        let normalized = crate::cli::normalize_minimax_body_overrides(
+            &session.task_opts,
+            "minimax",
+        )?;
+        let efforts = supported_reasoning_efforts(
+            &normalized,
+            "minimax",
+            "MiniMax-M3.1-Flash-Preview",
+            state_manager.as_ref(),
+        );
+
+        assert_eq!(normalized.reasoning_effort, Some(crate::cli::ReasoningEffort::Medium));
+        assert_eq!(
+            efforts.first(),
+            Some(&crate::cli::ReasoningEffort::Low)
+        );
+        assert!(!efforts.contains(&crate::cli::ReasoningEffort::None));
+        assert!(efforts.contains(&crate::cli::ReasoningEffort::Medium));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_effort_keeps_active_provider_unchanged() -> anyhow::Result<()> {
+        let mut task_opts = retry_test_task_opts();
+        task_opts.provider = Some("gemini".to_string());
+        task_opts.model = Some("gemini-2.5-flash".to_string());
+        task_opts.api_key = Some("test-key".to_string());
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts,
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let mut app = App::new();
+
+        request_reasoning_effort(
+            crate::cli::ReasoningEffort::High,
+            &mut app,
+            &session,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        let sess = session.lock().await;
+        assert!(sess.task_opts.reasoning_effort.is_none());
+        let agent = sess.agent_loop().await;
+        let provider = agent.get_provider();
+        assert_eq!(provider.name(), "gemini");
+        assert_eq!(provider.get_model().id, "gemini-2.5-flash");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_new_command_switches_to_fresh_task() -> anyhow::Result<()> {
         let task_opts = retry_test_task_opts();
         let session = Arc::new(Mutex::new(
@@ -12997,6 +13421,58 @@ mod tests {
         assert!(app.picker_results.is_empty());
         assert!(!app.mention_search_active);
         assert!(app.mention_search_query.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bare_effort_opens_picker_with_current_selection() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        session.lock().await.task_opts.reasoning_effort = Some(crate::cli::ReasoningEffort::High);
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+
+        handle_cli_only_command(
+            CliOnlyCommand::ReasoningEffort(String::new()),
+            "/effort",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle,
+            &Arc::new(Mutex::new(None)),
+            &task_opts,
+            false,
+        )
+        .await?;
+
+        assert!(app.reasoning_effort_picker_active);
+        assert_eq!(app.reasoning_effort_picker_selected, 3);
         Ok(())
     }
 

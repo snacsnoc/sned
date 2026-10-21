@@ -1145,6 +1145,12 @@ pub struct App {
     pub model_picker_results: Vec<crate::cli::slash_commands::ModelPickerEntry>,
     /// Currently selected index in model picker.
     pub model_picker_selected: usize,
+    /// Whether the reasoning effort picker is active.
+    pub reasoning_effort_picker_active: bool,
+    /// Currently selected index in reasoning effort picker.
+    pub reasoning_effort_picker_selected: usize,
+    /// Effort levels supported by the active provider and model.
+    pub reasoning_effort_picker_options: Vec<crate::cli::ReasoningEffort>,
     /// Model switch awaiting an API key for a provider not configured in this process.
     pub pending_model_switch: Option<PendingModelSwitch>,
     last_completion_text: Option<String>,
@@ -1327,6 +1333,7 @@ impl App {
         self.slash_command_active = false;
         self.slash_command_help_active = false;
         self.model_picker_active = false;
+        self.reasoning_effort_picker_active = false;
         self.pending_plan_approve = false;
         self.picker_results.clear();
         self.picker_index = 0;
@@ -1340,6 +1347,8 @@ impl App {
         self.slash_command_completed_text = None;
         self.model_picker_results.clear();
         self.model_picker_selected = 0;
+        self.reasoning_effort_picker_selected = 0;
+        self.reasoning_effort_picker_options.clear();
         self.clear_text_selection();
         self.needs_redraw = true;
         true
@@ -1556,6 +1565,9 @@ impl App {
             model_picker_active: false,
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
+            reasoning_effort_picker_active: false,
+            reasoning_effort_picker_selected: 0,
+            reasoning_effort_picker_options: Vec::new(),
             pending_model_switch: None,
             last_completion_text: None,
             completion_lines: Vec::new(),
@@ -4528,6 +4540,9 @@ impl App {
         if self.model_picker_active {
             self.render_model_picker_overlay(frame, output_area);
         }
+        if self.reasoning_effort_picker_active {
+            self.render_reasoning_effort_picker_overlay(frame, output_area);
+        }
         if has_plan {
             self.render_plan_panel(frame, plan_area);
         }
@@ -4535,6 +4550,7 @@ impl App {
         let selection_blocked = self.picker_active
             || self.slash_command_active
             || self.model_picker_active
+            || self.reasoning_effort_picker_active
             || self.pending_model_switch.is_some();
         if selection_blocked {
             self.clear_text_selection();
@@ -5396,6 +5412,46 @@ impl App {
             selected,
             visible_rows,
         );
+    }
+
+    fn render_reasoning_effort_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
+        let efforts = &self.reasoning_effort_picker_options;
+        let Some((overlay_area, visible_rows)) =
+            Self::picker_overlay_area(output_area, efforts.len())
+        else {
+            return;
+        };
+        let selected = self
+            .reasoning_effort_picker_selected
+            .min(efforts.len().saturating_sub(1));
+        let first_visible = Self::picker_viewport_start(selected, efforts.len(), visible_rows);
+        let rows = efforts
+            .iter()
+            .enumerate()
+            .skip(first_visible)
+            .take(visible_rows)
+            .map(|(index, effort)| {
+                let label = format!(" {}", effort.as_provider_str());
+                if index == selected {
+                    Line::from(Span::styled(label, theme::picker_selected_style()))
+                } else {
+                    Line::from(label)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        frame.render_widget(Clear, overlay_area);
+        let block = theme::overlay_block(" Reasoning Effort ");
+        let inner = block.inner(overlay_area);
+        frame.render_widget(block, overlay_area);
+        let [list_area, footer_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+        frame.render_widget(Paragraph::new(rows), list_area);
+        frame.render_widget(
+            Paragraph::new("Tab/Enter select · ↑/↓ move · Esc close").style(theme::dim_style()),
+            footer_area,
+        );
+        Self::render_picker_scrollbar(frame, list_area, efforts.len(), selected, visible_rows);
     }
 
     pub fn handle_paste(&mut self, content: &str, fold_large: bool) -> PasteOutcome {
@@ -7093,6 +7149,17 @@ mod tests {
         )));
         assert!(rendered.contains(selected_model));
         assert!(rendered.contains("Tab/Enter switch"));
+
+        let mut effort_picker = App::new();
+        effort_picker.reasoning_effort_picker_active = true;
+        effort_picker.reasoning_effort_picker_options =
+            <crate::cli::ReasoningEffort as clap::ValueEnum>::value_variants().to_vec();
+        let rendered = render(&mut effort_picker);
+        assert!(rendered.contains("Reasoning Effort"));
+        for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+            assert!(rendered.contains(effort), "missing {effort}: {rendered}");
+        }
+        assert!(rendered.contains("Tab/Enter select"));
     }
 
     #[test]

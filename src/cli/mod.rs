@@ -217,7 +217,7 @@ pub enum ReasoningEffort {
 
 impl ReasoningEffort {
     /// The string value sent in API request bodies.
-    fn as_provider_str(&self) -> &'static str {
+    pub(crate) fn as_provider_str(&self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Low => "low",

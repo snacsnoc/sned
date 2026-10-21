@@ -32,6 +32,7 @@ enum SlashCommandId {
     Queue,
     Retry,
     Model,
+    ReasoningEffort,
     Act,
     Plan,
     PlanStatus,
@@ -362,6 +363,17 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         requirement: CommandRequirement::Always,
     },
     SlashCommandSpec {
+        id: SlashCommandId::ReasoningEffort,
+        name: "effort",
+        aliases: &[],
+        description: "Set the active model's reasoning effort",
+        usage: "/effort [none|low|medium|high|xhigh|max]",
+        detail: "Opens the reasoning effort picker without an argument, or applies one supported level to the active provider and model for this session.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
         id: SlashCommandId::Act,
         name: "act",
         aliases: &[],
@@ -630,6 +642,7 @@ pub enum CliOnlyCommand {
     PlanComplete,
     PlanFail,
     ModelSwitch(String), // /model provider/model_id
+    ReasoningEffort(String), // /effort [level]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -782,6 +795,7 @@ impl CliOnlyCommand {
                 | Self::PlanComplete
                 | Self::PlanFail
                 | Self::ModelSwitch(_)
+                | Self::ReasoningEffort(_)
         )
     }
 
@@ -891,6 +905,7 @@ fn cli_command_from_match(matched: &StaticCommandMatch<'_>) -> Option<CliOnlyCom
         SlashCommandId::Queue => Some(CliOnlyCommand::Queue),
         SlashCommandId::Retry => Some(CliOnlyCommand::Retry),
         SlashCommandId::Model => Some(CliOnlyCommand::ModelSwitch(args.to_string())),
+        SlashCommandId::ReasoningEffort => Some(CliOnlyCommand::ReasoningEffort(args.to_string())),
         SlashCommandId::Act => Some(CliOnlyCommand::Act),
         SlashCommandId::Plan => CliOnlyCommand::parse_plan_with_args(args),
         SlashCommandId::PlanStatus => CliOnlyCommand::parse_plan_with_args("status"),
@@ -2778,6 +2793,27 @@ mod tests {
         let result = CliOnlyCommand::parse_with_arg("model", "anthropic/claude-sonnet-4");
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), CliOnlyCommand::ModelSwitch(_)));
+    }
+
+    #[test]
+    fn test_parse_reasoning_effort_command_with_and_without_value() {
+        assert!(matches!(
+            CliOnlyCommand::parse("effort"),
+            Some(CliOnlyCommand::ReasoningEffort(value)) if value.is_empty()
+        ));
+        assert!(matches!(
+            CliOnlyCommand::parse_with_arg("effort", "high"),
+            Some(CliOnlyCommand::ReasoningEffort(value)) if value == "high"
+        ));
+        assert!(matches!(
+            get_cli_only_command("/effort"),
+            Some(CliOnlyCommand::ReasoningEffort(_))
+        ));
+    }
+
+    #[test]
+    fn test_reasoning_effort_command_is_local() {
+        assert!(CliOnlyCommand::ReasoningEffort("max".to_string()).is_local_command());
     }
 
     #[test]
