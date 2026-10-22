@@ -147,11 +147,14 @@ pub fn highlight_code(code: &str, lang: &str) -> String {
         language: normalized_language,
         no_color,
     };
-    if let Some(rendered) = highlight_cache()
+    // Bound explicitly so the cache guard is released at statement end
+    // instead of living for the whole `if let`, shrinking the critical
+    // section around the mutex.
+    let cached = highlight_cache()
         .lock()
         .expect("highlight cache poisoned")
-        .get(&key)
-    {
+        .get(&key);
+    if let Some(rendered) = cached {
         HIGHLIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return rendered;
     }

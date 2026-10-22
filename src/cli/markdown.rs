@@ -219,7 +219,11 @@ fn render_streamed_markdown_cached(
         code_line_limit,
         no_color: std::env::var_os("NO_COLOR").is_some(),
     };
-    if let Some(rendered) = lock_markdown_cache().get(&key) {
+    // Bound explicitly so the cache guard is released at statement end
+    // instead of living for the whole `if let`, shrinking the critical
+    // section around the mutex.
+    let cached = lock_markdown_cache().get(&key);
+    if let Some(rendered) = cached {
         MARKDOWN_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return rendered;
     }
