@@ -206,6 +206,8 @@ impl ToolRegistry {
 }
 
 /// Shared execution context passed to all tool handlers.
+// Execution flags describe independent call-site permissions.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 pub struct ToolContext {
     pub state: Arc<Mutex<TaskState>>,
@@ -822,7 +824,7 @@ pub(crate) fn parse_relaxed_stringified_string_array(value: &str) -> Option<Vec<
     // quote is followed by a comma and another string, the intended array
     // boundary is ambiguous and must be retried instead of guessed.
     let interior = &trimmed[2..interior_end];
-    let mut scan = interior.char_indices().peekable();
+    let mut scan = interior.char_indices();
     while let Some((_, character)) = scan.next() {
         if character == '\\' {
             scan.next();

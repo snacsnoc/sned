@@ -1343,7 +1343,7 @@ async fn process_openai_sse_line(
                     // Sort by index to ensure deterministic emission order
                     let mut sorted_indices: Vec<_> =
                         accumulated_tool_calls.keys().copied().collect();
-                    sorted_indices.sort();
+                    sorted_indices.sort_unstable();
 
                     for idx in &sorted_indices {
                         let (id, name, _) = &accumulated_tool_calls[idx];
@@ -1578,7 +1578,7 @@ pub async fn finish_openai_sse_to_chunks(
     // (some providers don't send finish_reason == "tool_calls" explicitly)
     if !matches!(last_stop_reason.as_deref(), Some("content_filter")) {
         let mut sorted_indices: Vec<_> = accumulated_tool_calls.keys().copied().collect();
-        sorted_indices.sort();
+        sorted_indices.sort_unstable();
 
         for idx in &sorted_indices {
             let (id, name, _) = &accumulated_tool_calls[idx];
@@ -1824,7 +1824,7 @@ impl Provider for OpenAiProvider {
                 let mut stream = stream;
                 loop {
                     tokio::select! {
-                        _ = raw_tx.closed() => break,
+                        () = raw_tx.closed() => break,
                         item = stream.next() => {
                             let Some(result) = item else { break };
                             let received_at = Instant::now();

@@ -348,7 +348,7 @@ impl PartialEq for VisualLayoutIndex {
         if self.wrap_width != other.wrap_width || self.dirty != other.dirty {
             return false;
         }
-        let normalized_state = |index: &VisualLayoutIndex| {
+        let normalized_state = |index: &Self| {
             let active_len = index.active_len();
             let entries = index
                 .entries
@@ -943,6 +943,9 @@ fn read_scrollback_tail(path: &Path) -> io::Result<Option<String>> {
 }
 
 /// Application state for the ratatui TUI.
+// Each flag describes an independent, user-visible TUI capability rather than
+// states of one concept, so a flat struct keeps the contract concrete.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     /// Output lines buffer (agent output, submitted prompts, etc.)
     pub output_lines: VecDeque<Line<'static>>,
@@ -2245,8 +2248,7 @@ impl App {
                 .expect("no-op finalization must have rendered lines");
             // Prepend the turn indicator to the first rendered line's
             // first span instead of doing a full pop+reinsert.
-            let mut prefixed_turn_indicator = false;
-            if let Some(first) = rendered.first_mut()
+            let prefixed_turn_indicator = if let Some(first) = rendered.first_mut()
                 && self.turn_indicator.take().is_some()
             {
                 let mut new_spans = Vec::with_capacity(first.spans.len() + 1);
@@ -2256,8 +2258,10 @@ impl App {
                 ));
                 new_spans.extend(first.spans.iter().cloned());
                 first.spans = new_spans;
-                prefixed_turn_indicator = true;
-            }
+                true
+            } else {
+                false
+            };
             if prefixed_turn_indicator {
                 self.output_lines[model_entry_indices[0]] = rendered[0].clone();
                 self.output_line_kinds[model_entry_indices[0]] = BlockKind::Model;
@@ -2553,6 +2557,9 @@ impl App {
             return false;
         }
 
+        // Materialized now: the iterator borrows `self`, and the mutable
+        // calls below need that borrow released first.
+        #[allow(clippy::needless_collect)]
         let saved_entries = self
             .turn_stream_entries
             .iter()
@@ -2650,6 +2657,9 @@ impl App {
         };
         let manual_anchor = self.manual_viewport_anchor(self.last_wrap_width());
 
+        // Materialized now: the iterator borrows `self`, and the mutation
+        // loop below needs that borrow released first.
+        #[allow(clippy::needless_collect)]
         let saved_entries = self
             .turn_stream_entries
             .iter()
@@ -2710,6 +2720,9 @@ impl App {
             .filter_map(|(id, kind)| self.output_index_for_id(id).map(|index| (index, kind)))
             .collect();
         self.last_stream_group = saved_last_group.and_then(|(ids, kind)| {
+            // Scanned twice (first/last check plus the contiguity scan), so it
+            // cannot stay lazy.
+            #[allow(clippy::needless_collect)]
             let indices = ids
                 .iter()
                 .filter_map(|id| self.output_index_for_id(*id))
@@ -3352,7 +3365,7 @@ impl App {
 
     pub fn shutdown_task_transcript_writer(&mut self) -> io::Result<()> {
         if let Some(mut writer) = self.task_transcript_writer.take() {
-            writer.shutdown()?
+            writer.shutdown()?;
         }
         Ok(())
     }
@@ -4775,8 +4788,10 @@ impl App {
             let color = match choice.result() {
                 crate::core::approval::ApprovalResult::Approved => theme::success_fg(),
                 crate::core::approval::ApprovalResult::Denied => theme::error_fg(),
-                crate::core::approval::ApprovalResult::Always => theme::accent(),
-                crate::core::approval::ApprovalResult::AllowExternalDirectory => theme::accent(),
+                crate::core::approval::ApprovalResult::Always
+                | crate::core::approval::ApprovalResult::AllowExternalDirectory => {
+                    theme::accent()
+                }
             };
             actions.push(Span::styled(
                 format!("[{shortcut}]"),
@@ -4859,7 +4874,7 @@ impl App {
         }
     }
 
-    fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect) {
+    fn render_status_bar(&self, frame: &mut Frame, status_area: Rect) {
         if let Some(notification) = self.status_notification.as_ref() {
             let (marker, color) = match notification.kind {
                 NotificationKind::Info => ("i", theme::accent()),
@@ -5323,6 +5338,9 @@ impl App {
         let inner = block.inner(overlay_area);
         frame.render_widget(block, overlay_area);
 
+        // The irrefutable two-element slice pattern pins the split to exactly
+        // two regions; indexing `.areas()` would need an explicit type.
+        #[allow(clippy::tuple_array_conversions)]
         let (list_area, detail_area) = if inner.width >= 72 {
             let [list, detail] =
                 Layout::horizontal([Constraint::Length(34), Constraint::Min(24)]).areas(inner);

@@ -268,13 +268,14 @@ impl PlanState {
             return None;
         }
 
-        let mut changed = false;
-        if let Some(step) = self.steps.get_mut(self.current_step_index)
+        let mut changed = if let Some(step) = self.steps.get_mut(self.current_step_index)
             && step.status == PlanStepStatus::Running
         {
             step.status = PlanStepStatus::Done;
-            changed = true;
-        }
+            true
+        } else {
+            false
+        };
 
         // Check if current step is Failed — do NOT skip it
         if let Some(step) = self.steps.get(self.current_step_index)

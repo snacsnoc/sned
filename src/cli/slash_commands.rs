@@ -62,6 +62,8 @@ enum CommandRequirement {
     PlanEditable,
 }
 
+// Each flag reports whether a distinct command is currently reachable.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SlashCommandAvailability {
     pub track_changes: bool,

@@ -60,7 +60,10 @@ pub enum AgentMode {
 /// The Mutex provides necessary memory barriers for cross-thread visibility.
 /// `is_cancelled_atomic` is an `Arc<AtomicBool>` that can be cloned and read
 /// without the mutex for the hot-path cancellation check in the streaming loop.
+// Flags track independent lifecycle conditions observed across threads; a
+// state machine would not express them more clearly.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct TaskState {
     /// Number of consecutive mistakes made by the assistant.
     pub consecutive_mistakes: u32,
@@ -313,6 +316,8 @@ impl Default for AgentConfig {
 }
 
 /// Configuration for the agent loop.
+// Loop knobs are independent opt-ins resolved once per task.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 pub struct AgentConfig {
     /// The provider to use for API calls.

@@ -57,7 +57,7 @@ impl RatatuiPerformer {
 impl Perform for RatatuiPerformer {
     fn print(&mut self, c: char) {
         self.current_text.push(c);
-        self.current_column += if c == '\t' { 0 } else { 1 };
+        self.current_column += usize::from(c != '\t');
     }
 
     fn execute(&mut self, byte: u8) {

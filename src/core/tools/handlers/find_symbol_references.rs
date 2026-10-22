@@ -91,10 +91,10 @@ impl FindSymbolReferencesHandler {
                     indexed_paths.insert(path.to_string(), resolved);
                 }
                 Ok(_) => {
-                    index_warnings.push(format!("Index entry skipped outside workspace: {path}"))
+                    index_warnings.push(format!("Index entry skipped outside workspace: {path}"));
                 }
                 Err(error) => {
-                    index_warnings.push(format!("Index entry skipped for {path}: {error}"))
+                    index_warnings.push(format!("Index entry skipped for {path}: {error}"));
                 }
             }
         }

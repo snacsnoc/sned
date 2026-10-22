@@ -16,6 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+// Each field holds a distinct event instant; the shared `_at` postfix is the
+// clearest way to say so.
+#[allow(clippy::struct_field_names)]
 #[derive(Clone, Copy, Debug)]
 pub struct TurnEndTiming {
     pub(crate) provider_completed_at: Option<Instant>,
@@ -785,28 +788,28 @@ impl DropCounters {
     }
 
     fn format_summary(&self) -> String {
-        let m = self.model_text.load(std::sync::atomic::Ordering::Relaxed);
-        let t = self.tool_output.load(std::sync::atomic::Ordering::Relaxed);
-        let r = self.reasoning.load(std::sync::atomic::Ordering::Relaxed);
-        let a = self
+        let model_lines = self.model_text.load(std::sync::atomic::Ordering::Relaxed);
+        let tool_lines = self.tool_output.load(std::sync::atomic::Ordering::Relaxed);
+        let reasoning_lines = self.reasoning.load(std::sync::atomic::Ordering::Relaxed);
+        let approval_lines = self
             .approval_prompt
             .load(std::sync::atomic::Ordering::Relaxed);
-        let o = self.other.load(std::sync::atomic::Ordering::Relaxed);
+        let other_lines = self.other.load(std::sync::atomic::Ordering::Relaxed);
         let mut parts = Vec::new();
-        if m > 0 {
-            parts.push(format!("{m} model"));
+        if model_lines > 0 {
+            parts.push(format!("{model_lines} model"));
         }
-        if t > 0 {
-            parts.push(format!("{t} tools"));
+        if tool_lines > 0 {
+            parts.push(format!("{tool_lines} tools"));
         }
-        if r > 0 {
-            parts.push(format!("{r} reasoning"));
+        if reasoning_lines > 0 {
+            parts.push(format!("{reasoning_lines} reasoning"));
         }
-        if a > 0 {
-            parts.push(format!("{a} approvals"));
+        if approval_lines > 0 {
+            parts.push(format!("{approval_lines} approvals"));
         }
-        if o > 0 {
-            parts.push(format!("{o} other"));
+        if other_lines > 0 {
+            parts.push(format!("{other_lines} other"));
         }
         if parts.is_empty() {
             "none".to_string()

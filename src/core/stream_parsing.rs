@@ -94,6 +94,7 @@ pub struct ThinkingTagStreamFilter {
 }
 
 impl ThinkingTagStreamFilter {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             at_line_start: true,

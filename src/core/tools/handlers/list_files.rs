@@ -192,15 +192,16 @@ impl ListFilesHandler {
         }
 
         // Bound concurrent opens so large listings do not exhaust file descriptors.
-        let mut file_line_counts: Vec<Option<usize>> = vec![None; file_paths.len()];
-        if include_line_counts {
+        let file_line_counts: Vec<Option<usize>> = if include_line_counts {
             let paths: Vec<_> = file_paths.iter().map(|(_, path, _)| path.clone()).collect();
-            file_line_counts = stream::iter(paths)
+            stream::iter(paths)
                 .map(|path| async move { count_lines_fast(&path).await })
                 .buffered(MAX_CONCURRENT_LINE_COUNTS)
                 .collect()
-                .await;
-        }
+                .await
+        } else {
+            vec![None; file_paths.len()]
+        };
 
         // Build file infos with line counts in original order
         for ((_, path, _), line_count) in file_paths.into_iter().zip(file_line_counts) {
@@ -318,15 +319,16 @@ impl ListFilesHandler {
         }
 
         // Bound concurrent opens so large listings do not exhaust file descriptors.
-        let mut file_line_counts: Vec<Option<usize>> = vec![None; file_paths.len()];
-        if include_line_counts {
+        let file_line_counts: Vec<Option<usize>> = if include_line_counts {
             let paths: Vec<_> = file_paths.iter().map(|(_, path)| path.clone()).collect();
-            file_line_counts = stream::iter(paths)
+            stream::iter(paths)
                 .map(|path| async move { count_lines_fast(&path).await })
                 .buffered(MAX_CONCURRENT_LINE_COUNTS)
                 .collect()
-                .await;
-        }
+                .await
+        } else {
+            vec![None; file_paths.len()]
+        };
 
         // Build file infos with line counts in original order
         for ((_, path), line_count) in file_paths.into_iter().zip(file_line_counts) {

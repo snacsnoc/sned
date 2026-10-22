@@ -60,7 +60,7 @@ pub enum GeminiThinkingLevel {
 }
 
 impl GeminiThinkingLevel {
-    fn as_str(&self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::Minimal => "minimal",
             Self::Low => "low",
@@ -400,6 +400,9 @@ struct GeminiResponseFunctionCall {
     id: Option<String>,
 }
 
+// Field names mirror the Gemini usageMetadata schema verbatim so the wire
+// format stays recognizable when reading this mapping.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiUsageMetadata {

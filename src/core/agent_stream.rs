@@ -106,6 +106,7 @@ pub struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
+    #[must_use]
     pub fn new(json_output: bool, provider: StreamProviderInfo) -> Self {
         Self {
             filter: ThinkingTagStreamFilter::new(),
@@ -149,6 +150,7 @@ impl StreamAccumulator {
         }
     }
 
+    #[must_use]
     pub fn finish(mut self) -> StreamOutcome {
         let filtered_tail = self.filter.finish();
         self.filtered_text.push_str(&filtered_tail);

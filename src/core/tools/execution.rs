@@ -946,6 +946,9 @@ async fn resolve_preflight(
             if any_unsafe {
                 // In non-interactive mode, deny unsafe commands directly
                 // (no TUI available to prompt the user).
+                // The non-interactive denial is the safer branch to keep
+                // first, so inverting for the lint is not worth it.
+                #[allow(clippy::if_not_else)]
                 if !inputs.interactive_mode {
                     let mut state = inputs.state.lock().await;
                     let is_subagent = state.is_subagent_execution;

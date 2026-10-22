@@ -111,7 +111,7 @@ pub enum DocumentSource {
 }
 
 /// Content of a tool result.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ToolResultContent {
     Text(String),
@@ -148,7 +148,7 @@ pub struct ToolUseBlock {
 }
 
 /// A tool result block (user-side).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolResultBlock {
     #[serde(rename = "tool_use_id")]
     pub tool_use_id: String,
@@ -186,7 +186,7 @@ pub struct DocumentContentBlock {
 }
 
 /// Union of all user content blocks.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum UserContentBlock {
     #[serde(rename = "text")]
@@ -200,7 +200,7 @@ pub enum UserContentBlock {
 }
 
 /// Union of all assistant content blocks.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum AssistantContentBlock {
     #[serde(rename = "text")]
@@ -261,7 +261,7 @@ pub struct StorageMessage {
 }
 
 /// Content of a storage message.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
@@ -316,7 +316,7 @@ pub(crate) async fn send_chunk(
 ) -> bool {
     tokio::select! {
         biased;
-        _ = tx.closed() => {
+        () = tx.closed() => {
             tracing::debug!(
                 "{provider_name} provider channel closed, cannot send {chunk_type} chunk"
             );
@@ -399,7 +399,7 @@ pub struct ApiStreamReasoningChunk {
 }
 
 /// Tool call chunk.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiStreamToolCallsChunk {
     pub tool_call: ApiStreamToolCall,
     pub id: Option<String>,
@@ -1277,7 +1277,7 @@ impl Provider for RetryTestProvider {
     fn get_model(&self) -> ProviderModel {
         ProviderModel {
             id: "test".to_string(),
-            info: Default::default(),
+            info: ModelInfo::default(),
         }
     }
 

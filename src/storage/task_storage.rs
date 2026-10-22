@@ -13,7 +13,8 @@ use crate::cli::tui::BlockKind;
 use crate::core::context::context_manager::PersistedApiReqInfo;
 use crate::providers::StorageMessage;
 use crate::providers::{
-    AssistantContentBlock, MessageContent, MessageRole, TextContentBlock, UserContentBlock,
+    AssistantContentBlock, MessageContent, MessageRole, SharedContentFields, TextContentBlock,
+    UserContentBlock,
 };
 use crate::storage::disk::GlobalFileNames;
 
@@ -46,12 +47,13 @@ fn default_transcript_format_version() -> u32 {
 
 /// RAII guard that releases the task storage lock on drop.
 pub struct LockGuard {
-    _file: fs::File,
+    // Underscore-free because Drop reads it; a `_` prefix would mislead.
+    file: fs::File,
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = self._file.unlock();
+        let _ = self.file.unlock();
     }
 }
 
@@ -109,7 +111,11 @@ pub struct TranscriptSpan {
 
 /// Name a terminal color for transcript storage. `Reset` maps to `None`
 /// since it renders as the default anyway.
+#[must_use]
 pub fn encode_transcript_color(color: &ratatui::style::Color) -> Option<String> {
+    // A dense wire-format mapping reads far better with the variants in scope
+    // than fully qualified.
+    #[allow(clippy::enum_glob_use)]
     use ratatui::style::Color::*;
     Some(
         match color {
@@ -139,7 +145,10 @@ pub fn encode_transcript_color(color: &ratatui::style::Color) -> Option<String> 
 
 /// Inverse of [`encode_transcript_color`]. Unknown names yield `None` so a
 /// corrupt style degrades to the default instead of dropping the line.
+#[must_use]
 pub fn decode_transcript_color(name: &str) -> Option<ratatui::style::Color> {
+    // Inverse table mirrors `encode_transcript_color`; same reasoning.
+    #[allow(clippy::enum_glob_use)]
     use ratatui::style::Color::*;
     match name {
         "black" => Some(Black),
@@ -579,6 +588,7 @@ impl TaskStorage {
     }
 
     /// Read API conversation history (Anthropic MessageParam format)
+    #[must_use]
     pub fn read_api_conversation_history(&self) -> Vec<StorageMessage> {
         self.read_api_conversation_history_with_recovery().messages
     }
@@ -809,7 +819,7 @@ impl TaskStorage {
         // pruned messages are lineage drops: no survivor covers them.
         let mut pruned: Vec<(usize, StorageMessage)> = Vec::with_capacity(history.len());
         let mut dropped: Vec<usize> = Vec::new();
-        for (index, mut message) in history.into_iter() {
+        for (index, mut message) in history {
             let keep = match &mut message.content {
                 MessageContent::AssistantBlocks(blocks) => {
                     blocks.retain(|block| {
@@ -898,7 +908,7 @@ impl TaskStorage {
                 if !text.is_empty() {
                     merged.push(UserContentBlock::Text(TextContentBlock {
                         text: text.clone(),
-                        shared: Default::default(),
+                        shared: SharedContentFields::default(),
                         reasoning_details: None,
                     }));
                 }
@@ -912,7 +922,7 @@ impl TaskStorage {
                 if !text.is_empty() {
                     merged.push(UserContentBlock::Text(TextContentBlock {
                         text: text.clone(),
-                        shared: Default::default(),
+                        shared: SharedContentFields::default(),
                         reasoning_details: None,
                     }));
                 }
@@ -925,7 +935,7 @@ impl TaskStorage {
                 if !text.is_empty() {
                     merged.push(AssistantContentBlock::Text(TextContentBlock {
                         text: text.clone(),
-                        shared: Default::default(),
+                        shared: SharedContentFields::default(),
                         reasoning_details: None,
                     }));
                 }
@@ -939,7 +949,7 @@ impl TaskStorage {
                 if !text.is_empty() {
                     merged.push(AssistantContentBlock::Text(TextContentBlock {
                         text: text.clone(),
-                        shared: Default::default(),
+                        shared: SharedContentFields::default(),
                         reasoning_details: None,
                     }));
                 }
@@ -1193,7 +1203,7 @@ impl TaskStorage {
             }
         })?;
 
-        Ok(LockGuard { _file: file })
+        Ok(LockGuard { file })
     }
 
     async fn acquire_lock_with_retry_for(&self, lock_file: &str) -> io::Result<LockGuard> {
@@ -1222,7 +1232,7 @@ impl TaskStorage {
         file.lock()
             .map_err(|e| io::Error::other(format!("Failed to acquire lock: {e}")))?;
 
-        Ok(LockGuard { _file: file })
+        Ok(LockGuard { file })
     }
 
     /// Execute a closure while holding an exclusive lock on the task directory.
@@ -2310,14 +2320,14 @@ mod tests {
                 content: MessageContent::AssistantBlocks(vec![
                     AssistantContentBlock::Text(TextContentBlock {
                         text: format!("thinking {i}"),
-                        shared: Default::default(),
+                        shared: SharedContentFields::default(),
                         reasoning_details: None,
                     }),
                     AssistantContentBlock::ToolUse(ToolUseBlock {
                         id: format!("tool-{i}"),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "/tmp/x.rs"}),
-                        shared: Default::default(),
+                        shared: SharedContentFields::default(),
                         reasoning_details: None,
                     }),
                 ]),
@@ -2332,7 +2342,7 @@ mod tests {
                     ToolResultBlock {
                         tool_use_id: format!("tool-{i}"),
                         content: ToolResultContent::Text(format!("result {i}")),
-                        shared: Default::default(),
+                        shared: SharedContentFields::default(),
                     },
                 )]),
                 model_info: None,
@@ -2492,7 +2502,7 @@ mod tests {
                     ToolResultBlock {
                         tool_use_id: "tool-ghost".to_string(),
                         content: ToolResultContent::Text("orphan".to_string()),
-                        shared: Default::default(),
+                        shared: SharedContentFields::default(),
                     },
                 )]),
                 model_info: None,
@@ -2529,14 +2539,14 @@ mod tests {
                 content: MessageContent::AssistantBlocks(vec![
                     AssistantContentBlock::Text(TextContentBlock {
                         text: "working".to_string(),
-                        shared: Default::default(),
+                        shared: SharedContentFields::default(),
                         reasoning_details: None,
                     }),
                     AssistantContentBlock::ToolUse(ToolUseBlock {
                         id: "tool-ghost".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({}),
-                        shared: Default::default(),
+                        shared: SharedContentFields::default(),
                         reasoning_details: None,
                     }),
                 ]),

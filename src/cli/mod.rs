@@ -205,7 +205,7 @@ fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
 // ── Reasoning effort enum ──────────────────────────────────────────────
 
 /// Provider-supported reasoning levels.
-#[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
+#[derive(Debug, Clone, PartialEq, Eq, clap::ValueEnum)]
 pub enum ReasoningEffort {
     None,
     Low,
@@ -235,6 +235,9 @@ impl ReasoningEffort {
 /// `.option()` calls on both the root command and the `task` subcommand.
 #[derive(Debug, Clone, Parser)]
 #[command(next_help_heading = "Session Options")]
+// CLI flags are independent opt-ins; grouping them would obscure the
+// clap-derived surface.
+#[allow(clippy::struct_excessive_bools)]
 pub struct TaskOptions {
     /// Run in act mode
     #[arg(short = 'a', long)]

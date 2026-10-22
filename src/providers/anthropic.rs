@@ -534,6 +534,9 @@ struct AnthropicMessageDelta {
     stop_reason: Option<String>,
 }
 
+// Field names mirror the Anthropic usage JSON schema verbatim so the wire
+// format stays recognizable when reading this mapping.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Deserialize, Default)]
 struct AnthropicUsage {
     #[serde(default)]

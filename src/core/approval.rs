@@ -885,6 +885,8 @@ impl std::error::Error for PathPatternError {}
 
 /// Per-action auto-approval settings, ported from
 /// `autoApprove.ts` `autoApprovalSettings.actions`.
+// One flag per independently grantable action; each is checked in isolation.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AutoApprovalSettings {
     pub read_files: bool,

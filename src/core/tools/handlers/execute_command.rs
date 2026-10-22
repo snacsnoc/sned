@@ -1426,7 +1426,7 @@ impl ExecuteCommandHandler {
                                 let _ = child.kill().await;
                             }
                             let _ = child.wait().await;
-                            Self::unregister_command_pid(&task_state, child_pid).await;
+                            Self::unregister_command_pid(task_state.as_ref(), child_pid).await;
                             return Err(anyhow::anyhow!("Script cancelled by user"));
                         }
                     }
@@ -1452,7 +1452,7 @@ impl ExecuteCommandHandler {
                 if e.to_string() == "Script cancelled by user" {
                     return Err(e);
                 }
-                Self::unregister_command_pid(&task_state, child_pid).await;
+                Self::unregister_command_pid(task_state.as_ref(), child_pid).await;
                 return Err(anyhow::anyhow!("Script failed to execute: {e}"));
             }
             Err(_) => {
@@ -1472,7 +1472,7 @@ impl ExecuteCommandHandler {
                     let _ = child.kill().await;
                 }
                 let _ = child.wait().await;
-                Self::unregister_command_pid(&task_state, child_pid).await;
+                Self::unregister_command_pid(task_state.as_ref(), child_pid).await;
                 let stdout = stdout_task
                     .await
                     .ok()
@@ -1522,7 +1522,7 @@ impl ExecuteCommandHandler {
 
         let combined = assemble_sandboxed_output(combined, &env_report, command_output_limit());
 
-        Self::unregister_command_pid(&task_state, child_pid).await;
+        Self::unregister_command_pid(task_state.as_ref(), child_pid).await;
 
         if !combined.is_empty() {
             use crate::cli::output::OutputEvent;
@@ -1536,7 +1536,7 @@ impl ExecuteCommandHandler {
         }
     }
 
-    async fn unregister_command_pid(task_state: &Option<Arc<Mutex<TaskState>>>, child_pid: i32) {
+    async fn unregister_command_pid(task_state: Option<&Arc<Mutex<TaskState>>>, child_pid: i32) {
         #[cfg(unix)]
         if child_pid != 0
             && let Some(state) = task_state

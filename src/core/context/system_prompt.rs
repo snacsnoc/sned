@@ -10,7 +10,9 @@ use crate::core::tools::definitions::ToolProfile;
 // ============================================================================
 
 /// Context used when building the system prompt.
-///
+// Prompt feature toggles are orthogonal; splitting them would multiply
+// context types for no behavior gain.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct SystemPromptContext {
     pub cwd: Option<String>,

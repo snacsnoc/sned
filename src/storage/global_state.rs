@@ -6,6 +6,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// Global state and settings combined (mirrors TypeScript GlobalStateAndSettings)
+// This is the persisted on-disk schema. Restructuring the bools would break
+// existing saved state files.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalState {
     #[serde(skip_serializing_if = "Option::is_none")]

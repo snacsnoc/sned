@@ -971,7 +971,7 @@ fn textarea_cursor_byte_offset(lines: &[String], cursor: (usize, usize)) -> usiz
     preceding_lines.saturating_add(column_offset)
 }
 
-fn spawn_mention_search(app: &mut App, query: String) {
+fn spawn_mention_search(app: &App, query: String) {
     let Some(tx) = app.mention_search_tx.clone() else {
         return;
     };
@@ -5137,6 +5137,11 @@ impl TurnRenderWorker {
     }
 }
 
+// `TurnRenderWorker` holds a `std::sync::mpsc::Receiver` (not `Sync`), which
+// makes this future `!Send`. It is only ever driven by `Runtime::block_on`,
+// so that is safe. Do not `tokio::spawn` this future without first moving the
+// render-worker channel to a `Send`-compatible type.
+#[allow(clippy::future_not_send)]
 async fn run_main_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -6407,6 +6412,9 @@ async fn run_main_loop(
     }
 }
 
+// Inherits `run_main_loop`'s `!Send` via `TurnRenderWorker`. See the comment
+// on `run_main_loop` for the constraint this documents.
+#[allow(clippy::future_not_send)]
 pub async fn run_interactive_shell_inner(
     task_opts: TaskOptions,
     root_opts: RootOnlyOptions,

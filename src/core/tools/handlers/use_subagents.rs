@@ -159,7 +159,7 @@ impl UseSubagentsHandler {
         prefix: &str,
         line: &str,
         emit_progress: bool,
-        output_writer: &Option<crate::cli::output::OutputWriterArc>,
+        output_writer: Option<&crate::cli::output::OutputWriterArc>,
         is_stderr: bool,
     ) {
         if !emit_progress {
@@ -237,7 +237,7 @@ impl UseSubagentsHandler {
                             &stream_prefix,
                             &line_text,
                             emit_progress,
-                            &output_writer,
+                            output_writer.as_ref(),
                             is_stderr,
                         );
                     }
@@ -272,7 +272,7 @@ impl UseSubagentsHandler {
                     &stream_prefix,
                     &line_text,
                     emit_progress,
-                    &output_writer,
+                    output_writer.as_ref(),
                     is_stderr,
                 );
             }
@@ -557,7 +557,7 @@ impl UseSubagentsHandler {
                         Err(_) => SubagentWaitOutcome::TimedOut,
                     }
                 }
-                _ = Self::wait_for_cancellation(flag) => {
+                () = Self::wait_for_cancellation(flag) => {
                     Self::stop_subagent(&mut child, child_pid).await;
                     SubagentWaitOutcome::Cancelled
                 }

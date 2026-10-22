@@ -23,7 +23,7 @@ impl<'a> FollowupStateGuard<'a> {
     }
 }
 
-impl<'a> Drop for FollowupStateGuard<'a> {
+impl Drop for FollowupStateGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             crate::core::approval::clear_followup_sender(self.task_id);

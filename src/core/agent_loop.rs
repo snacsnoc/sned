@@ -692,32 +692,31 @@ impl AgentLoop {
     fn assistant_tool_input(
         prepared: &crate::core::tools::execution::PreparedToolCall,
     ) -> serde_json::Value {
-        match &prepared.parsed_args {
-            Ok(value) => value.clone(),
-            Err(_) => {
-                let raw = prepared
-                    .tool_call
-                    .function
-                    .arguments
-                    .as_deref()
-                    .unwrap_or("");
-                // Oversized payloads keep only a prefix in history; the full
-                // bytes already went to the error above.
-                let raw = if raw.len() > MAX_TOOL_ARGUMENT_SIZE {
-                    let preview: String = raw.chars().take(200).collect();
-                    format!(
-                        "{preview}…[truncated: showing {} of {} bytes]",
-                        preview.len(),
-                        raw.len()
-                    )
-                } else {
-                    raw.to_string()
-                };
-                serde_json::json!({
-                    "_raw_arguments": raw
-                })
-            }
+        if let Ok(value) = &prepared.parsed_args {
+            return value.clone();
         }
+
+        let raw = prepared
+            .tool_call
+            .function
+            .arguments
+            .as_deref()
+            .unwrap_or("");
+        // Oversized payloads keep only a prefix in history; the full
+        // bytes already went to the error above.
+        let raw = if raw.len() > MAX_TOOL_ARGUMENT_SIZE {
+            let preview: String = raw.chars().take(200).collect();
+            format!(
+                "{preview}…[truncated: showing {} of {} bytes]",
+                preview.len(),
+                raw.len()
+            )
+        } else {
+            raw.to_string()
+        };
+        serde_json::json!({
+            "_raw_arguments": raw
+        })
     }
 
     fn synthetic_json_completion_event(
@@ -2224,7 +2223,7 @@ impl AgentLoop {
             tokio::pin!(cancellation);
             let request_result = tokio::select! {
                 biased;
-                _ = &mut cancellation => None,
+                () = &mut cancellation => None,
                 result = tokio::time::timeout(remaining_preoutput_budget, &mut provider_request) => Some(result),
             };
             let Some(request_result) = request_result else {
@@ -4506,15 +4505,14 @@ impl AgentLoop {
 
         // Remove last message (assistant response)
         history.pop();
-        let mut removed = 1;
 
         // Remove user message if present
         if history.last().is_some_and(|m| m.role == MessageRole::User) {
             history.pop();
-            removed = 2;
+            2
+        } else {
+            1
         }
-
-        removed
     }
 
     /// Load file context tracker metadata from disk if task storage is configured.
@@ -4617,10 +4615,10 @@ impl AgentLoop {
                                 match result {
                                     Ok(Ok(())) => {}
                                     Ok(Err(e)) => {
-                                        warn!(error = %e, "Failed to persist file context metadata")
+                                        warn!(error = %e, "Failed to persist file context metadata");
                                     }
                                     Err(e) => {
-                                        warn!(error = %e, "File context metadata task failed")
+                                        warn!(error = %e, "File context metadata task failed");
                                     }
                                 }
                             });

@@ -118,6 +118,7 @@ impl ContextLoader {
         }
     }
 
+    #[must_use]
     pub fn with_symbol_index_service(
         mut self,
         symbol_index_service: Arc<Mutex<SymbolIndexService>>,
@@ -369,7 +370,7 @@ impl ContextLoader {
             };
             let display_path = abs_loc_path
                 .strip_prefix(&cwd_path)
-                .map_or(abs_loc_path.clone(), PathBuf::from)
+                .map_or_else(|_| abs_loc_path.clone(), PathBuf::from)
                 .display()
                 .to_string();
 
