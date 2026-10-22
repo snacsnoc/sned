@@ -144,8 +144,12 @@ fn init_shadow_repo_locked(workspace_root: &Path) -> Result<()> {
     }
 
     // Create parent directories
-    std::fs::create_dir_all(&shadow_git_path)
-        .with_context(|| format!("Failed to create shadow git dir: {shadow_git_path:?}"))?;
+    std::fs::create_dir_all(&shadow_git_path).with_context(|| {
+        format!(
+            "Failed to create shadow git dir: {}",
+            shadow_git_path.display()
+        )
+    })?;
 
     // Initialize git repo
     let output = Command::new("git")
