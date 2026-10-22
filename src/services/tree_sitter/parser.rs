@@ -3,6 +3,10 @@ use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 use tree_sitter::{Language, Query};
 
+// Glob because each query constant is feature-gated: an explicit list either
+// breaks non-default language builds or trips `unused_imports` on the default
+// feature set.
+#[allow(clippy::wildcard_imports)]
 use crate::services::tree_sitter::queries::*;
 
 /// Error type for language parser operations.
