@@ -5612,61 +5612,10 @@ mod tests {
                 "step {step}"
             );
             drop(state);
-            let history = agent.conversation_history.lock().await;
-            let expected_id = history
-                .iter()
-                .rev()
-                .find_map(|message| match &message.content {
-                    MessageContent::AssistantBlocks(blocks) => {
-                        blocks.iter().find_map(|block| match block {
-                            AssistantContentBlock::ToolUse(call)
-                                if call.shared.call_id.as_deref()
-                                    == Some(format!("workflow-{step}").as_str()) =>
-                            {
-                                Some(call.id.clone())
-                            }
-                            _ => None,
-                        })
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            let text = history
-                .iter()
-                .rev()
-                .find_map(|message| match &message.content {
-                    MessageContent::UserBlocks(blocks) => {
-                        blocks.iter().find_map(|block| match block {
-                            UserContentBlock::ToolResult(result)
-                                if result.tool_use_id == expected_id =>
-                            {
-                                match &result.content {
-                                    ToolResultContent::Text(text) => Some(text.clone()),
-                                    _ => None,
-                                }
-                            }
-                            _ => None,
-                        })
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    panic!("actual tool result must reach provider history: {history:?}")
-                });
+            let text =
+                tool_result_text(&agent.conversation_history, &format!("workflow-{step}")).await;
             if step == 0 || step == 3 {
-                copied = text
-                    .split('\n')
-                    .find(|line| {
-                        // Models copy the full numbered line (`NNN: Word§…`);
-                        // split_anchor strips the gutter downstream.
-                        let line = line.trim_start_matches(|c: char| {
-                            c.is_ascii_digit() || c == ':' || c == ' '
-                        });
-                        line.split_once('§')
-                            .is_some_and(|(word, _)| word.chars().all(char::is_alphanumeric))
-                    })
-                    .unwrap()
-                    .to_owned();
+                copied = first_copied_anchor(&text);
                 if step == 0 {
                     stale = copied.clone();
                 }
@@ -5678,7 +5627,6 @@ mod tests {
             if step == 2 {
                 assert!(text.contains("read_file"));
                 assert_eq!(std::fs::read(&path).unwrap(), b"changed\nbeta\n");
-                drop(history);
                 let context = Arc::new(ToolContext::new(
                     agent.state.clone(),
                     None,
@@ -7970,6 +7918,254 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(
             tools.iter().any(|tool| tool.function.name == "edit_file"),
             "new ACT task should recompute its profile instead of reusing DirectAnswer"
+        );
+    }
+
+    /// Text of the tool result produced for `call_id`, so a test can feed what
+    /// the model actually saw back into its next request instead of
+    /// synthesizing an anchor.
+    async fn tool_result_text(
+        history: &std::sync::Arc<Mutex<Vec<StorageMessage>>>,
+        call_id: &str,
+    ) -> String {
+        let guard = history.lock().await;
+        // The result is keyed by the tool-use block id, so resolve the block
+        // that carries this call id first.
+        let tool_use_id = guard
+            .iter()
+            .rev()
+            .find_map(|message| match &message.content {
+                MessageContent::AssistantBlocks(blocks) => {
+                    blocks.iter().find_map(|block| match block {
+                        AssistantContentBlock::ToolUse(call)
+                            if call.shared.call_id.as_deref() == Some(call_id) =>
+                        {
+                            Some(call.id.clone())
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("tool call {call_id} must reach provider history"));
+        guard
+            .iter()
+            .rev()
+            .find_map(|message| match &message.content {
+                MessageContent::UserBlocks(blocks) => blocks.iter().find_map(|block| match block {
+                    UserContentBlock::ToolResult(result) if result.tool_use_id == tool_use_id => {
+                        match &result.content {
+                            ToolResultContent::Text(text) => Some(text.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("a text tool result for {call_id} must reach provider history")
+            })
+    }
+
+    /// The first copied `NNN: Word§source` line in a `read_file` result, taken
+    /// the way a model copies it out of tool output.
+    fn first_copied_anchor(tool_result: &str) -> String {
+        tool_result
+            .split('\n')
+            .find(|line| {
+                let line =
+                    line.trim_start_matches(|c: char| c.is_ascii_digit() || c == ':' || c == ' ');
+                line.split_once('§')
+                    .is_some_and(|(word, _)| word.chars().all(char::is_alphanumeric))
+            })
+            .unwrap_or_else(|| panic!("read_file result must expose an anchor: {tool_result}"))
+            .to_owned()
+    }
+
+    /// PLAN → ACT must reach the file system rather than merely advertise the
+    /// ACT tool set: an edit driven from the current task lands on disk.
+    #[tokio::test]
+    async fn test_act_profile_after_plan_transition_edits_a_real_file() {
+        use crate::core::tools::handlers::{
+            attempt_completion::AttemptCompletionHandler, edit_file::EditFileHandler,
+            read_file::ReadFileHandler,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.txt");
+        std::fs::write(&path, "alpha  \nbeta\n").unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        registry.register(SnedTool::EditFile, Arc::new(EditFileHandler::new()));
+        registry.register(
+            SnedTool::AttemptCompletion,
+            Arc::new(AttemptCompletionHandler::new()),
+        );
+
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![],
+        )));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "act-edit-after-plan"))
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        agent.anchor_mgr = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        agent.state.lock().await.double_check_completion_enabled = false;
+
+        let user_message = |text: &str| StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        // An answer-only prompt followed by an edit task, so the profile has to
+        // resolve from the current task and not the first historical prompt.
+        agent.conversation_history.lock().await.extend([
+            user_message("Explain this repository"),
+            user_message("Edit the configuration parser and run its tests"),
+        ]);
+
+        agent.set_mode(AgentMode::Plan);
+        agent.set_mode(AgentMode::Act);
+
+        // Read first, so the anchor the model echoes comes from real output.
+        agent
+            .set_provider(Arc::new(Providers::Mock(
+                crate::providers::mock::MockProvider::single_tool_call(
+                    "act-edit-read",
+                    "read_file",
+                    serde_json::json!({"paths": ["fixture.txt"]}),
+                ),
+            )))
+            .await;
+        let outcome = agent.execute_turn().await;
+        assert!(
+            !matches!(outcome, TurnResult::Error(_)),
+            "read turn: {outcome:?}"
+        );
+        let anchor = first_copied_anchor(
+            &tool_result_text(&agent.conversation_history, "act-edit-read").await,
+        );
+
+        // The real edit, driven through the ACT-resolved profile.
+        agent
+            .set_provider(Arc::new(Providers::Mock(
+                crate::providers::mock::MockProvider::single_tool_call(
+                    "act-edit-edit",
+                    "edit_file",
+                    serde_json::json!({"files": [{"path": "fixture.txt", "edits": [{"anchor": anchor, "text": "changed"}]}]}),
+                ),
+            )))
+            .await;
+        let outcome = agent.execute_turn().await;
+        assert!(
+            !matches!(outcome, TurnResult::Error(_)),
+            "edit turn: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"changed\nbeta\n",
+            "the ACT profile must actually apply the edit to disk"
+        );
+
+        agent
+            .set_provider(Arc::new(Providers::Mock(
+                crate::providers::mock::MockProvider::single_tool_call(
+                    "act-edit-done",
+                    "attempt_completion",
+                    serde_json::json!({"result": "Updated fixture"}),
+                ),
+            )))
+            .await;
+        let outcome = agent.execute_turn().await;
+        assert!(
+            matches!(outcome, TurnResult::Complete),
+            "completion turn: {outcome:?}"
+        );
+    }
+
+    /// A direct-answer task must not leave the ACT session unable to perform a
+    /// file operation: a fresh edit task afterward still reaches the disk.
+    #[tokio::test]
+    async fn test_fresh_act_task_after_direct_answer_edits_a_real_file() {
+        use crate::core::tools::handlers::{
+            attempt_completion::AttemptCompletionHandler, write_to_file::WriteToFileHandler,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.txt");
+        std::fs::write(&path, "old content\n").unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::WriteToFile, Arc::new(WriteToFileHandler::new()));
+        registry.register(
+            SnedTool::AttemptCompletion,
+            Arc::new(AttemptCompletionHandler::new()),
+        );
+
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![
+                crate::providers::mock::MockResponse::Text("The answer is 4.".to_string()),
+                crate::providers::mock::MockResponse::ToolCalls(vec![
+                    crate::providers::mock::MockToolCall {
+                        call_id: "fresh-act-write".to_string(),
+                        name: "write_to_file".to_string(),
+                        arguments: serde_json::json!({"path": "fixture.txt", "content": "new content\n"}),
+                    },
+                ]),
+                crate::providers::mock::MockResponse::Text("Wrote the file.".to_string()),
+            ],
+        )));
+        let mut config = test_agent_config(provider, "fresh-act-after-direct-answer");
+        config.interactive_mode = false;
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        agent.state.lock().await.double_check_completion_enabled = false;
+        let state_manager = Arc::new(StateManager::new().unwrap());
+
+        let user_message = |text: &str| StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+
+        agent
+            .run(
+                vec![user_message("Explain this repository")],
+                state_manager.clone(),
+            )
+            .await
+            .expect("answer task should complete");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old content\n",
+            "a direct-answer task must not touch the workspace"
+        );
+
+        agent
+            .run(
+                vec![user_message("Edit the configuration parser")],
+                state_manager,
+            )
+            .await
+            .expect("edit task should complete");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"new content\n",
+            "a fresh ACT task after a direct-answer task must still write to disk"
         );
     }
 
