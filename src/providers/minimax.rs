@@ -20,9 +20,8 @@
 //!    - `content: null` causes error 2013
 //!    - Use `content: ""` for assistant messages with tool calls but no text
 //!
-//! 5. **reasoning_effort**: MiniMax-M3.1-Flash-Preview only, and only as a
-//!    top-level field. MiniMax also rejects `none` because M3.1 requires
-//!    adaptive thinking.
+//! 5. **reasoning_effort**: send it as a top-level field. MiniMax applies it
+//!    to models that support tunable thinking depth and ignores it otherwise.
 
 use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
@@ -108,12 +107,12 @@ impl MinimaxProvider {
         }
     }
 
-    pub(crate) const FLASH_PREVIEW_MODEL_ID: &'static str = "MiniMax-M3.1-Flash-Preview";
+    pub(crate) const FLASH_MODEL_ID: &'static str = "MiniMax-M3.1-Flash";
 
     pub(crate) fn canonical_model_id_for(model_id: &str) -> String {
         match model_id.trim().to_ascii_lowercase().as_str() {
             "minimax-m3" => "MiniMax-M3".to_string(),
-            "minimax-m3.1-flash-preview" => Self::FLASH_PREVIEW_MODEL_ID.to_string(),
+            "minimax-m3.1-flash" | "minimax-m3.1-flash-preview" => Self::FLASH_MODEL_ID.to_string(),
             "minimax-m2.7" => "MiniMax-M2.7".to_string(),
             "minimax-m2.7-highspeed" => "MiniMax-M2.7-highspeed".to_string(),
             "minimax-m2.5" => "MiniMax-M2.5".to_string(),
@@ -127,10 +126,6 @@ impl MinimaxProvider {
 
     fn canonical_model_id(&self) -> String {
         Self::canonical_model_id_for(&self.config.model_id)
-    }
-
-    pub(crate) fn supports_reasoning_effort(model_id: &str) -> bool {
-        Self::canonical_model_id_for(model_id) == Self::FLASH_PREVIEW_MODEL_ID
     }
 
     fn build_request_body(&self, request: &ProviderRequest) -> anyhow::Result<serde_json::Value> {
@@ -233,8 +228,8 @@ impl MinimaxProvider {
         let model_id = self.canonical_model_id();
 
         let mut info = match model_id.as_str() {
-            "MiniMax-M3.1-Flash-Preview" => ModelInfo {
-                name: Some(Self::FLASH_PREVIEW_MODEL_ID.to_string()),
+            "MiniMax-M3.1-Flash" => ModelInfo {
+                name: Some(Self::FLASH_MODEL_ID.to_string()),
                 max_tokens: None,
                 context_window: Some(1_000_000),
                 supports_images: Some(true),
@@ -248,7 +243,7 @@ impl MinimaxProvider {
                 cache_writes_price: None,
                 cache_reads_price: None,
                 description: Some(
-                    "MiniMax M3.1 Flash Preview is a multimodal coding model with tunable thinking depth."
+                    "MiniMax M3.1 Flash is a multimodal coding model with tunable thinking depth."
                         .to_string(),
                 ),
                 tiers: None,
@@ -1595,8 +1590,11 @@ mod tests {
     }
 
     #[test]
-    fn test_minimax_flash_preview_profile_and_canonical_id() {
+    fn test_minimax_flash_profile_and_canonical_id() {
         for model_id in [
+            "MiniMax-M3.1-Flash",
+            "minimax-m3.1-flash",
+            "MINIMAX-M3.1-FLASH",
             "MiniMax-M3.1-Flash-Preview",
             "minimax-m3.1-flash-preview",
             "MINIMAX-M3.1-FLASH-PREVIEW",
@@ -1613,7 +1611,7 @@ mod tests {
             let model = provider.get_model();
             assert_eq!(
                 model.id,
-                MinimaxProvider::FLASH_PREVIEW_MODEL_ID,
+                MinimaxProvider::FLASH_MODEL_ID,
                 "unrecognized model ID: {model_id}"
             );
             assert_eq!(model.info.context_window, Some(1_000_000));
@@ -1624,11 +1622,11 @@ mod tests {
     }
 
     #[test]
-    fn test_minimax_flash_preview_sends_reasoning_effort_top_level() {
+    fn test_minimax_flash_sends_reasoning_effort_top_level() {
         let provider = MinimaxProvider::new(MinimaxConfig {
             api_key: "test-key".to_string(),
             api_line: None,
-            model_id: MinimaxProvider::FLASH_PREVIEW_MODEL_ID.to_string(),
+            model_id: MinimaxProvider::FLASH_MODEL_ID.to_string(),
             reasoning_effort: Some("max".to_string()),
             model_info: None,
         })
@@ -1645,18 +1643,18 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(body["model"], MinimaxProvider::FLASH_PREVIEW_MODEL_ID);
+        assert_eq!(body["model"], MinimaxProvider::FLASH_MODEL_ID);
         assert_eq!(body["reasoning_effort"], "max");
         assert_eq!(body["reasoning_split"], true);
         assert!(body.get("extra_body").is_none());
     }
 
     #[test]
-    fn test_minimax_flash_preview_omits_reasoning_effort_by_default() {
+    fn test_minimax_flash_omits_reasoning_effort_by_default() {
         let provider = MinimaxProvider::new(MinimaxConfig {
             api_key: "test-key".to_string(),
             api_line: None,
-            model_id: MinimaxProvider::FLASH_PREVIEW_MODEL_ID.to_string(),
+            model_id: MinimaxProvider::FLASH_MODEL_ID.to_string(),
             reasoning_effort: None,
             model_info: None,
         })
@@ -1673,7 +1671,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(body["model"], MinimaxProvider::FLASH_PREVIEW_MODEL_ID);
+        assert_eq!(body["model"], MinimaxProvider::FLASH_MODEL_ID);
         assert!(body.get("reasoning_effort").is_none());
         assert_eq!(body["reasoning_split"], true);
     }

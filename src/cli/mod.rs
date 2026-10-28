@@ -325,8 +325,7 @@ pub struct TaskOptions {
     )]
     pub thinking: Option<Option<String>>,
 
-    /// Set a provider-supported reasoning level. MiniMax supports reasoning
-    /// effort only for MiniMax-M3.1-Flash-Preview.
+    /// Set a provider-supported reasoning level.
     #[arg(long, value_enum, conflicts_with = "thinking", hide_short_help = true)]
     pub reasoning_effort: Option<ReasoningEffort>,
 
@@ -1226,18 +1225,9 @@ pub(crate) fn create_provider(
             let minimax_reasoning_effort = match task_opts.reasoning_effort.as_ref() {
                 None => None,
                 Some(effort) => {
-                    if !crate::providers::minimax::MinimaxProvider::supports_reasoning_effort(
-                        &default_model,
-                    ) {
-                        anyhow::bail!(
-                            "--reasoning-effort is supported only for MiniMax model '{current}'; '{default_model}' does not accept it.",
-                            current =
-                                crate::providers::minimax::MinimaxProvider::FLASH_PREVIEW_MODEL_ID
-                        );
-                    }
                     if matches!(effort, ReasoningEffort::None) {
                         anyhow::bail!(
-                            "--reasoning-effort none is rejected by MiniMax-M3.1-Flash-Preview, which requires adaptive thinking."
+                            "--reasoning-effort none is not supported by MiniMax. Use low, medium, high, xhigh, or max."
                         );
                     }
                     Some(effort.as_provider_str().to_string())
@@ -1395,9 +1385,7 @@ pub(crate) fn create_provider(
                 );
             }
             if matches!(task_opts.reasoning_effort, Some(ReasoningEffort::Max)) {
-                anyhow::bail!(
-                    "--reasoning-effort max is supported only by MiniMax-M3.1-Flash-Preview."
-                );
+                anyhow::bail!("--reasoning-effort max is not supported by Gemini.");
             }
             if task_opts.reasoning_effort.is_some()
                 && !gemini_model_info
@@ -3617,14 +3605,14 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_minimax_accepts_reasoning_effort_on_flash_preview() {
+    fn test_create_provider_minimax_accepts_reasoning_effort() {
         for effort in ["low", "medium", "high", "xhigh", "max"] {
             let cli = Cli::try_parse_from([
                 "sned",
                 "--provider",
                 "minimax",
                 "--model",
-                "MiniMax-M3.1-Flash-Preview",
+                "MiniMax-M3.1-Flash",
                 "--api-key",
                 "test-key",
                 "--reasoning-effort",
@@ -3638,25 +3626,21 @@ mod tests {
     }
 
     #[test]
-    fn test_create_provider_minimax_rejects_reasoning_effort_on_older_models() {
+    fn test_create_provider_minimax_does_not_gate_effort_by_model_name() {
         let cli = Cli::try_parse_from([
             "sned",
             "--provider",
             "minimax",
             "--model",
-            "MiniMax-M2.7",
+            "MiniMax-Future-Model",
             "--api-key",
             "test-key",
             "--reasoning-effort",
             "high",
         ])
         .unwrap();
-        let err = create_provider(&cli.task_opts, None).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("--reasoning-effort is supported only for MiniMax model"),
-            "got: {msg}"
-        );
+        create_provider(&cli.task_opts, None)
+            .expect("MiniMax effort support must not depend on a local model allowlist");
     }
 
     #[test]
@@ -3666,7 +3650,7 @@ mod tests {
             "--provider",
             "minimax",
             "--model",
-            "MiniMax-M3.1-Flash-Preview",
+            "MiniMax-M3.1-Flash",
             "--api-key",
             "test-key",
             "--reasoning-effort",
@@ -3676,7 +3660,7 @@ mod tests {
         let err = create_provider(&cli.task_opts, None).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("--reasoning-effort none is rejected"),
+            msg.contains("--reasoning-effort none is not supported by MiniMax"),
             "got: {msg}"
         );
     }
@@ -3698,7 +3682,7 @@ mod tests {
         let err = create_provider(&cli.task_opts, None).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("--reasoning-effort max is supported only by MiniMax-M3.1-Flash-Preview"),
+            msg.contains("--reasoning-effort max is not supported by Gemini"),
             "got: {msg}"
         );
     }
@@ -3710,7 +3694,7 @@ mod tests {
             "--provider",
             "minimax",
             "--model",
-            "MiniMax-M3.1-Flash-Preview",
+            "MiniMax-M3.1-Flash",
             "--api-key",
             "test-key",
             "--extra-body",
@@ -3730,7 +3714,7 @@ mod tests {
             "--provider",
             "minimax",
             "--model",
-            "MiniMax-M3.1-Flash-Preview",
+            "MiniMax-M3.1-Flash",
             "--api-key",
             "test-key",
             "--extra-body",
@@ -3755,7 +3739,7 @@ mod tests {
             "--provider",
             "minimax",
             "--model",
-            "MiniMax-M3.1-Flash-Preview",
+            "MiniMax-M3.1-Flash",
             "--api-key",
             "test-key",
             "--reasoning-effort",
@@ -3778,7 +3762,7 @@ mod tests {
             "--provider",
             "minimax",
             "--model",
-            "MiniMax-M3.1-Flash-Preview",
+            "MiniMax-M3.1-Flash",
             "--api-key",
             "test-key",
             "--extra-body",
@@ -3798,7 +3782,7 @@ mod tests {
             "--base-url",
             "https://api.minimax.io/v1",
             "--model",
-            "MiniMax-M3.1-Flash-Preview",
+            "MiniMax-M3.1-Flash",
             "--api-key",
             "test-key",
             "--extra-body",

@@ -13022,6 +13022,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_effort_command_accepts_released_minimax_flash_id() -> anyhow::Result<()> {
+        let mut task_opts = retry_test_task_opts();
+        task_opts.provider = Some("minimax".to_string());
+        task_opts.model = Some("minimax-m3.1-flash".to_string());
+        task_opts.api_key = Some("test-key".to_string());
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts,
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let mut app = App::new();
+
+        request_reasoning_effort(
+            crate::cli::ReasoningEffort::High,
+            &mut app,
+            &session,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        let sess = session.lock().await;
+        assert_eq!(
+            sess.task_opts.reasoning_effort,
+            Some(crate::cli::ReasoningEffort::High)
+        );
+        assert_eq!(sess.task_opts.model.as_deref(), Some("MiniMax-M3.1-Flash"));
+        assert_eq!(
+            sess.agent_loop().await.get_provider().get_model().id,
+            "MiniMax-M3.1-Flash"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_model_switch_preserves_selected_effort() -> anyhow::Result<()> {
         let mut task_opts = retry_test_task_opts();
         task_opts.provider = Some("openrouter".to_string());
@@ -13071,7 +13111,7 @@ mod tests {
     async fn test_effort_picker_uses_normalized_minimax_effort() -> anyhow::Result<()> {
         let mut task_opts = retry_test_task_opts();
         task_opts.provider = Some("minimax".to_string());
-        task_opts.model = Some("MiniMax-M3.1-Flash-Preview".to_string());
+        task_opts.model = Some("MiniMax-M3.1-Flash".to_string());
         task_opts.api_key = Some("test-key".to_string());
         task_opts.extra_body = Some(r#"{"reasoning_effort":"medium"}"#.to_string());
         let session = InteractiveSession::build_with_writer(
@@ -13091,7 +13131,7 @@ mod tests {
         let efforts = supported_reasoning_efforts(
             &normalized,
             "minimax",
-            "MiniMax-M3.1-Flash-Preview",
+            "MiniMax-M3.1-Flash",
             state_manager.as_ref(),
         );
 
