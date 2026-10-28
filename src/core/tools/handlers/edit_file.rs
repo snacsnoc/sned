@@ -10010,7 +10010,7 @@ edition = "2021"
     async fn model_sim_insert_before_ambiguous_anchor_does_not_apply() {
         let _guard = TEST_MUTEX.lock().await;
         let original = "keep top\n    \"\"\",\nmid line\n    \"\"\",\nkeep bottom\n";
-        let (dir, file_path, _anchors, ctx) =
+        let (_dir, file_path, _anchors, ctx) =
             setup_test_ctx(original, "sim-insert-ambiguous").await;
 
         // Two `""",` lines exist; the model picks a `""",` content
@@ -10147,7 +10147,7 @@ edition = "2021"
     #[tokio::test]
     async fn test_edit_file_anchor_edit_ignores_included_expected_file_hash() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, file_path, anchors, ctx) =
+        let (_dir, file_path, anchors, ctx) =
             setup_test_ctx("line 1\nline 2\nline 3\n", "hash-ignored").await;
 
         let params = serde_json::json!({
@@ -10186,7 +10186,7 @@ edition = "2021"
         // validation with a clear error rather than silently being treated as
         // a revision-checked edit.
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, _file_path, anchors, ctx) =
+        let (_dir, _file_path, anchors, ctx) =
             setup_test_ctx("line 1\nline 2\n", "mixed-batch").await;
 
         let params = serde_json::json!({
@@ -10212,7 +10212,7 @@ edition = "2021"
     #[tokio::test]
     async fn test_edit_file_null_expected_file_hash_routes_to_anchor() {
         let _guard = TEST_MUTEX.lock().await;
-        let (dir, _file_path, anchors, ctx) =
+        let (_dir, _file_path, anchors, ctx) =
             setup_test_ctx("line 1\nline 2\n", "null-hash-test").await;
 
         let params = serde_json::json!({
