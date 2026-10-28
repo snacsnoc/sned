@@ -386,7 +386,7 @@ pub enum OutputEvent {
     CommandOutputLine(Line<'static>),
     /// Raw streamed reasoning text, styled and assembled by the renderer.
     ReasoningChunk(String),
-    /// User-submitted prompt line ("❯ ..." or multi-line "│ ❯ ...").
+    /// User-submitted prompt line ("❯ ..." with aligned continuation lines).
     UserPromptLine(Line<'static>),
     /// A queued user message is about to begin a new agent turn. The TUI uses
     /// the remaining count to stop suppressing terminal panels from prior turns.
@@ -584,7 +584,7 @@ impl OutputEvent {
         Self::ReasoningChunk(text.into())
     }
 
-    /// Emit a user-prompt line (e.g. "❯ ..." or "│ ❯ ...").  Routed
+    /// Emit a user-prompt line (e.g. "❯ ..."). Routed
     /// to the TUI buffer with `BlockKind::UserPrompt` so render-time
     /// grouping gives it a visual boundary above.
     pub fn user_prompt_line(text: impl Into<String>) -> Self {

@@ -3273,7 +3273,6 @@ impl App {
     }
 
     /// Push a user message with proper formatting (splits on newlines).
-    /// Multi-line messages get a left border accent for visual grouping.
     pub fn push_user_message(&mut self, text: &str, writer: &OutputWriterArc) {
         self.push_submission_echo(text, writer, false);
     }
@@ -3292,9 +3291,9 @@ impl App {
         for (i, line) in lines.iter().enumerate() {
             let content = if is_multiline {
                 if i == 0 {
-                    format!("│ ❯ {line}")
+                    format!("❯ {line}")
                 } else {
-                    format!("│   {line}")
+                    format!("  {line}")
                 }
             } else {
                 format!("❯ {line}")
@@ -8980,7 +8979,7 @@ mod tests {
         assert_eq!(app.scroll_offset, 0);
 
         // The three pushed lines must be the last three in output_lines,
-        // in order, with the multiline-tail prefix on lines 2 and 3.
+        // in order, with continuation text aligned under the prompt body.
         let last_three: Vec<String> = app
             .output_lines
             .iter()
@@ -8994,9 +8993,26 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert_eq!(last_three[0], "│ ❯ first line");
-        assert_eq!(last_three[1], "│   second line");
-        assert_eq!(last_three[2], "│   third line");
+        assert_eq!(last_three[0], "❯ first line");
+        assert_eq!(last_three[1], "  second line");
+        assert_eq!(last_three[2], "  third line");
+
+        let mut targets = Vec::new();
+        let rendered = app
+            .output_lines
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|line| {
+                App::output_row_for_render(Some(line), BlockKind::UserPrompt, &mut targets)
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            ["│❯ first line", "│  second line", "│  third line"]
+        );
     }
 
     #[test]
