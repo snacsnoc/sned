@@ -945,11 +945,12 @@ pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -
         Ok(_) => args.to_string(),
         Err(e) => {
             tracing::warn!(
-                "{} tool call arguments JSON invalid {} ({}), attempting repair. args_preview={}",
+                "{} tool call arguments JSON invalid {} ({}), attempting repair; bytes={}, category={:?}",
                 provider_name,
                 context,
                 e,
-                args.chars().take(100).collect::<String>()
+                args.len(),
+                e.classify()
             );
 
             let repaired = repair_json_args(args);
@@ -963,13 +964,24 @@ pub fn validate_tool_call_args(args: &str, provider_name: &str, context: &str) -
                     context
                 );
                 serde_json::json!({
-                    TOOL_ARGUMENTS_ERROR_FIELD: format!(
-                        r#"{e}. Use valid JSON: escape backslashes as \\, quotes as \", and newlines or tabs as \n or \t."#
-                    )
+                    TOOL_ARGUMENTS_ERROR_FIELD: tool_arguments_repair_error(&e)
                 })
                 .to_string()
             }
         }
+    }
+}
+
+fn tool_arguments_repair_error(error: &serde_json::Error) -> String {
+    match error.classify() {
+        serde_json::error::Category::Eof => format!(
+            "arguments ended before a complete value was supplied at line {} column {}. Retry with complete JSON arguments.",
+            error.line(),
+            error.column()
+        ),
+        _ => format!(
+            r#"{error}. Use valid JSON: escape backslashes as \\, quotes as \", and newlines or tabs as \n or \t."#
+        ),
     }
 }
 
@@ -1841,6 +1853,31 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_tool_call_args_guidance_uses_single_layer_json_escapes() {
+        let result = validate_tool_call_args("totally not json", "test", "unit");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let error = tool_arguments_error(&parsed).expect("invalid arguments must be rejected");
+        let (_, guidance) = error.split_once("Use valid JSON: ").unwrap();
+
+        assert_eq!(
+            guidance,
+            r#"escape backslashes as \\, quotes as \", and newlines or tabs as \n or \t."#
+        );
+    }
+
+    #[test]
+    fn test_validate_tool_call_args_reports_incomplete_value_at_eof() {
+        let args = r#"{"end_line": 150, "paths": ["SDRSkeleton/SDRSkeleton/WaterfallViewModel.swift"], "start_line": "#;
+        let result = validate_tool_call_args(args, "OpenAI", "on finish_reason:tool_calls");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let error = tool_arguments_error(&parsed).expect("incomplete arguments must be rejected");
+
+        assert!(error.contains("arguments ended before a complete value was supplied"));
+        assert!(!error.contains("escape backslashes"));
+        assert!(!error.contains("start_line"));
+    }
+
+    #[test]
     fn test_validate_tool_call_args_empty_returns_empty_object() {
         assert_eq!(validate_tool_call_args("", "test", "unit"), "{}");
     }
@@ -1957,6 +1994,7 @@ pub struct RecordingChunkProvider {
     pub responses: Vec<Vec<ApiStreamChunk>>,
     response_index: std::sync::Mutex<usize>,
     pub requests: std::sync::Arc<std::sync::Mutex<Vec<ProviderRequest>>>,
+    pub context_window: u64,
 }
 
 #[cfg(test)]
@@ -1969,6 +2007,7 @@ impl RecordingChunkProvider {
             responses,
             response_index: std::sync::Mutex::new(0),
             requests,
+            context_window: 8192,
         }
     }
 }
@@ -1992,7 +2031,7 @@ impl Provider for RecordingChunkProvider {
             info: ModelInfo {
                 name: Some("Recording Model".to_string()),
                 max_tokens: Some(4096),
-                context_window: Some(8192),
+                context_window: Some(self.context_window),
                 ..Default::default()
             },
         }

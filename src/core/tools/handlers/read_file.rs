@@ -1143,6 +1143,55 @@ impl ReadFileHandler {
             .min(2_048)
     }
 
+    fn output_limit_notice(
+        start: usize,
+        shown_end: usize,
+        total: usize,
+        knows_total: bool,
+    ) -> String {
+        let range = if knows_total {
+            format!("Lines {start}–{shown_end} of {total} shown")
+        } else {
+            format!("Lines {start}–{shown_end} shown; total lines unknown")
+        };
+        let continuation = if !knows_total || shown_end < total {
+            format!(
+                " To inspect remaining content, request start_line={}.",
+                shown_end.saturating_add(1)
+            )
+        } else {
+            " No additional source lines were omitted.".to_string()
+        };
+        format!("[Output limited. {range}.{continuation}]")
+    }
+
+    fn output_limit_header(
+        prefix: &str,
+        path: &str,
+        hash: &str,
+        start: usize,
+        shown_end: usize,
+        total: usize,
+        knows_total: bool,
+    ) -> String {
+        let mut lines = prefix.lines().map(str::to_owned).collect::<Vec<_>>();
+        let Some(header_index) = lines.iter().position(|line| line.starts_with("[File: ")) else {
+            return prefix.to_string();
+        };
+        let count = if knows_total {
+            format!("{total} lines total")
+        } else {
+            "total lines unknown".to_string()
+        };
+        let range = if shown_end < start {
+            "no source lines shown".to_string()
+        } else {
+            format!("Lines {start}–{shown_end} shown")
+        };
+        lines[header_index] = format!("[File: {path}, Hash: {hash}] ({count}, {range})");
+        lines.join("\n")
+    }
+
     fn limit_visible_results(results: &mut [FileReadResult], warning_reserve: usize) {
         let history_limit = crate::core::agent_loop::tool_result_history_limit();
         let mut remaining = history_limit.saturating_sub(warning_reserve);
@@ -1192,14 +1241,32 @@ impl ReadFileHandler {
             }
             let prefix_count = lines.len() - source_line_count;
             let prefix = lines[..prefix_count].join("\n");
+            let knows_total = result.refreshes_edit_context;
             let mut shown = String::new();
             let mut shown_count = 0;
             for line in &lines[prefix_count..] {
-                let next_line = start.saturating_add(shown_count).saturating_add(1);
-                let marker =
-                    format!("\n[Output limited. Lines {start}–{next_line} shown. Proceed with current context; request start_line={next_line} only if unseen lines are needed.]");
-                let added = line.len() + usize::from(shown_count > 0);
-                if prefix.len() + 1 + shown.len() + added + marker.len() + 64 > budget {
+                let next_line = start.saturating_add(shown_count);
+                let source_len = shown
+                    .len()
+                    .saturating_add(usize::from(shown_count > 0))
+                    .saturating_add(line.len());
+                let header = Self::output_limit_header(
+                    &prefix,
+                    &result.path,
+                    &result.hash,
+                    start,
+                    next_line,
+                    total,
+                    knows_total,
+                );
+                let notice = Self::output_limit_notice(start, next_line, total, knows_total);
+                let candidate_len = header
+                    .len()
+                    .saturating_add(1)
+                    .saturating_add(source_len)
+                    .saturating_add(1)
+                    .saturating_add(notice.len());
+                if candidate_len > budget {
                     break;
                 }
                 if shown_count > 0 {
@@ -1214,26 +1281,34 @@ impl ReadFileHandler {
                     .iter()
                     .find(|line| line.contains("File truncated to"))
                     .map_or(String::new(), |line| format!("{line}\n"));
-                let line_count = if result.refreshes_edit_context {
+                let count = if knows_total {
                     format!("{total} lines total")
                 } else {
-                    format!("{total} lines in file preview")
+                    "total lines unknown".to_string()
                 };
-                result.content = format!(
-                    "{note}[File: {}, Hash: {}] ({line_count})\n[Output limited. No source lines shown; request a narrower line range.]",
+                let header = format!(
+                    "[File: {}, Hash: {}] ({count}, no source lines shown)",
                     result.path, result.hash
+                );
+                result.content = format!(
+                    "{note}{header}\n[Output limited. No source lines shown. To inspect the file, request a narrower line range.]",
                 );
                 result.visible_range = None;
                 result.refreshes_edit_context = false;
             } else {
                 let shown_end = start + shown_count - 1;
-                let prefix = prefix.replace(
-                    &format!("Lines {start}–{end}"),
-                    &format!("Lines {start}–{shown_end}"),
+                let prefix = Self::output_limit_header(
+                    &prefix,
+                    &result.path,
+                    &result.hash,
+                    start,
+                    shown_end,
+                    total,
+                    knows_total,
                 );
                 result.content = format!(
-                    "{prefix}\n{shown}\n[Output limited. Lines {start}–{shown_end} shown. Proceed with current context; request start_line={} only if unseen lines are needed.]",
-                    shown_end.saturating_add(1)
+                    "{prefix}\n{shown}\n{}",
+                    Self::output_limit_notice(start, shown_end, total, knows_total)
                 );
                 result.visible_range = Some((start, shown_end, total));
             }
@@ -1563,6 +1638,92 @@ mod tests {
         )
     }
 
+    #[test]
+    fn limited_headers_preserve_paths_and_unknown_totals() {
+        let prefix = "[File: folder/a]b.swift, Hash: abc123] (300 lines shown)\nGuidance";
+        let header = ReadFileHandler::output_limit_header(
+            prefix,
+            "folder/a]b.swift",
+            "abc123",
+            41,
+            52,
+            300,
+            false,
+        );
+        assert!(header.contains("[File: folder/a]b.swift, Hash: abc123]"));
+        assert!(header.contains("total lines unknown, Lines 41–52 shown"));
+        assert!(header.contains("Guidance"));
+
+        let notice = ReadFileHandler::output_limit_notice(41, 52, 300, false);
+        assert!(notice.contains("total lines unknown"));
+        assert!(notice.contains("start_line=53"));
+    }
+
+    #[tokio::test]
+    async fn limited_range_reports_absolute_source_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = (1..=1000)
+            .map(|line| format!("line {line:04} {}", "雪".repeat(30)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(directory.path().join("a]b.txt"), source).unwrap();
+        let context = coverage_context(&directory);
+        let output = ToolHandler::execute(
+            &ReadFileHandler::new(),
+            &context,
+            serde_json::json!({"paths": ["a]b.txt"], "start_line": 100, "end_line": 900}),
+        )
+        .await
+        .unwrap();
+        let text = output.as_str().unwrap();
+        let numbers = text
+            .lines()
+            .filter_map(|line| {
+                let (number, source) = line.split_once(": ")?;
+                source
+                    .contains('§')
+                    .then(|| number.parse::<usize>().ok())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        let end = *numbers.last().unwrap();
+        assert_eq!(numbers, (100..=end).collect::<Vec<_>>());
+        assert!(end < 900);
+        assert!(text.len() <= crate::core::agent_loop::tool_result_history_limit());
+        assert_eq!(
+            crate::core::tool_output::path_from_read_file_header(text),
+            Some("a]b.txt")
+        );
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .contains(&format!("Lines 100–{end} shown"))
+        );
+        assert!(text.contains(&format!("Lines 100–{end} of 1000 shown")));
+        assert!(text.contains(&format!("start_line={}", end + 1)));
+    }
+
+    #[tokio::test]
+    async fn limited_read_with_no_source_omits_anchor_guidance() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("long.txt"), "x".repeat(30_000)).unwrap();
+        let context = coverage_context(&directory);
+        let output = ToolHandler::execute(
+            &ReadFileHandler::new(),
+            &context,
+            serde_json::json!({"paths": ["long.txt"]}),
+        )
+        .await
+        .unwrap();
+        let text = output.as_str().unwrap();
+        assert!(text.contains("1 lines total, no source lines shown"));
+        assert!(text.contains("[Output limited. No source lines shown."));
+        assert!(!text.contains("[Anchors:"));
+        assert!(!text.contains('§'));
+        assert!(text.len() <= crate::core::agent_loop::tool_result_history_limit());
+    }
+
     #[tokio::test]
     async fn oversized_full_read_does_not_claim_hidden_lines_are_visible() {
         let directory = tempfile::tempdir().unwrap();
@@ -1581,9 +1742,21 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(first.as_str().unwrap().contains("974 lines total"));
-        let history_visible =
-            crate::core::agent_loop::truncate_tool_result(first.as_str().unwrap());
+        let first_text = first.as_str().unwrap();
+        assert!(
+            first_text.contains("974 lines total, Lines 1–"),
+            "{first_text}"
+        );
+        assert!(first_text.contains("of 974 shown"), "{first_text}");
+        assert!(
+            first_text.contains("To inspect remaining content, request start_line="),
+            "{first_text}"
+        );
+        assert!(
+            !first_text.contains("Proceed with current context"),
+            "{first_text}"
+        );
+        let history_visible = crate::core::agent_loop::truncate_tool_result(first_text);
         assert!(history_visible.contains("Output limited"));
         assert!(!history_visible.contains("lines truncated"));
 
@@ -1664,8 +1837,18 @@ mod tests {
                 output.contains(&format!("[File: {name}, Hash:")),
                 "{name} missing"
             );
+            assert!(
+                output.contains("500 lines total, Lines 1–"),
+                "truncated full reads must report the visible range in the header: {output}"
+            );
         }
         assert_eq!(output.matches("[Output limited.").count(), 4);
+        assert!(output.contains("of 500 shown"), "{output}");
+        assert!(
+            output.contains("To inspect remaining content, request start_line="),
+            "{output}"
+        );
+        assert!(!output.contains("Proceed with current context"), "{output}");
 
         let unseen = ToolHandler::execute(
             &handler,

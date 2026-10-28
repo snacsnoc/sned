@@ -6911,6 +6911,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_streamed_arguments_reach_next_request_and_retry() {
+        use crate::providers::openai::{
+            OpenAiStreamDeltaState, finish_openai_sse_to_chunks, parse_openai_sse_to_chunks,
+        };
+
+        // Exact Qwen/Salad argument bytes from the October 24 debug run.
+        let args = r#"{"end_line": 150, "paths": ["SDRSkeleton/SDRSkeleton/WaterfallViewModel.swift"], "start_line": "#;
+        let mut sse = String::new();
+        for (index, fragment) in args.as_bytes().chunks(19).enumerate() {
+            let chunk = serde_json::json!({
+                "id": "qwen-incomplete",
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": if index == 0 { "call_incomplete" } else { "" },
+                        "function": {
+                            "name": if index == 0 { "read_file" } else { "" },
+                            "arguments": std::str::from_utf8(fragment).unwrap()
+                        }
+                    }]},
+                    "finish_reason": null
+                }]
+            });
+            sse.push_str(&format!("data: {chunk}\n\n"));
+        }
+        sse.push_str("data: {\"id\":\"qwen-incomplete\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n");
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut buffer = crate::providers::SseLineBuffer::default();
+        let mut delta = OpenAiStreamDeltaState::default();
+        let mut calls = HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+        let mut stop = None;
+        let mut usage_sent = false;
+        for bytes in sse.as_bytes().chunks(7) {
+            parse_openai_sse_to_chunks(
+                bytes,
+                &mut buffer,
+                &tx,
+                &mut delta,
+                &mut calls,
+                &mut completed,
+                &mut stop,
+                None,
+                &mut usage_sent,
+            )
+            .await;
+        }
+        finish_openai_sse_to_chunks(
+            &mut buffer,
+            &tx,
+            &mut delta,
+            &mut calls,
+            &mut completed,
+            &mut stop,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+        let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let responses = vec![
+            chunks,
+            tool_call_chunks(&[(
+                "call_retry",
+                "read_file",
+                serde_json::json!({"paths": ["Cargo.toml"]}),
+            )]),
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "Done".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured)),
+        ));
+        let executions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::ReadFile,
+            Arc::new(OrderProbeHandler {
+                log: Arc::clone(&executions),
+                delay_ms: 0,
+                rendezvous: None,
+            }),
+        );
+        let mut agent = AgentLoop::new(test_agent_config(provider, "incomplete-args-retry"))
+            .with_tools(Arc::new(registry));
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(
+            executions.lock().unwrap().is_empty(),
+            "incomplete arguments must never execute"
+        );
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert_eq!(
+            *executions.lock().unwrap(),
+            ["start Cargo.toml", "finish Cargo.toml"]
+        );
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
+
+        let captured = captured.lock().unwrap();
+        let errors = stored_tool_results(&captured[1].messages);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "call_incomplete");
+        assert!(
+            errors[0].1.contains("arguments ended before"),
+            "{}",
+            errors[0].1
+        );
+        assert!(errors[0].1.contains("line 1 column 95"), "{}", errors[0].1);
+        assert!(!errors[0].1.contains("escape backslashes"));
+        let retry = stored_tool_results(&captured[2].messages);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].1, "ok");
+        assert_eq!(
+            Some(&retry[0].0),
+            assistant_tool_use_ids(&captured[2].messages).last()
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_read_coverage_reaches_next_request_and_continues() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let source = (1..=3236)
+            .map(|line| format!("line {line:04} {}", "x".repeat(40)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &source).unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut recording = crate::providers::RecordingChunkProvider::new(
+            vec![tool_call_chunks(&[(
+                "full_read",
+                "read_file",
+                serde_json::json!({"paths": ["large.txt"]}),
+            )])],
+            Arc::clone(&captured),
+        );
+        recording.context_window = 200_000;
+        let provider = Arc::new(Providers::RecordingChunk(recording));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "truncated-read-history"))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            })
+            .with_tools(Arc::new(registry));
+        agent.anchor_mgr = AnchorStateManager::with_cache_file(dir.path().join("anchors.json"));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let first = tool_result_text(&agent.conversation_history, "full_read").await;
+        let shown_end = first
+            .lines()
+            .filter_map(|line| {
+                let (number, anchored) = line.split_once(": ")?;
+                anchored
+                    .contains('§')
+                    .then(|| number.parse::<usize>().ok())
+                    .flatten()
+            })
+            .last()
+            .unwrap();
+        assert!(shown_end < 3236);
+        let next = shown_end + 1;
+        let range =
+            serde_json::json!({"paths": ["large.txt"], "start_line": next, "end_line": next + 2});
+        let responses = vec![
+            tool_call_chunks(&[("next_range", "read_file", range.clone())]),
+            tool_call_chunks(&[("same_range", "read_file", range)]),
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "Done".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let mut recording =
+            crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured));
+        recording.context_window = 200_000;
+        agent
+            .set_provider(Arc::new(Providers::RecordingChunk(recording)))
+            .await;
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
+
+        let captured = captured.lock().unwrap();
+        let results = stored_tool_results(&captured[1].messages);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, first);
+        assert_eq!(
+            Some(&results[0].0),
+            assistant_tool_use_ids(&captured[1].messages).last()
+        );
+        assert!(first.len() <= tool_result_history_limit());
+        assert_eq!(path_from_read_file_header(&first), Some("large.txt"));
+        assert!(
+            first
+                .lines()
+                .next()
+                .unwrap()
+                .contains(&format!("Lines 1–{shown_end} shown")),
+            "{}",
+            first.lines().next().unwrap()
+        );
+        assert!(first.contains(&format!("Lines 1–{shown_end} of 3236 shown")));
+        assert!(first.contains(&format!("start_line={next}")));
+        assert!(!first.contains("Proceed with current context"));
+        for index in [2, 3] {
+            let result = stored_tool_results(&captured[index].messages);
+            assert_eq!(result.len(), 1);
+            assert_eq!(
+                Some(&result[0].0),
+                assistant_tool_use_ids(&captured[index].messages).last()
+            );
+            for line in next..=next + 2 {
+                assert!(result[0].1.contains(&format!("§line {line:04} ")));
+            }
+            assert!(!result[0].1.contains("Already read"));
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+
+    #[tokio::test]
     async fn test_interrupted_tool_call_gets_synthetic_result_in_next_request() {
         use crate::providers::{
             AssistantContentBlock, MessageContent, MessageRole, SharedContentFields,
@@ -11651,8 +11877,16 @@ Irrespective of whether additional information or instructions are given, you ar
     #[test]
     fn test_parse_tool_arguments_rejects_oversized_arguments() {
         use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = CapturedTraceWriter(Arc::clone(&captured));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let oversized = format!(
-            "{{\"content\": \"{}\"}}",
+            "{{\"path\":\"private-fixture.txt\",\"content\": \"{}\"}}",
             "x".repeat(MAX_TOOL_ARGUMENT_SIZE)
         );
         assert!(oversized.len() > MAX_TOOL_ARGUMENT_SIZE);
@@ -11660,6 +11894,13 @@ Irrespective of whether additional information or instructions are given, you ar
             .expect_err("oversized arguments must never reach a tool handler");
         assert!(error.contains("exceed"));
         assert!(error.contains("big-1"));
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("tool call arguments exceed size limit"));
+        for diagnostic in [&error, &logs] {
+            assert!(!diagnostic.contains("private-fixture.txt"));
+            assert!(!diagnostic.contains("xxxxxxxx"));
+            assert!(!diagnostic.contains("args_preview"));
+        }
     }
 
     #[test]

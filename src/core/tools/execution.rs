@@ -167,16 +167,14 @@ pub(crate) fn parse_tool_arguments(
     // JSON looks after repair. Fail the call; the stream assembly below
     // keeps draining so the protocol stays in sync.
     if raw.len() > MAX_TOOL_ARGUMENT_SIZE {
-        let preview: String = raw.chars().take(200).collect();
         error!(
             tool_name = %tool_name,
             tool_id = %tool_id,
             args_len = raw.len(),
-            args_preview = %preview,
             "tool call arguments exceed size limit; call will not execute"
         );
         return Err(format!(
-            "Tool '{tool_name}' arguments exceed the {MAX_TOOL_ARGUMENT_SIZE}-byte limit ({} bytes, id: {tool_id}) and were not executed. Please retry with smaller arguments. Rejected argument prefix: {preview}",
+            "Tool '{tool_name}' arguments exceed the {MAX_TOOL_ARGUMENT_SIZE}-byte limit ({} bytes, id: {tool_id}) and were not executed. Please retry with smaller arguments.",
             raw.len()
         ));
     }
@@ -219,13 +217,12 @@ pub(crate) fn parse_tool_arguments(
             Ok(parsed)
         }
         Err(err) => {
-            let preview: String = raw.chars().take(200).collect();
             error!(
                 tool_name = %tool_name,
                 tool_id = %tool_id,
                 error = %err,
                 args_len = raw.len(),
-                args_preview = %preview,
+                category = ?err.classify(),
                 "failed to parse tool call arguments JSON"
             );
             Err(format!(

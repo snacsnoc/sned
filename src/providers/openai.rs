@@ -1016,12 +1016,20 @@ enum OpenAiTextStreamMode {
     Cumulative,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ToolArgumentStats {
+    fragments: usize,
+    received_bytes: usize,
+    retained_bytes: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct OpenAiStreamDeltaState {
     emitted_reasoning: String,
     emitted_text: String,
     text_mode: OpenAiTextStreamMode,
     started_tool_call_indices: std::collections::HashSet<usize>,
+    tool_argument_stats: std::collections::HashMap<usize, ToolArgumentStats>,
 }
 
 impl OpenAiStreamDeltaState {
@@ -1101,6 +1109,90 @@ fn is_safe_tool_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn record_tool_argument_fragment(
+    delta_state: &mut OpenAiStreamDeltaState,
+    tool_index: usize,
+    received_bytes: usize,
+    retained_bytes: usize,
+) {
+    let stats = delta_state
+        .tool_argument_stats
+        .entry(tool_index)
+        .or_default();
+    stats.fragments = stats.fragments.saturating_add(1);
+    stats.received_bytes = stats.received_bytes.saturating_add(received_bytes);
+    stats.retained_bytes = stats.retained_bytes.saturating_add(retained_bytes);
+}
+
+fn bounded_trace_label(value: &str) -> &str {
+    &value[..value.floor_char_boundary(128)]
+}
+
+fn log_tool_argument_failure(
+    delta_state: &OpenAiStreamDeltaState,
+    tool_index: usize,
+    call_id: &str,
+    tool_name: &str,
+    dispatch_location: &str,
+    finish_reason: Option<&str>,
+    args: &str,
+) {
+    let stats = delta_state
+        .tool_argument_stats
+        .get(&tool_index)
+        .copied()
+        .unwrap_or_default();
+    let parse_error = serde_json::from_str::<serde_json::Value>(args).err();
+    let failure_reason = if stats.received_bytes > stats.retained_bytes {
+        "size_limit"
+    } else {
+        "invalid_json"
+    };
+    tracing::warn!(
+        tool_index,
+        call_id = %bounded_trace_label(call_id),
+        tool_name = %bounded_trace_label(tool_name),
+        dispatch_location,
+        finish_reason = ?finish_reason.map(bounded_trace_label),
+        failure_reason,
+        parser_category = ?parse_error.as_ref().map(|error| format!("{:?}", error.classify())),
+        parser_line = ?parse_error.as_ref().map(serde_json::Error::line),
+        parser_column = ?parse_error.as_ref().map(serde_json::Error::column),
+        argument_fragments = stats.fragments,
+        received_argument_bytes = stats.received_bytes,
+        retained_argument_bytes = stats.retained_bytes,
+        "OpenAI streamed tool arguments rejected"
+    );
+}
+
+fn validate_openai_tool_arguments(
+    delta_state: &OpenAiStreamDeltaState,
+    tool_index: usize,
+    call_id: &str,
+    tool_name: &str,
+    args: &str,
+    context: &str,
+    dispatch_location: &str,
+    finish_reason: Option<&str>,
+) -> String {
+    let validated = crate::providers::validate_tool_call_args(args, "OpenAI", context);
+    if serde_json::from_str::<serde_json::Value>(&validated)
+        .ok()
+        .is_some_and(|value| crate::providers::tool_arguments_error(&value).is_some())
+    {
+        log_tool_argument_failure(
+            delta_state,
+            tool_index,
+            call_id,
+            tool_name,
+            dispatch_location,
+            finish_reason,
+            args,
+        );
+    }
+    validated
 }
 
 fn openai_error_chunk(data: &str) -> Option<ApiStreamChunk> {
@@ -1274,36 +1366,37 @@ async fn process_openai_sse_line(
                             accumulate_streamed_tool_name(&mut entry.1, &name);
                         }
                         if let Some(args) = function.arguments.filter(|a| !a.is_empty()) {
-                            let entry = accumulated_tool_calls
-                                .entry(tool_index)
-                                .or_insert_with(|| (String::new(), String::new(), String::new()));
-                            if crate::providers::tool_arguments_are_rejected(&entry.2) {
-                                continue;
-                            }
-                            // Enforce MAX_TOOL_ARGUMENT_SIZE during accumulation to prevent
-                            // memory exhaustion from providers sending many small deltas.
-                            // This matches the validation in agent_loop.rs for other providers.
-                            if entry.2.len() + args.len()
-                                <= crate::providers::MAX_TOOL_ARGUMENT_SIZE
-                            {
-                                entry.2.push_str(&args);
-                            } else {
-                                let remaining =
-                                    crate::providers::MAX_TOOL_ARGUMENT_SIZE - entry.2.len();
-                                if remaining > 0 {
+                            let retained_bytes = {
+                                let entry =
+                                    accumulated_tool_calls.entry(tool_index).or_insert_with(|| {
+                                        (String::new(), String::new(), String::new())
+                                    });
+                                if crate::providers::tool_arguments_are_rejected(&entry.2) {
+                                    0
+                                } else if entry.2.len() + args.len()
+                                    <= crate::providers::MAX_TOOL_ARGUMENT_SIZE
+                                {
+                                    entry.2.push_str(&args);
+                                    args.len()
+                                } else {
+                                    let remaining = crate::providers::MAX_TOOL_ARGUMENT_SIZE
+                                        .saturating_sub(entry.2.len());
                                     let safe_end = args.floor_char_boundary(remaining);
                                     entry.2.push_str(&args[..safe_end]);
+                                    let retained_bytes = safe_end;
+                                    entry.2 = crate::providers::rejected_truncated_tool_args(
+                                        "OpenAI",
+                                        "during stream accumulation",
+                                    );
+                                    retained_bytes
                                 }
-                                tracing::warn!(
-                                    tool_index = tc.index,
-                                    accumulated_size = entry.2.len(),
-                                    "OpenAI tool call arguments exceeded MAX_TOOL_ARGUMENT_SIZE, truncated"
-                                );
-                                entry.2 = crate::providers::rejected_truncated_tool_args(
-                                    "OpenAI",
-                                    "during stream accumulation",
-                                );
-                            }
+                            };
+                            record_tool_argument_fragment(
+                                delta_state,
+                                tool_index,
+                                args.len(),
+                                retained_bytes,
+                            );
                         }
                     }
 
@@ -1376,10 +1469,15 @@ async fn process_openai_sse_line(
                             && !name.is_empty()
                         {
                             let name = completed_streamed_tool_name(name);
-                            let validated_args = crate::providers::validate_tool_call_args(
+                            let validated_args = validate_openai_tool_arguments(
+                                delta_state,
+                                idx,
+                                id,
+                                &name,
                                 args,
-                                "OpenAI",
                                 "on finish_reason:tool_calls",
+                                "finish_reason",
+                                Some("tool_calls"),
                             );
                             completed_tool_call_indices.insert(idx);
                             send_chunk(
@@ -1608,8 +1706,16 @@ pub async fn finish_openai_sse_to_chunks(
             let (id, name, args) = &accumulated_tool_calls[&idx];
             if !completed_tool_call_indices.contains(&idx) && !id.is_empty() && !name.is_empty() {
                 let name = completed_streamed_tool_name(name);
-                let validated_args =
-                    crate::providers::validate_tool_call_args(args, "OpenAI", "at stream end");
+                let validated_args = validate_openai_tool_arguments(
+                    delta_state,
+                    idx,
+                    id,
+                    &name,
+                    args,
+                    "at stream end",
+                    "stream_end",
+                    last_stop_reason.as_deref(),
+                );
                 completed_tool_call_indices.insert(idx);
                 if !send_chunk(
                     tx,
@@ -2261,6 +2367,23 @@ mod tests {
         SharedContentFields, SseLineBuffer, StorageMessage, ThinkingBlock, ToolDefinition,
         ToolResultBlock, ToolResultContent, ToolUseBlock, UserContentBlock,
     };
+
+    #[derive(Clone)]
+    struct CapturedTraceWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedTraceWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     struct EnvVarGuard {
         key: &'static str,
         original: Option<String>,
@@ -4255,6 +4378,382 @@ mod tests {
                         .as_deref()
                         .and_then(|arguments| serde_json::from_str(arguments).ok())
                         == Some(serde_json::json!({"commands": ["pwd"]}))
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_fragmented_incomplete_tool_arguments_are_rejected_at_dispatch() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
+        let first = r#"{"end_line":150,"paths":["WaterfallViewModel.swift"],"#;
+        let second = r#""start_line":"#;
+
+        for line in [
+            serde_json::json!({
+                "id": "chatcmpl-eof",
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call-eof",
+                        "function": {"name": "read_file", "arguments": first}
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-eof",
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "",
+                        "function": {"arguments": second}
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-eof",
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+            }),
+        ] {
+            process_openai_sse_line(
+                &format!("data: {line}"),
+                &tx,
+                &mut delta_state,
+                &mut accumulated_tool_calls,
+                &mut completed_tool_call_indices,
+                &mut last_stop_reason,
+                None,
+                &mut usage_sent,
+            )
+            .await;
+        }
+
+        let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let arguments = chunks.iter().find_map(|chunk| match chunk {
+            ApiStreamChunk::ToolCalls(chunk) => chunk.tool_call.function.arguments.as_deref(),
+            _ => None,
+        });
+        let arguments =
+            arguments.expect("incomplete tool call must reach agent-loop error handling");
+        let parsed: serde_json::Value = serde_json::from_str(arguments).unwrap();
+        let error = crate::providers::tool_arguments_error(&parsed).unwrap();
+        assert!(error.contains("arguments ended before a complete value was supplied"));
+        assert_eq!(delta_state.tool_argument_stats[&0].fragments, 2);
+        assert_eq!(
+            delta_state.tool_argument_stats[&0].received_bytes,
+            first.len() + second.len()
+        );
+        assert_eq!(
+            delta_state.tool_argument_stats[&0].retained_bytes,
+            first.len() + second.len()
+        );
+        assert!(!format!("{delta_state:?}").contains("WaterfallViewModel"));
+    }
+
+    #[tokio::test]
+    async fn test_rejected_tool_arguments_log_bounded_summary_once() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer({
+                let captured = captured.clone();
+                move || CapturedTraceWriter(captured.clone())
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
+        for line in [
+            serde_json::json!({
+                "id": "chatcmpl-log",
+                "choices": [{
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call-log",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"secret/path.swift\",\"start_line\":"
+                        }
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-log",
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+            }),
+        ] {
+            process_openai_sse_line(
+                &format!("data: {line}"),
+                &tx,
+                &mut delta_state,
+                &mut accumulated_tool_calls,
+                &mut completed_tool_call_indices,
+                &mut last_stop_reason,
+                None,
+                &mut usage_sent,
+            )
+            .await;
+        }
+        while rx.try_recv().is_ok() {}
+        drop(_guard);
+
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("OpenAI streamed tool arguments rejected")
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("dispatch_location=\"finish_reason\""), "{log}");
+        assert!(log.contains("finish_reason=Some(\"tool_calls\")"), "{log}");
+        assert!(log.contains("parser_category=Some(\"Eof\")"), "{log}");
+        assert!(log.contains("parser_line=Some(1)"), "{log}");
+        assert!(log.contains("parser_column=Some("), "{log}");
+        assert!(log.contains("argument_fragments=1"), "{log}");
+        assert!(log.contains("received_argument_bytes="), "{log}");
+        assert!(log.contains("retained_argument_bytes="), "{log}");
+        assert!(!log.contains("secret/path.swift"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn test_rejected_tool_arguments_log_stream_end_fallback() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer({
+                let captured = captured.clone();
+                move || CapturedTraceWriter(captured.clone())
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
+        let line = serde_json::json!({
+            "id": "chatcmpl-fallback",
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call-fallback",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"start_line\":"
+                    }
+                }]},
+                "finish_reason": null
+            }]
+        });
+        process_openai_sse_line(
+            &format!("data: {line}"),
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+        finish_openai_sse_to_chunks(
+            &mut SseLineBuffer::default(),
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+        while rx.try_recv().is_ok() {}
+        drop(_guard);
+
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("OpenAI streamed tool arguments rejected")
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("dispatch_location=\"stream_end\""), "{log}");
+        assert!(log.contains("finish_reason=None"), "{log}");
+    }
+
+    #[test]
+    fn test_streamed_tool_argument_stats_are_independent_per_index() {
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        record_tool_argument_fragment(&mut delta_state, 1, 7, 5);
+        record_tool_argument_fragment(&mut delta_state, 0, 11, 11);
+        record_tool_argument_fragment(&mut delta_state, 1, 3, 0);
+
+        assert_eq!(
+            delta_state.tool_argument_stats[&0],
+            ToolArgumentStats {
+                fragments: 1,
+                received_bytes: 11,
+                retained_bytes: 11,
+            }
+        );
+        assert_eq!(
+            delta_state.tool_argument_stats[&1],
+            ToolArgumentStats {
+                fragments: 2,
+                received_bytes: 10,
+                retained_bytes: 5,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_interleaved_invalid_and_valid_tool_calls_dispatch_independently() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
+        for line in [
+            serde_json::json!({
+                "id": "chatcmpl-interleaved",
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call-invalid",
+                    "function": {"name": "read_file", "arguments": "{\"start_line\":"}
+                }]}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-interleaved",
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 1,
+                    "id": "call-valid",
+                    "function": {"name": "list_files", "arguments": "{\"path\":\".\"}"}
+                }]}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-interleaved",
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}]
+            }),
+        ] {
+            process_openai_sse_line(
+                &format!("data: {line}"),
+                &tx,
+                &mut delta_state,
+                &mut accumulated_tool_calls,
+                &mut completed_tool_call_indices,
+                &mut last_stop_reason,
+                None,
+                &mut usage_sent,
+            )
+            .await;
+        }
+
+        let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ApiStreamChunk::ToolCalls(tool_chunk)
+                if tool_chunk.tool_call.call_id.as_deref() == Some("call-invalid")
+                    && tool_chunk
+                        .tool_call
+                        .function
+                        .arguments
+                        .as_deref()
+                        .is_some_and(crate::providers::tool_arguments_are_rejected)
+        )));
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ApiStreamChunk::ToolCalls(tool_chunk)
+                if tool_chunk.tool_call.call_id.as_deref() == Some("call-valid")
+                    && tool_chunk
+                        .tool_call
+                        .function
+                        .arguments
+                        .as_deref()
+                        .is_some_and(|arguments| arguments == "{\"path\":\".\"}")
+        )));
+        assert_eq!(delta_state.tool_argument_stats[&0].fragments, 1);
+        assert_eq!(delta_state.tool_argument_stats[&1].fragments, 1);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_streamed_tool_arguments_are_rejected_with_bounded_stats() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason: Option<String> = None;
+        let mut usage_sent = false;
+        let args = format!(
+            "{{\"content\":\"{}\"}}",
+            "x".repeat(crate::providers::MAX_TOOL_ARGUMENT_SIZE)
+        );
+        let line = serde_json::json!({
+            "id": "chatcmpl-large",
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call-large",
+                    "function": {"name": "write_to_file", "arguments": args}
+                }]},
+                "finish_reason": null
+            }]
+        });
+
+        process_openai_sse_line(
+            &format!("data: {line}"),
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+        finish_openai_sse_to_chunks(
+            &mut SseLineBuffer::default(),
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+
+        let stats = delta_state.tool_argument_stats[&0];
+        assert_eq!(stats.fragments, 1);
+        assert_eq!(stats.received_bytes, args.len());
+        assert!(stats.retained_bytes <= crate::providers::MAX_TOOL_ARGUMENT_SIZE);
+        assert!(!format!("{delta_state:?}").contains("content"));
+
+        let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            ApiStreamChunk::ToolCalls(tool_chunk)
+                if tool_chunk
+                    .tool_call
+                    .function
+                    .arguments
+                    .as_deref()
+                    .is_some_and(crate::providers::tool_arguments_are_rejected)
         )));
     }
 
