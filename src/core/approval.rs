@@ -1034,7 +1034,17 @@ impl ApprovalManager {
                 root.display()
             ));
         }
-        if self.is_path_local(&root.to_string_lossy()) {
+        let canonical_workspace_root = self
+            .workspace_root
+            .as_ref()
+            .map(|workspace_root| {
+                std::fs::canonicalize(workspace_root)
+                    .unwrap_or_else(|_| PathBuf::from(workspace_root))
+            });
+        if canonical_workspace_root
+            .as_ref()
+            .is_some_and(|workspace_root| root.starts_with(workspace_root))
+        {
             return Err(format!(
                 "Directory is already inside the workspace: {}",
                 root.display()
@@ -2959,6 +2969,18 @@ mod tests {
                 Some(external_file.to_str().unwrap())
             )
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_external_directory_grant_accepts_single_component_absolute_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut manager = ApprovalManager::new()
+            .with_workspace_root(workspace.path().to_string_lossy().to_string());
+
+        manager
+            .grant_external_directory("/dev", ToolCategory::ReadFiles)
+            .unwrap();
     }
 
     #[test]
