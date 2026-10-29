@@ -4758,8 +4758,10 @@ async fn handle_cli_only_command(
 }
 
 fn serialize_conversation_export<T: serde::Serialize>(history: &T) -> Result<String, String> {
-    serde_json::to_string_pretty(history)
-        .map(|json| crate::cli::redact::redact_secrets(&json).into_owned())
+    let mut value = serde_json::to_value(history)
+        .map_err(|e| format!("Failed to serialize conversation: {e}"))?;
+    crate::cli::redact::redact_json(&mut value);
+    serde_json::to_string_pretty(&value)
         .map_err(|e| format!("Failed to serialize conversation: {e}"))
 }
 
@@ -4767,7 +4769,7 @@ fn write_conversation_export(export_path: &str, export_data: &str) -> Result<Str
     crate::storage::disk::atomic_write_file(export_path, export_data)
         .map_err(|e| format!("Failed to write export file: {e}"))?;
     Ok(format!(
-        "Conversation exported to: {export_path} (secrets redacted)"
+        "Conversation exported to: {export_path} (recognized secrets redacted; review before sharing)"
     ))
 }
 
@@ -11102,6 +11104,20 @@ mod tests {
         let err = result.expect_err("serialization should fail");
         assert!(err.contains("Failed to serialize conversation"));
         assert!(err.contains("boom"));
+    }
+
+    #[test]
+    fn export_redacts_credentials_without_corrupting_json() {
+        let history = serde_json::json!({
+            "text": "line one\nkey: sk-ant-abcdefghijklmnopqrstuvwxyz123",
+            "tool_input": {"api_key": "short-value", "password": "escaped \"secret\""}
+        });
+        let exported = serialize_conversation_export(&history).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert!(!exported.contains("abcdefghijklmnopqrstuvwxyz123"));
+        assert!(!exported.contains("short-value"));
+        assert!(!exported.contains("escaped"));
+        assert_eq!(parsed["tool_input"]["password"], "[REDACTED]");
     }
 
     #[test]
