@@ -226,9 +226,7 @@ impl EditFileHandler {
             // diagnostics (`801: foo`), and ripgrep `--line-number`
             // (`801 | foo`) all produce this shape.
             let trimmed_prefix = prefix.trim_matches([' ', '\t']);
-            if !trimmed_prefix.is_empty()
-                && trimmed_prefix.chars().all(|c| c.is_ascii_digit())
-            {
+            if !trimmed_prefix.is_empty() && trimmed_prefix.chars().all(|c| c.is_ascii_digit()) {
                 without_diff_marker[idx + 1..]
                     .trim_start_matches([' ', '\t'])
                     .to_string()
@@ -295,7 +293,9 @@ impl EditFileHandler {
         if !first.contains(ANCHOR_DELIMITER) || !ANCHOR_NAME_REGEX.is_match(&word) {
             return Self::normalized_anchor("anchor", path, raw);
         }
-        let anchored_continuations = lines[1..].iter().any(|line| line.contains(ANCHOR_DELIMITER));
+        let anchored_continuations = lines[1..]
+            .iter()
+            .any(|line| line.contains(ANCHOR_DELIMITER));
         let mut normalized = vec![first];
         for line in &lines[1..] {
             if anchored_continuations {
@@ -325,7 +325,10 @@ impl EditFileHandler {
                 .collect());
         }
 
-        let block = raw.strip_suffix("\r\n").or_else(|| raw.strip_suffix('\n')).unwrap_or(raw);
+        let block = raw
+            .strip_suffix("\r\n")
+            .or_else(|| raw.strip_suffix('\n'))
+            .unwrap_or(raw);
         let lines = block.split('\n').collect::<Vec<_>>();
         if lines.len() == 1 {
             return Ok(vec![Self::normalized_anchor(field_name, path, lines[0])?]);
@@ -435,9 +438,7 @@ impl EditFileHandler {
         format!("{error} near line {line_number}, column {column}: {snippet:?}")
     }
 
-    fn parse_stringified_edits_array(
-        raw: &str,
-    ) -> Result<Vec<serde_json::Value>, String> {
+    fn parse_stringified_edits_array(raw: &str) -> Result<Vec<serde_json::Value>, String> {
         match serde_json::from_str::<Vec<serde_json::Value>>(raw) {
             Ok(edits) => Ok(edits),
             Err(error) => {
@@ -594,7 +595,9 @@ impl EditFileHandler {
                 .or_else(|| params.get("replace"))
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!(""));
-            let object = params.as_object_mut().ok_or("edit_file arguments must be a JSON object")?;
+            let object = params
+                .as_object_mut()
+                .ok_or("edit_file arguments must be a JSON object")?;
             object.remove("path");
             object.remove("old_text");
             object.remove("old_str");
@@ -611,7 +614,10 @@ impl EditFileHandler {
         }
         if params.get("path").is_some() && params.get("edits").is_some() {
             if params.get("paths").is_some() {
-                return Err("Ambiguous edit_file arguments: use either 'paths' or 'path' with 'edits'.".to_string());
+                return Err(
+                    "Ambiguous edit_file arguments: use either 'paths' or 'path' with 'edits'."
+                        .to_string(),
+                );
             }
             let path = params
                 .get("path")
@@ -626,12 +632,19 @@ impl EditFileHandler {
                 _ => return Err("Invalid 'edits': expected an array of edit objects".to_string()),
             };
             if edits.is_empty() || edits.iter().any(|edit| !edit.is_object()) {
-                return Err("Invalid 'edits': expected a nonempty array of edit objects".to_string());
+                return Err(
+                    "Invalid 'edits': expected a nonempty array of edit objects".to_string()
+                );
             }
-            let object = params.as_object_mut().ok_or("edit_file arguments must be a JSON object")?;
+            let object = params
+                .as_object_mut()
+                .ok_or("edit_file arguments must be a JSON object")?;
             object.remove("path");
             object.remove("edits");
-            object.insert("files".to_string(), serde_json::json!([{"path": path, "edits": edits}]));
+            object.insert(
+                "files".to_string(),
+                serde_json::json!([{"path": path, "edits": edits}]),
+            );
             return Ok(true);
         }
         let files = match params.get("paths") {
@@ -888,8 +901,7 @@ impl EditFileHandler {
                 let end_is_anchored_block = end_block.len() > 1;
                 let end_anchor = (!end_block.is_empty()).then(|| end_block.join("\n"));
 
-                if (anchor.contains('\n') || end_is_anchored_block) && edit_type != "replace"
-                {
+                if (anchor.contains('\n') || end_is_anchored_block) && edit_type != "replace" {
                     return Err(ToolError::InvalidInput(format!(
                         "File '{path}': multiline anchor blocks are supported only for replace edits; use a single-line anchor for insertions."
                     )));
@@ -1061,7 +1073,8 @@ impl EditFileHandler {
                     .get("anchor")
                     .and_then(|a: &serde_json::Value| a.as_str())
                     .unwrap_or("");
-                let anchor_block = match Self::normalized_selector_block("anchor", path, anchor_raw) {
+                let anchor_block = match Self::normalized_selector_block("anchor", path, anchor_raw)
+                {
                     Ok(anchor) => anchor,
                     Err(message) => {
                         if anchor_raw.trim_start().contains(['\n', '\r']) {
@@ -1225,6 +1238,10 @@ impl EditFileHandler {
         state.last_read_turn.remove(&key);
         state.recent_read_windows.remove(&key);
         state.read_file_snapshots.remove(&key);
+        state.read_file_coverage.remove(&key);
+        state
+            .pending_read_coverage
+            .retain(|candidate| candidate.canonical_path != key);
     }
 
     fn reread_required_error(display_path: &str, absolute_path: &str) -> ToolError {
@@ -2525,9 +2542,10 @@ impl EditFileHandler {
             // Latch a re-read only when a failure impugns the file's
             // remaining anchors; other failures resolve against untouched
             // lines, where a forced re-read would be a wasted turn.
-            let anchors_suspect = prepared.failed_edits.iter().any(|failed| {
-                EditFailureReason::from_diagnostic(&failed.error).requires_reread()
-            });
+            let anchors_suspect = prepared
+                .failed_edits
+                .iter()
+                .any(|failed| EditFailureReason::from_diagnostic(&failed.error).requires_reread());
             if anchors_suspect {
                 Self::mark_must_reread(state, &batch.absolute_path).await;
                 reread_paths.insert(batch.absolute_path.clone());
@@ -3878,13 +3896,18 @@ mod tests {
         .await
         .unwrap();
         assert!(output.as_str().unwrap().contains("1 edit(s) applied"));
-        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "alpha\ngamma\n");
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "alpha\ngamma\n"
+        );
         // Success clears the latch for subsequent edits.
-        assert!(!state
-            .lock()
-            .await
-            .must_reread_before_edit
-            .contains(&canonical));
+        assert!(
+            !state
+                .lock()
+                .await
+                .must_reread_before_edit
+                .contains(&canonical)
+        );
     }
 
     #[tokio::test]
@@ -3899,11 +3922,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        state
-            .lock()
-            .await
-            .must_reread_before_edit
-            .insert(canonical);
+        state.lock().await.must_reread_before_edit.insert(canonical);
         let ctx = ToolContext::new(
             state,
             None,
@@ -4429,10 +4448,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edit_file_accepts_top_level_path_and_stringified_edits_with_plain_continuations() {
+    async fn test_edit_file_accepts_top_level_path_and_stringified_edits_with_plain_continuations()
+    {
         let _guard = TEST_MUTEX.lock().await;
-        let (_dir, file_path, anchors, ctx) =
-            setup_test_ctx("before\nfirst\n    second\n\nthird\nafter\n", "plain-anchor-block").await;
+        let (_dir, file_path, anchors, ctx) = setup_test_ctx(
+            "before\nfirst\n    second\n\nthird\nafter\n",
+            "plain-anchor-block",
+        )
+        .await;
         let edits = serde_json::json!([{
             "anchor": format!("{}§first\n    second\n\nthird", anchors[1]),
             "text": "replacement"
@@ -4441,14 +4464,18 @@ mod tests {
 
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
         assert!(result.is_ok(), "{result:?}");
-        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "before\nreplacement\nafter\n");
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "before\nreplacement\nafter\n"
+        );
     }
 
     #[tokio::test]
     async fn test_edit_file_rejects_mismatched_plain_continuation_without_writing() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "before\nfirst\nsecond\nafter\n";
-        let (_dir, file_path, anchors, ctx) = setup_test_ctx(content, "plain-anchor-mismatch").await;
+        let (_dir, file_path, anchors, ctx) =
+            setup_test_ctx(content, "plain-anchor-mismatch").await;
         let params = serde_json::json!({
             "path": "test.txt",
             "edits": [{"anchor": format!("{}§first\nchanged", anchors[1]), "text": "replacement"}]
@@ -4475,7 +4502,10 @@ mod tests {
         let _guard = TEST_MUTEX.lock().await;
         let (_dir, file_path, anchors, ctx) =
             setup_test_ctx("first\nsecond\n", "anchor-block-trailing-empty").await;
-        let block = format!("{}§first\n{}§second\n{}§\n", anchors[0], anchors[1], anchors[2]);
+        let block = format!(
+            "{}§first\n{}§second\n{}§\n",
+            anchors[0], anchors[1], anchors[2]
+        );
         let params = serde_json::json!({
             "files": [{"path": "test.txt", "edits": [{"anchor": block, "text": "replacement"}]}]
         });
@@ -4503,7 +4533,10 @@ mod tests {
 
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
         assert!(result.is_ok(), "{result:?}");
-        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "replacement\nafter\n");
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "replacement\nafter\n"
+        );
     }
 
     #[tokio::test]
@@ -4641,10 +4674,7 @@ mod tests {
         )
         .await;
         let output = edit.expect("edit after the session's own rewrite must not go stale");
-        assert!(
-            output.to_string().contains("1 edit(s) applied"),
-            "{output}"
-        );
+        assert!(output.to_string().contains("1 edit(s) applied"), "{output}");
         assert_eq!(
             std::fs::read_to_string(file_path).unwrap(),
             "alpha\nBETA\nGAMMA\n"
@@ -4723,10 +4753,7 @@ mod tests {
     async fn test_edit_file_repairs_stringified_file_entry_edits() {
         let _guard = TEST_MUTEX.lock().await;
         let (_dir, file_path, anchors, ctx) = setup_test_ctx("old\n", "stringified-edits").await;
-        let edits = format!(
-            "[{{\"anchor\":\"{}§old\",\"text\":\"new\"}}]",
-            anchors[0]
-        );
+        let edits = format!("[{{\"anchor\":\"{}§old\",\"text\":\"new\"}}]", anchors[0]);
         let params = serde_json::json!({
             "files": [{"path": "test.txt", "edits": edits}]
         });
@@ -4753,7 +4780,8 @@ mod tests {
     async fn test_edit_file_rejects_mismatched_line_in_anchor_block() {
         let _guard = TEST_MUTEX.lock().await;
         let content = "before\nfirst\nsecond\nthird\nafter\n";
-        let (_dir, file_path, anchors, ctx) = setup_test_ctx(content, "anchor-block-mismatch").await;
+        let (_dir, file_path, anchors, ctx) =
+            setup_test_ctx(content, "anchor-block-mismatch").await;
         let block = format!(
             "{}§first\n{}§second\n{}§third",
             anchors[1], anchors[4], anchors[3]
@@ -4837,10 +4865,14 @@ mod tests {
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
         let err = result.expect_err("multiline plain continuation must be rejected for insertion");
         assert!(
-            err.to_string().contains("multiline anchor blocks are supported only for replace edits"),
+            err.to_string()
+                .contains("multiline anchor blocks are supported only for replace edits"),
             "{err}"
         );
-        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "first\nsecond\n");
+        assert_eq!(
+            std::fs::read_to_string(file_path).unwrap(),
+            "first\nsecond\n"
+        );
     }
 
     #[test]
@@ -4875,8 +4907,7 @@ mod tests {
     #[test]
     fn normalized_anchor_strips_diff_plus_prefix() {
         let raw = "+AXeXDnV5WaXnvNOO§    return color";
-        let result =
-            EditFileHandler::normalized_anchor("anchor", "test.swift", raw).unwrap();
+        let result = EditFileHandler::normalized_anchor("anchor", "test.swift", raw).unwrap();
         assert_eq!(result, "AXeXDnV5WaXnvNOO§    return color");
     }
 
@@ -4886,8 +4917,7 @@ mod tests {
     #[test]
     fn normalized_anchor_strips_diff_minus_prefix() {
         let raw = "-AXeXDnV5WaXnvNOO§    return color";
-        let result =
-            EditFileHandler::normalized_anchor("anchor", "test.swift", raw).unwrap();
+        let result = EditFileHandler::normalized_anchor("anchor", "test.swift", raw).unwrap();
         assert_eq!(result, "AXeXDnV5WaXnvNOO§    return color");
     }
 
@@ -4905,8 +4935,7 @@ mod tests {
         ] {
             let result = EditFileHandler::normalized_anchor("anchor", "test.swift", raw).unwrap();
             assert_eq!(
-                result,
-                "AXeXDnV5WaXnvNOO§    return color",
+                result, "AXeXDnV5WaXnvNOO§    return color",
                 "raw input {raw:?} did not normalize to canonical form"
             );
         }
@@ -4928,7 +4957,10 @@ mod tests {
             ("12:AXeX§foo", "AXeX§foo"),
             ("801 | AXeX§foo", "AXeX§foo"),
             ("801:AXeX§foo", "AXeX§foo"),
-            ("1234567 | AmprR8§    func setupScannerCallback() {", "AmprR8§    func setupScannerCallback() {"),
+            (
+                "1234567 | AmprR8§    func setupScannerCallback() {",
+                "AmprR8§    func setupScannerCallback() {",
+            ),
         ] {
             let result = EditFileHandler::normalized_anchor("anchor", "test.swift", raw).unwrap();
             assert_eq!(
@@ -4946,8 +4978,8 @@ mod tests {
     #[test]
     fn normalized_anchor_does_not_strip_non_numeric_line_prefix() {
         // "abc:" is not a line number; should be left alone.
-        let result = EditFileHandler::normalized_anchor("anchor", "test.swift", "abc:AXeX§foo")
-            .unwrap();
+        let result =
+            EditFileHandler::normalized_anchor("anchor", "test.swift", "abc:AXeX§foo").unwrap();
         assert_eq!(result, "abc:AXeX§foo");
         // Pure colon without prefix: not stripped (no digits to match).
         let result =
@@ -6771,11 +6803,8 @@ edition = "2021"
                     true,
                 ));
             } else {
-                handler.publication_cache_failure = Some(
-                    dir.path()
-                        .join("anchor-tasks")
-                        .join("staged-handler.json"),
-                );
+                handler.publication_cache_failure =
+                    Some(dir.path().join("anchor-tasks").join("staged-handler.json"));
             }
             let error = ToolHandler::execute(&handler, &ctx, params.clone())
                 .await
@@ -6853,10 +6882,7 @@ edition = "2021"
     #[tokio::test]
     async fn test_staged_corrupt_storage_requires_user_repair_even_with_reread_latch() {
         let (dir, ctx, params, path, _) = staged_handler_fixture();
-        let shard = dir
-            .path()
-            .join("anchor-tasks")
-            .join("staged-handler.json");
+        let shard = dir.path().join("anchor-tasks").join("staged-handler.json");
         std::fs::write(&shard, "invalid cache JSON").unwrap();
         for _ in 0..2 {
             let error = ToolHandler::execute(&EditFileHandler::new(), &ctx, params.clone())
@@ -6967,10 +6993,7 @@ edition = "2021"
     #[tokio::test]
     async fn test_staged_invalid_mapping_rejected_without_reread_or_mutation() {
         let (dir, ctx, params, path, _) = staged_handler_fixture();
-        let shard = dir
-            .path()
-            .join("anchor-tasks")
-            .join("staged-handler.json");
+        let shard = dir.path().join("anchor-tasks").join("staged-handler.json");
         let before = std::fs::read(&shard).unwrap();
         let anchors = ctx.anchor_mgr.get_anchors(&path, Some("staged-handler"));
         let mut handler = EditFileHandler::new();
@@ -7015,10 +7038,7 @@ edition = "2021"
     #[tokio::test]
     async fn test_staged_output_verification_preserves_external_bytes_and_anchor_cache() {
         let (dir, ctx, params, path, _) = staged_handler_fixture();
-        let shard = dir
-            .path()
-            .join("anchor-tasks")
-            .join("staged-handler.json");
+        let shard = dir.path().join("anchor-tasks").join("staged-handler.json");
         let before = std::fs::read(&shard).unwrap();
         let mut handler = EditFileHandler::new();
         handler.external_change_after_writes = Some((path.clone(), "external\r\n".into()));
@@ -7396,7 +7416,9 @@ edition = "2021"
         }]});
 
         let result = ToolHandler::execute(&EditFileHandler::new(), &ctx, params).await;
-        let output = result.expect("whitespace-trimmed edit must succeed").to_string();
+        let output = result
+            .expect("whitespace-trimmed edit must succeed")
+            .to_string();
         assert!(
             output.contains("2 edit(s) applied"),
             "both edits must apply, got: {output}"
@@ -8393,10 +8415,7 @@ edition = "2021"
             "error must suggest the current anchor, got: {msg}"
         );
         let updated = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(
-            updated, original,
-            "rejected edit must not modify the file"
-        );
+        assert_eq!(updated, original, "rejected edit must not modify the file");
     }
 
     #[tokio::test]
@@ -8410,7 +8429,11 @@ edition = "2021"
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let anchor_mgr = AnchorStateManager::new();
         let lines = crate::core::file_editor::split_content_lines(original);
-        let anchors = anchor_mgr.reconcile(file_path.to_str().unwrap(), &lines, Some("trailing-nl-task"));
+        let anchors = anchor_mgr.reconcile(
+            file_path.to_str().unwrap(),
+            &lines,
+            Some("trailing-nl-task"),
+        );
         let anchor_with_nl = format!("{}§struct Bookmark {{\n", anchors[0]);
         let end_anchor_with_nl = format!("{}§}}\n", anchors[2]);
         let ctx = ToolContext::new(

@@ -437,6 +437,10 @@ impl ToolHandler for WriteToFileHandler {
                         state.last_read_turn.remove(&key);
                         state.recent_read_windows.remove(&key);
                         state.read_file_snapshots.remove(&key);
+                        state.read_file_coverage.remove(&key);
+                        state
+                            .pending_read_coverage
+                            .retain(|candidate| candidate.canonical_path != key);
                     }
                     let task_id = ctx.task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
@@ -1074,22 +1078,18 @@ mod tests {
         // after it. Previously the implementation used `rfind`, which
         // incorrectly matched the LAST closer and left the first closer row
         // as stray content in the body.
-        let stripped = strip_outer_markdown_fences(
-            Path::new("foo.txt"),
-            "```\nfirst\n````\nsecond\n````\n",
-        )
-        .into_owned();
+        let stripped =
+            strip_outer_markdown_fences(Path::new("foo.txt"), "```\nfirst\n````\nsecond\n````\n")
+                .into_owned();
         assert_eq!(
             stripped, "first\nsecond\n````\n",
             "first valid closer wins, not the last"
         );
 
         // When the first valid closer sits immediately after the opener line:
-        let stripped_immediate = strip_outer_markdown_fences(
-            Path::new("foo.txt"),
-            "```\n````\nfoo\n````\n",
-        )
-        .into_owned();
+        let stripped_immediate =
+            strip_outer_markdown_fences(Path::new("foo.txt"), "```\n````\nfoo\n````\n")
+                .into_owned();
         assert_eq!(
             stripped_immediate, "foo\n````\n",
             "immediate first closer leaves subsequent lines intact"

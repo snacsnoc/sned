@@ -45,6 +45,26 @@ pub struct DeniedToolAction {
     pub params_fingerprint: String,
 }
 
+/// Source ranges that a read result actually made available to the model for
+/// one exact file revision. Ranges are inclusive and merged by read_file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadCoverage {
+    pub revision: String,
+    pub total_lines: Option<usize>,
+    pub ranges: Vec<(usize, usize)>,
+}
+
+/// A source range observed by a tool call but not yet committed to coverage.
+/// The agent loop commits candidates only after appending the tool result to
+/// model history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadCoverageCandidate {
+    pub canonical_path: String,
+    pub revision: String,
+    pub total_lines: usize,
+    pub range: (usize, usize),
+}
+
 /// The mode the agent is operating in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentMode {
@@ -178,6 +198,13 @@ pub struct TaskState {
     /// only for paths whose bytes may have changed externally.
     pub read_file_snapshots:
         std::collections::HashMap<String, (u64, Option<std::time::SystemTime>)>,
+    /// Exact source ranges retained in model-visible history, keyed by
+    /// canonical path. This is separate from read-loop warning state because
+    /// coverage survives interleaved reads of other files.
+    pub read_file_coverage: std::collections::HashMap<String, ReadCoverage>,
+    /// Read ranges awaiting confirmation that their tool result was appended
+    /// to model-visible history.
+    pub pending_read_coverage: Vec<ReadCoverageCandidate>,
     /// Number of tool calls executed in the current turn (for subagent result reporting).
     pub turn_tool_calls: u32,
     /// Cumulative total tool calls across all turns in the session (never
@@ -260,6 +287,8 @@ impl Default for TaskState {
             last_read_turn: std::collections::HashMap::new(),
             recent_read_windows: std::collections::HashMap::new(),
             read_file_snapshots: std::collections::HashMap::new(),
+            read_file_coverage: std::collections::HashMap::new(),
+            pending_read_coverage: Vec::new(),
             plan_state: None,
             last_injected_plan_state_hash: None,
             denied_tool_actions: Vec::new(),

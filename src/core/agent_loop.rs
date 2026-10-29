@@ -18,9 +18,7 @@ use crate::core::agent_stream::{
 };
 use crate::core::agent_types::code_block_display_limit;
 pub use crate::core::agent_types::{AgentConfig, AgentError, AgentMode, TaskState, TurnResult};
-use crate::core::context::{
-    PromptBuilder, SystemPromptContext, context_manager, context_window,
-};
+use crate::core::context::{PromptBuilder, SystemPromptContext, context_manager, context_window};
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::provider_retry::{
     DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES, RetryConfig, create_message_with_retry,
@@ -719,6 +717,8 @@ impl AgentLoop {
         state.consecutive_reads.clear();
         state.last_read_turn.clear();
         state.recent_read_windows.clear();
+        state.read_file_coverage.clear();
+        state.pending_read_coverage.clear();
     }
 
     fn current_turn_retry_candidate(history: &[StorageMessage]) -> Option<StorageMessage> {
@@ -1123,9 +1123,10 @@ impl AgentLoop {
 
         let mut changed_paths = Vec::new();
         for (path, snapshot) in snapshots {
-            let current = tokio::fs::metadata(&path).await.ok().map(|metadata| {
-                (metadata.len(), metadata.modified().ok())
-            });
+            let current = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .map(|metadata| (metadata.len(), metadata.modified().ok()));
             if current.as_ref() != Some(&snapshot) {
                 changed_paths.push(path);
             }
@@ -1140,6 +1141,10 @@ impl AgentLoop {
             guard.last_read_turn.remove(&path);
             guard.recent_read_windows.remove(&path);
             guard.read_file_snapshots.remove(&path);
+            guard.read_file_coverage.remove(&path);
+            guard
+                .pending_read_coverage
+                .retain(|candidate| candidate.canonical_path != path);
         }
     }
 
@@ -1995,9 +2000,9 @@ impl AgentLoop {
         });
         let first_chunk_to_displayable_text_us =
             state.first_provider_chunk_time.and_then(|chunk| {
-                state.first_displayable_text_time.map(|displayable| {
-                    displayable.duration_since(chunk).as_micros() as u64
-                })
+                state
+                    .first_displayable_text_time
+                    .map(|displayable| displayable.duration_since(chunk).as_micros() as u64)
             });
         let displayable_text_to_output_us =
             state.first_displayable_text_time.and_then(|displayable| {
@@ -2060,7 +2065,8 @@ impl AgentLoop {
             // Pass history by reference to context_manager — saves a full deep clone
             // of every message/tool-result per turn.
             let mut conversation_guard = self.conversation_history.lock().await;
-            compact_old_tool_results(&mut conversation_guard);
+            let compaction = compact_old_tool_results(&mut conversation_guard);
+            let read_coverage_compacted = compaction.collapsed > 0;
             close_dangling_tool_calls(&mut conversation_guard);
             let original_history_len = conversation_guard.len();
             let result = context_manager::get_new_context_messages_and_metadata(
@@ -2078,11 +2084,17 @@ impl AgentLoop {
             );
             drop(conversation_guard);
 
+            if read_coverage_compacted {
+                let mut state = self.state.lock().await;
+                state.read_file_coverage.clear();
+            }
+
             // Update state if deleted range changed, then persist the
             // range without holding the state guard across disk IO.
             if result.updated_conversation_history_deleted_range {
                 let (deleted_range, history_item) = {
                     let mut state = self.state.lock().await;
+                    Self::clear_history_dependent_read_state(&mut state);
                     let deleted_range = result.conversation_history_deleted_range;
                     state.conversation_history_deleted_range = deleted_range;
                     let history_item = deleted_range.and_then(|_| {
@@ -3264,10 +3276,7 @@ impl AgentLoop {
             let tools_called = batch_output.tools_called;
             tool_failure_count = batch_output.tool_failure_count;
 
-            let all_executed = batch_output
-                .outcomes
-                .iter()
-                .all(|outcome| outcome.executed);
+            let all_executed = batch_output.outcomes.iter().all(|outcome| outcome.executed);
             identical_batch_streak = if all_executed {
                 let signature =
                     crate::core::tools::execution::tool_batch_signature(&prepared_tool_calls);
@@ -3380,7 +3389,11 @@ impl AgentLoop {
                             .output_writer
                             .emit(OutputEvent::tool_output_line(
                                 format!("  {status} {stats}"),
-                                Style::default().fg(if is_error { error_fg() } else { prompt_fg() }),
+                                Style::default().fg(if is_error {
+                                    error_fg()
+                                } else {
+                                    prompt_fg()
+                                }),
                             ));
                         if is_error {
                             for detail in
@@ -3542,7 +3555,8 @@ impl AgentLoop {
 
                 append_tool_result_blocks(&mut tool_result_blocks, tool_id, result_output);
             }
-            if !tool_result_blocks.is_empty() {
+            let had_tool_results = !tool_result_blocks.is_empty();
+            if had_tool_results {
                 if !self.config.json_output {
                     self.config.output_writer.flush();
                 }
@@ -3567,6 +3581,22 @@ impl AgentLoop {
                         metrics: None,
                         ts: Some(chrono::Utc::now().timestamp_millis() as u64),
                     });
+                }
+            }
+
+            // Read coverage is committed only after the result batch is in
+            // model history; parallel calls in this batch must not suppress
+            // one another before that point.
+            {
+                let mut state = self.state.lock().await;
+                if !had_tool_results {
+                    state.pending_read_coverage.clear();
+                } else {
+                    // Candidates are created only for successful read_file
+                    // results and are invalidated by any later mutation of
+                    // the same path. An unrelated failed tool must not throw
+                    // away reads that were successfully appended to history.
+                    crate::core::tools::handlers::read_file::ReadFileHandler::commit_pending_read_coverage(&mut state);
                 }
             }
 
@@ -4786,6 +4816,7 @@ impl AgentLoop {
     }
 
     pub async fn clear_queue(&self) {
+        self.retry_message_ids.lock().await.clear();
         self.message_queue.lock().await.clear();
     }
 }
@@ -5025,9 +5056,7 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) -> CompactionSummary
             let is_search_result = !is_read_result
                 && !is_shell_result
                 && tool_name.is_some_and(|name| {
-                    *name == "search_files"
-                        || *name == "list_files"
-                        || *name == "get_file_skeleton"
+                    *name == "search_files" || *name == "list_files" || *name == "get_file_skeleton"
                 });
 
             let is_edit_result = !is_read_result
@@ -7260,17 +7289,26 @@ mod tests {
         assert!(first.contains(&format!("Lines 1–{shown_end} of 3236 shown")));
         assert!(first.contains(&format!("start_line={next}")));
         assert!(!first.contains("Proceed with current context"));
-        for index in [2, 3] {
-            let result = stored_tool_results(&captured[index].messages);
-            assert_eq!(result.len(), 1);
-            assert_eq!(
-                Some(&result[0].0),
-                assistant_tool_use_ids(&captured[index].messages).last()
-            );
-            for line in next..=next + 2 {
-                assert!(result[0].1.contains(&format!("§line {line:04} ")));
-            }
-            assert!(!result[0].1.contains("Already read"));
+        let next_result = stored_tool_results(&captured[2].messages);
+        assert_eq!(next_result.len(), 1);
+        assert_eq!(
+            Some(&next_result[0].0),
+            assistant_tool_use_ids(&captured[2].messages).last()
+        );
+        for line in next..=next + 2 {
+            assert!(next_result[0].1.contains(&format!("§line {line:04} ")));
+        }
+        assert!(!next_result[0].1.contains("Already read"));
+
+        let repeated_result = stored_tool_results(&captured[3].messages);
+        assert_eq!(repeated_result.len(), 1);
+        assert_eq!(
+            Some(&repeated_result[0].0),
+            assistant_tool_use_ids(&captured[3].messages).last()
+        );
+        assert!(repeated_result[0].1.starts_with("Already read:"));
+        for line in next..=next + 2 {
+            assert!(!repeated_result[0].1.contains(&format!("§line {line:04} ")));
         }
         assert_eq!(std::fs::read_to_string(path).unwrap(), source);
     }
@@ -8556,12 +8594,8 @@ Irrespective of whether additional information or instructions are given, you ar
             turns_completed: 5,
             ..Default::default()
         };
-        state
-            .consecutive_reads
-            .insert("/tmp/foo.c".to_string(), 3);
-        state
-            .last_read_turn
-            .insert("/tmp/foo.c".to_string(), 4);
+        state.consecutive_reads.insert("/tmp/foo.c".to_string(), 3);
+        state.last_read_turn.insert("/tmp/foo.c".to_string(), 4);
         let mut ring = std::collections::VecDeque::new();
         ring.push_back((370, 410));
         ring.push_back((380, 403));
@@ -8595,10 +8629,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 state.last_read_turn
             );
             assert_eq!(
-                state
-                    .recent_read_windows
-                    .get("/tmp/foo.c")
-                    .map(|r| r.len()),
+                state.recent_read_windows.get("/tmp/foo.c").map(|r| r.len()),
                 Some(3),
                 "{tool} must preserve recent_read_windows, got: {:?}",
                 state.recent_read_windows
@@ -8612,17 +8643,18 @@ Irrespective of whether additional information or instructions are given, you ar
     /// resets the model's mental model.
     #[test]
     fn decay_read_loop_state_clears_state_for_mutating_tools() {
-        for tool in &["edit_file", "write_to_file", "replace_symbol", "rename_symbol"] {
+        for tool in &[
+            "edit_file",
+            "write_to_file",
+            "replace_symbol",
+            "rename_symbol",
+        ] {
             let mut state = TaskState {
                 turns_completed: 5,
                 ..Default::default()
             };
-            state
-                .consecutive_reads
-                .insert("/tmp/foo.c".to_string(), 3);
-            state
-                .last_read_turn
-                .insert("/tmp/foo.c".to_string(), 4);
+            state.consecutive_reads.insert("/tmp/foo.c".to_string(), 3);
+            state.last_read_turn.insert("/tmp/foo.c".to_string(), 4);
             let mut ring = std::collections::VecDeque::new();
             ring.push_back((370, 410));
             state
@@ -8659,12 +8691,8 @@ Irrespective of whether additional information or instructions are given, you ar
             turns_completed: 5,
             ..Default::default()
         };
-        state
-            .consecutive_reads
-            .insert("/tmp/foo.c".to_string(), 3);
-        state
-            .last_read_turn
-            .insert("/tmp/foo.c".to_string(), 4);
+        state.consecutive_reads.insert("/tmp/foo.c".to_string(), 3);
+        state.last_read_turn.insert("/tmp/foo.c".to_string(), 4);
         // 1-turn gap (current=5, last=4) — must NOT clear.
         AgentLoop::decay_read_loop_state(&mut state, "ask_followup_question");
         assert_eq!(
@@ -8674,9 +8702,7 @@ Irrespective of whether additional information or instructions are given, you ar
             state.consecutive_reads
         );
         // Push past the 2-turn window — must clear.
-        state
-            .last_read_turn
-            .insert("/tmp/foo.c".to_string(), 0);
+        state.last_read_turn.insert("/tmp/foo.c".to_string(), 0);
         AgentLoop::decay_read_loop_state(&mut state, "ask_followup_question");
         assert!(
             state.consecutive_reads.is_empty(),
@@ -8692,7 +8718,9 @@ Irrespective of whether additional information or instructions are given, you ar
         state
             .consecutive_reads
             .insert("/tmp/abandoned.c".to_string(), 4);
-        state.last_read_turn.insert("/tmp/abandoned.c".to_string(), 1);
+        state
+            .last_read_turn
+            .insert("/tmp/abandoned.c".to_string(), 1);
         AgentLoop::decay_read_loop_state(&mut state, "ask_followup_question");
         assert!(state.consecutive_reads.contains_key("/tmp/active.c"));
         assert!(!state.consecutive_reads.contains_key("/tmp/abandoned.c"));
@@ -8715,9 +8743,7 @@ Irrespective of whether additional information or instructions are given, you ar
             state
                 .consecutive_reads
                 .insert("/tmp/foo.c".to_string(), turn);
-            state
-                .last_read_turn
-                .insert("/tmp/foo.c".to_string(), turn);
+            state.last_read_turn.insert("/tmp/foo.c".to_string(), turn);
             AgentLoop::decay_read_loop_state(&mut state, "execute_command");
         }
         assert_eq!(
@@ -10606,12 +10632,21 @@ Irrespective of whether additional information or instructions are given, you ar
             .recent_read_windows
             .insert(path.clone(), std::collections::VecDeque::from([(1, 100)]));
         state.read_file_snapshots.insert(path.clone(), (100, None));
+        state.read_file_coverage.insert(
+            path.clone(),
+            crate::core::agent_types::ReadCoverage {
+                revision: "rev".to_string(),
+                total_lines: Some(100),
+                ranges: vec![(1, 100)],
+            },
+        );
 
         AgentLoop::clear_history_dependent_read_state(&mut state);
 
         assert!(state.consecutive_reads.is_empty());
         assert!(state.last_read_turn.is_empty());
         assert!(state.recent_read_windows.is_empty());
+        assert!(state.read_file_coverage.is_empty());
         assert!(state.read_file_snapshots.contains_key(&path));
     }
 
@@ -12273,7 +12308,10 @@ Irrespective of whether additional information or instructions are given, you ar
             rendered.contains("does not match consecutive current Word§source lines"),
             "{rendered}"
         );
-        assert!(rendered.contains("Read the changed range again"), "{rendered}");
+        assert!(
+            rendered.contains("Read the changed range again"),
+            "{rendered}"
+        );
         assert!(!agent.state.lock().await.must_reread_before_edit.is_empty());
     }
 
@@ -12548,8 +12586,7 @@ Irrespective of whether additional information or instructions are given, you ar
             "content": "fn main() {}\n"
         });
 
-        let edit_paths =
-            extract_file_action_path("edit_file", &edit_params, workspace.path());
+        let edit_paths = extract_file_action_path("edit_file", &edit_params, workspace.path());
         let write_paths =
             extract_file_action_path("write_to_file", &write_params, workspace.path());
 
@@ -13967,8 +14004,8 @@ Irrespective of whether additional information or instructions are given, you ar
                 StorageMessage {
                     id: None,
                     role: MessageRole::Assistant,
-                    content: MessageContent::AssistantBlocks(vec![
-                        AssistantContentBlock::ToolUse(ToolUseBlock {
+                    content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                        ToolUseBlock {
                             id: id.clone(),
                             name: "search_files".to_string(),
                             input: serde_json::json!({}),
@@ -13977,8 +14014,8 @@ Irrespective of whether additional information or instructions are given, you ar
                                 signature: None,
                             },
                             reasoning_details: None,
-                        }),
-                    ]),
+                        },
+                    )]),
                     model_info: None,
                     metrics: None,
                     ts: None,
@@ -14048,8 +14085,8 @@ Irrespective of whether additional information or instructions are given, you ar
                 StorageMessage {
                     id: None,
                     role: MessageRole::Assistant,
-                    content: MessageContent::AssistantBlocks(vec![
-                        AssistantContentBlock::ToolUse(ToolUseBlock {
+                    content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                        ToolUseBlock {
                             id: id.clone(),
                             name: "get_file_skeleton".to_string(),
                             input: serde_json::json!({}),
@@ -14058,8 +14095,8 @@ Irrespective of whether additional information or instructions are given, you ar
                                 signature: None,
                             },
                             reasoning_details: None,
-                        }),
-                    ]),
+                        },
+                    )]),
                     model_info: None,
                     metrics: None,
                     ts: None,
@@ -14129,8 +14166,8 @@ Irrespective of whether additional information or instructions are given, you ar
                 StorageMessage {
                     id: None,
                     role: MessageRole::Assistant,
-                    content: MessageContent::AssistantBlocks(vec![
-                        AssistantContentBlock::ToolUse(ToolUseBlock {
+                    content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                        ToolUseBlock {
                             id: id.clone(),
                             name: "edit_file".to_string(),
                             input: serde_json::json!({}),
@@ -14139,8 +14176,8 @@ Irrespective of whether additional information or instructions are given, you ar
                                 signature: None,
                             },
                             reasoning_details: None,
-                        }),
-                    ]),
+                        },
+                    )]),
                     model_info: None,
                     metrics: None,
                     ts: None,
@@ -14211,8 +14248,8 @@ Irrespective of whether additional information or instructions are given, you ar
                 StorageMessage {
                     id: None,
                     role: MessageRole::Assistant,
-                    content: MessageContent::AssistantBlocks(vec![
-                        AssistantContentBlock::ToolUse(ToolUseBlock {
+                    content: MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                        ToolUseBlock {
                             id: id.clone(),
                             name: tool.to_string(),
                             input: serde_json::json!({}),
@@ -14221,8 +14258,8 @@ Irrespective of whether additional information or instructions are given, you ar
                                 signature: None,
                             },
                             reasoning_details: None,
-                        }),
-                    ]),
+                        },
+                    )]),
                     model_info: None,
                     metrics: None,
                     ts: None,
@@ -14299,8 +14336,7 @@ Irrespective of whether additional information or instructions are given, you ar
             "Most recent shell output must not be compacted"
         );
         assert!(
-            !texts[1].contains(&"y".repeat(5000))
-                && texts[1].contains("Earlier shell output"),
+            !texts[1].contains(&"y".repeat(5000)) && texts[1].contains("Earlier shell output"),
             "Oldest large shell output must be collapsed, got: {}",
             &texts[1][..texts[1].len().min(200)]
         );
@@ -15578,9 +15614,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 blocks
                     .iter()
                     .filter_map(|block| match block {
-                        AssistantContentBlock::ToolUse(tool_use) => {
-                            Some(tool_use.id.clone())
-                        }
+                        AssistantContentBlock::ToolUse(tool_use) => Some(tool_use.id.clone()),
                         _ => None,
                     })
                     .collect()
@@ -15588,9 +15622,7 @@ Irrespective of whether additional information or instructions are given, you ar
             .unwrap_or_default()
     }
 
-    fn stored_tool_results(
-        history: &[crate::providers::StorageMessage],
-    ) -> Vec<(String, String)> {
+    fn stored_tool_results(history: &[crate::providers::StorageMessage]) -> Vec<(String, String)> {
         use crate::providers::{MessageContent, ToolResultContent, UserContentBlock};
         history
             .iter()
@@ -15851,9 +15883,7 @@ Irrespective of whether additional information or instructions are given, you ar
                     function: ApiStreamToolCallFunction {
                         id: None,
                         name: Some("read_file".to_string()),
-                        arguments: Some(
-                            serde_json::json!({"path": "shown.txt"}).to_string(),
-                        ),
+                        arguments: Some(serde_json::json!({"path": "shown.txt"}).to_string()),
                     },
                     signature: None,
                 },

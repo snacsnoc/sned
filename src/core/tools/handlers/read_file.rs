@@ -10,6 +10,7 @@
 //! - Handle errors gracefully
 
 use crate::core::agent_loop::TaskState;
+use crate::core::agent_types::{ReadCoverage, ReadCoverageCandidate};
 use crate::core::file_editor::{AnchorStateManager, normalize_file_content, split_content_lines};
 use crate::core::hash_utils::{
     ANCHOR_GUIDANCE, anchor_guidance, content_hash, format_numbered_line_with_hash,
@@ -96,9 +97,15 @@ struct FileReadResult {
     canonical_path: Option<String>,
     content: String,
     hash: String,
+    /// Strong revision derived from the bytes read for this result. It is
+    /// present only for full-file reads that can safely participate in
+    /// coverage suppression.
+    revision: Option<String>,
     success: bool,
     refreshes_edit_context: bool,
     visible_range: Option<(usize, usize, usize)>,
+    /// The actual file window returned before history-size truncation.
+    source_range: Option<(usize, usize, usize)>,
     error: Option<String>,
 }
 
@@ -144,9 +151,11 @@ impl ReadFileHandler {
             canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
             content: String::new(),
             hash: String::new(),
+            revision: None,
             success: false,
             refreshes_edit_context: false,
             visible_range: None,
+            source_range: None,
             error: Some(format!(
                 "Line-range read requires a file no larger than {max_kb}KB, but this file is {actual_kb}KB. Ask the user to restart Sned with a higher SNED_MAX_FILE_READ_SIZE. For a supported definition, get_function or get_file_skeleton can provide anchors only for the lines they return."
             )),
@@ -159,9 +168,11 @@ impl ReadFileHandler {
             canonical_path: None,
             content: String::new(),
             hash: String::new(),
+            revision: None,
             success: false,
             refreshes_edit_context: false,
             visible_range: None,
+            source_range: None,
             error: Some(format!(
                 "Invalid line range: start_line ({start_line}) must be less than or equal to end_line ({end_line}). Re-issue read_file with start_line <= end_line."
             )),
@@ -237,7 +248,6 @@ impl ReadFileHandler {
         results
     }
 
-
     /// Read a single file with optional line range.
     ///
     /// Returns the file content with hash-anchored lines if successful,
@@ -287,9 +297,11 @@ impl ReadFileHandler {
                     canonical_path: None,
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(err.display()),
                 };
             }
@@ -305,9 +317,11 @@ impl ReadFileHandler {
                     canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(err.display()),
                 };
             }
@@ -323,9 +337,11 @@ impl ReadFileHandler {
                 canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                 content: String::new(),
                 hash: String::new(),
+                revision: None,
                 success: false,
                 refreshes_edit_context: false,
                 visible_range: None,
+                source_range: None,
                 error: Some(err.display()),
             };
         }
@@ -441,9 +457,11 @@ impl ReadFileHandler {
                     canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(format!(
                         "Unable to persist editable anchor state for {display_path}: {error}"
                     )),
@@ -468,9 +486,11 @@ impl ReadFileHandler {
                 canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                 content: String::new(),
                 hash: String::new(),
+                revision: None,
                 success: false,
                 refreshes_edit_context: false,
                 visible_range: None,
+                source_range: None,
                 error: Some(format!(
                     "Internal error: anchor/line length mismatch for {}: {} lines vs {} anchors",
                     display_path,
@@ -513,6 +533,15 @@ impl ReadFileHandler {
             content_for_hash
         };
         let hash = content_hash(&hash_content);
+        let revision = if refreshes_edit_context {
+            use sha2::{Digest, Sha256};
+            Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(hash_content.as_bytes())
+            ))
+        } else {
+            None
+        };
 
         let guidance = if refreshes_edit_context {
             anchor_guidance(lines_for_reconcile.len())
@@ -558,9 +587,31 @@ impl ReadFileHandler {
             canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
             content,
             hash,
+            revision,
             success: true,
             refreshes_edit_context,
             visible_range: Some((
+                if has_line_range {
+                    if refreshes_edit_context {
+                        range_start + 1
+                    } else {
+                        line_number_offset + 1
+                    }
+                } else {
+                    1
+                },
+                if has_line_range {
+                    if refreshes_edit_context {
+                        range_end
+                    } else {
+                        line_number_offset + range_end
+                    }
+                } else {
+                    lines_for_reconcile.len()
+                },
+                lines_for_reconcile.len(),
+            )),
+            source_range: Some((
                 if has_line_range {
                     if refreshes_edit_context {
                         range_start + 1
@@ -617,9 +668,11 @@ impl ReadFileHandler {
                     canonical_path: None,
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -636,9 +689,11 @@ impl ReadFileHandler {
                     canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -660,9 +715,11 @@ impl ReadFileHandler {
                         canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                         content: String::new(),
                         hash: String::new(),
+                        revision: None,
                         success: false,
                         refreshes_edit_context: false,
                         visible_range: None,
+                        source_range: None,
                         error: Some(err.display()),
                     });
                 }
@@ -770,9 +827,11 @@ impl ReadFileHandler {
                     canonical_path: None,
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -789,9 +848,11 @@ impl ReadFileHandler {
                     canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -828,9 +889,11 @@ impl ReadFileHandler {
                         canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                         content: String::new(),
                         hash: String::new(),
+                        revision: None,
                         success: false,
                         refreshes_edit_context: false,
                         visible_range: None,
+                        source_range: None,
                         error: Some(err.display()),
                     });
                 }
@@ -888,9 +951,11 @@ impl ReadFileHandler {
                             canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                             content: String::new(),
                             hash: String::new(),
+                            revision: None,
                             success: false,
                             refreshes_edit_context: false,
                             visible_range: None,
+                            source_range: None,
                             error: Some(err.display()),
                         }
                     })?;
@@ -956,9 +1021,11 @@ impl ReadFileHandler {
                     canonical_path: None,
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -988,9 +1055,11 @@ impl ReadFileHandler {
                     canonical_path: None,
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -1005,9 +1074,11 @@ impl ReadFileHandler {
                     canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -1022,9 +1093,11 @@ impl ReadFileHandler {
                     canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
                     content: String::new(),
                     hash: String::new(),
+                    revision: None,
                     success: false,
                     refreshes_edit_context: false,
                     visible_range: None,
+                    source_range: None,
                     error: Some(err.display()),
                 });
             }
@@ -1127,6 +1200,124 @@ impl ReadFileHandler {
         }
     }
 
+    fn merge_coverage(
+        coverage: &mut ReadCoverage,
+        revision: &str,
+        total_lines: Option<usize>,
+        range: (usize, usize),
+    ) {
+        if coverage.revision != revision {
+            coverage.revision = revision.to_string();
+            coverage.total_lines = total_lines;
+            coverage.ranges.clear();
+        } else if total_lines.is_some() {
+            coverage.total_lines = total_lines;
+        }
+
+        let (start, end) = range;
+        if start > end {
+            return;
+        }
+        coverage.ranges.push((start, end));
+        coverage
+            .ranges
+            .sort_unstable_by_key(|(range_start, _)| *range_start);
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(coverage.ranges.len());
+        for (next_start, next_end) in coverage.ranges.drain(..) {
+            if let Some((_, merged_end)) = merged.last_mut()
+                && next_start <= merged_end.saturating_add(1)
+            {
+                *merged_end = (*merged_end).max(next_end);
+            } else {
+                merged.push((next_start, next_end));
+            }
+        }
+        coverage.ranges = merged;
+    }
+
+    fn range_is_covered(coverage: &ReadCoverage, start: usize, end: usize) -> bool {
+        start <= end
+            && coverage
+                .ranges
+                .iter()
+                .any(|(covered_start, covered_end)| *covered_start <= start && *covered_end >= end)
+    }
+
+    /// Apply suppression only after limit_visible_results has reduced each
+    /// result to the source that can fit in model history. This keeps local
+    /// handler output from being mistaken for model-visible content.
+    fn apply_read_coverage(
+        state: &mut TaskState,
+        results: &mut [FileReadResult],
+        refresh: bool,
+    ) -> Vec<ReadCoverageCandidate> {
+        let mut candidates = Vec::new();
+        for result in results {
+            let Some(canonical) = result.canonical_path.clone() else {
+                continue;
+            };
+            let Some((visible_start, visible_end, _total_lines)) = result.visible_range else {
+                continue;
+            };
+            let Some((source_start, source_end, source_total)) = result.source_range else {
+                continue;
+            };
+            if !result.success || !result.refreshes_edit_context || result.hash.is_empty() {
+                continue;
+            }
+            let Some(revision) = result.revision.clone() else {
+                continue;
+            };
+
+            let coverage = state.read_file_coverage.get(&canonical);
+
+            let requested_start = source_start;
+            let requested_end = source_end;
+            if !refresh
+                && coverage.is_some_and(|coverage| {
+                    coverage.revision == revision
+                        && Self::range_is_covered(coverage, requested_start, requested_end)
+                })
+            {
+                result.content = format!(
+                    "Already read: {}\nRevision: {}\nLines {requested_start}–{requested_end} were already supplied in the current context. Reuse the existing content; use refresh=true only if a fresh copy is needed.",
+                    result.path, revision
+                );
+                result.visible_range = None;
+                result.source_range = None;
+                result.refreshes_edit_context = false;
+                continue;
+            }
+
+            candidates.push(ReadCoverageCandidate {
+                canonical_path: canonical,
+                revision,
+                total_lines: source_total,
+                range: (visible_start, visible_end),
+            });
+        }
+        candidates
+    }
+
+    pub(crate) fn commit_pending_read_coverage(state: &mut TaskState) {
+        let candidates = std::mem::take(&mut state.pending_read_coverage);
+        for candidate in candidates {
+            let coverage = state
+                .read_file_coverage
+                .entry(candidate.canonical_path)
+                .or_insert_with(|| ReadCoverage {
+                    revision: candidate.revision.clone(),
+                    total_lines: Some(candidate.total_lines),
+                    ranges: Vec::new(),
+                });
+            Self::merge_coverage(
+                coverage,
+                &candidate.revision,
+                Some(candidate.total_lines),
+                candidate.range,
+            );
+        }
+    }
 
     fn warning_reserve(state: &TaskState, results: &[FileReadResult]) -> usize {
         results
@@ -1324,12 +1515,16 @@ impl ReadFileHandler {
         task_id: Option<&str>,
         output_writer: Option<&crate::cli::output::OutputWriterArc>,
     ) -> Result<String, ToolError> {
+        let refresh = params.get("refresh").and_then(serde_json::Value::as_bool) == Some(true);
         let (paths, results, start_line, end_line) = self
             .execute_with_results(params, anchor_mgr, task_id, output_writer)
             .await?;
         let mut results = results;
         let warning_reserve = Self::warning_reserve(state, &results);
         Self::limit_visible_results(&mut results, warning_reserve);
+        let candidates = Self::apply_read_coverage(state, &mut results, refresh);
+        state.pending_read_coverage.extend(candidates);
+        Self::commit_pending_read_coverage(state);
         Self::track_read_files(state, &paths, &results, start_line, end_line);
         let mut warnings = Self::read_loop_warnings(state, &paths, &results);
         let output = Self::format_results(results.clone());
@@ -1543,9 +1738,7 @@ impl ToolHandler for ReadFileHandler {
         let handler = self.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
-            // Accepted for compatibility (models still send it); reads are
-            // always fresh so there is nothing to force.
-            let _refresh = params.get("refresh").and_then(serde_json::Value::as_bool) == Some(true);
+            let refresh = params.get("refresh").and_then(serde_json::Value::as_bool) == Some(true);
             let (paths, start_line, end_line) = Self::parse_params(&params)?;
             let display_paths: Vec<String> = paths
                 .iter()
@@ -1588,6 +1781,8 @@ impl ToolHandler for ReadFileHandler {
                 let mut results = results;
                 let warning_reserve = Self::warning_reserve(&state, &results);
                 Self::limit_visible_results(&mut results, warning_reserve);
+                let candidates = Self::apply_read_coverage(&mut state, &mut results, refresh);
+                state.pending_read_coverage.extend(candidates);
                 Self::track_read_files(&mut state, &paths, &results, start_line, end_line);
                 let mut warnings = Self::read_loop_warnings(&state, &paths, &results);
                 let output = Self::format_results(results.clone());
@@ -1636,6 +1831,11 @@ mod tests {
             Arc::new(crate::cli::output::StderrOutputWriter),
             false,
         )
+    }
+
+    async fn commit_coverage(context: &ToolContext) {
+        let mut state = context.state.lock().await;
+        ReadFileHandler::commit_pending_read_coverage(&mut state);
     }
 
     #[test]
@@ -1743,6 +1943,7 @@ mod tests {
         .await
         .unwrap();
         let first_text = first.as_str().unwrap();
+        commit_coverage(&context).await;
         assert!(
             first_text.contains("974 lines total, Lines 1–"),
             "{first_text}"
@@ -1774,6 +1975,7 @@ mod tests {
         let result = second.as_str().unwrap();
         assert!(result.contains("§line 0730"), "{result}");
         assert!(!result.starts_with("Already read:"));
+        commit_coverage(&context).await;
 
         let third = ToolHandler::execute(
             &handler,
@@ -1787,9 +1989,8 @@ mod tests {
         .await
         .unwrap();
         let result = third.as_str().unwrap();
-        // Re-reads always serve fresh lines; no "Already read" refusal.
-        assert!(!result.starts_with("Already read:"), "{result}");
-        assert!(result.contains("§line 0740"), "{result}");
+        assert!(result.starts_with("Already read:"), "{result}");
+        assert!(!result.contains("§line 0740"), "{result}");
 
         let close_up = ToolHandler::execute(
             &handler,
@@ -1803,8 +2004,8 @@ mod tests {
         .await
         .unwrap();
         let result = close_up.as_str().unwrap();
-        assert!(result.contains("§line 0730"), "{result}");
-        assert!(!result.starts_with("Already read:"));
+        assert!(result.starts_with("Already read:"), "{result}");
+        assert!(!result.contains("§line 0730"), "{result}");
     }
 
     #[tokio::test]
@@ -1827,6 +2028,7 @@ mod tests {
         .await
         .unwrap();
         let output = first.as_str().unwrap();
+        commit_coverage(&context).await;
         assert!(output.len() <= crate::core::agent_loop::tool_result_history_limit());
         assert!(
             output.len() > crate::core::agent_loop::tool_result_history_limit() - 2_048,
@@ -1858,6 +2060,7 @@ mod tests {
         .await
         .unwrap();
         assert!(unseen.as_str().unwrap().contains("§d.txt line 0450"));
+        commit_coverage(&context).await;
         let repeated = ToolHandler::execute(
             &handler,
             &context,
@@ -1865,9 +2068,73 @@ mod tests {
         )
         .await
         .unwrap();
-        // Re-reads always serve fresh lines; no "Already read" refusal.
-        assert!(repeated.as_str().unwrap().contains("§d.txt line 0455"));
-        assert!(!repeated.as_str().unwrap().starts_with("Already read:"));
+        assert!(repeated.as_str().unwrap().starts_with("Already read:"));
+        assert!(!repeated.as_str().unwrap().contains("§d.txt line 0455"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_paths_in_one_batch_keep_only_one_visible_source_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.txt"), "alpha\nbeta\ngamma").unwrap();
+        let context = coverage_context(&directory);
+
+        let result = ToolHandler::execute(
+            &ReadFileHandler::new(),
+            &context,
+            serde_json::json!({"paths": ["a.txt", "a.txt"]}),
+        )
+        .await
+        .unwrap();
+        let text = result.as_str().unwrap();
+        assert_eq!(text.matches("§alpha").count(), 2, "{text}");
+        assert!(!text.contains("Already read: a.txt"), "{text}");
+        {
+            let state = context.state.lock().await;
+            assert!(state.read_file_coverage.is_empty());
+            assert_eq!(state.pending_read_coverage.len(), 2);
+        }
+        commit_coverage(&context).await;
+        let repeated = ToolHandler::execute(
+            &ReadFileHandler::new(),
+            &context,
+            serde_json::json!({"paths": ["a.txt"]}),
+        )
+        .await
+        .unwrap();
+        assert!(repeated.as_str().unwrap().starts_with("Already read:"));
+    }
+
+    #[tokio::test]
+    async fn beyond_eof_clamp_does_not_hide_uncovered_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let content = (1..=500)
+            .map(|line| format!("line {line:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(directory.path().join("a.txt"), content).unwrap();
+        let context = coverage_context(&directory);
+        let handler = ReadFileHandler::new();
+
+        let tail = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["a.txt"], "start_line": 500, "end_line": 500}),
+        )
+        .await
+        .unwrap();
+        assert!(tail.as_str().unwrap().contains("§line 0500"));
+        commit_coverage(&context).await;
+
+        let clamped = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["a.txt"], "start_line": 900, "end_line": 1000}),
+        )
+        .await
+        .unwrap();
+        let text = clamped.as_str().unwrap();
+        assert!(!text.starts_with("Already read:"), "{text}");
+        assert!(text.contains("§line 0451"), "{text}");
     }
 
     #[tokio::test]
@@ -1882,6 +2149,7 @@ mod tests {
             ToolHandler::execute(&handler, &context, serde_json::json!({"paths": [path]}))
                 .await
                 .unwrap();
+            commit_coverage(&context).await;
         }
         let repeated = ToolHandler::execute(
             &handler,
@@ -1890,21 +2158,26 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(repeated.as_str().unwrap().contains("§beta"));
-        assert!(!repeated.as_str().unwrap().starts_with("Already read:"));
+        assert!(repeated.as_str().unwrap().starts_with("Already read:"));
+        assert!(!repeated.as_str().unwrap().contains("§beta"));
     }
 
     #[tokio::test]
-    async fn rereads_always_serve_fresh_lines() {
+    async fn covered_reads_are_suppressed_and_refresh_restores_source() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("a.txt"), "one\ntwo\nthree\nfour\nfive").unwrap();
+        std::fs::write(
+            directory.path().join("a.txt"),
+            "one\ntwo\nthree\nfour\nfive",
+        )
+        .unwrap();
         let context = coverage_context(&directory);
         let handler = ReadFileHandler::new();
         ToolHandler::execute(&handler, &context, serde_json::json!({"paths": ["a.txt"]}))
             .await
             .unwrap();
+        commit_coverage(&context).await;
 
-        for (start, end, marker) in [(1, 2, "§one"), (4, 5, "§four"), (4, 5, "§four")] {
+        for (start, end) in [(1, 2), (4, 5)] {
             let reread = ToolHandler::execute(
                 &handler,
                 &context,
@@ -1913,9 +2186,22 @@ mod tests {
             .await
             .unwrap();
             let text = reread.as_str().unwrap();
-            assert!(!text.starts_with("Already read:"), "{text}");
-            assert!(text.contains(marker), "{text}");
+            assert!(text.starts_with("Already read:"), "{text}");
+            assert!(!text.contains('§'), "{text}");
         }
+        let refreshed = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({
+                "paths": ["a.txt"],
+                "start_line": 4,
+                "end_line": 5,
+                "refresh": true
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(refreshed.as_str().unwrap().contains("§four"));
     }
 
     #[tokio::test]
@@ -1932,6 +2218,7 @@ mod tests {
             ToolHandler::execute(&handler, &context, serde_json::json!({"paths": [path]}))
                 .await
                 .unwrap();
+            commit_coverage(&context).await;
         }
         context.invalidate_edit_context(&second_path).await;
 
@@ -1939,7 +2226,8 @@ mod tests {
             ToolHandler::execute(&handler, &context, serde_json::json!({"paths": ["a.txt"]}))
                 .await
                 .unwrap();
-        assert!(first.as_str().unwrap().contains("§alpha"));
+        assert!(first.as_str().unwrap().starts_with("Already read:"));
+        assert!(!first.as_str().unwrap().contains("§alpha"));
 
         let second =
             ToolHandler::execute(&handler, &context, serde_json::json!({"paths": ["b.txt"]}))
@@ -1963,6 +2251,7 @@ mod tests {
             )
             .await
             .unwrap();
+            commit_coverage(&context).await;
             assert!(result.as_str().unwrap().contains("§"));
             assert!(!result.as_str().unwrap().starts_with("Already read:"));
         }
@@ -1974,8 +2263,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(covered.as_str().unwrap().contains("§two"));
-        assert!(!covered.as_str().unwrap().starts_with("Already read:"));
+        assert!(covered.as_str().unwrap().starts_with("Already read:"));
+        assert!(!covered.as_str().unwrap().contains('§'));
+        let repeated = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["a.txt"], "start_line": 2, "end_line": 3}),
+        )
+        .await
+        .unwrap();
+        assert!(repeated.as_str().unwrap().starts_with("Already read:"));
     }
 
     #[tokio::test]
@@ -1990,6 +2287,7 @@ mod tests {
         ToolHandler::execute(&handler, &context, params.clone())
             .await
             .unwrap();
+        commit_coverage(&context).await;
         let forced = ToolHandler::execute(
             &handler,
             &context,
@@ -1998,6 +2296,7 @@ mod tests {
         .await
         .unwrap();
         assert!(forced.as_str().unwrap().contains("§beta"));
+        commit_coverage(&context).await;
 
         let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::fs::write(&path, "alpha\nzeta\n").unwrap();
@@ -2012,6 +2311,31 @@ mod tests {
             .unwrap();
         assert!(changed.as_str().unwrap().contains("§zeta"));
         assert!(!changed.as_str().unwrap().starts_with("Already read:"));
+    }
+
+    #[tokio::test]
+    async fn coverage_revision_is_stable_across_crlf_normalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("a.txt");
+        std::fs::write(&path, b"alpha\r\nbeta\r\n").unwrap();
+        let context = coverage_context(&directory);
+        let handler = ReadFileHandler::new();
+
+        let first =
+            ToolHandler::execute(&handler, &context, serde_json::json!({"paths": ["a.txt"]}))
+                .await
+                .unwrap();
+        assert!(first.as_str().unwrap().contains("§alpha"));
+        commit_coverage(&context).await;
+
+        // read_file exposes normalized LF lines, so an external rewrite that
+        // changes only CRLF to LF must not invalidate identical visible text.
+        std::fs::write(&path, b"alpha\nbeta\n").unwrap();
+        let repeated =
+            ToolHandler::execute(&handler, &context, serde_json::json!({"paths": ["a.txt"]}))
+                .await
+                .unwrap();
+        assert!(repeated.as_str().unwrap().starts_with("Already read:"));
     }
 
     fn drain_rendered_output(
@@ -2096,6 +2420,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_success() {
+        use sha2::Digest as _;
+
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "Hello, world!").unwrap();
 
@@ -2115,6 +2441,11 @@ mod tests {
         assert!(result.success);
         assert!(result.content.contains("Hello, world!"));
         assert!(result.content.contains("[File: "));
+        let expected_revision = format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest("Hello, world!\n".as_bytes())
+        );
+        assert_eq!(result.revision.as_deref(), Some(expected_revision.as_str()));
         assert_eq!(result.error, None);
     }
 
@@ -2380,9 +2711,9 @@ mod tests {
             .content
             .lines()
             .filter(|line| {
-                line.split_once(':')
-                    .is_some_and(|(number, _)| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
-                    && line.contains('§')
+                line.split_once(':').is_some_and(|(number, _)| {
+                    !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+                }) && line.contains('§')
             })
             .collect();
         assert_eq!(numbered.len(), 2);
@@ -2996,7 +3327,12 @@ mod tests {
 
         assert!(result.as_str().unwrap().contains("§content"));
         assert!(!result.as_str().unwrap().starts_with("Already read:"));
-        assert!(result.as_str().unwrap().contains("has overlapping read ranges"));
+        assert!(
+            result
+                .as_str()
+                .unwrap()
+                .contains("has overlapping read ranges")
+        );
     }
 
     #[tokio::test]
@@ -3120,7 +3456,8 @@ mod tests {
         for i in 1..=3 {
             state.turns_completed = i;
             let params = serde_json::json!({
-                "paths": [temp_file.path().to_str().unwrap()]
+                "paths": [temp_file.path().to_str().unwrap()],
+                "refresh": true
             });
             let _ = handler
                 .execute(&mut state, params, &anchor_mgr, Some("test-task"), None)
@@ -3171,7 +3508,10 @@ mod tests {
         handler
             .execute(
                 &mut state,
-                serde_json::json!({"paths": [temp_file.path().to_str().unwrap()]}),
+                serde_json::json!({
+                    "paths": [temp_file.path().to_str().unwrap()],
+                    "refresh": true
+                }),
                 &anchor_mgr,
                 Some("test-task"),
                 None,
@@ -3234,7 +3574,8 @@ mod tests {
         for round in 2..=3 {
             state.turns_completed = round;
             let params = serde_json::json!({
-                "paths": [temp_file.path().to_str().unwrap()]
+                "paths": [temp_file.path().to_str().unwrap()],
+                "refresh": true
             });
             let output = handler
                 .execute(&mut state, params, &anchor_mgr, Some("slicing-task"), None)
@@ -3279,6 +3620,7 @@ mod tests {
                 "paths": [temp_file.path().to_str().unwrap()],
                 "start_line": start,
                 "end_line": end,
+                "refresh": true,
             });
             let output = handler
                 .execute(&mut state, params, &anchor_mgr, Some("thrash-task"), None)
@@ -3310,6 +3652,7 @@ mod tests {
                 "paths": [temp_file.path().to_str().unwrap()],
                 "start_line": start,
                 "end_line": end,
+                "refresh": true,
             });
             let output = handler
                 .execute(&mut state, params, &anchor_mgr, Some("scan-task"), None)

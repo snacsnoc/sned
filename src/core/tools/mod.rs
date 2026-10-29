@@ -321,6 +321,11 @@ impl ToolContext {
         state.consecutive_reads.remove(&key);
         state.last_read_turn.remove(&key);
         state.recent_read_windows.remove(&key);
+        state.read_file_snapshots.remove(&key);
+        state.read_file_coverage.remove(&key);
+        state
+            .pending_read_coverage
+            .retain(|candidate| candidate.canonical_path != key);
         // A write does not deliver fresh anchors. Keep the old dictionary so the
         // next read can retire old words, and require that read before editing.
         state.must_reread_before_edit.insert(key);
@@ -831,7 +836,10 @@ pub(crate) fn parse_relaxed_stringified_string_array(value: &str) -> Option<Vec<
             continue;
         }
         if character == '"' {
-            let remaining = scan.clone().map(|(_, character)| character).collect::<String>();
+            let remaining = scan
+                .clone()
+                .map(|(_, character)| character)
+                .collect::<String>();
             let remaining = remaining.trim_start();
             if let Some(after_comma) = remaining.strip_prefix(',')
                 && after_comma.trim_start().starts_with('"')
