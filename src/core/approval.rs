@@ -771,7 +771,10 @@ pub(crate) fn split_command_segments(s: &str) -> Vec<&str> {
             start = i;
             continue;
         }
-        if b == b'\\' && i + 1 < bytes.len() {
+        // Backslashes are literal inside single quotes.  Skipping the next
+        // byte there can hide a quote that closes the string and make a real
+        // command separator look quoted to the safety checks.
+        if b == b'\\' && !in_single && i + 1 < bytes.len() {
             i += 2;
             continue;
         }
@@ -1034,13 +1037,9 @@ impl ApprovalManager {
                 root.display()
             ));
         }
-        let canonical_workspace_root = self
-            .workspace_root
-            .as_ref()
-            .map(|workspace_root| {
-                std::fs::canonicalize(workspace_root)
-                    .unwrap_or_else(|_| PathBuf::from(workspace_root))
-            });
+        let canonical_workspace_root = self.workspace_root.as_ref().map(|workspace_root| {
+            std::fs::canonicalize(workspace_root).unwrap_or_else(|_| PathBuf::from(workspace_root))
+        });
         if canonical_workspace_root
             .as_ref()
             .is_some_and(|workspace_root| root.starts_with(workspace_root))
@@ -1866,7 +1865,10 @@ fn format_tool_parameters_in_workspace(
                 .get("allow_commands")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let timeout = obj.get("timeout").and_then(serde_json::Value::as_i64).unwrap_or(300);
+            let timeout = obj
+                .get("timeout")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(300);
             output.push_str(&format!(
                 "\n    Subagents: {prompt_count} prompt(s), timeout {timeout}s"
             ));
@@ -2683,6 +2685,25 @@ mod tests {
 
         // The splitter must still catch a real unquoted `&`.
         assert!(checker.is_safe("ls & rm -rf /").is_err());
+    }
+
+    #[test]
+    fn test_single_quoted_backslash_does_not_hide_command_separator() {
+        let command = r"echo 'foo\'; touch /tmp/marker; echo 'bar'";
+
+        assert_eq!(
+            split_command_segments(command),
+            vec!["echo 'foo\\'", " touch /tmp/marker", " echo 'bar'"]
+        );
+        assert!(CommandSafetyChecker::new().is_safe(command).is_err());
+    }
+
+    #[test]
+    fn test_single_quoted_operators_remain_inert() {
+        let command = r"echo 'foo\;bar'";
+
+        assert_eq!(split_command_segments(command), vec![command]);
+        assert!(CommandSafetyChecker::new().is_safe(command).is_ok());
     }
 
     #[test]
