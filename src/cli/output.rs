@@ -1187,7 +1187,10 @@ impl ChannelOutputWriter {
 
 impl OutputWriter for ChannelOutputWriter {
     fn emit(&self, event: OutputEvent) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let OutputEvent::ReasoningChunk(chunk) = event {
             let sequence = inner.next_sequence;
@@ -1296,7 +1299,10 @@ impl OutputWriter for ChannelOutputWriter {
     }
 
     fn flush_deferred_finalized_events(&self) -> (usize, usize) {
-        let mut inner = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.flush_deferred_finalized_events_inner(&mut inner)
     }
 

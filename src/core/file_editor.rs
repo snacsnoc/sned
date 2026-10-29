@@ -2707,11 +2707,11 @@ impl EditExecutor {
         lines: &[String],
     ) -> Result<(usize, usize), String> {
         let source_lines = raw.split('\n').collect::<Vec<_>>();
-        let first_line = source_lines[0].strip_suffix('\r').unwrap_or(source_lines[0]);
+        let first_line = source_lines[0]
+            .strip_suffix('\r')
+            .unwrap_or(source_lines[0]);
         let (first_word, first_content) = split_anchor(first_line);
-        if !first_line.contains(ANCHOR_DELIMITER)
-            || !ANCHOR_NAME_REGEX.is_match(&first_word)
-        {
+        if !first_line.contains(ANCHOR_DELIMITER) || !ANCHOR_NAME_REGEX.is_match(&first_word) {
             return Err("A multiline anchored block must start with a complete Word§source line from read_file.".to_string());
         }
         let anchored_continuations = source_lines[1..]
@@ -2739,14 +2739,16 @@ impl EditExecutor {
                 .iter()
                 .enumerate()
                 .filter(|(start, word)| {
-                    expected.iter().enumerate().all(|(offset, (expected_word, expected_content))| {
-                        start
-                            .checked_add(offset)
-                            .is_some_and(|index| {
-                                expected_word.as_ref().is_none_or(|word| line_hashes.get(index) == Some(word))
+                    expected.iter().enumerate().all(
+                        |(offset, (expected_word, expected_content))| {
+                            start.checked_add(offset).is_some_and(|index| {
+                                expected_word
+                                    .as_ref()
+                                    .is_none_or(|word| line_hashes.get(index) == Some(word))
                                     && lines.get(index) == Some(expected_content)
                             })
-                    }) && *word == &first_word
+                        },
+                    ) && *word == &first_word
                 })
                 .map(|(start, _)| start)
                 .collect::<Vec<_>>()
@@ -5492,21 +5494,16 @@ mod tests {
             "second".to_string(),
             "third".to_string(),
         ];
-        let hashes = vec![
-            "Alpha".to_string(),
-            "Beta".to_string(),
-            "Gamma".to_string(),
-        ];
+        let hashes = vec!["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()];
 
         // The word binds line 0 but the quoted content is line 2: a
         // miscopied prefix must not silently edit the wrong line.
-        let (idx, error) =
-            executor.resolve_anchor("anchor", "Alpha§third", &hashes, &lines);
+        let (idx, error) = executor.resolve_anchor("anchor", "Alpha§third", &hashes, &lines);
         assert_eq!(idx, usize::MAX);
         assert!(error.is_some());
     }
 
-        #[test]
+    #[test]
     fn test_block_mode_tolerates_pasted_line_number_gutters() {
         let executor = EditExecutor::new();
         let lines = vec![
@@ -5514,11 +5511,7 @@ mod tests {
             "        sdr_core_skip(core)".to_string(),
             "    }".to_string(),
         ];
-        let hashes = vec![
-            "AxA".to_string(),
-            "AxB".to_string(),
-            "AxC".to_string(),
-        ];
+        let hashes = vec!["AxA".to_string(), "AxB".to_string(), "AxC".to_string()];
         let edit = Edit {
             anchor: String::new(),
             end_anchor: None,
@@ -5531,7 +5524,10 @@ mod tests {
             ),
         };
         let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
-        assert!(failed.is_empty(), "guttered old_text must resolve: {failed:?}");
+        assert!(
+            failed.is_empty(),
+            "guttered old_text must resolve: {failed:?}"
+        );
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].line_idx, 0);
     }
@@ -5640,11 +5636,16 @@ mod tests {
         let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
         assert!(resolved.is_empty());
         assert_eq!(failed.len(), 1);
-        assert!(failed[0].error.contains("cannot position"), "{:?}", failed[0].error);
+        assert!(
+            failed[0].error.contains("cannot position"),
+            "{:?}",
+            failed[0].error
+        );
     }
 
     #[test]
-    fn test_multiline_anchor_field_resolves_consecutive_span() {        let executor = EditExecutor::new();
+    fn test_multiline_anchor_field_resolves_consecutive_span() {
+        let executor = EditExecutor::new();
         let lines = vec![
             "a".to_string(),
             "            ))".to_string(),
@@ -5673,7 +5674,10 @@ mod tests {
             old_text: None,
         };
         let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
-        assert!(failed.is_empty(), "consecutive anchored span must resolve: {failed:?}");
+        assert!(
+            failed.is_empty(),
+            "consecutive anchored span must resolve: {failed:?}"
+        );
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].line_idx, 1);
     }
@@ -5704,7 +5708,10 @@ mod tests {
             old_text: None,
         };
         let (resolved, failed) = executor.resolve_edits(&[edit], &lines, &hashes);
-        assert!(failed.is_empty(), "mixed continuations must resolve: {failed:?}");
+        assert!(
+            failed.is_empty(),
+            "mixed continuations must resolve: {failed:?}"
+        );
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].line_idx, 0);
     }
@@ -5749,8 +5756,7 @@ mod tests {
         for revision in 0..(MAX_RETIRED_ANCHORS + 64) {
             let _ = manager.reconcile("file", &[format!("revision {revision}")], Some("task"));
         }
-        let bytes =
-            std::fs::read(dir.path().join("anchor-tasks").join("task.json")).unwrap();
+        let bytes = std::fs::read(dir.path().join("anchor-tasks").join("task.json")).unwrap();
         let shard: TaskShard = serde_json::from_slice(&bytes).unwrap();
         let document = &shard.documents["file"];
         assert!(document.retired_anchors.len() <= MAX_RETIRED_ANCHORS);

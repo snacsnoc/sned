@@ -110,11 +110,7 @@ pub fn format_line_with_hash(content: &str, anchor: &str) -> String {
 /// Line-numbered read output: `NNN: Word§source`. The number lets models map
 /// compiler errors to lines without shell workarounds; parsers strip it.
 #[must_use]
-pub fn format_numbered_line_with_hash(
-    line_no: usize,
-    content: &str,
-    anchor: &str,
-) -> String {
+pub fn format_numbered_line_with_hash(line_no: usize, content: &str, anchor: &str) -> String {
     format!("{line_no}: {anchor}{ANCHOR_DELIMITER}{content}")
 }
 
@@ -316,7 +312,10 @@ mod tests {
         );
         assert_eq!(strip_line_number_gutter("979: AxD6§x"), "AxD6§x");
         assert_eq!(strip_line_number_gutter("AxD6§x"), "AxD6§x");
-        assert_eq!(strip_line_number_gutter("2024 was a year"), "2024 was a year");
+        assert_eq!(
+            strip_line_number_gutter("2024 was a year"),
+            "2024 was a year"
+        );
         let (word, content) = split_anchor("979: AxD6§    lock.withLock {");
         assert_eq!(word, "AxD6");
         assert_eq!(content, "    lock.withLock {");

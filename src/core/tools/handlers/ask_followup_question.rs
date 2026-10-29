@@ -72,7 +72,9 @@ impl AskFollowupQuestionHandler {
 
             ctx.output_writer.emit(OutputEvent::tool_output_line(
                 format!("\n{} {}\n", "[Sned Question]", question),
-                Style::default().fg(warning_fg()).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(warning_fg())
+                    .add_modifier(Modifier::BOLD),
             ));
 
             // Render the question text as markdown so the TUI displays

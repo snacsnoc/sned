@@ -858,8 +858,7 @@ fn write_scrollback_pending(
     let batch_bytes = pending.len() as u64;
     let batch_lines = String::from_utf8_lossy(pending).lines().count() as u64;
     pending.clear();
-    if state.known
-        && !should_rotate_scrollback(state.bytes, state.lines, batch_bytes, batch_lines)
+    if state.known && !should_rotate_scrollback(state.bytes, state.lines, batch_bytes, batch_lines)
     {
         state.bytes = state.bytes.saturating_add(batch_bytes);
         state.lines = state.lines.saturating_add(batch_lines);
@@ -1195,7 +1194,9 @@ impl App {
             .iter()
             .flat_map(|span| span.content.chars())
             .skip_while(|ch| ch.is_whitespace());
-        prefix.chars().all(|next| chars.next().is_some_and(|cell| cell == next))
+        prefix
+            .chars()
+            .all(|next| chars.next().is_some_and(|cell| cell == next))
     }
 
     fn allocate_output_line_id(&mut self) -> OutputLineId {
@@ -1793,8 +1794,7 @@ impl App {
         } else if self.cached_wrap_width == Some(wrap_width) {
             // Hot path: keep the cached row count in sync for simple appends
             // so the next render does not need to rescan the whole transcript.
-            let added_rows =
-                new_line_rows.saturating_add(usize::from(separator_before_line));
+            let added_rows = new_line_rows.saturating_add(usize::from(separator_before_line));
             self.cached_visual_rows = self.cached_visual_rows.saturating_add(added_rows);
         }
         if can_extend_layout && self.visual_layout_index.is_valid_for(wrap_width) {
@@ -1878,11 +1878,11 @@ impl App {
             let visible = crate::core::hash_utils::strip_hashes(&self.reasoning_partial_line);
             let line = Line::from(Span::styled(
                 format!("  Ɵ {}", Self::shorten_reasoning_line(&visible)),
-                Style::default().fg(crate::cli::tui::theme::accent()).add_modifier(
-                    crate::cli::tui::theme::reasoning_modifier_for(
+                Style::default()
+                    .fg(crate::cli::tui::theme::accent())
+                    .add_modifier(crate::cli::tui::theme::reasoning_modifier_for(
                         crate::cli::tui::theme::high_contrast(),
-                    ),
-                ),
+                    )),
             ));
             self.replace_last_stream_line(line, StreamKind::Reasoning);
             if complete {
@@ -3698,8 +3698,7 @@ impl App {
         {
             let old_max = max_offset;
             let grown_rows = self.output_visual_rows(wrap_width);
-            max_offset =
-                Self::max_scroll_offset_for(grown_rows, self.last_content_height);
+            max_offset = Self::max_scroll_offset_for(grown_rows, self.last_content_height);
             self.scroll_mode = ScrollMode::Manual;
             self.scroll_offset = max_offset.saturating_sub(old_max);
         }
@@ -4189,7 +4188,8 @@ impl App {
         line.spans
             .insert(0, Span::styled(marker.to_string(), marker_style));
         if !body.is_empty() {
-            line.spans.insert(1, Span::styled(body.to_string(), span.style));
+            line.spans
+                .insert(1, Span::styled(body.to_string(), span.style));
         }
     }
 
@@ -4475,35 +4475,35 @@ impl App {
         // tool/command bodies from their next header.
         matches!(
             (prev, next),
-            (BlockKind::Model, BlockKind::ToolHeader
-            | BlockKind::CommandHeader
-            | BlockKind::ToolOutput
-            | BlockKind::CommandOutput
-            | BlockKind::Reasoning
-            | BlockKind::UserPrompt
-            | BlockKind::BlockingPrompt
-            | BlockKind::Completion
-            | BlockKind::Error)
-            | (
+            (
+                BlockKind::Model,
+                BlockKind::ToolHeader
+                    | BlockKind::CommandHeader
+                    | BlockKind::ToolOutput
+                    | BlockKind::CommandOutput
+                    | BlockKind::Reasoning
+                    | BlockKind::UserPrompt
+                    | BlockKind::BlockingPrompt
+                    | BlockKind::Completion
+                    | BlockKind::Error
+            ) | (
                 _,
                 BlockKind::UserPrompt
-                | BlockKind::BlockingPrompt
-                | BlockKind::Completion
-                | BlockKind::Error,
-            )
-            | (
+                    | BlockKind::BlockingPrompt
+                    | BlockKind::Completion
+                    | BlockKind::Error,
+            ) | (
                 BlockKind::ToolOutput
-                | BlockKind::CommandOutput
-                | BlockKind::ToolHeader
-                | BlockKind::CommandHeader
-                | BlockKind::Reasoning
-                | BlockKind::UserPrompt
-                | BlockKind::BlockingPrompt
-                | BlockKind::Completion
-                | BlockKind::Error,
+                    | BlockKind::CommandOutput
+                    | BlockKind::ToolHeader
+                    | BlockKind::CommandHeader
+                    | BlockKind::Reasoning
+                    | BlockKind::UserPrompt
+                    | BlockKind::BlockingPrompt
+                    | BlockKind::Completion
+                    | BlockKind::Error,
                 BlockKind::Model,
-            )
-                | (BlockKind::ToolHeader, BlockKind::ToolOutput)
+            ) | (BlockKind::ToolHeader, BlockKind::ToolOutput)
                 | (BlockKind::CommandHeader, BlockKind::CommandOutput)
                 | (BlockKind::ToolOutput, BlockKind::ToolHeader)
                 | (BlockKind::CommandOutput, BlockKind::CommandHeader)
@@ -4788,9 +4788,7 @@ impl App {
                 crate::core::approval::ApprovalResult::Approved => theme::success_fg(),
                 crate::core::approval::ApprovalResult::Denied => theme::error_fg(),
                 crate::core::approval::ApprovalResult::Always
-                | crate::core::approval::ApprovalResult::AllowExternalDirectory => {
-                    theme::accent()
-                }
+                | crate::core::approval::ApprovalResult::AllowExternalDirectory => theme::accent(),
             };
             actions.push(Span::styled(
                 format!("[{shortcut}]"),
@@ -4903,10 +4901,7 @@ impl App {
         let right_budget = total_width.saturating_sub(leading_width + left_width + 1);
         let mut right_segments: Vec<(String, bool)> = Vec::new();
         if self.output_overflow {
-            right_segments.push((
-                format!("⚠ {} dropped", self.output_overflow_count),
-                true,
-            ));
+            right_segments.push((format!("⚠ {} dropped", self.output_overflow_count), true));
         }
         if let Some((tokens, window)) = self.context_usage {
             right_segments.push((format_context_usage(tokens, window), false));
@@ -5019,8 +5014,7 @@ impl App {
 
         self.restore_pending_manual_viewport_after_reflow(wrap_width);
         let output_rows = self.total_visual_rows(wrap_width);
-        self.transcript_selection_area =
-            Self::selection_content_area(output_area);
+        self.transcript_selection_area = Self::selection_content_area(output_area);
         let scroll_y = self.resolved_output_scroll_y_for(wrap_width, output_rows, content_height);
         let (start_idx, visible_count, visible_scroll_y) =
             self.visible_output_window(wrap_width, scroll_y, content_height);
@@ -5721,10 +5715,7 @@ mod tests {
     #[test]
     fn header_rows_preserve_semantic_text_styles() {
         let mut app = App::new();
-        app.push_output_with_kind(
-            Line::from("Running: cargo check"),
-            BlockKind::CommandHeader,
-        );
+        app.push_output_with_kind(Line::from("Running: cargo check"), BlockKind::CommandHeader);
         let rows = app.collect_output_rows_range(0, 1, app.last_wrap_width());
         assert_eq!(rows[0].style.fg, Some(theme::info_fg()));
         assert!(rows[0].style.add_modifier.contains(Modifier::BOLD));
@@ -5744,18 +5735,19 @@ mod tests {
                 .add_modifier(Modifier::BOLD),
         ));
         let mut targets = Vec::new();
-        let rendered = App::output_row_for_render(
-            Some(&line),
-            BlockKind::UserPrompt,
-            &mut targets,
-        );
+        let rendered = App::output_row_for_render(Some(&line), BlockKind::UserPrompt, &mut targets);
 
         assert_eq!(rendered.spans[0].style.fg, Some(theme::user_marker_fg()));
         assert_eq!(rendered.spans[1].content, "❯");
         assert_eq!(rendered.spans[1].style.fg, Some(theme::user_marker_fg()));
         assert_eq!(rendered.spans[2].content, " inspect the project");
         assert_eq!(rendered.spans[2].style.fg, Some(theme::echo_fg()));
-        assert!(rendered.spans[2].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            rendered.spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     fn rendered_rows(buffer: &Buffer) -> Vec<String> {
@@ -5772,7 +5764,8 @@ mod tests {
             .area
             .height
             .saturating_sub(1)
-            .saturating_sub(app.render_input_height_for_width(buffer.area.width)) as usize;
+            .saturating_sub(app.render_input_height_for_width(buffer.area.width))
+            as usize;
         rendered_rows(buffer)
             .into_iter()
             .take(output_height)
@@ -5851,13 +5844,19 @@ mod tests {
         let now = Instant::now();
         assert!(app.begin_text_selection(column.saturating_sub(1), row, now));
         app.extend_text_selection(column, row, now + Duration::from_millis(20));
-        assert_eq!(app.finish_text_selection(column, row), Some("tu".to_string()));
+        assert_eq!(
+            app.finish_text_selection(column, row),
+            Some("tu".to_string())
+        );
     }
 
     #[test]
     fn test_osc8_path_survives_tui_render_as_click_target() {
         let mut app = App::new();
-        app.push_output(Line::from("  ▶ read \x1b]8;;file:///tmp/example.rs\x1b\\/tmp/example.rs\x1b]8;;\x1b\\".to_string()));
+        app.push_output(Line::from(
+            "  ▶ read \x1b]8;;file:///tmp/example.rs\x1b\\/tmp/example.rs\x1b]8;;\x1b\\"
+                .to_string(),
+        ));
         let backend = TestBackend::new(48, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         terminal
@@ -6113,8 +6112,7 @@ mod tests {
             .draw(|frame| app.render(frame))
             .expect("streamed selection frame should render");
 
-        let (updated_column, updated_row) =
-            selection_text_position(&app, "T");
+        let (updated_column, updated_row) = selection_text_position(&app, "T");
         assert_ne!(updated_row, row);
         assert!(
             terminal
@@ -7031,7 +7029,10 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("⠋ Processing…"));
-        assert_eq!(buffer.cell((0, 9)).map(|cell| cell.fg), Some(theme::accent()));
+        assert_eq!(
+            buffer.cell((0, 9)).map(|cell| cell.fg),
+            Some(theme::accent())
+        );
     }
 
     #[test]
@@ -7897,8 +7898,7 @@ mod tests {
             .position(|symbol| *symbol == "█")
             .expect("top scrollbar thumb should render");
         assert_eq!(
-            top_thumb,
-            1,
+            top_thumb, 1,
             "top scrollbar thumb should start below the transcript border"
         );
     }
@@ -7979,7 +7979,10 @@ mod tests {
 
         app.scroll_lines(-3);
 
-        assert!(app.in_scrollback, "scrolling past the top must enter history");
+        assert!(
+            app.in_scrollback,
+            "scrolling past the top must enter history"
+        );
         assert_eq!(app.scroll_mode, ScrollMode::Manual);
         assert_eq!(app.output_lines[0].to_string(), "history 0");
         assert_eq!(app.output_lines[6].to_string(), "line 0");
@@ -8102,17 +8105,14 @@ mod tests {
                 terminal
                     .draw(|frame| app.render(frame))
                     .expect("tabbed content should render");
-                let area_width =
-                    terminal.backend().buffer().area.width as usize;
+                let area_width = terminal.backend().buffer().area.width as usize;
                 let rows = rendered_rows(terminal.backend().buffer());
                 let allowed = [
                     '│', '┌', '┐', '└', '┘', '╭', '╮', '╰', '╯', '─', '█', '║', ' ',
                 ];
                 for (row_idx, row) in rows.iter().enumerate() {
                     let chars: Vec<char> = row.chars().collect();
-                    for (label, cell) in
-                        [("left", chars[0]), ("right", chars[area_width - 1])]
-                    {
+                    for (label, cell) in [("left", chars[0]), ("right", chars[area_width - 1])] {
                         assert!(
                             allowed.contains(&cell),
                             "width {width} offset {offset}: {label} edge of row {row_idx} \
@@ -8252,7 +8252,13 @@ mod tests {
         app.finish_reasoning_stream();
 
         let rendered: Vec<String> = app.output_lines.iter().map(ToString::to_string).collect();
-        assert_eq!(rendered, ["  Ɵ     let x = 1;", "  Ɵ plain prose with a § symbol stays"]);
+        assert_eq!(
+            rendered,
+            [
+                "  Ɵ     let x = 1;",
+                "  Ɵ plain prose with a § symbol stays"
+            ]
+        );
     }
 
     #[test]
@@ -8265,10 +8271,11 @@ mod tests {
         app.finish_reasoning_stream();
 
         assert!(app.output_lines.is_empty());
-        assert!(app
-            .turn_stream_entries
-            .iter()
-            .all(|(_, kind)| *kind != StreamKind::Reasoning));
+        assert!(
+            app.turn_stream_entries
+                .iter()
+                .all(|(_, kind)| *kind != StreamKind::Reasoning)
+        );
     }
 
     #[test]
@@ -8343,7 +8350,10 @@ mod tests {
             "reasoning stored as one logical row"
         );
         let line = &app.output_lines[0];
-        assert_eq!(line.spans[0].style.fg, Some(crate::cli::tui::theme::accent()));
+        assert_eq!(
+            line.spans[0].style.fg,
+            Some(crate::cli::tui::theme::accent())
+        );
         assert!(line.spans[0].style.add_modifier.contains(Modifier::ITALIC));
     }
 
@@ -8780,7 +8790,10 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("⠋ Processing…"));
-        assert_eq!(buffer.cell((0, 9)).map(|cell| cell.fg), Some(theme::accent()));
+        assert_eq!(
+            buffer.cell((0, 9)).map(|cell| cell.fg),
+            Some(theme::accent())
+        );
     }
 
     #[test]
@@ -9806,9 +9819,10 @@ mod tests {
     fn test_turn_render_without_streamed_lines_keeps_empty_model_fallback() {
         let mut app = App::new();
         app.set_content_width(80);
-        assert!(app
-            .begin_async_turn_render("unstreamed result".to_string())
-            .is_none());
+        assert!(
+            app.begin_async_turn_render("unstreamed result".to_string())
+                .is_none()
+        );
         assert_eq!(app.model_text_for_completion(), "");
     }
 
@@ -10319,7 +10333,10 @@ mod tests {
 
         let content = std::fs::read_to_string(file_path).unwrap();
         assert_eq!(content.lines().count(), SCROLLBACK_ROTATE_LINE_TARGET);
-        let first_line = format!("line {}", MAX_SCROLLBACK_LOAD_LINES + 3 - SCROLLBACK_ROTATE_LINE_TARGET);
+        let first_line = format!(
+            "line {}",
+            MAX_SCROLLBACK_LOAD_LINES + 3 - SCROLLBACK_ROTATE_LINE_TARGET
+        );
         assert_eq!(content.lines().next(), Some(first_line.as_str()));
         let last_line = format!("line {}", MAX_SCROLLBACK_LOAD_LINES + 2);
         assert_eq!(content.lines().last(), Some(last_line.as_str()));
@@ -10366,7 +10383,12 @@ mod tests {
             0,
             0
         ));
-        assert!(should_rotate_scrollback(0, 0, MAX_SCROLLBACK_LOAD_BYTES + 1, 1));
+        assert!(should_rotate_scrollback(
+            0,
+            0,
+            MAX_SCROLLBACK_LOAD_BYTES + 1,
+            1
+        ));
         assert!(should_rotate_scrollback(
             0,
             0,

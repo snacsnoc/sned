@@ -643,7 +643,7 @@ pub enum CliOnlyCommand {
     PlanAbort,
     PlanComplete,
     PlanFail,
-    ModelSwitch(String), // /model provider/model_id
+    ModelSwitch(String),     // /model provider/model_id
     ReasoningEffort(String), // /effort [level]
 }
 
@@ -815,7 +815,6 @@ impl CliOnlyCommand {
                 | Self::CheckpointUndo
         )
     }
-
 }
 
 struct StaticCommandMatch<'a> {

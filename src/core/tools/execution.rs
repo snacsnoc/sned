@@ -1187,7 +1187,12 @@ pub(crate) fn tool_batch_signature(calls: &[PreparedToolCall]) -> String {
             Err(_) => format!(
                 "{}:<malformed:{}>",
                 prepared.tool_name,
-                prepared.tool_call.function.arguments.as_deref().unwrap_or("")
+                prepared
+                    .tool_call
+                    .function
+                    .arguments
+                    .as_deref()
+                    .unwrap_or("")
             ),
         })
         .collect::<Vec<_>>()
@@ -1254,7 +1259,11 @@ mod tests {
         }
     }
 
-    fn prepared_call(name: &str, args: Option<&str>, parsed: Result<serde_json::Value, &str>) -> PreparedToolCall {
+    fn prepared_call(
+        name: &str,
+        args: Option<&str>,
+        parsed: Result<serde_json::Value, &str>,
+    ) -> PreparedToolCall {
         PreparedToolCall {
             tool_call: crate::providers::ApiStreamToolCall {
                 call_id: Some("c1".to_string()),
@@ -1275,7 +1284,10 @@ mod tests {
     fn tool_batch_signature_distinguishes_distinct_malformed_payloads() {
         let first = prepared_call("read_file", Some("{bad one"), Err("parse"));
         let second = prepared_call("read_file", Some("{bad two"), Err("parse"));
-        assert_ne!(tool_batch_signature(&[first]), tool_batch_signature(&[second]));
+        assert_ne!(
+            tool_batch_signature(&[first]),
+            tool_batch_signature(&[second])
+        );
         let repeat = prepared_call("read_file", Some("{bad one"), Err("parse"));
         assert_eq!(
             tool_batch_signature(&[prepared_call("read_file", Some("{bad one"), Err("parse"))]),
@@ -1288,7 +1300,10 @@ mod tests {
         let args = serde_json::json!({"paths": ["a.txt"]});
         let first = prepared_call("read_file", None, Ok(args.clone()));
         let second = prepared_call("read_file", None, Ok(args));
-        assert_eq!(tool_batch_signature(&[first]), tool_batch_signature(&[second]));
+        assert_eq!(
+            tool_batch_signature(&[first]),
+            tool_batch_signature(&[second])
+        );
     }
 
     #[test]

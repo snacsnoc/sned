@@ -984,7 +984,6 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-
     fn key_event(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }

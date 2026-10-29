@@ -762,8 +762,10 @@ impl HookManager {
                                 nix::unistd::Pid::from_raw(-(pid as i32)),
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
-                                Ok(nix::sys::wait::WaitStatus::Exited(_, _)
-                                | nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                                Ok(
+                                    nix::sys::wait::WaitStatus::Exited(_, _)
+                                    | nix::sys::wait::WaitStatus::Signaled(_, _, _),
+                                ) => break,
                                 _ => std::thread::sleep(std::time::Duration::from_millis(100)),
                             }
                         }
@@ -796,8 +798,10 @@ impl HookManager {
                                 nix::unistd::Pid::from_raw(-(pid as i32)),
                                 Some(nix::sys::wait::WaitPidFlag::WNOHANG),
                             ) {
-                                Ok(nix::sys::wait::WaitStatus::Exited(_, _)
-                                | nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
+                                Ok(
+                                    nix::sys::wait::WaitStatus::Exited(_, _)
+                                    | nix::sys::wait::WaitStatus::Signaled(_, _, _),
+                                ) => break,
                                 _ => std::thread::sleep(std::time::Duration::from_millis(100)),
                             }
                         }

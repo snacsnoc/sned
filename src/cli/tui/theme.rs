@@ -407,8 +407,12 @@ mod tests {
         assert_eq!(DEFAULT_PALETTE.error_fg, Color::Red);
         assert_eq!(DEFAULT_PALETTE.picker_selected_bg, Color::Blue);
         assert_eq!(DEFAULT_PALETTE.picker_selected_fg, Color::White);
-        const { assert!(!DEFAULT_PALETTE.reasoning_double_border); }
-        const { assert!(DEFAULT_PALETTE.dim_hints); }
+        const {
+            assert!(!DEFAULT_PALETTE.reasoning_double_border);
+        }
+        const {
+            assert!(DEFAULT_PALETTE.dim_hints);
+        }
     }
 
     #[test]
@@ -422,13 +426,14 @@ mod tests {
         assert_eq!(HIGH_CONTRAST_PALETTE.info_fg, Rgb(0, 255, 255));
         assert_eq!(HIGH_CONTRAST_PALETTE.tool_call_fg, Rgb(255, 0, 255));
         assert_eq!(HIGH_CONTRAST_PALETTE.echo_fg, Color::White);
-        assert_eq!(
-            HIGH_CONTRAST_PALETTE.picker_selected_bg,
-            Rgb(255, 255, 0)
-        );
+        assert_eq!(HIGH_CONTRAST_PALETTE.picker_selected_bg, Rgb(255, 255, 0));
         assert_eq!(HIGH_CONTRAST_PALETTE.picker_selected_fg, Color::Black);
-        const { assert!(HIGH_CONTRAST_PALETTE.reasoning_double_border); }
-        const { assert!(!HIGH_CONTRAST_PALETTE.dim_hints); }
+        const {
+            assert!(HIGH_CONTRAST_PALETTE.reasoning_double_border);
+        }
+        const {
+            assert!(!HIGH_CONTRAST_PALETTE.dim_hints);
+        }
     }
 
     fn input_corner(palette: &Palette, state: InputBorderState) -> String {
@@ -484,10 +489,7 @@ mod tests {
     fn emphasis_helpers_bold_only_under_high_contrast() {
         let base = Style::default().fg(Color::Magenta);
         assert_eq!(emphasize_for(false, base), base);
-        assert_eq!(
-            emphasize_for(true, base),
-            base.add_modifier(Modifier::BOLD)
-        );
+        assert_eq!(emphasize_for(true, base), base.add_modifier(Modifier::BOLD));
         assert_eq!(reasoning_modifier_for(false), Modifier::ITALIC);
         assert_eq!(reasoning_modifier_for(true), Modifier::BOLD);
     }
@@ -495,10 +497,7 @@ mod tests {
     #[test]
     fn processing_border_bolds_only_under_high_contrast() {
         use ratatui::style::Modifier;
-        for (palette, bold) in [
-            (&DEFAULT_PALETTE, false),
-            (&HIGH_CONTRAST_PALETTE, true),
-        ] {
+        for (palette, bold) in [(&DEFAULT_PALETTE, false), (&HIGH_CONTRAST_PALETTE, true)] {
             let backend = TestBackend::new(10, 3);
             let mut terminal = Terminal::new(backend).expect("terminal should initialize");
             terminal

@@ -1197,9 +1197,7 @@ pub(crate) fn create_provider(
                 crate::providers::anthropic::get_anthropic_model_info(&default_model),
                 task_opts.context_window,
             );
-            let base_url = stored_state
-                .anthropic_base_url
-                .filter(|u| !u.is_empty());
+            let base_url = stored_state.anthropic_base_url.filter(|u| !u.is_empty());
             Arc::new(crate::providers::Providers::Anthropic(
                 crate::providers::anthropic::AnthropicProvider::new(
                     crate::providers::anthropic::AnthropicConfig {
@@ -1466,8 +1464,7 @@ pub(crate) fn create_provider(
                      Set the environment variable, use --api-key, or run sned auth --provider nvidia."
                 )
             })?;
-            let model_id_str =
-                model_id.unwrap_or_else(|| "meta/llama-3.1-8b-instruct".to_string());
+            let model_id_str = model_id.unwrap_or_else(|| "meta/llama-3.1-8b-instruct".to_string());
             let mut nvidia_model_info =
                 crate::providers::nvidia::get_nvidia_model_info(&model_id_str);
             apply_context_window_override(&mut nvidia_model_info.base, task_opts.context_window);

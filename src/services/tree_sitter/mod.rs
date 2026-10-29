@@ -108,7 +108,9 @@ pub fn parse_file(
                 .filter(|(def_node, _)| {
                     def_node.start_byte() <= name_byte && def_node.end_byte() >= name_byte
                 })
-                .min_by_key(|(def_node, _)| def_node.end_byte().saturating_sub(def_node.start_byte()))
+                .min_by_key(|(def_node, _)| {
+                    def_node.end_byte().saturating_sub(def_node.start_byte())
+                })
                 .map(|(def_node, _)| def_node.end_position().row)
                 .unwrap_or(start_line);
 

@@ -584,8 +584,14 @@ impl CheckpointTracker {
         args: &[&str],
         cancelled: Option<&AtomicBool>,
     ) -> Result<(), CheckpointError> {
-        let run =
-            || Self::run_git_cmd_with_worktree_cancellable(&self.shadow_git_path, &self.cwd, args, cancelled);
+        let run = || {
+            Self::run_git_cmd_with_worktree_cancellable(
+                &self.shadow_git_path,
+                &self.cwd,
+                args,
+                cancelled,
+            )
+        };
         let first = run();
         if !matches!(&first, Err(error) if Self::is_index_lock_conflict(&error.to_string())) {
             return first;

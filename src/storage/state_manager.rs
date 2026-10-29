@@ -662,7 +662,8 @@ impl StateManager {
             self.global_state
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .task_history.clone_from(&history);
+                .task_history
+                .clone_from(&history);
         }
         let generation = self.next_pending_generation();
         self.record_history_operation(generation, HistoryOperation::Replace(history));
@@ -1184,7 +1185,9 @@ impl StateManager {
             if key == GlobalStateKey::TaskHistory && !history_operations.is_empty() {
                 for operation in history_operations.values() {
                     match operation {
-                        HistoryOperation::Replace(history) => state.task_history.clone_from(history),
+                        HistoryOperation::Replace(history) => {
+                            state.task_history.clone_from(history)
+                        }
                         HistoryOperation::Upsert(item) => {
                             state.task_history.retain(|entry| entry.id != item.id);
                             state.task_history.push(item.clone());

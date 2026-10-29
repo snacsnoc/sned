@@ -716,7 +716,8 @@ mod tests {
         let lines = render_completion_markdown("🚀 ", "Use `ls` to list files");
         let found = lines.iter().any(|l| {
             l.spans.iter().any(|s| {
-                s.content.contains("`ls`") && s.style.fg == Some(crate::cli::tui::theme::prompt_fg())
+                s.content.contains("`ls`")
+                    && s.style.fg == Some(crate::cli::tui::theme::prompt_fg())
             })
         });
         assert!(

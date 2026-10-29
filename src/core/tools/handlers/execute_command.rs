@@ -89,9 +89,9 @@ impl StreamLine {
     fn into_text(self, stream: &str) -> String {
         match self {
             Self::Text(text) => text,
-            Self::Overlong => format!(
-                "({stream} line exceeded {MAX_STREAM_LINE_BYTES} bytes and was discarded.)"
-            ),
+            Self::Overlong => {
+                format!("({stream} line exceeded {MAX_STREAM_LINE_BYTES} bytes and was discarded.)")
+            }
         }
     }
 }
@@ -611,9 +611,8 @@ impl ExecuteCommandHandler {
             if let Some(dir) = cwd
                 && (!dir.exists() || !dir.is_dir())
             {
-                let err = crate::cli::actionable_errors::directory_not_found(
-                    &dir.display().to_string(),
-                );
+                let err =
+                    crate::cli::actionable_errors::directory_not_found(&dir.display().to_string());
                 return Err(anyhow::anyhow!("{}", err.display()));
             }
 
@@ -630,7 +629,9 @@ impl ExecuteCommandHandler {
                 Ok(child) => child,
                 #[cfg(unix)]
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    tracing::warn!("bash was not found on PATH; falling back to sh without pipefail");
+                    tracing::warn!(
+                        "bash was not found on PATH; falling back to sh without pipefail"
+                    );
                     Self::configured_command_process(cmd_str, cwd, &sandboxed_env, false).spawn()?
                 }
                 Err(error) => return Err(error.into()),
@@ -1174,10 +1175,8 @@ impl ExecuteCommandHandler {
                     );
                     continue;
                 }
-                let err = crate::cli::actionable_errors::command_exit_code(
-                    cmd_str,
-                    output.status.code(),
-                );
+                let err =
+                    crate::cli::actionable_errors::command_exit_code(cmd_str, output.status.code());
                 append_limited_text(
                     &mut combined_output,
                     &format!("\n{}", err.display()),
@@ -2360,7 +2359,10 @@ mod tests {
         let result = handler
             .execute_commands(vec!["false | tail -1".to_string()], None)
             .await;
-        assert!(result.is_err(), "pipefail must preserve the upstream failure");
+        assert!(
+            result.is_err(),
+            "pipefail must preserve the upstream failure"
+        );
     }
 
     #[cfg(unix)]

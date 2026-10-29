@@ -2863,8 +2863,23 @@ mod tests {
     fn test_transcript_span_colors_round_trip() {
         use ratatui::style::Color::*;
         for color in [
-            Black, Red, Green, Yellow, Blue, Magenta, Cyan, Gray, DarkGray, LightRed,
-            LightGreen, LightYellow, LightBlue, LightMagenta, LightCyan, White, Rgb(1, 2, 3),
+            Black,
+            Red,
+            Green,
+            Yellow,
+            Blue,
+            Magenta,
+            Cyan,
+            Gray,
+            DarkGray,
+            LightRed,
+            LightGreen,
+            LightYellow,
+            LightBlue,
+            LightMagenta,
+            LightCyan,
+            White,
+            Rgb(1, 2, 3),
             Indexed(7),
         ] {
             let name = encode_transcript_color(&color).expect("named color encodes");

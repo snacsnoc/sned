@@ -263,12 +263,18 @@ async fn native_workflow_known_edit_manager_matches_copied_duplicate_identity() 
         .unwrap();
     assert_eq!(
         managed[1],
-        strip_line_number_gutter(&copied[1]).split_once('§').unwrap().0,
+        strip_line_number_gutter(&copied[1])
+            .split_once('§')
+            .unwrap()
+            .0,
         "original above retains identity"
     );
     assert_eq!(
         managed[5],
-        strip_line_number_gutter(&copied[3]).split_once('§').unwrap().0,
+        strip_line_number_gutter(&copied[3])
+            .split_once('§')
+            .unwrap()
+            .0,
         "original below retains identity"
     );
     assert_ne!(
