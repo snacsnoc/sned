@@ -9058,6 +9058,53 @@ Irrespective of whether additional information or instructions are given, you ar
         );
     }
 
+    #[tokio::test]
+    async fn queued_retry_follows_intervening_conversation_in_provider_request() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                    text: "done".into(),
+                    id: None,
+                    signature: None,
+                })]],
+                Arc::clone(&captured),
+            ),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "queued-retry-intervening"));
+        let message = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("retry original".into()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        {
+            let mut history = agent.conversation_history.lock().await;
+            history.push(message.clone());
+            history.push(StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("intervening answer".into()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+        }
+        agent
+            .message_queue_handle()
+            .prepend_retry_message(message)
+            .await;
+        let _ = agent
+            .run(Vec::new(), Arc::new(StateManager::new().unwrap()))
+            .await;
+        let requests = captured.lock().unwrap();
+        let last = requests[0].messages.last().unwrap();
+        assert_eq!(last.role, MessageRole::User);
+        assert_eq!(last.content, MessageContent::Text("retry original".into()));
+    }
+
     /// Regression test for the `consecutive_mistakes` cap. When the
     /// model returns an empty response (no text, no tool calls, no
     /// reasoning) N times in a row where N = `max_consecutive_mistakes`,
