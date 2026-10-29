@@ -1137,6 +1137,9 @@ async fn process_minimax_sse_line(
     let data = line
         .strip_prefix("data:")
         .map(|s| s.strip_prefix(" ").unwrap_or(s));
+    if data.is_none() {
+        return;
+    }
     if data.is_some_and(|value| value.trim().is_empty()) {
         return;
     }
@@ -2366,6 +2369,28 @@ mod tests {
         let mut text = String::new();
         let mut signature = None;
         let mut reasoning = MinimaxReasoningState::default();
+        for control in [
+            ": keepalive",
+            "event: message",
+            "id: 1",
+            "retry: 1000",
+            "data:",
+        ] {
+            process_minimax_sse_line(
+                control,
+                &tx,
+                &mut calls,
+                &mut completed,
+                &mut stop_reason,
+                &mut xml,
+                &mut text,
+                &mut signature,
+                &mut reasoning,
+            )
+            .await;
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(stop_reason.is_none());
         process_minimax_sse_line(
             "data: not-json",
             &tx,
