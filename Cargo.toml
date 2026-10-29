@@ -37,7 +37,7 @@ lang-swift = ["dep:tree-sitter-swift"]
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env", "string"] }
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "io-std", "process", "signal"] }  # pinned to 1.52.x for MSRV
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "io-std", "process", "signal"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -54,7 +54,7 @@ regex = "1"
 similar = "2"
 fastrand = "2"
 ignore = "0.4"
-lru = "0.15"
+lru = "0.18.2"
 tree-sitter = "0.26"  # Updated from 0.25, pinned ABI
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-javascript = { version = "0.25", optional = true }
