@@ -1388,7 +1388,10 @@ impl AnchorStateManager {
         }
     }
 
-    fn allocate_identity(document: &mut TrackedDocument) -> Result<String, AnchorTransitionError> {
+    fn allocate_identity(
+        document: &mut TrackedDocument,
+        skip_collision_scan: bool,
+    ) -> Result<String, AnchorTransitionError> {
         if document.anchor_namespace.is_none() {
             let live = document.anchors.clone();
             Self::migrate_allocator_state(document, &live);
@@ -1403,8 +1406,9 @@ impl AnchorStateManager {
                 document.anchor_namespace.as_deref().unwrap_or_default(),
                 Self::encode_base36(counter)
             );
-            if !document.anchors.contains(&identity)
-                && !document.retired_anchors.contains(&identity)
+            if skip_collision_scan
+                || (!document.anchors.contains(&identity)
+                    && !document.retired_anchors.contains(&identity))
             {
                 return Ok(identity);
             }
@@ -1472,7 +1476,7 @@ impl AnchorStateManager {
                 retired_anchors: VecDeque::new(),
             };
             for _ in 0..document.hashes.len() {
-                let identity = Self::allocate_identity(&mut document)?;
+                let identity = Self::allocate_identity(&mut document, false)?;
                 document.anchors.push(identity);
             }
             document
@@ -1509,6 +1513,10 @@ impl AnchorStateManager {
         }
         let mut document = snapshot.document.clone();
         Self::migrate_allocator_state(&mut document, &snapshot.anchors);
+        // Large snapshots intentionally mint fresh identities for every line.
+        // Scanning the full anchor and retired-identity lists for each of those
+        // lines turns a bounded edit into quadratic work.
+        let skip_identity_collision_scan = snapshot.snapshot_mode;
         document.hashes = compute_hashes(&lines);
         document.anchors.clear();
         let mut previous = None;
@@ -1530,7 +1538,7 @@ impl AnchorStateManager {
             } else if let Some(origin) = origin.filter(|_| !snapshot.snapshot_mode) {
                 snapshot.document.anchors[origin].clone()
             } else {
-                Self::allocate_identity(&mut document)?
+                Self::allocate_identity(&mut document, skip_identity_collision_scan)?
             };
             document.anchors.push(word);
         }
@@ -1547,8 +1555,9 @@ impl AnchorStateManager {
             .filter(|word| !live_words.contains(word))
             .cloned()
             .collect::<Vec<_>>();
+        let mut retired_set: HashSet<String> = document.retired_anchors.iter().cloned().collect();
         for identity in &retired_identities {
-            if !document.retired_anchors.contains(identity) {
+            if retired_set.insert(identity.clone()) {
                 document.retired_anchors.push_back(identity.clone());
             }
         }
@@ -2020,7 +2029,7 @@ impl AnchorStateManager {
                 retired_anchors: VecDeque::new(),
             };
             for _ in 0..tracked.hashes.len() {
-                let identity = Self::allocate_identity(&mut tracked)?;
+                let identity = Self::allocate_identity(&mut tracked, false)?;
                 tracked.anchors.push(identity);
             }
             let anchors = tracked.anchors.clone();
@@ -2060,7 +2069,7 @@ impl AnchorStateManager {
             match change {
                 DiffChange::Added(count) => {
                     for _ in 0..count {
-                        let identity = Self::allocate_identity(&mut next_document)?;
+                        let identity = Self::allocate_identity(&mut next_document, false)?;
                         new_anchors.push(identity.clone());
                         next_document.anchors.push(identity);
                     }
@@ -2077,7 +2086,7 @@ impl AnchorStateManager {
                             && (old_counts[&hash] > 1
                                 || new_counts.get(&hash).copied().unwrap_or(0) > 1)
                         {
-                            Self::allocate_identity(&mut next_document)?
+                            Self::allocate_identity(&mut next_document, false)?
                         } else {
                             tracked.anchors[old_idx].clone()
                         };
