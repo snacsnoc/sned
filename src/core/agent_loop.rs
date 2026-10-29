@@ -488,13 +488,13 @@ impl AgentLoopDeps {
             yolo: false,
         }
     }
-
 }
 
 /// A clonable handle for enqueuing messages into an AgentLoop from any task.
 #[derive(Clone)]
 pub struct MessageQueueHandle {
     queue: Arc<Mutex<VecDeque<StorageMessage>>>,
+    retry_message_ids: Arc<Mutex<HashSet<String>>>,
     json_output: bool,
     message_counter: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -580,6 +580,46 @@ impl MessageQueueHandle {
         }
     }
 
+    /// Queue a failed request ahead of ordinary prompts. The marker lets the
+    /// agent reuse the existing history entry instead of recording a duplicate
+    /// user turn when this retry starts.
+    pub async fn prepend_retry_message(&self, mut message: StorageMessage) {
+        let id = AgentLoop::next_message_id(&self.message_counter);
+        message.id = Some(id.clone());
+        self.retry_message_ids.lock().await.insert(id);
+
+        let max_queue_len = message_queue_max_len();
+        let mut mq = self.queue.lock().await;
+        mq.push_front(message);
+
+        let mut dropped = 0usize;
+        while mq.len() > max_queue_len {
+            if let Some(dropped_message) = mq.pop_back()
+                && let Some(id) = dropped_message.id
+            {
+                self.retry_message_ids.lock().await.remove(&id);
+            }
+            dropped += 1;
+        }
+        let count = mq.len();
+        drop(mq);
+
+        if dropped > 0 {
+            warn!(
+                max_queue_len,
+                dropped,
+                "message queue exceeded its limit; dropped queued message(s) from the back"
+            );
+        }
+        if !self.json_output && count > 0 {
+            info!(
+                "[sned] Retry queued to run next ({} message{} in queue)",
+                count,
+                if count == 1 { "" } else { "s" }
+            );
+        }
+    }
+
     pub async fn queued_message_count(&self) -> usize {
         self.queue.lock().await.len()
     }
@@ -650,6 +690,7 @@ pub struct AgentLoop {
     anchor_mgr: AnchorStateManager,
     conversation_history: Arc<Mutex<Vec<StorageMessage>>>,
     message_queue: Arc<Mutex<VecDeque<StorageMessage>>>,
+    retry_message_ids: Arc<Mutex<HashSet<String>>>,
     deps: AgentLoopDeps,
     state_manager: Option<Arc<crate::storage::state_manager::StateManager>>,
     /// Tracks model/provider/mode usage for task metadata
@@ -660,6 +701,7 @@ pub struct AgentLoop {
     /// Shared via Arc so static methods (execute_tool_with_hooks_internal) can also generate IDs.
     message_counter: Arc<std::sync::atomic::AtomicUsize>,
     current_turn_retry_candidate: Option<StorageMessage>,
+    retry_mode: bool,
 }
 
 impl AgentLoop {
@@ -888,6 +930,7 @@ impl AgentLoop {
             anchor_mgr: AnchorStateManager::new(),
             conversation_history: Arc::new(Mutex::new(Vec::new())),
             message_queue: Arc::new(Mutex::new(VecDeque::new())),
+            retry_message_ids: Arc::new(Mutex::new(HashSet::new())),
             deps: AgentLoopDeps::new(),
             state_manager: None,
             model_tracker: Some(crate::core::context_tracking::ModelContextTracker::new(
@@ -898,6 +941,7 @@ impl AgentLoop {
             ),
             message_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             current_turn_retry_candidate: None,
+            retry_mode: false,
         }
     }
 
@@ -977,6 +1021,7 @@ impl AgentLoop {
     pub fn message_queue_handle(&self) -> MessageQueueHandle {
         MessageQueueHandle {
             queue: self.message_queue.clone(),
+            retry_message_ids: self.retry_message_ids.clone(),
             json_output: self.config.json_output,
             message_counter: self.message_counter.clone(),
         }
@@ -1270,12 +1315,33 @@ impl AgentLoop {
         self
     }
 
+    /// Retry a failed request without adding a second copy of its user
+    /// message to conversation history. If compaction removed the original,
+    /// `run` adds the request back once as a fallback.
+    pub async fn run_retry(
+        &mut self,
+        retry_message: StorageMessage,
+        state_manager: Arc<crate::storage::state_manager::StateManager>,
+    ) -> Result<(), AgentError> {
+        self.retry_mode = true;
+        let result = self.run(vec![retry_message], state_manager).await;
+        self.retry_mode = false;
+        result
+    }
+
     pub async fn run(
         &mut self,
-        initial_messages: Vec<StorageMessage>,
+        mut initial_messages: Vec<StorageMessage>,
         state_manager: Arc<crate::storage::state_manager::StateManager>,
     ) -> Result<(), AgentError> {
         tracing::debug!(target: "sned::agent_loop", "AgentLoop::run() called with {} initial messages", initial_messages.len());
+        if !self.retry_mode {
+            for message in &mut initial_messages {
+                if message.role == MessageRole::User && message.id.is_none() {
+                    message.id = Some(Self::next_message_id(&self.message_counter));
+                }
+            }
+        }
         if initial_messages
             .iter()
             .any(|message| message.role == MessageRole::User)
@@ -1295,7 +1361,20 @@ impl AgentLoop {
         // On resume, history may already be populated from disk - append instead of replace
         {
             let mut history = self.conversation_history.lock().await;
-            if history.is_empty() {
+            if self.retry_mode {
+                for message in &initial_messages {
+                    let already_present = history.iter().any(|existing| {
+                        if let Some(id) = message.id.as_ref() {
+                            existing.id.as_ref() == Some(id)
+                        } else {
+                            existing.role == message.role && existing.content == message.content
+                        }
+                    });
+                    if !already_present {
+                        history.push(message.clone());
+                    }
+                }
+            } else if history.is_empty() {
                 *history = initial_messages;
             } else if !initial_messages.is_empty() {
                 history.extend(initial_messages);
@@ -1352,7 +1431,9 @@ impl AgentLoop {
         }
 
         // Process initial context with ContextLoader on first turn
-        if let Some(ref loader) = self.deps.context_loader {
+        if !self.retry_mode
+            && let Some(ref loader) = self.deps.context_loader
+        {
             let mut history = self.conversation_history.lock().await;
             if let Some(first_msg) = history.first_mut()
                 && let crate::providers::MessageContent::Text(ref text) = first_msg.content
@@ -1388,7 +1469,9 @@ impl AgentLoop {
         }
 
         // Execute TaskStart hook before first turn with timeout to prevent hangs
-        if let Some(hook_mgr) = self.deps.hook_manager.clone() {
+        if !self.retry_mode
+            && let Some(hook_mgr) = self.deps.hook_manager.clone()
+        {
             let task = task_text.clone().unwrap_or_default();
             let task_id = self.config.task_id.clone();
 
@@ -1576,7 +1659,14 @@ impl AgentLoop {
                 if let Some(queued_message) = mq.pop_front() {
                     let queue_remaining = mq.len();
                     drop(mq);
-                    self.current_turn_retry_candidate = Some(queued_message.clone());
+                    let queued_is_retry = if let Some(id) = queued_message.id.as_ref() {
+                        self.retry_message_ids.lock().await.remove(id)
+                    } else {
+                        false
+                    };
+                    if !queued_is_retry {
+                        self.current_turn_retry_candidate = Some(queued_message.clone());
+                    }
                     if !self.config.json_output {
                         if queue_remaining > 0 {
                             info!(
@@ -1594,7 +1684,9 @@ impl AgentLoop {
                         }
                         // Display the queued message in the transcript only when
                         // it leaves the queue and begins its agent turn.
-                        if let MessageContent::Text(ref text) = queued_message.content {
+                        if !queued_is_retry
+                            && let MessageContent::Text(ref text) = queued_message.content
+                        {
                             self.config
                                 .output_writer
                                 .emit(OutputEvent::queued_message_started(queue_remaining));
@@ -1603,6 +1695,7 @@ impl AgentLoop {
                                 .emit(OutputEvent::user_prompt_line(text));
                         }
                     }
+                    let original_queued_message = queued_message.clone();
                     let expanded_message = self.expand_message_mentions(queued_message).await;
                     // If a plan is active, prepend plan context so the model doesn't abandon it
                     let final_message = {
@@ -1627,7 +1720,25 @@ impl AgentLoop {
                         }
                     };
                     let mut history = self.conversation_history.lock().await;
-                    history.push(final_message);
+                    let already_in_history = queued_is_retry
+                        && history.last().is_some_and(|existing| {
+                            existing.role == original_queued_message.role
+                                && existing.content == original_queued_message.content
+                        });
+                    if !already_in_history {
+                        history.push(final_message.clone());
+                    }
+                    if queued_is_retry {
+                        self.current_turn_retry_candidate = history
+                            .iter()
+                            .rev()
+                            .find(|existing| {
+                                existing.role == original_queued_message.role
+                                    && existing.content == original_queued_message.content
+                            })
+                            .cloned()
+                            .or(Some(final_message));
+                    }
                     drop(history);
                     let mut state = self.state.lock().await;
                     state.clear_denied_tool_actions();
@@ -1664,7 +1775,14 @@ impl AgentLoop {
                         if let Some(queued_message) = mq.pop_front() {
                             let queue_remaining = mq.len();
                             drop(mq);
-                            self.current_turn_retry_candidate = Some(queued_message.clone());
+                            let queued_is_retry = if let Some(id) = queued_message.id.as_ref() {
+                                self.retry_message_ids.lock().await.remove(id)
+                            } else {
+                                false
+                            };
+                            if !queued_is_retry {
+                                self.current_turn_retry_candidate = Some(queued_message.clone());
+                            }
                             if !self.config.json_output {
                                 if queue_remaining > 0 {
                                     info!(
@@ -1682,7 +1800,9 @@ impl AgentLoop {
                                 }
                                 // Display the queued message in the transcript only when
                                 // it leaves the queue and begins its agent turn.
-                                if let MessageContent::Text(ref text) = queued_message.content {
+                                if !queued_is_retry
+                                    && let MessageContent::Text(ref text) = queued_message.content
+                                {
                                     self.config
                                         .output_writer
                                         .emit(OutputEvent::queued_message_started(queue_remaining));
@@ -1691,6 +1811,7 @@ impl AgentLoop {
                                         .emit(OutputEvent::user_prompt_line(text));
                                 }
                             }
+                            let original_queued_message = queued_message.clone();
                             let expanded_message =
                                 self.expand_message_mentions(queued_message).await;
                             // If a plan is active, prepend plan context so the model doesn't abandon it
@@ -1716,7 +1837,25 @@ impl AgentLoop {
                                 }
                             };
                             let mut history = self.conversation_history.lock().await;
-                            history.push(final_message);
+                            let already_in_history = queued_is_retry
+                                && history.last().is_some_and(|existing| {
+                                    existing.role == original_queued_message.role
+                                        && existing.content == original_queued_message.content
+                                });
+                            if !already_in_history {
+                                history.push(final_message.clone());
+                            }
+                            if queued_is_retry {
+                                self.current_turn_retry_candidate = history
+                                    .iter()
+                                    .rev()
+                                    .find(|existing| {
+                                        existing.role == original_queued_message.role
+                                            && existing.content == original_queued_message.content
+                                    })
+                                    .cloned()
+                                    .or(Some(final_message));
+                            }
                             drop(history);
                             {
                                 let mut state = self.state.lock().await;
@@ -8823,6 +8962,74 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(matches!(result, TurnResult::Error(_)));
         let state = agent.state.lock().await;
         assert_eq!(state.retryable_failed_request, Some(message));
+    }
+
+    #[tokio::test]
+    async fn test_retry_reuses_existing_history_message() {
+        let provider = Arc::new(Providers::Error(crate::providers::ErrorProvider));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "retry-history"));
+        let message = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("retry this request".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        agent
+            .conversation_history
+            .lock()
+            .await
+            .push(message.clone());
+
+        let state_manager = Arc::new(StateManager::new().unwrap());
+        let _ = agent.run_retry(message, state_manager).await;
+
+        let history = agent.conversation_history.lock().await;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|entry| entry.role == MessageRole::User)
+                .count(),
+            1,
+            "retry must not append a duplicate user message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_queued_retry_reuses_existing_history_message() {
+        let provider = Arc::new(Providers::Error(crate::providers::ErrorProvider));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "queued-retry-history"));
+        let message = StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("retry this queued request".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        agent
+            .conversation_history
+            .lock()
+            .await
+            .push(message.clone());
+        agent
+            .message_queue_handle()
+            .prepend_retry_message(message)
+            .await;
+
+        let state_manager = Arc::new(StateManager::new().unwrap());
+        let _ = agent.run(Vec::new(), state_manager).await;
+
+        let history = agent.conversation_history.lock().await;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|entry| entry.role == MessageRole::User)
+                .count(),
+            1,
+            "queued retry must not append a duplicate user message"
+        );
     }
 
     /// Regression test for the `consecutive_mistakes` cap. When the

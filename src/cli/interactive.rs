@@ -332,16 +332,11 @@ impl InteractiveSession {
         state_handle.lock().await.retryable_failed_request.clone()
     }
 
-    async fn prepend_retryable_failed_request(
-        &self,
-        message: crate::providers::StorageMessage,
-    ) -> bool {
-        if let crate::providers::MessageContent::Text(text) = message.content {
-            self.queue_handle().await.prepend_text_message(text).await;
-            true
-        } else {
-            false
-        }
+    async fn prepend_retryable_failed_request(&self, message: crate::providers::StorageMessage) {
+        self.queue_handle()
+            .await
+            .prepend_retry_message(message)
+            .await;
     }
 
     async fn state_handle(&self) -> Arc<tokio::sync::Mutex<crate::core::agent_types::TaskState>> {
@@ -1146,8 +1141,8 @@ fn restore_transcript_line(entry: &TranscriptEntry) -> Line<'static> {
 /// that render uniformly take a color; mixed lines (model body, tool
 /// output, completion banners) replay in the default the live body uses.
 fn replay_fallback_style(kind: crate::cli::tui::BlockKind, markdown: &str) -> Style {
-    use crate::cli::tui::theme;
     use crate::cli::tui::BlockKind;
+    use crate::cli::tui::theme;
     use ratatui::style::Modifier;
     match kind {
         BlockKind::ToolHeader => Style::default().fg(theme::tool_call_fg()),
@@ -1320,7 +1315,12 @@ fn apply_output_event(
         OutputEvent::ToolHeaderLine(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
             for line in split_output_line_on_newlines(line) {
-                persist_transcript_line(app, storage, crate::cli::tui::BlockKind::ToolHeader, &line);
+                persist_transcript_line(
+                    app,
+                    storage,
+                    crate::cli::tui::BlockKind::ToolHeader,
+                    &line,
+                );
                 app.push_output_with_kind(line, crate::cli::tui::BlockKind::ToolHeader);
             }
         }
@@ -2555,6 +2555,7 @@ async fn spawn_agent_task(
             vec![initial_message],
             output_writer,
             agent_done_clone,
+            false,
         )
         .await;
     });
@@ -2571,6 +2572,7 @@ async fn spawn_agent_task_from_message(
     agent_start_time: &Arc<Mutex<Option<Instant>>>,
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     output_writer: OutputWriterArc,
+    retry: bool,
 ) -> anyhow::Result<()> {
     agent_busy.store(true, Ordering::Relaxed);
     *agent_start_time.lock().await = Some(Instant::now());
@@ -2589,6 +2591,7 @@ async fn spawn_agent_task_from_message(
             vec![initial_message],
             output_writer,
             agent_done_clone,
+            retry,
         )
         .await;
     });
@@ -2644,11 +2647,20 @@ async fn run_agent_task(
     initial_messages: Vec<crate::providers::StorageMessage>,
     output_writer: OutputWriterArc,
     agent_done: Arc<tokio::sync::Notify>,
+    retry: bool,
 ) {
     let result = {
         let mut agent = agent_loop.lock().await;
         agent.reset_cancellation().await;
-        agent.run(initial_messages, state_manager).await
+        if retry {
+            let retry_message = initial_messages
+                .into_iter()
+                .next()
+                .expect("retry task requires a message");
+            agent.run_retry(retry_message, state_manager).await
+        } else {
+            agent.run(initial_messages, state_manager).await
+        }
     };
     let retry_available = {
         let state_handle = agent_loop.lock().await.state_handle();
@@ -3211,9 +3223,10 @@ async fn handle_key_event_inner(
     let cursor_row = app.input.cursor().0;
     let on_first_input_line = cursor_row == 0;
     let on_last_input_line = cursor_row.saturating_add(1) >= app.input.lines().len();
-    let can_navigate_history =
-        key.modifiers.is_empty() && !app.picker_active && !app.model_picker_active
-            && !app.reasoning_effort_picker_active;
+    let can_navigate_history = key.modifiers.is_empty()
+        && !app.picker_active
+        && !app.model_picker_active
+        && !app.reasoning_effort_picker_active;
 
     if key.code == KeyCode::Up && can_navigate_history && on_first_input_line {
         if !app.history.is_navigating() {
@@ -3885,13 +3898,7 @@ async fn handle_cli_only_command(
                     return Ok(false);
                 }
                 let sess = session.lock().await;
-                if !sess.prepend_retryable_failed_request(retry_message).await {
-                    app.show_notification(
-                        "The last failed request includes non-text content. Wait for idle, then run /retry again.",
-                        NotificationKind::Error,
-                    );
-                    return Ok(false);
-                }
+                sess.prepend_retryable_failed_request(retry_message).await;
                 let count = sess.queue_handle().await.queued_message_count().await;
                 app.set_pending_queued_prompts(count);
                 app.show_notification(
@@ -3909,6 +3916,7 @@ async fn handle_cli_only_command(
                     agent_start_time,
                     agent_task,
                     output_writer.clone(),
+                    true,
                 )
                 .await?;
                 app.agent_busy = true;
@@ -5943,14 +5951,8 @@ async fn run_main_loop(
                         app.clear_text_selection();
                         match action {
                             Action::ModelSwitch(request) => {
-                                request_model_switch(
-                                    request,
-                                    None,
-                                    app,
-                                    &session,
-                                    &agent_busy,
-                                )
-                                .await;
+                                request_model_switch(request, None, app, &session, &agent_busy)
+                                    .await;
                                 continue;
                             }
                             Action::SetReasoningEffort(effort) => {
@@ -6669,8 +6671,8 @@ mod tests {
     use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
     use ratatui::buffer::Cell;
     use ratatui::layout::{Position, Size};
-    use ratatui::text::{Line, Span};
     use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
     use serde::ser::{Error as _, Serialize, Serializer};
 
     #[test]
@@ -12978,8 +12980,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_effort_command_rebuilds_active_provider_with_selected_effort() -> anyhow::Result<()>
-    {
+    async fn test_effort_command_rebuilds_active_provider_with_selected_effort()
+    -> anyhow::Result<()> {
         let mut task_opts = retry_test_task_opts();
         task_opts.provider = Some("openrouter".to_string());
         task_opts.model = Some("openai/gpt-5.4".to_string());
@@ -13134,10 +13136,8 @@ mod tests {
         )
         .await?;
         let state_manager = Arc::clone(&session.state_manager);
-        let normalized = crate::cli::normalize_minimax_body_overrides(
-            &session.task_opts,
-            "minimax",
-        )?;
+        let normalized =
+            crate::cli::normalize_minimax_body_overrides(&session.task_opts, "minimax")?;
         let efforts = supported_reasoning_efforts(
             &normalized,
             "minimax",
@@ -13145,11 +13145,11 @@ mod tests {
             state_manager.as_ref(),
         );
 
-        assert_eq!(normalized.reasoning_effort, Some(crate::cli::ReasoningEffort::Medium));
         assert_eq!(
-            efforts.first(),
-            Some(&crate::cli::ReasoningEffort::Low)
+            normalized.reasoning_effort,
+            Some(crate::cli::ReasoningEffort::Medium)
         );
+        assert_eq!(efforts.first(), Some(&crate::cli::ReasoningEffort::Low));
         assert!(!efforts.contains(&crate::cli::ReasoningEffort::None));
         assert!(efforts.contains(&crate::cli::ReasoningEffort::Medium));
         Ok(())
