@@ -8,8 +8,12 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 const HISTORY_RECORD_PREFIX: &str = "v1\t";
+const COMPACTION_INTERVAL: usize = 500;
+static APPENDS: LazyLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 fn get_history_file_path() -> PathBuf {
     crate::storage::disk::get_sned_dir().join("cli_history")
@@ -30,6 +34,16 @@ pub(crate) fn load_command_history() -> Vec<String> {
     load_command_history_from(&history_path)
 }
 
+fn parse_history_record(line: &str) -> Option<String> {
+    if let Some(encoded) = line.strip_prefix(HISTORY_RECORD_PREFIX) {
+        serde_json::from_str(encoded).ok()
+    } else if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
 fn load_command_history_from(history_path: &Path) -> Vec<String> {
     if !history_path.exists() {
         return Vec::new();
@@ -37,18 +51,7 @@ fn load_command_history_from(history_path: &Path) -> Vec<String> {
 
     match std::fs::read_to_string(history_path) {
         Ok(content) => {
-            let mut lines: Vec<String> = content
-                .lines()
-                .filter_map(|line| {
-                    if let Some(encoded) = line.strip_prefix(HISTORY_RECORD_PREFIX) {
-                        serde_json::from_str(encoded).ok()
-                    } else if line.is_empty() {
-                        None
-                    } else {
-                        Some(line.to_string())
-                    }
-                })
-                .collect();
+            let mut lines: Vec<String> = content.lines().filter_map(parse_history_record).collect();
 
             let max = max_history_lines();
             if lines.len() > max {
@@ -69,6 +72,15 @@ fn append_command_to_history(history_path: &Path, command: &str) -> io::Result<(
     let dir = history_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
 
+    // Lock a separate file so atomic replacement cannot invalidate the lock.
+    let lock_path = history_path.with_extension("lock");
+    let mut lock_options = OpenOptions::new();
+    lock_options.create(true).write(true);
+    #[cfg(unix)]
+    lock_options.mode(0o600);
+    let lock = lock_options.open(lock_path)?;
+    lock.lock()?;
+
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -78,6 +90,29 @@ fn append_command_to_history(history_path: &Path, command: &str) -> io::Result<(
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let encoded = serde_json::to_string(command).map_err(io::Error::other)?;
     writeln!(file, "{HISTORY_RECORD_PREFIX}{encoded}")?;
+    drop(file);
+
+    let mut counts = APPENDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let count = counts
+        .entry(history_path.to_path_buf())
+        .or_insert(COMPACTION_INTERVAL);
+    *count += 1;
+    if *count >= COMPACTION_INTERVAL {
+        let content = std::fs::read_to_string(history_path)?;
+        let lines: Vec<_> = content.lines().collect();
+        let max = max_history_lines();
+        if lines.len() > max.saturating_add(COMPACTION_INTERVAL) {
+            let valid: Vec<_> = lines
+                .into_iter()
+                .filter(|line| parse_history_record(line).is_some())
+                .collect();
+            let retained = format!("{}\n", valid[valid.len().saturating_sub(max)..].join("\n"));
+            crate::storage::disk::atomic_write_file(history_path, &retained)?;
+        }
+        *count = 0;
+    }
     Ok(())
 }
 
@@ -227,6 +262,59 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn compaction_keeps_newest_records_and_multiline_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli_history");
+        let max = max_history_lines();
+        let content = "old\n".repeat(max + COMPACTION_INTERVAL);
+        std::fs::write(&path, content).unwrap();
+        append_command_to_history(&path, "new\ncommand").unwrap();
+        let history = load_command_history_from(&path);
+        assert_eq!(history.len(), max);
+        assert_eq!(history.last().unwrap(), "new\ncommand");
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), max);
+    }
+
+    #[test]
+    fn compaction_does_not_count_invalid_records_toward_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli_history");
+        let max = max_history_lines();
+        let mut content = String::new();
+        for i in 0..max {
+            content.push_str(&format!("command-{i}\n"));
+        }
+        content.push_str(&"\nv1\tnot-json\n".repeat(COMPACTION_INTERVAL));
+        std::fs::write(&path, content).unwrap();
+        append_command_to_history(&path, "new\ncommand").unwrap();
+        let history = load_command_history_from(&path);
+        assert_eq!(history.len(), max);
+        assert_eq!(history.first().unwrap(), "command-1");
+        assert_eq!(history.last().unwrap(), "new\ncommand");
+    }
+
+    #[test]
+    fn concurrent_appends_survive_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cli_history");
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for entry in 0..200 {
+                        append_command_to_history(&path, &format!("{worker}-{entry}")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let history = load_command_history_from(&path);
+        assert_eq!(history.len(), 800.min(max_history_lines()));
     }
 
     #[test]
