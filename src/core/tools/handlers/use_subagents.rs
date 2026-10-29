@@ -1385,6 +1385,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_collect_stream_output_bounds_retained_bytes_and_drains() {
         let _guard = crate::test_support::env_lock()
             .lock()
@@ -1494,6 +1495,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_handler_allow_commands_requires_parent_yolo() {
         let _guard = crate::test_support::env_lock()
             .lock()
@@ -1520,6 +1522,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_handler_recursion_blocked_via_env_var() {
         let _env_guard = crate::test_support::env_lock()
             .lock()

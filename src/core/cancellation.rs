@@ -361,6 +361,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_cancellation_handler_sets_abort_flag() {
         let state = Arc::new(Mutex::new(TaskState::default()));
         let handler = CancellationHandler::new(state.clone());
@@ -403,6 +404,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_abort_task_with_state_persist() {
         let state = Arc::new(Mutex::new(TaskState::default()));
         let handler = CancellationHandler::new(state.clone());

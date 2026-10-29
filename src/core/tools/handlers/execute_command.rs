@@ -2290,6 +2290,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_script_limits_captured_output() {
         let _guard = crate::test_support::env_lock()
             .lock()
@@ -2314,6 +2315,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_command_limits_collected_output() {
         let _guard = crate::test_support::env_lock()
             .lock()
@@ -2522,9 +2524,9 @@ mod tests {
                 .await
         });
 
-        let _pid = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if state.lock().await.running_command_pids.first().is_some() {
+                if !state.lock().await.running_command_pids.is_empty() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2600,6 +2602,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_uses_workspace_root_not_process_cwd() {
         let _guard = crate::test_support::env_lock()
             .lock()
@@ -2636,6 +2639,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_script_uses_workspace_root_not_process_cwd() {
         let _guard = crate::test_support::env_lock()
             .lock()
@@ -3067,6 +3071,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_sandbox_output_excludes_withheld_names_when_truncated() {
         let _guard = crate::test_support::env_lock()
             .lock()
@@ -3113,6 +3118,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_script_reports_sandbox_names_without_values() {
         let _guard = crate::test_support::env_lock()
             .lock()

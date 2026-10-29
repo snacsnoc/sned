@@ -407,8 +407,8 @@ mod tests {
         assert_eq!(DEFAULT_PALETTE.error_fg, Color::Red);
         assert_eq!(DEFAULT_PALETTE.picker_selected_bg, Color::Blue);
         assert_eq!(DEFAULT_PALETTE.picker_selected_fg, Color::White);
-        assert!(!DEFAULT_PALETTE.reasoning_double_border);
-        assert!(DEFAULT_PALETTE.dim_hints);
+        const { assert!(!DEFAULT_PALETTE.reasoning_double_border); }
+        const { assert!(DEFAULT_PALETTE.dim_hints); }
     }
 
     #[test]
@@ -427,8 +427,8 @@ mod tests {
             Rgb(255, 255, 0)
         );
         assert_eq!(HIGH_CONTRAST_PALETTE.picker_selected_fg, Color::Black);
-        assert!(HIGH_CONTRAST_PALETTE.reasoning_double_border);
-        assert!(!HIGH_CONTRAST_PALETTE.dim_hints);
+        const { assert!(HIGH_CONTRAST_PALETTE.reasoning_double_border); }
+        const { assert!(!HIGH_CONTRAST_PALETTE.dim_hints); }
     }
 
     fn input_corner(palette: &Palette, state: InputBorderState) -> String {

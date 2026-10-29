@@ -179,6 +179,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_missing_question_does_not_set_followup_state() {
         let _lock = approval_test_guard();
         let task_id = "ask_followup_question_missing_question";
@@ -197,6 +198,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_json_output_rejects_without_arming_followup_state() {
         let _lock = approval_test_guard();
         let task_id = "ask_followup_question_json_output";
@@ -217,6 +219,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_followup_cleanup_after_timeout() {
         let _lock = approval_test_guard();
         let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());

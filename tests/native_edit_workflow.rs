@@ -190,7 +190,7 @@ async fn native_workflow_known_edit_structural_reads_preserve_duplicate_identity
             w.edit_path("code.rs", json!([{"anchor": copied[2], "edit_type": "insert_before", "text": "fn added() {\n}"}]))
                 .await
                 .unwrap();
-            let mut expected = vec![
+            let mut expected = [
                 "fn foo() {",
                 "}",
                 "fn added() {",
@@ -662,6 +662,7 @@ async fn native_workflow_failed_edit_reread_clears_canonical_freshness_latch() {
 
 #[tokio::test]
 async fn native_workflow_diff_marks_only_changed_lines() {
+    let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
     for (edit_type, text, expected, additions) in [
         (
             "insert_after",
@@ -684,7 +685,6 @@ async fn native_workflow_diff_marks_only_changed_lines() {
             .await
             .unwrap();
         w.assert_bytes(expected.as_bytes());
-        let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
         let output = ansi.replace_all(output.as_str().unwrap(), "");
         let added: Vec<_> = output
             .lines()

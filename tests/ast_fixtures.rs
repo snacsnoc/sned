@@ -82,7 +82,7 @@ fn run_language_fixtures(lang: &str, extension: &str) {
     std::env::set_current_dir(&fixture_dir).unwrap();
     let _cwd_guard = WorkingDirectoryGuard(original_cwd);
 
-    let result = (|| {
+    let result = {
         let tests_json_content = fs::read_to_string(&tests_json_path)
             .unwrap_or_else(|error| panic!("Missing {}: {error}", tests_json_path.display()));
         let tests: FixtureTests = serde_json::from_str(&tests_json_content)
@@ -249,7 +249,7 @@ fn run_language_fixtures(lang: &str, extension: &str) {
         }
 
         Ok::<(), ()>(())
-    })();
+    };
 
     result.unwrap();
 }

@@ -2896,18 +2896,20 @@ mod tests {
 
     #[test]
     fn test_stats_context_uses_tracked_context_tokens() {
-        let mut state = crate::core::agent_types::TaskState::default();
-        state.last_api_req_info = Some(crate::core::context::context_manager::ApiReqInfo {
-            tokens_in: Some(100),
-            tokens_out: Some(50),
-            cache_writes: Some(20),
-            cache_reads: Some(30),
-            reasoning_tokens: Some(25),
-            context_tokens: Some(200),
-            context_window: Some(1_000),
-            context_usage_percentage: Some(20.0),
+        let state = crate::core::agent_types::TaskState {
+            last_api_req_info: Some(crate::core::context::context_manager::ApiReqInfo {
+                tokens_in: Some(100),
+                tokens_out: Some(50),
+                cache_writes: Some(20),
+                cache_reads: Some(30),
+                reasoning_tokens: Some(25),
+                context_tokens: Some(200),
+                context_window: Some(1_000),
+                context_usage_percentage: Some(20.0),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
 
         let stats = format_stats_text(&state);
 

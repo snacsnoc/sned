@@ -151,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_skills_with_skills() {
         let handler = ListSkillsHandler::new();
-        let mut state = TaskState {
+        let state = TaskState {
             available_skills: vec![
                 SkillMetadata {
                     name: "project-skill".to_string(),
@@ -168,7 +168,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let result = handler.execute(&mut state, serde_json::json!({}));
+        let result = handler.execute(&state, serde_json::json!({}));
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("# AVAILABLE SKILLS"));
@@ -184,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_skills_from_filesystem() {
         let handler = ListSkillsHandler::new();
-        let mut state = TaskState {
+        let state = TaskState {
             available_skills: vec![SkillMetadata {
                 name: "fs-skill".to_string(),
                 description: "Filesystem discovered skill".to_string(),
@@ -194,7 +194,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handler.execute(&mut state, serde_json::json!({}));
+        let result = handler.execute(&state, serde_json::json!({}));
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("fs-skill: Filesystem discovered skill"));

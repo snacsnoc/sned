@@ -7074,7 +7074,7 @@ mod tests {
                     .then(|| number.parse::<usize>().ok())
                     .flatten()
             })
-            .last()
+            .next_back()
             .unwrap();
         assert!(shown_end < 3236);
         let next = shown_end + 1;
@@ -7305,6 +7305,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_digest_omits_denied_command() {
         use crate::core::approval::ApprovalManager;
         use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
@@ -7690,6 +7691,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_run_startup_applies_configured_strict_plan_mode() {
         use crate::test_support::env_lock;
 
@@ -7781,6 +7783,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_approval_timeout_does_not_skip_remaining_batch_calls() {
         use crate::core::approval::{ApprovalManager, ApprovalResult};
         use crate::core::tools::ToolRegistry;
@@ -8410,8 +8413,10 @@ Irrespective of whether additional information or instructions are given, you ar
     /// with shell commands.
     #[test]
     fn decay_read_loop_state_keeps_state_for_inspection_tools() {
-        let mut state = TaskState::default();
-        state.turns_completed = 5;
+        let mut state = TaskState {
+            turns_completed: 5,
+            ..Default::default()
+        };
         state
             .consecutive_reads
             .insert("/tmp/foo.c".to_string(), 3);
@@ -8469,8 +8474,10 @@ Irrespective of whether additional information or instructions are given, you ar
     #[test]
     fn decay_read_loop_state_clears_state_for_mutating_tools() {
         for tool in &["edit_file", "write_to_file", "replace_symbol", "rename_symbol"] {
-            let mut state = TaskState::default();
-            state.turns_completed = 5;
+            let mut state = TaskState {
+                turns_completed: 5,
+                ..Default::default()
+            };
             state
                 .consecutive_reads
                 .insert("/tmp/foo.c".to_string(), 3);
@@ -8509,8 +8516,10 @@ Irrespective of whether additional information or instructions are given, you ar
     /// the model finally returns to the same file in a new task.
     #[test]
     fn decay_read_loop_state_applies_cooldown_for_unknown_tools() {
-        let mut state = TaskState::default();
-        state.turns_completed = 5;
+        let mut state = TaskState {
+            turns_completed: 5,
+            ..Default::default()
+        };
         state
             .consecutive_reads
             .insert("/tmp/foo.c".to_string(), 3);
@@ -8556,8 +8565,10 @@ Irrespective of whether additional information or instructions are given, you ar
     /// inspection-tool allowlist this would still be 1.
     #[test]
     fn decay_read_loop_state_alternating_read_execute_accumulates() {
-        let mut state = TaskState::default();
-        state.turns_completed = 1;
+        let mut state = TaskState {
+            turns_completed: 1,
+            ..Default::default()
+        };
         for turn in 1..=3u32 {
             // Simulate: read_file increments count, then a shell grep
             // follows without wiping.
@@ -9413,6 +9424,7 @@ Irrespective of whether additional information or instructions are given, you ar
     /// Skipped per plan: no production code changes.
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_run_preserves_pending_cancellation_until_observed() {
         use crate::test_support::env_lock;
 
@@ -9591,6 +9603,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_cancel_during_pending_approval_starts_no_tool() {
         use crate::core::approval::{ApprovalManager, ApprovalResult};
         use crate::core::tools::ToolRegistry;
@@ -10700,6 +10713,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_task_resume() {
         use crate::test_support::env_lock;
         use std::env;
@@ -11383,6 +11397,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_approval_manager_non_interactive_denies_by_default() {
         use crate::core::approval::ApprovalManager;
         use crate::core::tools::ToolRegistry;
@@ -11559,6 +11574,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_command_pipeline_scope_approval_skips_noninteractive_prompt() {
         use crate::core::approval::{ApprovalManager, command_approval_scopes};
         use crate::core::tools::ToolRegistry;
@@ -12683,6 +12699,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_cumulative_openai_stream_reaches_agent_loop_without_duplicate_text() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -15393,6 +15410,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_all_denied_batch_counts_mistakes_and_continues() {
         use crate::core::approval::ApprovalManager;
         use crate::core::tools::ToolRegistry;
@@ -15603,6 +15621,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_mixed_success_and_denial_fails_plan_step_without_advancing() {
         use crate::core::approval::ApprovalManager;
         use crate::core::tools::ToolRegistry;

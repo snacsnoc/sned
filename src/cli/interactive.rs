@@ -9086,6 +9086,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_command_side_effect_waits_for_approval_response() {
         use crate::core::agent_types::{AgentConfig, AgentMode, TaskState};
         use crate::core::approval::{
@@ -10430,6 +10431,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_handle_key_event_pages_through_completion_in_transcript() -> anyhow::Result<()> {
         use crate::cli::tui::app::ScrollMode;
         use ratatui::Terminal;
@@ -11995,6 +11997,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_handle_key_event_y_approves_pending_plan_with_empty_input() -> anyhow::Result<()>
     {
         use crate::core::plan_state::PlanState;
@@ -12038,6 +12041,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_handle_key_event_uppercase_y_approves_pending_plan_with_empty_input()
     -> anyhow::Result<()> {
         use crate::core::plan_state::PlanState;
@@ -12081,6 +12085,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_handle_key_event_y_then_letter_types_full_word() -> anyhow::Result<()> {
         use crate::core::plan_state::PlanState;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -12123,6 +12128,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_handle_key_event_input_reset_disarms_plan_approve() -> anyhow::Result<()> {
         use crate::core::plan_state::PlanState;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -12166,6 +12172,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_handle_key_event_followup_answer_not_prefixed_after_arm() -> anyhow::Result<()> {
         use crate::core::plan_state::PlanState;
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -12216,6 +12223,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_handle_key_event_y_remains_text_when_plan_input_is_non_empty()
     -> anyhow::Result<()> {
         use crate::core::plan_state::PlanState;
@@ -12403,6 +12411,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_handle_key_event_submits_multiline_input() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -12470,6 +12479,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_followup_submit_clears_input_overlays() -> anyhow::Result<()> {
         use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 

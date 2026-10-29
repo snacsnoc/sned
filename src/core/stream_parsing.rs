@@ -803,11 +803,9 @@ mod tests {
 
     #[test]
     fn test_dedent_never_cuts_short_indent_lines() {
-        let lines = vec![
-            "                alpha".to_string(),
+        let lines = ["                alpha".to_string(),
             "                beta".to_string(),
-            "12345678901234567890".to_string(),
-        ];
+            "12345678901234567890".to_string()];
         assert_eq!(
             strip_common_indent(&lines.iter().map(String::as_str).collect::<Vec<_>>()),
             vec![
@@ -820,11 +818,9 @@ mod tests {
 
     #[test]
     fn test_dedent_never_splits_a_multibyte_character() {
-        let lines = vec![
-            "                alpha".to_string(),
+        let lines = ["                alpha".to_string(),
             "                beta".to_string(),
-            "123456789012345Étail".to_string(),
-        ];
+            "123456789012345Étail".to_string()];
         assert_eq!(
             strip_common_indent(&lines.iter().map(String::as_str).collect::<Vec<_>>())[2],
             "123456789012345Étail".to_string()
@@ -836,11 +832,9 @@ mod tests {
         // Fifteen spaces plus a two-byte NBSP: the 16-byte dedent lands
         // between the NBSP bytes, which byte indexing cannot express.
         let nbsp_line = "               \u{a0}x".to_string();
-        let lines = vec![
-            "                alpha".to_string(),
+        let lines = ["                alpha".to_string(),
             "                beta".to_string(),
-            nbsp_line.clone(),
-        ];
+            nbsp_line.clone()];
         assert_eq!(
             strip_common_indent(&lines.iter().map(String::as_str).collect::<Vec<_>>()),
             vec!["alpha".to_string(), "beta".to_string(), nbsp_line]

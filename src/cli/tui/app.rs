@@ -5857,9 +5857,7 @@ mod tests {
     #[test]
     fn test_osc8_path_survives_tui_render_as_click_target() {
         let mut app = App::new();
-        app.push_output(Line::from(format!(
-            "  ▶ read \x1b]8;;file:///tmp/example.rs\x1b\\/tmp/example.rs\x1b]8;;\x1b\\"
-        )));
+        app.push_output(Line::from("  ▶ read \x1b]8;;file:///tmp/example.rs\x1b\\/tmp/example.rs\x1b]8;;\x1b\\".to_string()));
         let backend = TestBackend::new(48, 12);
         let mut terminal = Terminal::new(backend).expect("terminal should initialize");
         terminal
@@ -8618,7 +8616,7 @@ mod tests {
             .collect();
         for line in &all_lines {
             assert!(
-                !(line.trim() == "\u{2666}"),
+                (line.trim() != "\u{2666}"),
                 "indicator must not be on its own line: {:?}",
                 all_lines
             );

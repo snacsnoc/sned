@@ -808,8 +808,10 @@ mod tests {
         let mut hook_manager = HookManager::new("test-user");
         hook_manager.set_runtime_hooks_dir(temp_dir.path().to_path_buf());
 
-        let mut initial_state = TaskState::default();
-        initial_state.consecutive_mistakes = 2;
+        let initial_state = TaskState {
+            consecutive_mistakes: 2,
+            ..Default::default()
+        };
         let state = Arc::new(tokio::sync::Mutex::new(initial_state));
         let ctx = ToolContext::new(
             state.clone(),

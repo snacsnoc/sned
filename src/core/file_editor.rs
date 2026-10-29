@@ -3673,7 +3673,7 @@ mod tests {
         assert_eq!(transition.edit_ranges.len(), 2);
         assert!(manager.is_tracking("duplicates", Some("staged")));
         manager
-            .commit_transitions_checked(&[transition.clone()])
+            .commit_transitions_checked(std::slice::from_ref(&transition))
             .unwrap();
         assert_eq!(
             manager.get_anchors("duplicates", Some("staged")).unwrap(),
@@ -3716,7 +3716,7 @@ mod tests {
         ));
         assert_eq!(transition.retired_identities.len(), 3);
         manager
-            .commit_transitions_checked(&[transition.clone()])
+            .commit_transitions_checked(std::slice::from_ref(&transition))
             .unwrap();
         assert_eq!(
             manager
@@ -3787,7 +3787,7 @@ mod tests {
             snapshot_line_anchors(&transition.output_lines)
         );
         manager
-            .commit_transitions_checked(&[transition.clone()])
+            .commit_transitions_checked(std::slice::from_ref(&transition))
             .unwrap();
         assert!(!manager.is_tracking("large", Some("staged")));
         assert_eq!(
@@ -4337,7 +4337,7 @@ mod tests {
                 .all(|origin| matches!(origin, LineProvenance::Created { .. }))
         );
         manager
-            .commit_transitions_checked(&[transition.clone()])
+            .commit_transitions_checked(std::slice::from_ref(&transition))
             .unwrap();
         assert_eq!(
             manager
@@ -4358,7 +4358,7 @@ mod tests {
         let stale = AnchorStateManager::with_cache_file(cache.clone());
         let transition = staged_edit(&first, "file", original, &[(1, 1, "replace", "new")]);
         first
-            .commit_transitions_checked(&[transition.clone()])
+            .commit_transitions_checked(std::slice::from_ref(&transition))
             .unwrap();
         stale.save();
         assert_eq!(
@@ -4407,7 +4407,7 @@ mod tests {
             &[(0, 0, "replace", "winner")],
         );
         fresh
-            .commit_transitions_checked(&[transition.clone()])
+            .commit_transitions_checked(std::slice::from_ref(&transition))
             .unwrap();
         let committed = std::fs::read(&shard).unwrap();
         manager.invalidate_state("file", Some("staged"));
