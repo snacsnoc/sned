@@ -1057,9 +1057,9 @@ fn repair_close_braces(args: &str) -> String {
                     let valid_escape =
                         matches!(next, Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't'));
                     let valid_unicode_escape = next == Some('u')
-                        && chars.get(index + 2..index + 6).is_some_and(|digits| {
-                            digits.iter().all(char::is_ascii_hexdigit)
-                        });
+                        && chars
+                            .get(index + 2..index + 6)
+                            .is_some_and(|digits| digits.iter().all(char::is_ascii_hexdigit));
                     if valid_escape {
                         repaired.push('\\');
                         repaired.push(next.expect("valid escape has next character"));

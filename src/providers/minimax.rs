@@ -1127,12 +1127,19 @@ async fn process_minimax_sse_line(
     reasoning_state: &mut MinimaxReasoningState,
 ) {
     let line = line.trim();
-    if line.is_empty() || line == "data: [DONE]" || line == "[DONE]" {
+    if line.is_empty()
+        || line == "data: [DONE]"
+        || line == "[DONE]"
+        || last_stop_reason.as_deref() == Some(MINIMAX_SSE_PARSE_FAILURE)
+    {
         return;
     }
     let data = line
         .strip_prefix("data:")
         .map(|s| s.strip_prefix(" ").unwrap_or(s));
+    if data.is_some_and(|value| value.trim().is_empty()) {
+        return;
+    }
     if let Some(inner) = data
         && let Ok(event) = serde_json::from_str::<OpenAIStreamResponse>(inner)
     {
@@ -1358,21 +1365,18 @@ async fn process_minimax_sse_line(
             .await;
         }
     } else {
-        tracing::warn!(
-            "MiniMax SSE parse failure for line: {}",
-            data.unwrap_or("").chars().take(500).collect::<String>()
-        );
-        send_chunk(
+        *last_stop_reason = Some(MINIMAX_SSE_PARSE_FAILURE.to_string());
+        tracing::warn!("MiniMax SSE parse failure");
+        let _ = send_chunk(
             tx,
-            ApiStreamChunk::Error(format!(
-                "MiniMax SSE parse failure: {}",
-                data.unwrap_or("").chars().take(200).collect::<String>()
-            )),
+            ApiStreamChunk::Error("MiniMax SSE parse error: invalid JSON (retryable)".to_string()),
             "error",
         )
         .await;
     }
 }
+
+const MINIMAX_SSE_PARSE_FAILURE: &str = "__sned_sse_parse_failure__";
 
 impl Provider for MinimaxProvider {
     async fn create_message(&self, request: ProviderRequest) -> Result<ApiStream, ProviderError> {
@@ -1444,12 +1448,26 @@ impl Provider for MinimaxProvider {
                                 &mut reasoning_state,
                             )
                             .await;
+                            if last_stop_reason.as_deref() == Some(MINIMAX_SSE_PARSE_FAILURE) {
+                                stream_errored = true;
+                                break;
+                            }
                             if tx.is_closed() {
                                 break;
                             }
                         }
+                        if stream_errored {
+                            break;
+                        }
                         if let Some(err) = sse_buffer.take_error() {
-                            let _ = send_chunk(&tx, ApiStreamChunk::Error(err), "error").await;
+                            last_stop_reason = Some(MINIMAX_SSE_PARSE_FAILURE.to_string());
+                            stream_errored = true;
+                            let _ = send_chunk(
+                                &tx,
+                                ApiStreamChunk::Error(format!("{err} (retryable)")),
+                                "error",
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -1489,6 +1507,9 @@ impl Provider for MinimaxProvider {
                         &mut reasoning_state,
                     )
                     .await;
+                    if last_stop_reason.as_deref() == Some(MINIMAX_SSE_PARSE_FAILURE) {
+                        return;
+                    }
                     if tx.is_closed() {
                         return;
                     }
@@ -2333,6 +2354,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_malformed_sse_emits_bounded_error_and_stops() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut calls = std::collections::HashMap::new();
+        let mut completed = std::collections::HashSet::new();
+        let mut stop_reason = None;
+        let mut xml = String::new();
+        let mut text = String::new();
+        let mut signature = None;
+        let mut reasoning = MinimaxReasoningState::default();
+        process_minimax_sse_line(
+            "data: not-json",
+            &tx,
+            &mut calls,
+            &mut completed,
+            &mut stop_reason,
+            &mut xml,
+            &mut text,
+            &mut signature,
+            &mut reasoning,
+        )
+        .await;
+        process_minimax_sse_line(
+            r#"data: {"id":"evt_2","choices":[{"delta":{"content":"must not emit"}}]}"#,
+            &tx,
+            &mut calls,
+            &mut completed,
+            &mut stop_reason,
+            &mut xml,
+            &mut text,
+            &mut signature,
+            &mut reasoning,
+        )
+        .await;
+
+        assert_eq!(stop_reason.as_deref(), Some(MINIMAX_SSE_PARSE_FAILURE));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ApiStreamChunk::Error(error))
+                if error == "MiniMax SSE parse error: invalid JSON (retryable)"
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

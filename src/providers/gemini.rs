@@ -424,6 +424,8 @@ fn gemini_candidate_block_error(finish_reason: &str) -> Option<String> {
     })
 }
 
+const GEMINI_SSE_PARSE_FAILURE: &str = "__sned_sse_parse_failure__";
+
 async fn send_chunk(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     chunk: ApiStreamChunk,
@@ -443,18 +445,37 @@ async fn process_gemini_sse_line(
     model_info: Option<&crate::providers::ModelInfo>,
 ) {
     let line = line.trim();
-    if line.is_empty() || line == "data: [DONE]" {
+    if line.is_empty()
+        || line == "data: [DONE]"
+        || line.starts_with(':')
+        || line.starts_with("event:")
+        || line.starts_with("id:")
+        || line.starts_with("retry:")
+        || last_stop_reason.as_deref() == Some(GEMINI_SSE_PARSE_FAILURE)
+    {
         return;
     }
 
     let data = line
         .strip_prefix("data:")
         .map_or(line, |s| s.strip_prefix(' ').unwrap_or(s));
+    if data.trim().is_empty() {
+        return;
+    }
 
     let chunk = match serde_json::from_str::<GeminiStreamChunk>(data) {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(line = %line, error = %e, "Gemini SSE: failed to parse chunk");
+            *last_stop_reason = Some(GEMINI_SSE_PARSE_FAILURE.to_string());
+            tracing::warn!(error = %e, "Gemini SSE: failed to parse chunk");
+            let _ = send_chunk(
+                tx,
+                ApiStreamChunk::Error(
+                    "Gemini SSE parse error: invalid JSON (retryable)".to_string(),
+                ),
+                "error",
+            )
+            .await;
             return;
         }
     };
@@ -860,12 +881,26 @@ impl Provider for GeminiProvider {
                                 model_info.as_ref(),
                             )
                             .await;
+                            if last_stop_reason.as_deref() == Some(GEMINI_SSE_PARSE_FAILURE) {
+                                stream_errored = true;
+                                break;
+                            }
                             if tx.is_closed() {
                                 break;
                             }
                         }
+                        if stream_errored {
+                            break;
+                        }
                         if let Some(err) = sse_buffer.take_error() {
-                            let _ = send_chunk(&tx, ApiStreamChunk::Error(err), "error").await;
+                            last_stop_reason = Some(GEMINI_SSE_PARSE_FAILURE.to_string());
+                            stream_errored = true;
+                            let _ = send_chunk(
+                                &tx,
+                                ApiStreamChunk::Error(format!("{err} (retryable)")),
+                                "error",
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -1068,6 +1103,91 @@ pub(crate) fn get_gemini_model_info(model_id: &str) -> ModelInfo {
 mod tests {
     use super::*;
     use crate::providers::{FunctionDefinition, MessageRole, StorageMessage, ToolDefinition};
+
+    #[tokio::test]
+    async fn test_malformed_sse_emits_bounded_error_and_stops() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut calls = HashMap::new();
+        let mut completed = HashSet::new();
+        let mut stop_reason = None;
+        let mut blocked = false;
+        let mut grounding = None;
+        process_gemini_sse_line(
+            ": provider keepalive",
+            &tx,
+            &mut calls,
+            &mut completed,
+            &mut stop_reason,
+            &mut blocked,
+            &mut grounding,
+            None,
+        )
+        .await;
+        process_gemini_sse_line(
+            "event: message",
+            &tx,
+            &mut calls,
+            &mut completed,
+            &mut stop_reason,
+            &mut blocked,
+            &mut grounding,
+            None,
+        )
+        .await;
+        process_gemini_sse_line(
+            "id: response-1",
+            &tx,
+            &mut calls,
+            &mut completed,
+            &mut stop_reason,
+            &mut blocked,
+            &mut grounding,
+            None,
+        )
+        .await;
+        process_gemini_sse_line(
+            "data:",
+            &tx,
+            &mut calls,
+            &mut completed,
+            &mut stop_reason,
+            &mut blocked,
+            &mut grounding,
+            None,
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+        process_gemini_sse_line(
+            "data: not-json",
+            &tx,
+            &mut calls,
+            &mut completed,
+            &mut stop_reason,
+            &mut blocked,
+            &mut grounding,
+            None,
+        )
+        .await;
+        process_gemini_sse_line(
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"must not emit"}]}}]}"#,
+            &tx,
+            &mut calls,
+            &mut completed,
+            &mut stop_reason,
+            &mut blocked,
+            &mut grounding,
+            None,
+        )
+        .await;
+
+        assert_eq!(stop_reason.as_deref(), Some(GEMINI_SSE_PARSE_FAILURE));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ApiStreamChunk::Error(error))
+                if error == "Gemini SSE parse error: invalid JSON (retryable)"
+        ));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn test_gemini_config() {

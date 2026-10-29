@@ -1030,6 +1030,8 @@ pub struct OpenAiStreamDeltaState {
     text_mode: OpenAiTextStreamMode,
     started_tool_call_indices: std::collections::HashSet<usize>,
     tool_argument_stats: std::collections::HashMap<usize, ToolArgumentStats>,
+    /// A malformed SSE frame terminates this attempt; never flush partial state as success.
+    parse_failed: bool,
 }
 
 impl OpenAiStreamDeltaState {
@@ -1238,9 +1240,9 @@ fn openai_error_chunk(data: &str) -> Option<ApiStreamChunk> {
     } else {
         ""
     };
+    let message: String = envelope.error.message.chars().take(500).collect();
     Some(ApiStreamChunk::Error(format!(
-        "OpenAI SSE error: {}{details}{retryable}",
-        envelope.error.message
+        "OpenAI SSE error: {message}{details}{retryable}"
     )))
 }
 
@@ -1255,6 +1257,9 @@ async fn process_openai_sse_line(
     model_info: Option<&crate::providers::OpenAiCompatibleModelInfo>,
     usage_sent: &mut bool,
 ) {
+    if delta_state.parse_failed {
+        return;
+    }
     let line = line.trim();
     if line.is_empty() || line == "data: [DONE]" {
         return;
@@ -1263,14 +1268,26 @@ async fn process_openai_sse_line(
         .strip_prefix("data:")
         .map(|s| s.strip_prefix(" ").unwrap_or(s));
     if let Some(data) = data {
+        if data.trim().is_empty() {
+            return;
+        }
         let chunk = match serde_json::from_str::<OpenAiStreamChunk>(data) {
             Ok(chunk) => chunk,
             Err(error) => {
+                delta_state.parse_failed = true;
                 if let Some(chunk) = openai_error_chunk(data) {
                     send_chunk(tx, chunk, "error").await;
                     return;
                 }
-                tracing::warn!(line = %line, error = %error, "OpenAI SSE: failed to parse chunk");
+                tracing::warn!(error = %error, "OpenAI SSE: failed to parse chunk");
+                let _ = send_chunk(
+                    tx,
+                    ApiStreamChunk::Error(
+                        "OpenAI SSE parse error: invalid JSON (retryable)".to_string(),
+                    ),
+                    "error",
+                )
+                .await;
                 return;
             }
         };
@@ -1351,9 +1368,7 @@ async fn process_openai_sse_line(
                         id.clone_into(
                             &mut accumulated_tool_calls
                                 .entry(tool_index)
-                                .or_insert_with(|| {
-                                    (String::new(), String::new(), String::new())
-                                })
+                                .or_insert_with(|| (String::new(), String::new(), String::new()))
                                 .0,
                         );
                     }
@@ -1630,9 +1645,20 @@ pub async fn parse_openai_sse_to_chunks(
         if tx.is_closed() {
             break;
         }
+        if delta_state.parse_failed {
+            break;
+        }
     }
-    if let Some(err) = buffer.take_error() {
-        let _ = send_chunk(tx, ApiStreamChunk::Error(err), "error").await;
+    if let Some(err) = buffer.take_error()
+        && !delta_state.parse_failed
+    {
+        delta_state.parse_failed = true;
+        let _ = send_chunk(
+            tx,
+            ApiStreamChunk::Error(format!("{err} (retryable)")),
+            "error",
+        )
+        .await;
     }
     (frame_count, empty_frame_count)
 }
@@ -1649,6 +1675,9 @@ pub async fn finish_openai_sse_to_chunks(
 ) -> (u64, u64) {
     let mut frame_count = 0;
     let mut empty_frame_count = 0;
+    if delta_state.parse_failed {
+        return (frame_count, empty_frame_count);
+    }
     if let Some(line) = buffer.finish() {
         frame_count += u64::from(line.trim_start().starts_with("data:"));
         empty_frame_count += u64::from(
@@ -2041,6 +2070,10 @@ impl Provider for OpenAiProvider {
                         .await;
                         raw_sse_frames += frames;
                         empty_sse_frames += empty_frames;
+                        if delta_state.parse_failed {
+                            stream_errored = true;
+                            break;
+                        }
                         if tx.is_closed() {
                             break;
                         }
@@ -3195,7 +3228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_openai_sse_line_ignores_unknown_malformed_data() {
+    async fn test_process_openai_sse_line_terminates_on_malformed_data() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let mut delta_state = OpenAiStreamDeltaState::default();
         let mut accumulated_tool_calls = std::collections::HashMap::new();
@@ -3215,7 +3248,57 @@ mod tests {
         )
         .await;
 
+        process_openai_sse_line(
+            r#"data: {"id":"later","choices":[{"delta":{"content":"must not emit"}}]}"#,
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+
+        let ApiStreamChunk::Error(error) = rx.try_recv().expect("malformed SSE must fail") else {
+            panic!("malformed SSE must emit an error");
+        };
+        assert_eq!(error, "OpenAI SSE parse error: invalid JSON (retryable)");
+        assert!(delta_state.parse_failed);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_malformed_frame_and_buffer_error_emit_only_one_error() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut buffer = SseLineBuffer::with_max_line_length(32);
+        let mut delta_state = OpenAiStreamDeltaState::default();
+        let mut accumulated_tool_calls = std::collections::HashMap::new();
+        let mut completed_tool_call_indices = std::collections::HashSet::new();
+        let mut last_stop_reason = None;
+        let mut usage_sent = false;
+
+        parse_openai_sse_to_chunks(
+            b"data: not-json\n0123456789012345678901234567890123456789",
+            &mut buffer,
+            &tx,
+            &mut delta_state,
+            &mut accumulated_tool_calls,
+            &mut completed_tool_call_indices,
+            &mut last_stop_reason,
+            None,
+            &mut usage_sent,
+        )
+        .await;
+
+        let ApiStreamChunk::Error(error) = rx.try_recv().expect("one parse error expected") else {
+            panic!("malformed SSE must emit an error");
+        };
+        assert!(error.contains("(retryable)"));
+        assert!(
+            rx.try_recv().is_err(),
+            "must not emit a duplicate buffer error"
+        );
     }
 
     #[tokio::test]

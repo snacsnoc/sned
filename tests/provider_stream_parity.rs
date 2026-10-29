@@ -591,17 +591,25 @@ async fn both_providers_handle_done_line() {
 }
 
 #[tokio::test]
-async fn both_providers_ignore_malformed_json() {
+async fn both_providers_report_malformed_json_as_retryable_error() {
     let openai_sse = "data: {not valid json}\n";
     let anthropic_sse = "data: {not valid json}\n";
 
     let openai_chunks = collect_openai_chunks(openai_sse).await;
     let anthropic_chunks = collect_anthropic_chunks(anthropic_sse).await;
 
-    // OpenAI emits synthetic usage, Anthropic does not
+    // Malformed provider frames terminate the attempt. They must not be
+    // converted into a synthetic successful completion.
     assert_eq!(openai_chunks.len(), 1);
-    assert!(matches!(&openai_chunks[0], ApiStreamChunk::Usage(_)));
-    assert_eq!(anthropic_chunks.len(), 0);
+    assert!(matches!(
+        &openai_chunks[0],
+        ApiStreamChunk::Error(error) if error.contains("(retryable)")
+    ));
+    assert_eq!(anthropic_chunks.len(), 1);
+    assert!(matches!(
+        &anthropic_chunks[0],
+        ApiStreamChunk::Error(error) if error.contains("(retryable)")
+    ));
 }
 
 #[tokio::test]

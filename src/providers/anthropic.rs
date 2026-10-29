@@ -618,6 +618,7 @@ impl Provider for AnthropicProvider {
             let mut stream = stream;
             let mut sse_buffer = crate::providers::SseLineBuffer::default();
             let mut last_tool_call = AnthropicToolCallState::default();
+            let mut stream_errored = false;
 
             while let Some(result) = stream.next().await {
                 if tx.is_closed() {
@@ -632,6 +633,10 @@ impl Provider for AnthropicProvider {
                             &mut last_tool_call,
                         )
                         .await;
+                        if last_tool_call.parse_failed {
+                            stream_errored = true;
+                            break;
+                        }
                         if tx.is_closed() {
                             break;
                         }
@@ -651,13 +656,15 @@ impl Provider for AnthropicProvider {
                         )
                         .await
                         {
+                            stream_errored = true;
                             break;
                         }
+                        stream_errored = true;
                         break;
                     }
                 }
             }
-            if !tx.is_closed() {
+            if !tx.is_closed() && !stream_errored {
                 finish_anthropic_sse_to_chunks(&mut sse_buffer, &tx, &mut last_tool_call).await;
             }
         });
@@ -691,6 +698,7 @@ pub struct AnthropicToolCallState {
     name: String,
     arguments: String,
     last_was_text: bool,
+    parse_failed: bool,
 }
 
 pub(crate) fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
@@ -850,6 +858,9 @@ async fn process_anthropic_sse_line(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     last_tool_call: &mut AnthropicToolCallState,
 ) {
+    if last_tool_call.parse_failed {
+        return;
+    }
     let line = line.trim();
     if line.is_empty() || line == "data: [DONE]" {
         return;
@@ -858,10 +869,22 @@ async fn process_anthropic_sse_line(
         .strip_prefix("data:")
         .map(|s| s.strip_prefix(" ").unwrap_or(s))
     {
+        if data.trim().is_empty() {
+            return;
+        }
         if let Ok(event) = serde_json::from_str::<AnthropicStreamEvent>(data) {
             process_anthropic_event(event, tx, last_tool_call).await;
         } else {
-            tracing::warn!(line = %line, "Anthropic SSE: failed to parse event");
+            last_tool_call.parse_failed = true;
+            tracing::warn!("Anthropic SSE: failed to parse event");
+            let _ = send_chunk(
+                tx,
+                ApiStreamChunk::Error(
+                    "Anthropic SSE parse error: invalid JSON (retryable)".to_string(),
+                ),
+                "error",
+            )
+            .await;
         }
     }
 }
@@ -875,12 +898,20 @@ pub async fn parse_anthropic_sse_to_chunks(
 ) {
     for line in buffer.push_chunk(chunk) {
         process_anthropic_sse_line(&line, tx, last_tool_call).await;
-        if tx.is_closed() {
+        if tx.is_closed() || last_tool_call.parse_failed {
             return;
         }
     }
-    if let Some(err) = buffer.take_error() {
-        let _ = send_chunk(tx, ApiStreamChunk::Error(err), "error").await;
+    if let Some(err) = buffer.take_error()
+        && !last_tool_call.parse_failed
+    {
+        last_tool_call.parse_failed = true;
+        let _ = send_chunk(
+            tx,
+            ApiStreamChunk::Error(format!("{err} (retryable)")),
+            "error",
+        )
+        .await;
     }
 }
 
@@ -889,6 +920,9 @@ pub async fn finish_anthropic_sse_to_chunks(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
     last_tool_call: &mut AnthropicToolCallState,
 ) {
+    if last_tool_call.parse_failed {
+        return;
+    }
     if let Some(line) = buffer.finish() {
         process_anthropic_sse_line(&line, tx, last_tool_call).await;
     }
@@ -1150,6 +1184,30 @@ async fn process_anthropic_event(
 mod tests {
     use super::*;
     use crate::providers::{FunctionDefinition, MessageRole, StorageMessage, ToolDefinition};
+
+    #[tokio::test]
+    async fn test_malformed_sse_emits_bounded_error_and_stops() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut buffer = crate::providers::SseLineBuffer::default();
+        let mut state = AnthropicToolCallState::default();
+        parse_anthropic_sse_to_chunks(b"data: not-json\n", &mut buffer, &tx, &mut state).await;
+        parse_anthropic_sse_to_chunks(
+            br#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}
+        "#,
+            &mut buffer,
+            &tx,
+            &mut state,
+        )
+        .await;
+
+        assert!(state.parse_failed);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ApiStreamChunk::Error(error))
+                if error == "Anthropic SSE parse error: invalid JSON (retryable)"
+        ));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn test_anthropic_config() {
