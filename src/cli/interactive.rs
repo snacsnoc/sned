@@ -4148,7 +4148,12 @@ async fn handle_cli_only_command_with_terminal(
                 if task_opts.track_changes
                     && crate::core::shadow_git::is_initialized(&workspace_root)
                 {
-                    match crate::core::shadow_git::diff_turns(&workspace_root, 1, 0) {
+                    let root = workspace_root.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::core::shadow_git::diff_turns(&root, 1, 0)
+                    })
+                    .await?;
+                    match result {
                         Ok(diff) => {
                             if diff.is_empty() {
                                 app.push_plain("No changes.");
@@ -4210,7 +4215,12 @@ async fn handle_cli_only_command_with_terminal(
                 if task_opts.track_changes
                     && crate::core::shadow_git::is_initialized(&workspace_root)
                 {
-                    match crate::core::shadow_git::log(&workspace_root, Some(10)) {
+                    let root = workspace_root.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::core::shadow_git::log(&root, Some(10))
+                    })
+                    .await?;
+                    match result {
                         Ok(log) => {
                             if log.is_empty() {
                                 app.push_plain("No log entries.");
@@ -4274,7 +4284,12 @@ async fn handle_cli_only_command_with_terminal(
             if let Some(msg) = commit_msg {
                 if let Ok(workspace_root) = std::env::current_dir() {
                     if crate::core::shadow_git::is_initialized(&workspace_root) {
-                        match crate::core::shadow_git::diff_turns(&workspace_root, 1, 0) {
+                        let root = workspace_root.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::core::shadow_git::diff_turns(&root, 1, 0)
+                        })
+                        .await?;
+                        match result {
                             Ok(diff) => {
                                 if diff.is_empty() {
                                     app.push_plain("No changes to commit.");
@@ -4298,10 +4313,14 @@ async fn handle_cli_only_command_with_terminal(
                                             Style::default().fg(theme::warning_fg()),
                                         );
                                     } else if confirm.trim().to_lowercase() == "y" {
-                                        match crate::core::shadow_git::commit_to_real_git(
-                                            &workspace_root,
-                                            &msg,
-                                        ) {
+                                        let result = tokio::task::spawn_blocking(move || {
+                                            crate::core::shadow_git::commit_to_real_git(
+                                                &workspace_root,
+                                                &msg,
+                                            )
+                                        })
+                                        .await?;
+                                        match result {
                                             Ok(files) => {
                                                 app.push_plain(format!(
                                                     "Committed {} file(s) to your git repo.",

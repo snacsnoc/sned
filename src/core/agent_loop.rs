@@ -1419,12 +1419,19 @@ impl AgentLoop {
         // Initialize shadow git repo for change tracking
         if self.config.track_changes
             && let Ok(workspace_root) = std::env::current_dir()
-            && let Err(e) = crate::core::shadow_git::init_shadow_repo(&workspace_root)
         {
-            warn!(
-                "Failed to initialize shadow git repo: {}. Change tracking disabled.",
-                e
-            );
+            let result = tokio::task::spawn_blocking(move || {
+                crate::core::shadow_git::init_shadow_repo(&workspace_root)
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
+                    "Failed to initialize shadow git repo: {}. Change tracking disabled.",
+                    error
+                ),
+                Err(error) => warn!("Shadow git initialization worker failed: {}", error),
+            }
         }
 
         // Apply subagents enabled setting from global state
