@@ -249,7 +249,7 @@ pub struct ExecuteCommandHandler {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct SandboxEnvReport {
+pub(super) struct SandboxEnvReport {
     not_allowlisted: Vec<String>,
     sensitive: Vec<String>,
 }
@@ -1550,7 +1550,7 @@ impl ExecuteCommandHandler {
             }
         }
     }
-    fn build_sandbox_env(
+    pub(super) fn build_sandbox_env(
         cwd: Option<&Path>,
     ) -> (std::collections::HashMap<String, String>, SandboxEnvReport) {
         use std::collections::HashMap;
@@ -1578,6 +1578,13 @@ impl ExecuteCommandHandler {
             "MORE",
             "LOGNAME",
             "HOSTNAME",
+            "DOCKER_HOST",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "GOPATH",
+            "PYTHONPATH",
+            "NODE_PATH",
+            "NPM_CONFIG_PREFIX",
         ];
 
         let extra: Vec<String> = std::env::var("SNED_ALLOW_ENV")

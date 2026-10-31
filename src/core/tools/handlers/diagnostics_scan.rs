@@ -47,7 +47,15 @@ async fn capture_diagnostics_command(
     mut command: Command,
     limit: usize,
 ) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+    let (env, _) = super::execute_command::ExecuteCommandHandler::build_sandbox_env(
+        command.as_std().get_current_dir(),
+    );
+    command.env_clear().envs(env).kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn()?;
+    #[cfg(unix)]
+    let mut group = DiagnosticsProcessGroup(child.id());
     let stdout = child
         .stdout
         .take()
@@ -67,7 +75,26 @@ async fn capture_diagnostics_command(
         .await
         .map_err(|error| anyhow::anyhow!("diagnostics stderr task failed: {error}"))??
         .display(limit, "diagnostics stderr");
+    #[cfg(unix)]
+    {
+        group.0 = None;
+    }
     Ok((status, stdout, stderr))
+}
+
+#[cfg(unix)]
+struct DiagnosticsProcessGroup(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for DiagnosticsProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // The child is the leader of the process group created above.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
 }
 
 /// Cache for detect_project_type results to avoid redundant filesystem walks.
@@ -803,6 +830,67 @@ mod tests {
         assert!(status.success());
         assert!(stdout.contains("retaining 1024 of 8192 bytes"));
         assert!(stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnostics_scrubs_environment_and_kills_descendants_on_cancel() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf '%s' \"${SNED_API_KEY:-absent}\""])
+            .env("SNED_API_KEY", "secret")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (_, stdout, _) = capture_diagnostics_command(command, 1024).await.unwrap();
+        assert_eq!(stdout, "absent");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new("sh");
+        command
+            .current_dir(dir.path())
+            .args(["-c", "(sleep 0.5; printf x > child-marker) & wait"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        assert!(
+            timeout(
+                Duration::from_millis(150),
+                capture_diagnostics_command(command, 1024)
+            )
+            .await
+            .is_err()
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!dir.path().join("child-marker").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnostics_preserves_documented_toolchain_environment() {
+        if std::env::var_os("SNED_TEST_DIAGNOSTIC_ENV").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "core::tools::handlers::diagnostics_scan::tests::diagnostics_preserves_documented_toolchain_environment"])
+                .env("SNED_TEST_DIAGNOSTIC_ENV", "1")
+                .env("SNED_API_KEY", "must-not-leak")
+                .env("CARGO_HOME", "/custom/cargo")
+                .env("RUSTUP_HOME", "/custom/rustup")
+                .env("PYTHONPATH", "/custom/python")
+                .env("NODE_PATH", "/custom/node")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '%s|%s|%s|%s|%s' \"$CARGO_HOME\" \"$RUSTUP_HOME\" \"$PYTHONPATH\" \"$NODE_PATH\" \"${SNED_API_KEY:-absent}\""])
+            .stdout(Stdio::piped()).stderr(Stdio::piped());
+        let (_, stdout, _) = capture_diagnostics_command(command, 1024).await.unwrap();
+        assert_eq!(
+            stdout,
+            "/custom/cargo|/custom/rustup|/custom/python|/custom/node|absent"
+        );
     }
 
     #[tokio::test]
