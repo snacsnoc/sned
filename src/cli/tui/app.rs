@@ -5217,22 +5217,7 @@ impl App {
         else {
             return;
         };
-        let labels: Vec<String> = self
-            .picker_results
-            .iter()
-            .map(|result| {
-                let icon = match result.file_type {
-                    crate::core::file_search::FileType::Folder => "📁",
-                    crate::core::file_search::FileType::File => "📄",
-                };
-                format!(
-                    "{} {}",
-                    icon,
-                    crate::core::file_search::truncated_display_path(&result.path)
-                )
-            })
-            .collect();
-        let result_count = labels.len();
+        let result_count = self.picker_results.len();
 
         let selected = self
             .picker_index
@@ -5250,12 +5235,21 @@ impl App {
             };
             vec![Line::from(Span::styled(message, theme::dim_style()))]
         } else {
-            labels
-                .into_iter()
+            self.picker_results
+                .iter()
                 .enumerate()
                 .skip(first_visible)
                 .take(visible_rows)
-                .map(|(i, label)| {
+                .map(|(i, result)| {
+                    let icon = match result.file_type {
+                        crate::core::file_search::FileType::Folder => "📁",
+                        crate::core::file_search::FileType::File => "📄",
+                    };
+                    let label = format!(
+                        "{} {}",
+                        icon,
+                        crate::core::file_search::truncated_display_path(&result.path)
+                    );
                     if i == selected {
                         Line::from(Span::styled(label, theme::picker_selected_style()))
                     } else {
