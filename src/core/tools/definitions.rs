@@ -181,6 +181,14 @@ pub fn list_files_schema() -> ToolSchema {
                 items: None,
                 extra: None,
             },
+            ToolParameter {
+                name: "include_line_counts",
+                required: false,
+                param_type: "boolean",
+                description: "Include line counts (default true unless recursive).",
+                items: None,
+                extra: None,
+            },
         ],
     }
 }
@@ -482,6 +490,14 @@ pub fn find_symbol_references_schema() -> ToolSchema {
                 description: "Symbol name.",
                 items: None,
                 extra: None,
+            },
+            ToolParameter {
+                name: "find_type",
+                required: false,
+                param_type: "string",
+                description: "Find definitions, references, or both (default both).",
+                items: None,
+                extra: Some(serde_json::json!({"enum": ["definition", "reference", "both"]})),
             },
         ],
     }
@@ -1464,18 +1480,18 @@ mod tests {
             write_bytes
         );
         assert!(
-            core_bytes < 7150,
-            "CoreEdit should be under 7150 bytes: got {}",
+            core_bytes < 7300,
+            "CoreEdit should be under 7300 bytes: got {}",
             core_bytes
         );
         assert!(
-            validate_bytes < 8650,
-            "Validate should be under 8650 bytes: got {}",
+            validate_bytes < 8800,
+            "Validate should be under 8800 bytes: got {}",
             validate_bytes
         );
         assert!(
-            symbol_bytes < 8700,
-            "Symbol should be under 8700 bytes: got {}",
+            symbol_bytes < 8950,
+            "Symbol should be under 8950 bytes: got {}",
             symbol_bytes
         );
         assert!(
@@ -1484,8 +1500,8 @@ mod tests {
             full_bytes
         );
         assert!(
-            full_bytes < 14000,
-            "Full should be under 14000 bytes: got {}",
+            full_bytes < 14200,
+            "Full should be under 14200 bytes: got {}",
             full_bytes
         );
 
@@ -1610,6 +1626,29 @@ mod tests {
 
         assert!(names.contains(&"plan_mode_respond"));
         assert!(!names.contains(&"attempt_completion"));
+        assert!(!names.contains(&"replace_symbol"));
+        assert!(!names.contains(&"rename_symbol"));
+    }
+
+    #[test]
+    fn inspection_schemas_expose_supported_options() {
+        let list = list_files_schema().to_tool_definition().function.parameters;
+        assert_eq!(list["properties"]["include_line_counts"]["type"], "boolean");
+        let refs = find_symbol_references_schema()
+            .to_tool_definition()
+            .function
+            .parameters;
+        assert_eq!(
+            refs["properties"]["find_type"]["enum"],
+            serde_json::json!(["definition", "reference", "both"])
+        );
+        assert!(
+            refs["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "name")
+        );
     }
 
     #[test]

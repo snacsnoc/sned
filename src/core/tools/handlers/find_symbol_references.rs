@@ -58,7 +58,7 @@ impl FindSymbolReferencesHandler {
 
         if symbols.is_empty() {
             return Err(ToolError::InvalidInput(
-                "Missing required parameter: names".to_string(),
+                "Missing required parameter: name".to_string(),
             ));
         }
 
