@@ -252,7 +252,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         detail: "Restores the most recent tracked checkpoint and removes the corresponding conversation turn.",
         category: SlashCommandCategory::Local,
         requires_args: false,
-        requirement: CommandRequirement::TrackChanges,
+        requirement: CommandRequirement::Always,
     },
     SlashCommandSpec {
         id: SlashCommandId::Diff,
@@ -260,10 +260,10 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         description: "Show changes from the last tracked turn",
         usage: "/diff",
-        detail: "Shows the shadow-git diff for the most recent tracked turn.",
+        detail: "Shows tracked changes, or changes since the latest checkpoint.",
         category: SlashCommandCategory::Local,
         requires_args: false,
-        requirement: CommandRequirement::TrackChanges,
+        requirement: CommandRequirement::Always,
     },
     SlashCommandSpec {
         id: SlashCommandId::Log,
@@ -271,10 +271,10 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         description: "Show tracked turn history",
         usage: "/log",
-        detail: "Shows recent shadow-git checkpoints created for tracked turns.",
+        detail: "Shows tracked turns, or recent checkpoints when change tracking is off.",
         category: SlashCommandCategory::Local,
         requires_args: false,
-        requirement: CommandRequirement::TrackChanges,
+        requirement: CommandRequirement::Always,
     },
     SlashCommandSpec {
         id: SlashCommandId::Commit,
@@ -296,7 +296,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         detail: "Lists available tracked checkpoints with their numbers and timestamps.",
         category: SlashCommandCategory::Local,
         requires_args: false,
-        requirement: CommandRequirement::TrackChanges,
+        requirement: CommandRequirement::Always,
     },
     SlashCommandSpec {
         id: SlashCommandId::CheckpointRestore,
@@ -307,7 +307,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         detail: "Shows affected files and asks for confirmation before restoring the selected checkpoint.",
         category: SlashCommandCategory::Local,
         requires_args: true,
-        requirement: CommandRequirement::TrackChanges,
+        requirement: CommandRequirement::Always,
     },
     SlashCommandSpec {
         id: SlashCommandId::CheckpointUndo,
@@ -318,7 +318,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         detail: "Restores the previous tracked checkpoint and trims the corresponding conversation turn.",
         category: SlashCommandCategory::Local,
         requires_args: false,
-        requirement: CommandRequirement::TrackChanges,
+        requirement: CommandRequirement::Always,
     },
     SlashCommandSpec {
         id: SlashCommandId::Changes,
@@ -1356,7 +1356,14 @@ const fn help_section_for(spec: &SlashCommandSpec) -> HelpSection {
         SlashCommandCategory::Agent => HelpSection::Context,
         SlashCommandCategory::Plan => HelpSection::PlanMode,
         _ if matches!(spec.id, SlashCommandId::Skills) => HelpSection::Skills,
-        _ if matches!(spec.requirement, CommandRequirement::TrackChanges) => {
+        _ if matches!(
+            spec.id,
+            SlashCommandId::Undo
+                | SlashCommandId::CheckpointList
+                | SlashCommandId::CheckpointRestore
+                | SlashCommandId::CheckpointUndo
+        ) || matches!(spec.requirement, CommandRequirement::TrackChanges) =>
+        {
             HelpSection::TrackedChanges
         }
         _ => HelpSection::Session,
@@ -2075,7 +2082,12 @@ mod tests {
         let names: std::collections::HashSet<&str> =
             entries.iter().map(|entry| entry.name.as_str()).collect();
         assert!(names.contains("plan"));
-        assert!(!names.contains("undo"));
+        assert!(names.contains("diff"));
+        assert!(names.contains("log"));
+        assert!(names.contains("undo"));
+        assert!(names.contains("checkpoint list"));
+        assert!(names.contains("checkpoint restore"));
+        assert!(names.contains("checkpoint undo"));
         assert!(!names.contains("retry"));
         assert!(!names.contains("resetcompact"));
         assert!(!names.contains("plan approve"));

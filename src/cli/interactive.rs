@@ -3671,7 +3671,7 @@ async fn handle_cli_only_command_with_terminal(
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     queue_handle: &Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>>,
-    _task_opts: &TaskOptions,
+    task_opts: &TaskOptions,
     auto_approve: bool,
     mut terminal: Option<&mut ratatui::DefaultTerminal>,
 ) -> anyhow::Result<bool> {
@@ -4035,11 +4035,21 @@ async fn handle_cli_only_command_with_terminal(
             return Ok(false);
         }
         CliOnlyCommand::Undo | CliOnlyCommand::CheckpointUndo => {
-            let sess = session.lock().await;
-            let agent_guard = sess.agent_loop().await;
-            let checkpoint_mgr = agent_guard
+            let Ok(sess) = session.try_lock() else {
+                app.push_plain("Agent is busy. Wait for it to finish before using checkpoints.");
+                return Ok(false);
+            };
+            let Ok(agent_guard) = sess.agent_loop.try_lock() else {
+                app.push_plain("Agent is busy. Wait for it to finish before using checkpoints.");
+                return Ok(false);
+            };
+            let Some(checkpoint_mgr) = agent_guard
                 .checkpoint_manager()
-                .expect("checkpoint manager should be initialized");
+                .filter(|manager| manager.is_enabled())
+            else {
+                app.push_plain("Checkpoints are not available.");
+                return Ok(false);
+            };
             let checkpoints = match checkpoint_mgr.list_checkpoints().await {
                 Ok(cps) => cps,
                 Err(e) => {
@@ -4133,7 +4143,9 @@ async fn handle_cli_only_command_with_terminal(
         }
         CliOnlyCommand::Diff => {
             if let Ok(workspace_root) = std::env::current_dir() {
-                if crate::core::shadow_git::is_initialized(&workspace_root) {
+                if task_opts.track_changes
+                    && crate::core::shadow_git::is_initialized(&workspace_root)
+                {
                     match crate::core::shadow_git::diff_turns(&workspace_root, 1, 0) {
                         Ok(diff) => {
                             if diff.is_empty() {
@@ -4152,13 +4164,50 @@ async fn handle_cli_only_command_with_terminal(
                         }
                     }
                 } else {
-                    app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
+                    if agent_busy.load(Ordering::Relaxed) {
+                        app.push_plain(
+                            "Agent is busy. Wait for it to finish before running /diff.",
+                        );
+                        return Ok(false);
+                    }
+                    let Ok(sess) = session.try_lock() else {
+                        app.push_plain(
+                            "Agent is busy. Wait for it to finish before running /diff.",
+                        );
+                        return Ok(false);
+                    };
+                    let Ok(agent) = sess.agent_loop.try_lock() else {
+                        app.push_plain(
+                            "Agent is busy. Wait for it to finish before running /diff.",
+                        );
+                        return Ok(false);
+                    };
+                    match agent
+                        .checkpoint_manager()
+                        .filter(|manager| manager.is_enabled())
+                    {
+                        Some(manager) => match manager.diff_worktree().await {
+                            Ok(None) => app.push_plain("No checkpoint found yet."),
+                            Ok(Some(diff)) if diff.is_empty() => {
+                                app.push_plain("No changes since the latest checkpoint.")
+                            }
+                            Ok(Some(diff)) => {
+                                for line in ansi_to_ratatui_lines(&diff) {
+                                    app.push_output(line);
+                                }
+                            }
+                            Err(e) => app.push_plain(format!("Failed to get checkpoint diff: {e}")),
+                        },
+                        None => app.push_plain("Checkpoints are not available."),
+                    }
                 }
             }
         }
         CliOnlyCommand::Log => {
             if let Ok(workspace_root) = std::env::current_dir() {
-                if crate::core::shadow_git::is_initialized(&workspace_root) {
+                if task_opts.track_changes
+                    && crate::core::shadow_git::is_initialized(&workspace_root)
+                {
                     match crate::core::shadow_git::log(&workspace_root, Some(10)) {
                         Ok(log) => {
                             if log.is_empty() {
@@ -4177,7 +4226,38 @@ async fn handle_cli_only_command_with_terminal(
                         }
                     }
                 } else {
-                    app.push_plain("Change tracking is not enabled. Use --track-changes to enable automatic undo/versioning.");
+                    if agent_busy.load(Ordering::Relaxed) {
+                        app.push_plain("Agent is busy. Wait for it to finish before running /log.");
+                        return Ok(false);
+                    }
+                    let Ok(sess) = session.try_lock() else {
+                        app.push_plain("Agent is busy. Wait for it to finish before running /log.");
+                        return Ok(false);
+                    };
+                    let Ok(agent) = sess.agent_loop.try_lock() else {
+                        app.push_plain("Agent is busy. Wait for it to finish before running /log.");
+                        return Ok(false);
+                    };
+                    match agent
+                        .checkpoint_manager()
+                        .filter(|manager| manager.is_enabled())
+                    {
+                        Some(manager) => match manager.list_checkpoints().await {
+                            Ok(checkpoints) if checkpoints.is_empty() => {
+                                app.push_plain("No checkpoints found.")
+                            }
+                            Ok(checkpoints) => {
+                                for checkpoint in checkpoints.iter().take(10) {
+                                    app.push_plain(format!(
+                                        "{} {}",
+                                        checkpoint.hash, checkpoint.message
+                                    ));
+                                }
+                            }
+                            Err(e) => app.push_plain(format!("Failed to list checkpoints: {e}")),
+                        },
+                        None => app.push_plain("Checkpoints are not available."),
+                    }
                 }
             }
         }
@@ -4257,11 +4337,21 @@ async fn handle_cli_only_command_with_terminal(
             }
         }
         CliOnlyCommand::CheckpointList => {
-            let sess = session.lock().await;
-            let agent_guard = sess.agent_loop().await;
-            let checkpoint_mgr = agent_guard
+            let Ok(sess) = session.try_lock() else {
+                app.push_plain("Agent is busy. Wait for it to finish before using checkpoints.");
+                return Ok(false);
+            };
+            let Ok(agent_guard) = sess.agent_loop.try_lock() else {
+                app.push_plain("Agent is busy. Wait for it to finish before using checkpoints.");
+                return Ok(false);
+            };
+            let Some(checkpoint_mgr) = agent_guard
                 .checkpoint_manager()
-                .expect("checkpoint manager should be initialized");
+                .filter(|manager| manager.is_enabled())
+            else {
+                app.push_plain("Checkpoints are not available.");
+                return Ok(false);
+            };
             match checkpoint_mgr.list_checkpoints().await {
                 Ok(checkpoints) => {
                     if checkpoints.is_empty() {
@@ -4281,11 +4371,21 @@ async fn handle_cli_only_command_with_terminal(
             }
         }
         CliOnlyCommand::CheckpointRestore => {
-            let sess = session.lock().await;
-            let agent_guard = sess.agent_loop().await;
-            let checkpoint_mgr = agent_guard
+            let Ok(sess) = session.try_lock() else {
+                app.push_plain("Agent is busy. Wait for it to finish before using checkpoints.");
+                return Ok(false);
+            };
+            let Ok(agent_guard) = sess.agent_loop.try_lock() else {
+                app.push_plain("Agent is busy. Wait for it to finish before using checkpoints.");
+                return Ok(false);
+            };
+            let Some(checkpoint_mgr) = agent_guard
                 .checkpoint_manager()
-                .expect("checkpoint manager should be initialized");
+                .filter(|manager| manager.is_enabled())
+            else {
+                app.push_plain("Checkpoints are not available.");
+                return Ok(false);
+            };
             let checkpoints = match checkpoint_mgr.list_checkpoints().await {
                 Ok(cps) => cps,
                 Err(e) => {
@@ -14340,6 +14440,134 @@ mod tests {
                 .contains("queued while agent is busy")
         }));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_commands_do_not_wait_for_busy_session_or_agent() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+        let opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let agent = session.lock().await.agent_loop.clone();
+        let writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let busy = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(Mutex::new(None));
+        let task = Arc::new(Mutex::new(None));
+        let state = Arc::new(Mutex::new(None));
+        let queue = Arc::new(Mutex::new(None));
+        for (command, name) in [
+            (CliOnlyCommand::Diff, "/diff"),
+            (CliOnlyCommand::Log, "/log"),
+            (CliOnlyCommand::Undo, "/undo"),
+            (CliOnlyCommand::CheckpointUndo, "/checkpoint undo"),
+            (CliOnlyCommand::CheckpointList, "/checkpoint list"),
+            (CliOnlyCommand::CheckpointRestore, "/checkpoint restore"),
+        ] {
+            for lock_case in 0..3 {
+                busy.store(lock_case == 2, Ordering::Relaxed);
+                let session_guard = if lock_case == 0 {
+                    Some(session.lock().await)
+                } else {
+                    None
+                };
+                let agent_guard = if lock_case == 1 {
+                    Some(agent.lock().await)
+                } else {
+                    None
+                };
+                let mut app = App::new();
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    handle_cli_only_command(
+                        command.clone(),
+                        name,
+                        &mut app,
+                        &writer,
+                        &session,
+                        "test",
+                        &busy,
+                        &done,
+                        &started,
+                        &task,
+                        &state,
+                        &queue,
+                        &opts,
+                        false,
+                    ),
+                )
+                .await??;
+                assert!(
+                    app.output_lines
+                        .iter()
+                        .any(|line| line.to_string().contains("Agent is busy"))
+                );
+                drop(agent_guard);
+                drop(session_guard);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_commands_report_disabled_tracker() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+        let mut opts = retry_test_task_opts();
+        opts.no_checkpoints = true;
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        for (command, name) in [
+            (CliOnlyCommand::Diff, "/diff"),
+            (CliOnlyCommand::Log, "/log"),
+            (CliOnlyCommand::Undo, "/undo"),
+            (CliOnlyCommand::CheckpointUndo, "/checkpoint undo"),
+            (CliOnlyCommand::CheckpointList, "/checkpoint list"),
+            (CliOnlyCommand::CheckpointRestore, "/checkpoint restore"),
+        ] {
+            let mut app = App::new();
+            handle_cli_only_command(
+                command,
+                name,
+                &mut app,
+                &writer,
+                &session,
+                "test",
+                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(tokio::sync::Notify::new()),
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(None)),
+                &opts,
+                false,
+            )
+            .await?;
+            assert!(
+                app.output_lines
+                    .iter()
+                    .any(|line| line.to_string().contains("Checkpoints are not available"))
+            );
+        }
         Ok(())
     }
 

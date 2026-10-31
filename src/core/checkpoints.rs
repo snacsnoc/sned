@@ -362,6 +362,9 @@ impl CheckpointTracker {
 
     /// List all checkpoint commits (newest first).
     pub fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>, CheckpointError> {
+        if self.get_head_commit()?.is_none() {
+            return Ok(Vec::new());
+        }
         let mut command = Command::new("git");
         command.args([
             "--git-dir",
@@ -398,6 +401,36 @@ impl CheckpointTracker {
             .collect();
 
         Ok(commits)
+    }
+
+    /// Compare the latest checkpoint with the current tracked worktree.
+    pub fn diff_worktree(&self) -> Result<Option<String>, CheckpointError> {
+        self.with_repo_lock(None, || self.diff_worktree_locked())
+    }
+
+    fn diff_worktree_locked(&self) -> Result<Option<String>, CheckpointError> {
+        let Some(head) = self.get_head_commit()? else {
+            return Ok(None);
+        };
+        let mut command = Command::new("git");
+        command.args([
+            "--git-dir",
+            self.shadow_git_path.to_str().unwrap_or("."),
+            "--work-tree",
+            self.cwd.to_str().unwrap_or("."),
+            "diff",
+            &head,
+            "--",
+        ]);
+        let output = Self::run_git_command_with_timeout(&mut command)
+            .map_err(|e| CheckpointError::CommandFailed(format!("git diff failed: {e}")))?;
+        if !output.status.success() {
+            return Err(CheckpointError::CommandFailed(format!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
     }
 
     /// Get the list of changed files between two commits.
@@ -724,6 +757,11 @@ impl TaskCheckpointManager {
         }
     }
 
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.tracker.is_some()
+    }
+
     /// Save a checkpoint of the current workspace state.
     /// Runs git commands in a blocking thread to avoid stalling the async runtime.
     pub async fn save_checkpoint(&mut self) -> Option<String> {
@@ -851,6 +889,17 @@ impl TaskCheckpointManager {
         }
     }
 
+    pub async fn diff_worktree(&self) -> Result<Option<String>, CheckpointError> {
+        let tracker = self.tracker.clone().ok_or_else(|| {
+            CheckpointError::CommandFailed("No checkpoint tracker available".to_string())
+        })?;
+        tokio::task::spawn_blocking(move || tracker.diff_worktree())
+            .await
+            .map_err(|e| {
+                CheckpointError::CommandFailed(format!("Checkpoint diff task panicked: {e}"))
+            })?
+    }
+
     /// Restore workspace by number in the order shown by `list_checkpoints`.
     pub async fn restore_by_number(&self, number: usize) -> Result<(), CheckpointError> {
         let checkpoints = self.list_checkpoints().await?;
@@ -891,6 +940,34 @@ mod tests {
         });
     }
     use std::io::Write;
+
+    #[test]
+    fn checkpoint_diff_reports_only_tracked_changes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let tracker = CheckpointTracker {
+            task_id: "test".into(),
+            cwd: workspace.path().to_path_buf(),
+            cwd_hash: "test".into(),
+            shadow_git_path: repo.path().join(".git"),
+        };
+        tracker.init_shadow_git().unwrap();
+        assert!(tracker.list_checkpoints().unwrap().is_empty());
+        assert!(tracker.diff_worktree().unwrap().is_none());
+        std::fs::write(workspace.path().join("existing.txt"), "before\n").unwrap();
+        tracker.commit().unwrap();
+        std::fs::write(workspace.path().join("existing.txt"), "after\n").unwrap();
+        std::fs::write(workspace.path().join("new.txt"), "new content\n").unwrap();
+        let diff = tracker.diff_worktree().unwrap().unwrap();
+        assert!(
+            diff.contains("-before") && diff.contains("+after"),
+            "{diff}"
+        );
+        assert!(!diff.contains("new.txt"), "{diff}");
+        std::fs::write(workspace.path().join("existing.txt"), "before\n").unwrap();
+        assert!(tracker.diff_worktree().unwrap().unwrap().is_empty());
+        assert_eq!(tracker.list_checkpoints().unwrap().len(), 1);
+    }
 
     #[test]
     fn test_hash_working_dir() {
