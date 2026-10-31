@@ -74,6 +74,10 @@ fn busy_input_poll_delay(
     }
 }
 
+fn busy_redraw_due(elapsed: Option<Duration>, interval: Duration, input_pending: bool) -> bool {
+    input_pending || elapsed.is_none_or(|elapsed| elapsed >= interval)
+}
+
 fn adaptive_main_event_budget(backlog: usize) -> usize {
     if backlog <= MAX_MAIN_EVENTS_PER_DRAIN {
         return MAX_MAIN_EVENTS_PER_DRAIN;
@@ -1752,9 +1756,13 @@ fn read_local_prompt<B: ratatui::backend::Backend>(
             break;
         };
         match event {
-            Event::Key(key) if key.kind == ratatui::crossterm::event::KeyEventKind::Press => {
+            Event::Key(key) if key.kind != ratatui::crossterm::event::KeyEventKind::Release => {
                 match key.code {
-                    KeyCode::Enter => break,
+                    KeyCode::Enter
+                        if key.kind == ratatui::crossterm::event::KeyEventKind::Press =>
+                    {
+                        break;
+                    }
                     KeyCode::Esc => {
                         answer.clear();
                         break;
@@ -2939,6 +2947,22 @@ async fn cancel_agent(
 /// Whether two Ctrl+C presses fall inside the force-quit window.
 fn is_ctrl_c_double_tap(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     last.is_some_and(|prev| now.duration_since(prev).as_secs() < 2)
+}
+
+fn accept_input_key(key: &KeyEvent, ctrl_c_held: &mut bool) -> bool {
+    use ratatui::crossterm::event::KeyEventKind;
+    if key.kind == KeyEventKind::Release {
+        if key.code == KeyCode::Char('c') {
+            *ctrl_c_held = false;
+        }
+        return false;
+    }
+    if key.kind == KeyEventKind::Repeat {
+        return !(key.code == KeyCode::Char('c')
+            && (*ctrl_c_held || key.modifiers.contains(KeyModifiers::CONTROL)));
+    }
+    *ctrl_c_held = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+    true
 }
 
 /// What a Ctrl+C press means. Dismissing overlays never arms the quit
@@ -5580,6 +5604,8 @@ async fn run_main_loop(
     let mouse_scroll_lines = mouse_scroll_lines();
     let (path_open_failure_tx, mut path_open_failure_rx) = mpsc::unbounded_channel();
     let last_ctrlc = Arc::new(StdMutex::new(None::<std::time::Instant>));
+    let mut ctrl_c_held = false;
+    let mut input_redraw_pending = false;
     let mut last_draw_at: Option<std::time::Instant> = None;
     let mut draw_retry_delay = BUSY_REDRAW_INTERVAL;
     let mut draw_retry_at: Option<std::time::Instant> = None;
@@ -5899,7 +5925,11 @@ async fn run_main_loop(
             if app.has_unrendered_approval() {
                 true
             } else if app.agent_busy {
-                last_draw_at.is_none_or(|last| last.elapsed() >= busy_redraw_interval)
+                busy_redraw_due(
+                    last_draw_at.map(|last| last.elapsed()),
+                    busy_redraw_interval,
+                    input_redraw_pending,
+                )
             } else {
                 true
             }
@@ -5914,6 +5944,7 @@ async fn run_main_loop(
                     DrawFrameResult::Rendered
                 ) {
                     last_draw_at = Some(std::time::Instant::now());
+                    input_redraw_pending = false;
                     draw_retry_delay = BUSY_REDRAW_INTERVAL;
                     draw_retry_at = None;
                     let draw_us = t.elapsed().as_micros() as u64;
@@ -6076,6 +6107,10 @@ async fn run_main_loop(
                     tui_io_error("TUI input read failed", error, task_opts.debug)
                 })? {
                     Event::Key(key) => {
+                        if !accept_input_key(&key, &mut ctrl_c_held) {
+                            continue;
+                        }
+                        input_redraw_pending = true;
                         app.needs_redraw = true;
                         if let Some(outcome) = handle_approval_key(app, &key) {
                             if let ApprovalKeyOutcome::Resolved { result, delivered } = outcome {
@@ -6537,6 +6572,7 @@ async fn run_main_loop(
                         }
                     }
                     Event::Paste(content) => {
+                        input_redraw_pending = true;
                         app.clear_text_selection();
                         app.needs_redraw = true;
                         match apply_paste_event(app, &content, &state_handle).await {
@@ -6711,8 +6747,7 @@ pub async fn run_interactive_shell_inner(
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?
     };
 
-    // Enable keyboard enhancement flags so Shift+Enter arrives distinctly
-    // from Enter on terminals that support CSI-u / kitty keyboard protocol.
+    // Request distinct key events on terminals that support the kitty protocol.
     let mut stdout = std::io::stdout();
     if std::env::var_os("SNED_DISABLE_MOUSE").is_some() {
         execute!(stdout, EnableBracketedPaste)?;
@@ -6721,7 +6756,10 @@ pub async fn run_interactive_shell_inner(
     }
     let _ = execute!(
         stdout,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
     );
 
     crate::core::cancellation::TERMINAL_INITIALIZED
@@ -10603,6 +10641,22 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_input_bypasses_busy_output_redraw_throttle() {
+        let interval = Duration::from_millis(32);
+        assert!(busy_redraw_due(
+            Some(Duration::from_millis(1)),
+            interval,
+            true
+        ));
+        assert!(!busy_redraw_due(
+            Some(Duration::from_millis(1)),
+            interval,
+            false
+        ));
+        assert!(busy_redraw_due(Some(interval), interval, false));
+    }
+
+    #[test]
     fn local_prompt_draws_and_accepts_confirmation_and_checkpoint_number() {
         use ratatui::backend::TestBackend;
         for (input, expected) in [
@@ -10635,6 +10689,28 @@ mod tests {
             assert!(screen.contains("Continue? (y/n):"));
             assert!(app.input.lines().join("\n").is_empty());
         }
+    }
+
+    #[test]
+    fn local_prompt_accepts_repeats_without_submitting_on_repeated_enter() {
+        use ratatui::{backend::TestBackend, crossterm::event::KeyEventKind};
+        let mut app = App::new();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let key = |code, kind| Event::Key(KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind));
+        let mut events = [
+            key(KeyCode::Char('1'), KeyEventKind::Press),
+            key(KeyCode::Char('1'), KeyEventKind::Repeat),
+            key(KeyCode::Backspace, KeyEventKind::Repeat),
+            key(KeyCode::Enter, KeyEventKind::Repeat),
+            key(KeyCode::Char('2'), KeyEventKind::Press),
+            key(KeyCode::Enter, KeyEventKind::Press),
+        ]
+        .into_iter();
+        assert_eq!(
+            read_local_prompt(&mut terminal, &mut app, |_| Ok(events.next())).unwrap(),
+            "12"
+        );
+        assert!(events.next().is_none());
     }
 
     #[test]
@@ -12991,6 +13067,55 @@ mod tests {
         assert!(!app.mention_search_active);
         assert!(!app.slash_command_active);
         assert!(!app.model_picker_active);
+    }
+
+    #[test]
+    fn ctrl_c_release_and_repeats_do_not_type_or_cancel_again() {
+        use ratatui::crossterm::event::KeyEventKind;
+
+        let mut held = false;
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(accept_input_key(&ctrl_c, &mut held));
+        let mut repeated = ctrl_c;
+        repeated.kind = KeyEventKind::Repeat;
+        assert!(!accept_input_key(&repeated, &mut held));
+        repeated.modifiers = KeyModifiers::empty();
+        assert!(!accept_input_key(&repeated, &mut held));
+        let mut released = repeated;
+        released.kind = KeyEventKind::Release;
+        assert!(!accept_input_key(&released, &mut held));
+        let typed_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
+        assert!(accept_input_key(&typed_c, &mut held));
+        assert!(accept_input_key(&repeated, &mut held));
+        assert!(
+            accept_input_key(&ctrl_c, &mut held),
+            "a second press still reaches double-tap handling"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_clear_ignores_repeat_but_accepts_new_c() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::KeyEventKind;
+        let (tx, _rx) = mpsc::channel(4);
+        let writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let state = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.set_input_text("draft");
+        let mut held = false;
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(accept_input_key(&ctrl_c, &mut held));
+        handle_idle_ctrl_c(&mut app);
+        let mut repeat = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
+        repeat.kind = KeyEventKind::Repeat;
+        if accept_input_key(&repeat, &mut held) {
+            handle_key_event(repeat, &mut app, &writer, &state, "task").await?;
+        }
+        assert_eq!(app.input.lines().join("\n"), "");
+        let typed_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
+        assert!(accept_input_key(&typed_c, &mut held));
+        handle_key_event(typed_c, &mut app, &writer, &state, "task").await?;
+        assert_eq!(app.input.lines().join("\n"), "c");
+        Ok(())
     }
 
     #[test]
