@@ -683,114 +683,15 @@ impl ExecuteCommandHandler {
             let mut stderr_truncated = false;
             let mut stderr_tail_buffer: VecDeque<String> = VecDeque::new();
 
+            let deadline = tokio::time::Instant::now() + timeout_duration;
+            let mut cancellation_poll = tokio::time::interval(Duration::from_millis(50));
+            let mut stdout_done = false;
+            let mut stderr_done = false;
             let output = loop {
                 tokio::select! {
-                    result = stdout_reader.next_line() => {
-                        match result {
-                            Ok(Some(line)) => {
-                                let line = line.into_text("stdout");
-                                stdout_displayed += 1;
-                                if !json_output {
-                                    if stream_limit.is_none() {
-                                    // No cap: stream every line.
-                                    use crate::cli::output::OutputEvent;
-                                    use ratatui::style::{Modifier, Style};
-                                    output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                                        line.clone(),
-                                        Style::default().add_modifier(Modifier::DIM),
-                                    ))));
-                                } else if stdout_displayed <= half {
-                                    // Head: print live
-                                    use crate::cli::output::OutputEvent;
-                                    use ratatui::style::{Modifier, Style};
-                                    output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                                        line.clone(),
-                                        Style::default().add_modifier(Modifier::DIM),
-                                    ))));
-                                } else if stdout_displayed == half + 1 && !stdout_truncated {
-                                    // First skipped line on this stream: emit condensed note once
-                                    use ratatui::style::{Modifier, Style};
-                                    output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                                        "… stdout".to_string(),
-                                        Style::default().add_modifier(Modifier::DIM),
-                                    ))));
-                                    stdout_truncated = true;
-                                }
-                                }
-                                if stdout_truncated {
-                                    // Keep tail ring buffer
-                                    stdout_tail_buffer.push_back(line.clone());
-                                    if stdout_tail_buffer.len() > half {
-                                        stdout_tail_buffer.pop_front();
-                                    }
-                                }
-                                append_limited_output(
-                                    &mut stdout_collected,
-                                    &line,
-                                    collect_limit,
-                                    &mut stdout_collect_truncated,
-                                    &mut stdout_total_bytes,
-                                );
-                            }
-                            Ok(None) => {}
-                            Err(e) => tracing::warn!("Failed to read stdout line: {}", e),
-                        }
-                    }
-                    result = stderr_reader.next_line() => {
-                        match result {
-                            Ok(Some(line)) => {
-                                let line = line.into_text("stderr");
-                                stderr_displayed += 1;
-                                if !json_output {
-                                    if stream_limit.is_none() {
-                                        // No cap: stream every line.
-                                        use crate::cli::output::OutputEvent;
-                                        use crate::cli::tui::theme::warning_fg;
-                                        use ratatui::style::Style;
-                                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                                            line.clone(),
-                                            Style::default().fg(warning_fg()),
-                                        ))));
-                                    } else if stderr_displayed <= half {
-                                        // Head: print live
-                                        use crate::cli::output::OutputEvent;
-                                        use crate::cli::tui::theme::warning_fg;
-                                        use ratatui::style::Style;
-                                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                                            line.clone(),
-                                            Style::default().fg(warning_fg()),
-                                        ))));
-                                    } else if stderr_displayed == half + 1 && !stderr_truncated {
-                                        // First skipped line on this stream: emit condensed note once
-                                        use ratatui::style::{Modifier, Style};
-                                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
-                                            "… stderr".to_string(),
-                                            Style::default().add_modifier(Modifier::DIM),
-                                        ))));
-                                        stderr_truncated = true;
-                                    }
-                                }
-                                if stderr_truncated {
-                                    // Keep tail ring buffer
-                                    stderr_tail_buffer.push_back(line.clone());
-                                    if stderr_tail_buffer.len() > half {
-                                        stderr_tail_buffer.pop_front();
-                                    }
-                                }
-                                append_limited_output(
-                                    &mut stderr_collected,
-                                    &line,
-                                    collect_limit,
-                                    &mut stderr_collect_truncated,
-                                    &mut stderr_total_bytes,
-                                );
-                            }
-                            Ok(None) => {}
-                            Err(e) => tracing::warn!("Failed to read stderr line: {}", e),
-                        }
-                    }
+                    biased;
                     // Periodic cancellation check to allow Ctrl+C to interrupt long-running commands
-                    () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    _ = cancellation_poll.tick() => {
                         // Check cancellation flag using try_lock (synchronous)
                         let is_cancelled = cancellation_flag.as_ref().is_some_and(|flag| {
                             flag.load(std::sync::atomic::Ordering::Acquire)
@@ -837,10 +738,12 @@ impl ExecuteCommandHandler {
                             return Err(anyhow::anyhow!("Command cancelled by user"));
                         }
                     }
-                    result = timeout(timeout_duration, child.wait()) => {
+                    result = tokio::time::timeout_at(deadline, child.wait()) => {
                         break match result {
                             Ok(Ok(status)) => {
-                                while let Ok(Some(line)) = stdout_reader.next_line().await {
+                                let drain_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(1));
+                                let drain_stdout = async {
+                                while let Ok(Ok(Some(line))) = tokio::time::timeout_at(drain_deadline, stdout_reader.next_line()).await {
                                     let line = line.into_text("stdout");
                                     stdout_displayed += 1;
                                     if !json_output {
@@ -881,7 +784,9 @@ impl ExecuteCommandHandler {
                                         &mut stdout_total_bytes,
                                     );
                                 }
-                                while let Ok(Some(line)) = stderr_reader.next_line().await {
+                                };
+                                let drain_stderr = async {
+                                while let Ok(Ok(Some(line))) = tokio::time::timeout_at(drain_deadline, stderr_reader.next_line()).await {
                                     let line = line.into_text("stderr");
                                     stderr_displayed += 1;
                                     if !json_output {
@@ -924,6 +829,8 @@ impl ExecuteCommandHandler {
                                         &mut stderr_total_bytes,
                                     );
                                 }
+                                };
+                                tokio::join!(drain_stdout, drain_stderr);
                                 std::process::Output {
                                     status,
                                     stdout: finalize_collected_output(
@@ -1034,6 +941,116 @@ impl ExecuteCommandHandler {
                                 ));
                             }
                         };
+                    }
+                    (is_stdout, result) = async {
+                        tokio::select! {
+                            result = stdout_reader.next_line(), if !stdout_done => (true, result),
+                            result = stderr_reader.next_line(), if !stderr_done => (false, result),
+                        }
+                    }, if !stdout_done || !stderr_done => {
+                        if is_stdout {
+                        match result {
+                            Ok(Some(line)) => {
+                                let line = line.into_text("stdout");
+                                stdout_displayed += 1;
+                                if !json_output {
+                                    if stream_limit.is_none() {
+                                    // No cap: stream every line.
+                                    use crate::cli::output::OutputEvent;
+                                    use ratatui::style::{Modifier, Style};
+                                    output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                                        line.clone(),
+                                        Style::default().add_modifier(Modifier::DIM),
+                                    ))));
+                                } else if stdout_displayed <= half {
+                                    // Head: print live
+                                    use crate::cli::output::OutputEvent;
+                                    use ratatui::style::{Modifier, Style};
+                                    output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                                        line.clone(),
+                                        Style::default().add_modifier(Modifier::DIM),
+                                    ))));
+                                } else if stdout_displayed == half + 1 && !stdout_truncated {
+                                    // First skipped line on this stream: emit condensed note once
+                                    use ratatui::style::{Modifier, Style};
+                                    output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                                        "… stdout".to_string(),
+                                        Style::default().add_modifier(Modifier::DIM),
+                                    ))));
+                                    stdout_truncated = true;
+                                }
+                                }
+                                if stdout_truncated {
+                                    // Keep tail ring buffer
+                                    stdout_tail_buffer.push_back(line.clone());
+                                    if stdout_tail_buffer.len() > half {
+                                        stdout_tail_buffer.pop_front();
+                                    }
+                                }
+                                append_limited_output(
+                                    &mut stdout_collected,
+                                    &line,
+                                    collect_limit,
+                                    &mut stdout_collect_truncated,
+                                    &mut stdout_total_bytes,
+                                );
+                            }
+                            Ok(None) => stdout_done = true,
+                            Err(e) => { stdout_done = true; tracing::warn!("Failed to read stdout line: {}", e); },
+                        }
+                        } else {
+                        match result {
+                            Ok(Some(line)) => {
+                                let line = line.into_text("stderr");
+                                stderr_displayed += 1;
+                                if !json_output {
+                                    if stream_limit.is_none() {
+                                        // No cap: stream every line.
+                                        use crate::cli::output::OutputEvent;
+                                        use crate::cli::tui::theme::warning_fg;
+                                        use ratatui::style::Style;
+                                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                                            line.clone(),
+                                            Style::default().fg(warning_fg()),
+                                        ))));
+                                    } else if stderr_displayed <= half {
+                                        // Head: print live
+                                        use crate::cli::output::OutputEvent;
+                                        use crate::cli::tui::theme::warning_fg;
+                                        use ratatui::style::Style;
+                                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                                            line.clone(),
+                                            Style::default().fg(warning_fg()),
+                                        ))));
+                                    } else if stderr_displayed == half + 1 && !stderr_truncated {
+                                        // First skipped line on this stream: emit condensed note once
+                                        use ratatui::style::{Modifier, Style};
+                                        output_writer.emit(OutputEvent::CommandOutputLine(Line::from(Span::styled(
+                                            "… stderr".to_string(),
+                                            Style::default().add_modifier(Modifier::DIM),
+                                        ))));
+                                        stderr_truncated = true;
+                                    }
+                                }
+                                if stderr_truncated {
+                                    // Keep tail ring buffer
+                                    stderr_tail_buffer.push_back(line.clone());
+                                    if stderr_tail_buffer.len() > half {
+                                        stderr_tail_buffer.pop_front();
+                                    }
+                                }
+                                append_limited_output(
+                                    &mut stderr_collected,
+                                    &line,
+                                    collect_limit,
+                                    &mut stderr_collect_truncated,
+                                    &mut stderr_total_bytes,
+                                );
+                            }
+                            Ok(None) => stderr_done = true,
+                            Err(e) => { stderr_done = true; tracing::warn!("Failed to read stderr line: {}", e); },
+                        }
+                        }
                     }
                 }
             };
@@ -2437,6 +2454,84 @@ mod tests {
             state.running_command_pids.is_empty(),
             "timed-out command PID should be removed from cancellation tracking"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_stdout_does_not_block_stderr_drain() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let result = handler
+            .execute_commands_with_timeout(
+                vec!["sleep 2 2>/dev/null & (sleep 0.1; printf 'late-stderr-marker\\n' >&2) >/dev/null &".to_string()],
+                None,
+                Some(Duration::from_secs(5)),
+                true,
+                None,
+                None,
+                true,
+                false,
+                &writer,
+            )
+            .await
+            .expect("command should succeed");
+        assert!(result.contains("late-stderr-marker"), "{result}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn noisy_command_obeys_deadline_and_cancellation() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let command =
+            "(while :; do printf 'output\\n'; done) & printf 'stderr-marker\\n' >&2; wait"
+                .to_string();
+        let timeout_result = tokio::time::timeout(
+            Duration::from_secs(3),
+            handler.execute_commands_with_timeout(
+                vec![command.clone()],
+                None,
+                Some(Duration::from_millis(150)),
+                true,
+                None,
+                None,
+                true,
+                false,
+                &writer,
+            ),
+        )
+        .await
+        .expect("noisy command must stop at the deadline");
+        let error = timeout_result.unwrap_err().to_string();
+        assert!(error.contains("timed out"));
+        assert!(error.contains("stderr-marker"));
+
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trigger = cancelled.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            trigger.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            handler.execute_commands_with_timeout(
+                vec![command],
+                None,
+                Some(Duration::from_secs(10)),
+                true,
+                None,
+                Some(cancelled),
+                true,
+                false,
+                &writer,
+            ),
+        )
+        .await
+        .expect("noisy command must respond to cancellation");
+        canceller.await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
     }
 
     #[tokio::test]
