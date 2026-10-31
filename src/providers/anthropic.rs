@@ -179,11 +179,17 @@ impl AnthropicProvider {
 
         // Keep the request valid if an upstream empty-content filter removed
         // every user turn from the conversation history.
-        if !messages.iter().any(|message| message["role"] == "user") {
-            messages.push(json!({
-                "role": "user",
-                "content": [{"type": "text", "text": "Please proceed."}],
-            }));
+        if messages
+            .first()
+            .is_none_or(|message| message["role"] != "user")
+        {
+            messages.insert(
+                0,
+                json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Please proceed."}],
+                }),
+            );
         }
 
         let mut system_content = vec![json!({
@@ -1355,6 +1361,14 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["temperature"], 0);
         assert!(!body["system"].as_array().unwrap().is_empty());
+
+        let mut pruned = request.clone();
+        pruned.messages[0].role = MessageRole::Assistant;
+        pruned.messages.push(request.messages[0].clone());
+        let messages = provider.build_request_body(&pruned).unwrap()["messages"].clone();
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "Please proceed.");
+        assert_eq!(messages[1]["role"], "assistant");
 
         let empty_history = ProviderRequest {
             messages: Vec::new(),

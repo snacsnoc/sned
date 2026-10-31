@@ -142,19 +142,25 @@ impl GeminiProvider {
         let mut contents = gemini_format::convert_to_gemini_contents(&request.messages);
         // Gemini requires a user turn. Keep the request valid if an upstream
         // empty-content filter removed every user message from the history.
-        if !contents.iter().any(|content| content.role == "user") {
-            contents.push(gemini_format::GeminiContent {
-                role: "user".to_string(),
-                parts: vec![gemini_format::GeminiPart {
-                    text: Some("Please proceed.".to_string()),
-                    thought: None,
-                    thought_signature: None,
-                    function_call: None,
-                    function_response: None,
-                    inline_data: None,
-                    file_data: None,
-                }],
-            });
+        if contents
+            .first()
+            .is_none_or(|content| content.role != "user")
+        {
+            contents.insert(
+                0,
+                gemini_format::GeminiContent {
+                    role: "user".to_string(),
+                    parts: vec![gemini_format::GeminiPart {
+                        text: Some("Please proceed.".to_string()),
+                        thought: None,
+                        thought_signature: None,
+                        function_call: None,
+                        function_response: None,
+                        inline_data: None,
+                        file_data: None,
+                    }],
+                },
+            );
         }
 
         // Gemini 3.5 and later reject deprecated sampling parameters.
@@ -1259,6 +1265,13 @@ mod tests {
             body["systemInstruction"]["parts"][0]["text"],
             "You are a helpful assistant."
         );
+
+        let mut pruned = request.clone();
+        pruned.messages[0].role = MessageRole::Assistant;
+        pruned.messages.push(request.messages[0].clone());
+        let contents = provider.build_request_body(&pruned).unwrap()["contents"].clone();
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[1]["role"], "model");
 
         let empty_history = ProviderRequest {
             messages: Vec::new(),
