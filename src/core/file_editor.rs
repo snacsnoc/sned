@@ -546,59 +546,24 @@ impl AnchorStorage {
     /// Load anchor state from disk (~/.sned/data/cache/anchors.json)
     fn load(anchors_file: std::path::PathBuf) -> Self {
         Self::migrate_legacy_to_shards(&anchors_file);
-        let mut tasks = match std::fs::read_to_string(&anchors_file) {
-            Ok(content) => {
-                match serde_json::from_str::<IndexMap<String, IndexMap<String, TrackedDocument>>>(
-                    &content,
-                ) {
-                    Ok(tasks) => tasks,
-                    Err(error) => {
-                        tracing::warn!("Failed to parse anchor cache: {}", error);
-                        IndexMap::new()
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => IndexMap::new(),
-            Err(error) => {
-                tracing::warn!("Failed to read anchor cache: {}", error);
-                IndexMap::new()
-            }
-        };
-        // Per-task shards win over the legacy single file; a shard exists
-        // only after its task was migrated by a write. Shards are the only
-        // durable state once migration completes and the legacy file is gone.
-        if let Ok(dir) = std::fs::read_dir(Self::shard_dir(&anchors_file)) {
-            for entry in dir.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                    continue;
-                }
-                match Self::read_shard(&path) {
-                    Ok((task_id, documents)) => {
-                        tasks.shift_remove(&task_id);
-                        tasks.insert(task_id, documents);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "Failed to parse anchor shard {}: {}",
-                            path.display(),
-                            error
-                        );
-                    }
-                }
-            }
-        }
-        tracing::debug!("Loaded {} task(s) from anchor cache", tasks.len());
-        let persisted_fingerprints = tasks
-            .iter()
-            .map(|(task_id, documents)| (task_id.clone(), Self::fingerprint_task(documents)))
-            .collect();
+        let tasks = IndexMap::new();
+        let persisted_fingerprints = IndexMap::new();
         Self {
             persisted_fingerprints,
             tasks,
             durable_shards: HashMap::new(),
             cache_file: anchors_file,
         }
+    }
+
+    fn ensure_task_loaded(&mut self, task_id: &str) -> std::io::Result<()> {
+        if !self.tasks.contains_key(task_id) {
+            let documents = self.read_task_documents_cached(task_id)?;
+            self.persisted_fingerprints
+                .insert(task_id.to_string(), Self::fingerprint_task(&documents));
+            self.tasks.insert(task_id.to_string(), documents);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1174,7 +1139,7 @@ pub enum AnchorTransitionError {
     Persistence(String),
 }
 
-/// Observation does not publish anchors, allocate shared words, or touch LRU state.
+/// Observation may populate the lazy cache but does not publish anchors or allocate shared words.
 #[derive(Debug, Clone)]
 pub struct AnchorSnapshot {
     absolute_path: String,
@@ -1429,16 +1394,20 @@ impl AnchorStateManager {
         let hashes = compute_hashes(&lines);
         let (memory_expected, expected) = {
             let mut storage = self.storage();
+            let documents = storage
+                .read_task_documents_cached(task_id)
+                .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?;
+            if !documents.is_empty() {
+                storage
+                    .ensure_task_loaded(task_id)
+                    .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?;
+            }
             let memory = storage
                 .tasks
                 .get(task_id)
                 .and_then(|files| files.get(absolute_path))
                 .cloned();
-            let disk = storage
-                .read_task_documents_cached(task_id)
-                .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?
-                .get(absolute_path)
-                .cloned();
+            let disk = documents.get(absolute_path).cloned();
             (memory, disk)
         };
         if expected.is_none() && memory_expected.is_some() && lines.len() <= MAX_TRACKED_LINES {
@@ -1668,6 +1637,10 @@ impl AnchorStateManager {
         let absolute_path = absolute_path.as_str();
         let mut storage = self.storage();
         let task_id = task_id.unwrap_or("default");
+        if let Err(error) = storage.ensure_task_loaded(task_id) {
+            tracing::warn!(%error, "Failed to load anchor task during invalidation");
+            storage.tasks.entry(task_id.to_string()).or_default();
+        }
         if let Some(files) = storage.tasks.get_mut(task_id) {
             files.shift_remove(absolute_path);
         }
@@ -1700,6 +1673,11 @@ impl AnchorStateManager {
         let mut durable: HashMap<String, IndexMap<String, TrackedDocument>> = HashMap::new();
         for transition in transitions {
             if !durable.contains_key(&transition.task_id) {
+                if transition.memory_expected.is_some() {
+                    storage
+                        .ensure_task_loaded(&transition.task_id)
+                        .map_err(persistence)?;
+                }
                 let documents = storage
                     .read_task_documents_cached(&transition.task_id)
                     .map_err(persistence)?;
@@ -1834,10 +1812,31 @@ impl AnchorStateManager {
         AnchorStorage::evict_old_task_shards(&storage.cache_file.clone());
         storage.forget_missing_shards();
         // There are no fallible operations after durable replacement.
-        storage.persisted_fingerprints.insert(
-            task_id.to_string(),
-            AnchorStorage::fingerprint_task(&documents),
-        );
+        let fingerprints = documents
+            .iter()
+            .map(|(path, current)| {
+                let unchanged = path != absolute_path
+                    && storage
+                        .tasks
+                        .get(task_id)
+                        .and_then(|files| files.get(path))
+                        .is_some_and(|old| old == current);
+                let digest = unchanged
+                    .then(|| {
+                        storage
+                            .persisted_fingerprints
+                            .get(task_id)
+                            .and_then(|files| files.get(path))
+                            .copied()
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| AnchorStorage::fingerprint_document(current));
+                (path.clone(), digest)
+            })
+            .collect();
+        storage
+            .persisted_fingerprints
+            .insert(task_id.to_string(), fingerprints);
         storage.tasks.insert(task_id.to_string(), documents);
         Ok(())
     }
@@ -1876,14 +1875,23 @@ impl AnchorStateManager {
 
     fn get_task_state(&self, task_id: &str) -> IndexMap<String, TrackedDocument> {
         let mut storage = self.storage();
+        if let Err(error) = storage.ensure_task_loaded(task_id) {
+            tracing::warn!(%error, "Failed to load anchor task");
+            return IndexMap::new();
+        }
         let state = storage.tasks.shift_remove(task_id);
 
         // Implement LRU for tasks
         if storage.tasks.len() >= MAX_TRACKED_TASKS {
             // Remove oldest task (first key - IndexMap maintains insertion order)
-            let oldest = storage.tasks.keys().next().cloned();
+            let oldest = storage
+                .tasks
+                .keys()
+                .find(|key| key.as_str() != task_id)
+                .cloned();
             if let Some(oldest_key) = oldest {
                 storage.tasks.shift_remove(&oldest_key);
+                storage.persisted_fingerprints.shift_remove(&oldest_key);
             }
         }
 
@@ -1897,10 +1905,17 @@ impl AnchorStateManager {
         task_id: &str,
     ) -> &'a mut IndexMap<String, TrackedDocument> {
         // Evict oldest task if at capacity and task doesn't exist
-        if !storage.tasks.contains_key(task_id) && storage.tasks.len() >= MAX_TRACKED_TASKS {
-            let oldest = storage.tasks.keys().next().cloned();
+        if (!storage.tasks.contains_key(task_id) && storage.tasks.len() >= MAX_TRACKED_TASKS)
+            || storage.tasks.len() > MAX_TRACKED_TASKS
+        {
+            let oldest = storage
+                .tasks
+                .keys()
+                .find(|key| key.as_str() != task_id)
+                .cloned();
             if let Some(oldest_key) = oldest {
                 storage.tasks.shift_remove(&oldest_key);
+                storage.persisted_fingerprints.shift_remove(&oldest_key);
             }
         }
 
@@ -1986,6 +2001,10 @@ impl AnchorStateManager {
                 .map(|i| format!("L{}N{i}", &revision[..32]))
                 .collect());
         }
+
+        self.storage()
+            .ensure_task_loaded(task_id)
+            .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?;
 
         let current_hashes = compute_hashes(current_lines);
         // A corrupt or unreadable cache fails closed; only a missing file
@@ -2194,8 +2213,41 @@ impl AnchorStateManager {
         {
             let mut storage = self.storage();
             if let Some(id) = task_id {
+                if let Err(error) = storage.ensure_task_loaded(id) {
+                    tracing::warn!(%error, "Failed to load anchor task for reset");
+                    return;
+                }
                 storage.tasks.shift_remove(id);
             } else {
+                let mut ids = Vec::new();
+                if let Ok(entries) =
+                    std::fs::read_dir(AnchorStorage::shard_dir(&storage.cache_file))
+                {
+                    for entry in entries.flatten() {
+                        if entry.path().extension().and_then(|ext| ext.to_str()) == Some("json") {
+                            match AnchorStorage::read_shard(&entry.path()) {
+                                Ok((id, _)) => ids.push(id),
+                                Err(error) => {
+                                    tracing::warn!(%error, "Failed to load anchor shard for reset");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                match AnchorStorage::read_tasks(&storage.cache_file) {
+                    Ok(tasks) => ids.extend(tasks.into_keys()),
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to load legacy anchor cache for reset");
+                        return;
+                    }
+                }
+                for id in ids {
+                    if let Err(error) = storage.ensure_task_loaded(&id) {
+                        tracing::warn!(%error, "Failed to load anchor task for reset");
+                        return;
+                    }
+                }
                 storage.tasks.clear();
             }
         }
@@ -3717,6 +3769,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cold_snapshot_stays_valid_when_task_is_read_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let seed = AnchorStateManager::with_cache_file(cache.clone());
+        let content = "first\nsecond\n";
+        seed.reconcile_checked("file", &split_content_lines(content), Some("staged"))
+            .unwrap();
+        let manager = AnchorStateManager::with_cache_file(cache);
+        let transition = staged_edit(&manager, "file", content, &[(1, 1, "replace", "updated")]);
+        assert!(manager.get_anchors("file", Some("staged")).is_some());
+        manager.commit_transitions_checked(&[transition]).unwrap();
+    }
+
     #[tokio::test]
     async fn async_commit_wrapper_publishes_and_rejects_stale() {
         let dir = tempfile::tempdir().unwrap();
@@ -4113,6 +4179,10 @@ mod tests {
             .collect();
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read(&backups[0]).unwrap(), legacy.as_bytes());
+        assert!(manager.storage().tasks.is_empty());
+        let _ = manager.get_task_state("task-a");
+        assert!(!manager.storage().tasks.contains_key("task-b"));
+        let _ = manager.get_task_state("task-b");
         let tasks = manager.storage().tasks.clone();
         assert_eq!(tasks.len(), 2);
         assert!(tasks["task-a"].contains_key("a.rs"));
@@ -4143,6 +4213,7 @@ mod tests {
 
         assert_eq!(std::fs::read(&shard).unwrap(), migrated);
         assert!(!cache.exists());
+        let _ = second.get_task_state("task-a");
         let tasks = second.storage().tasks.clone();
         assert!(tasks["task-a"].contains_key("fresh.rs"));
         assert!(!tasks["task-a"].contains_key("stale.rs"));
@@ -4168,6 +4239,7 @@ mod tests {
         // being skipped, so deleting legacy below strands nothing.
         let manager = AnchorStateManager::with_cache_file(cache.clone());
 
+        let _ = manager.get_task_state("task-a");
         let tasks = manager.storage().tasks.clone();
         assert!(tasks["task-a"].contains_key("fresh.rs"));
         assert!(!cache.exists());
@@ -4184,6 +4256,25 @@ mod tests {
         assert!(manager.storage().tasks.is_empty());
         assert!(!cache.exists());
         assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn lazy_shards_load_only_requested_task_and_reset_cold_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let seed = AnchorStateManager::with_cache_file(cache.clone());
+        let lines = vec!["content".to_string()];
+        seed.reconcile_checked("a.rs", &lines, Some("a")).unwrap();
+        seed.reconcile_checked("b.rs", &lines, Some("b")).unwrap();
+
+        let manager = AnchorStateManager::with_cache_file(cache.clone());
+        assert!(manager.storage().tasks.is_empty());
+        assert!(manager.get_anchors("a.rs", Some("a")).is_some());
+        assert!(!manager.storage().tasks.contains_key("b"));
+        manager.reset(None);
+        let reopened = AnchorStateManager::with_cache_file(cache);
+        assert!(reopened.get_anchors("a.rs", Some("a")).is_none());
+        assert!(reopened.get_anchors("b.rs", Some("b")).is_none());
     }
 
     #[test]
