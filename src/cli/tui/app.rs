@@ -183,6 +183,7 @@ pub(crate) struct TurnRenderRequest {
 
 struct LayoutReflowResult {
     wrap_width: usize,
+    content_revision: u64,
     output_lines: Vec<Line<'static>>,
     output_ids: Vec<OutputLineId>,
     output_kinds: Vec<BlockKind>,
@@ -1116,6 +1117,7 @@ pub struct App {
     layout_reflow_rx: Option<std_mpsc::Receiver<LayoutReflowResult>>,
     /// Width whose geometry is being prepared by the background reflow.
     layout_reflow_wrap_width: Option<usize>,
+    layout_content_revision: u64,
     layout_rebuild_total_us: u64,
     layout_rebuild_count: u64,
     layout_rebuild_peak_us: u64,
@@ -1622,6 +1624,7 @@ impl App {
             visual_layout_index: VisualLayoutIndex::default(),
             layout_reflow_rx: None,
             layout_reflow_wrap_width: None,
+            layout_content_revision: 0,
             layout_rebuild_total_us: 0,
             layout_rebuild_count: 0,
             layout_rebuild_peak_us: 0,
@@ -1948,6 +1951,7 @@ impl App {
                         .replace_output_rows(wrap_width, index, replacement_rows)
                         .is_some();
                     self.output_lines[index] = line;
+                    self.layout_content_revision = self.layout_content_revision.wrapping_add(1);
                     self.needs_redraw = true;
                     self.cached_visible_window = None;
                     self.cached_window_fingerprint = (0, 0, 0, 0, 0, ScrollMode::Auto);
@@ -2364,6 +2368,7 @@ impl App {
             };
             if prefixed_turn_indicator {
                 self.output_lines[model_entry_indices[0]] = rendered[0].clone();
+                self.layout_content_revision = self.layout_content_revision.wrapping_add(1);
                 self.output_line_kinds[model_entry_indices[0]] = BlockKind::Model;
             }
             self.needs_redraw = true;
@@ -3989,10 +3994,10 @@ impl App {
             .max(1)
     }
 
-    fn build_visual_layout_index(
-        output_lines: impl IntoIterator<Item = Line<'static>>,
+    fn build_visual_layout_index<'a>(
+        output_lines: impl IntoIterator<Item = &'a Line<'static>>,
         output_line_kinds: impl IntoIterator<Item = BlockKind>,
-        error_lines: impl IntoIterator<Item = Line<'static>>,
+        error_lines: impl IntoIterator<Item = &'a Line<'static>>,
         wrap_width: usize,
     ) -> VisualLayoutIndex {
         let output_lines = output_lines.into_iter().collect::<Vec<_>>();
@@ -4003,7 +4008,7 @@ impl App {
         let mut previous_kind = None;
         let mut previous_line = None;
 
-        for (index, (line, kind)) in output_lines.iter().zip(output_line_kinds).enumerate() {
+        for (index, (line, kind)) in output_lines.into_iter().zip(output_line_kinds).enumerate() {
             if previous_kind.is_some_and(|previous| {
                 Self::should_insert_separator_for_lines(previous, previous_line, kind, line)
             }) {
@@ -4023,7 +4028,7 @@ impl App {
             previous_line = Some(line);
         }
 
-        for (index, line) in error_lines.iter().enumerate() {
+        for (index, line) in error_lines.into_iter().enumerate() {
             if previous_kind
                 .is_some_and(|previous| Self::should_insert_separator(previous, BlockKind::Error))
             {
@@ -4057,9 +4062,9 @@ impl App {
     fn rebuild_visual_layout_index(&mut self, wrap_width: usize) {
         let started = Instant::now();
         let index = Self::build_visual_layout_index(
-            self.output_lines.iter().cloned(),
+            self.output_lines.iter(),
             self.output_line_kinds.iter().copied(),
-            self.error_lines.iter().cloned(),
+            self.error_lines.iter(),
             wrap_width,
         );
         let total = index.total_rows();
@@ -4105,6 +4110,7 @@ impl App {
         self.layout_reflow_wrap_width = None;
 
         let snapshot_matches = result.wrap_width == self.last_wrap_width()
+            && result.content_revision == self.layout_content_revision
             && result.output_lines.len() == self.output_lines.len()
             && result.output_lines.iter().eq(self.output_lines.iter())
             && result.output_ids.len() == self.output_line_ids.len()
@@ -4149,10 +4155,7 @@ impl App {
         let output_ids = self.output_line_ids.iter().copied().collect::<Vec<_>>();
         let output_kinds = self.output_line_kinds.iter().copied().collect::<Vec<_>>();
         let error_lines = self.error_lines.iter().cloned().collect::<Vec<_>>();
-        let result_output_ids = output_ids;
-        let result_output_lines = output_lines.clone();
-        let result_output_kinds = output_kinds.clone();
-        let result_error_lines = error_lines.clone();
+        let content_revision = self.layout_content_revision;
         let (sender, receiver) = std_mpsc::sync_channel(1);
         self.layout_reflow_rx = Some(receiver);
 
@@ -4161,17 +4164,18 @@ impl App {
             .spawn(move || {
                 let started = Instant::now();
                 let index = Self::build_visual_layout_index(
-                    output_lines,
-                    output_kinds,
-                    error_lines,
+                    output_lines.iter(),
+                    output_kinds.iter().copied(),
+                    error_lines.iter(),
                     wrap_width,
                 );
                 let result = LayoutReflowResult {
                     wrap_width,
-                    output_lines: result_output_lines,
-                    output_ids: result_output_ids,
-                    output_kinds: result_output_kinds,
-                    error_lines: result_error_lines,
+                    content_revision,
+                    output_lines,
+                    output_ids,
+                    output_kinds,
+                    error_lines,
                     index,
                     elapsed_us: started.elapsed().as_micros() as u64,
                 };
@@ -6474,6 +6478,60 @@ mod tests {
     }
 
     #[test]
+    fn background_reflow_rejects_public_output_mutation() {
+        let mut app = App::new();
+        app.set_content_width(120);
+        for index in 0..ASYNC_LAYOUT_REFLOW_THRESHOLD {
+            app.push_plain(format!("row {index}"));
+        }
+        app.set_content_width(24);
+        let width = App::content_wrap_width(24);
+        assert!(app.start_layout_reflow(width));
+
+        app.output_lines[0] = Line::from("x".repeat(100));
+        app.rebuild_visual_layout_index(width);
+        let updated_rows = app.visual_layout_index.total_rows();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.layout_reflow_rx.is_some() && Instant::now() < deadline {
+            app.poll_layout_reflow();
+            std::thread::yield_now();
+        }
+        assert!(app.layout_reflow_rx.is_none());
+        assert_eq!(app.visual_layout_index.total_rows(), updated_rows);
+        assert!(app.needs_redraw);
+    }
+
+    #[test]
+    fn background_reflow_rejects_finalized_indicator_with_same_line_id() {
+        let mut app = App::new();
+        app.set_content_width(120);
+        for index in 0..ASYNC_LAYOUT_REFLOW_THRESHOLD {
+            app.push_plain(format!("row {index}"));
+        }
+        app.push_turn_indicator(Line::from("♦"));
+        app.push_stream_line(Line::from("abcdefghijklmnopqrstu"), StreamKind::Model);
+        app.set_content_width(24);
+        let width = App::content_wrap_width(24);
+        assert!(app.start_layout_reflow(width));
+        let retained_ids = app.output_line_ids.clone();
+
+        app.finalize_turn_stream("abcdefghijklmnopqrstu");
+        assert_eq!(app.output_line_ids, retained_ids);
+        assert!(App::line_to_string(app.output_lines.back().unwrap()).starts_with("♦ "));
+        assert!(App::line_visual_rows(app.output_lines.back().unwrap(), width) > 1);
+        let finalized_rows = app.visual_layout_index.total_rows();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.layout_reflow_rx.is_some() && Instant::now() < deadline {
+            app.poll_layout_reflow();
+            std::thread::yield_now();
+        }
+        assert!(app.layout_reflow_rx.is_none());
+        assert_eq!(app.visual_layout_index.total_rows(), finalized_rows);
+        assert!(app.visual_layout_index.is_valid_for(width));
+    }
+
+    #[test]
     fn background_reflow_rejects_changed_output_with_same_line_id() {
         let mut app = App::new();
         app.set_content_width(120);
@@ -6625,8 +6683,7 @@ mod tests {
         assert_eq!(app.output_lines.len(), app.output_line_ids.len());
         // Rendered block lands at the first popped index; the
         // interleaved tool line survives after it with its original id.
-        let texts: Vec<String> =
-            app.output_lines.iter().map(App::line_to_string).collect();
+        let texts: Vec<String> = app.output_lines.iter().map(App::line_to_string).collect();
         assert_eq!(texts, vec!["history", "R1", "R2", "R3", "tool line"]);
         assert_eq!(
             app.output_line_kinds.iter().copied().collect::<Vec<_>>(),
