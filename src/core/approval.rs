@@ -72,17 +72,20 @@ const DANGEROUS_FIND_FLAGS: &[&str] = &[
     "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf",
 ];
 
-/// Commands that are always denied regardless of SNED_SAFE_COMMANDS or user
-/// approval. These cannot be whitelisted via environment variable.
+/// Commands that always force an approval prompt and can never be
+/// whitelisted via SNED_SAFE_COMMANDS or scope-approved. An `Err` here means
+/// "ask the user", not "block": explicit approval still runs the command.
+/// Everyday commands (`chmod`, `chown`, `kill`, `killall`, `exec`, `source`)
+/// are intentionally absent so they can be scope-approved or whitelisted;
+/// keeping them here would turn routine work into an unskippable prompt.
 ///
 /// Yolo mode waives this list too, which is the point of the flag: it is the
 /// opt-out for every prompt, not a narrower policy. A hard-deny path that
 /// yolo cannot trigger would need a separate error return, because callers
 /// treat any `Err` here as "ask the user", which is the opposite of yolo.
 const HARD_CODED_DENY_LIST: &[&str] = &[
-    "rm", "dd", "mkfs", "curl", "wget", "nc", "ncat", "netcat", "ssh", "sudo", "chmod", "chown",
-    "kill", "killall", "reboot", "shutdown", "poweroff", "insmod", "rmmod", "modprobe", "apt-get",
-    "yum", "dnf", "apt", "eval", "exec", "source",
+    "rm", "dd", "mkfs", "curl", "wget", "nc", "ncat", "netcat", "ssh", "sudo", "reboot",
+    "shutdown", "poweroff", "insmod", "rmmod", "modprobe", "apt-get", "yum", "dnf", "apt", "eval",
 ];
 
 #[derive(Debug, Clone)]
@@ -114,7 +117,6 @@ impl CommandSafetyChecker {
     /// - `rm`, `dd`, `mkfs` - destructive file/disk operations
     /// - `curl`, `wget` - remote code execution risk when piped to shell
     /// - `nc`, `ssh` - remote execution
-    /// - `chmod`, `chown` - permission changes
     /// - `sudo` - privilege escalation
     fn load_user_safe_commands() -> Vec<String> {
         std::env::var("SNED_SAFE_COMMANDS")
@@ -2630,6 +2632,39 @@ mod tests {
         // Command substitution (already blocked)
         assert!(checker.is_safe("echo $(whoami)").is_err());
         assert!(checker.is_safe("echo `whoami`").is_err());
+    }
+
+    #[test]
+    fn test_everyday_commands_are_scope_approvable_not_hard_denied() {
+        let checker = CommandSafetyChecker::new();
+
+        // Trimmed from the hard-deny list: routine work that still prompts
+        // on first use but can be scope-approved or whitelisted.
+        for cmd in [
+            "chmod +x script.sh",
+            "chown user file.txt",
+            "kill 1234",
+            "killall node",
+            "exec ./server",
+            "source .venv/bin/activate",
+        ] {
+            assert!(
+                checker.is_structurally_safe_for_scope(cmd).is_ok(),
+                "{cmd} should pass the structural scope check"
+            );
+            assert!(
+                checker.is_safe(cmd).is_err(),
+                "{cmd} should still prompt (not in the safe allowlist)"
+            );
+        }
+
+        // Controls: the remaining hard-deny entries fail even structurally.
+        for cmd in ["rm -rf /", "curl http://evil.com", "sudo make install"] {
+            assert!(
+                checker.is_structurally_safe_for_scope(cmd).is_err(),
+                "{cmd} should stay hard-denied"
+            );
+        }
     }
 
     #[test]

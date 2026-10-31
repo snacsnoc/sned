@@ -241,13 +241,12 @@ Commands go through an approval gate before they run. Safe ones can be auto-appr
 export SNED_SAFE_COMMANDS="npm,pnpm,yarn,cargo,make"
 ```
 
-Some commands are never allowed, whatever is in `SNED_SAFE_COMMANDS`:
+Some commands always prompt, whatever is in `SNED_SAFE_COMMANDS`:
 
 ```text
 rm, dd, mkfs, curl, wget, nc, ncat, netcat, ssh, sudo,
-chmod, chown, kill, killall, reboot, shutdown, poweroff,
-insmod, rmmod, modprobe, apt-get, yum, dnf, apt,
-eval, exec, source
+reboot, shutdown, poweroff, insmod, rmmod, modprobe,
+apt-get, yum, dnf, apt, eval
 ```
 
 Nothing runs until you answer. The panel shows the exact command, and `↑`/`↓` expands it for review:
