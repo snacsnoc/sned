@@ -47,6 +47,15 @@ Those run one shot and exit. To keep a session going, run `sned` with no prompt 
 sned
 ```
 
+You can pipe input into sned too:
+
+```bash
+cat prompt.md | sned --provider openrouter --model qwen/qwen3-coder
+git diff | sned "review this diff" --provider openrouter --model qwen/qwen3-coder
+```
+
+Piped input goes before the inline prompt. This works with `sned`, not `sned session`.
+
 ## TUI
 
 The TUI is the main client for model streaming and interaction. You can apply pressure to your keyboard's keys, and send abritrary text.

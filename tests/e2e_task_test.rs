@@ -53,6 +53,44 @@ fn test_e2e_mock_provider_selection() {
 }
 
 #[test]
+fn piped_prompt_and_inline_instruction_reach_conversation() {
+    for (stdin, inline, expected) in [
+        (
+            "first line\n  second line\n",
+            None,
+            "first line\n  second line",
+        ),
+        (
+            "first line\n  second line\n",
+            Some("review this"),
+            "first line\n  second line\n\n\nreview this",
+        ),
+    ] {
+        let (mut cmd, temp_dir) = sned_cmd();
+        let export = temp_dir.path().join("conversation.json");
+        cmd.args(["--export", export.to_str().unwrap()])
+            .write_stdin(stdin);
+        if let Some(inline) = inline {
+            cmd.arg(inline);
+        }
+        cmd.assert().success();
+        let conversation: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(export).unwrap()).unwrap();
+        assert_eq!(conversation[0]["role"], "user");
+        assert_eq!(conversation[0]["content"], expected);
+    }
+}
+
+#[test]
+fn empty_piped_prompt_is_rejected() {
+    let (mut cmd, _temp_dir) = sned_cmd();
+    cmd.write_stdin("")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Empty input received from stdin"));
+}
+
+#[test]
 fn test_json_text_only_completion_emits_completion_event_once() {
     let temp_dir = tempfile::tempdir().unwrap();
     let sned_dir = temp_dir.path().join("sned-home");
