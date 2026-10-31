@@ -254,11 +254,25 @@ impl GeminiProvider {
             let function_declarations: Vec<serde_json::Value> = tool_defs
                 .iter()
                 .map(|t| {
-                    json!({
+                    let mut declaration = json!({
                         "name": t.function.name,
                         "description": t.function.description,
-                        "parameters": sanitize_function_parameters(&t.function.parameters),
-                    })
+                    });
+                    let complex = needs_json_schema(&t.function.parameters);
+                    let mut parameters = if complex {
+                        t.function.parameters.clone()
+                    } else {
+                        sanitize_function_parameters(&t.function.parameters)
+                    };
+                    if let Some(object) = parameters.as_object_mut() {
+                        object.entry("type").or_insert_with(|| json!("object"));
+                    }
+                    declaration[if complex {
+                        "parametersJsonSchema"
+                    } else {
+                        "parameters"
+                    }] = parameters;
+                    declaration
                 })
                 .collect();
 
@@ -319,6 +333,19 @@ impl GeminiProvider {
             self.base_url(),
             self.config.model_id
         )
+    }
+}
+
+fn needs_json_schema(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "$ref" | "$defs" | "definitions" | "oneOf" | "allOf"
+            ) || needs_json_schema(value)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(needs_json_schema),
+        _ => false,
     }
 }
 
@@ -1438,6 +1465,22 @@ mod tests {
         assert_eq!(tools.len(), 1);
         let func = &tools[0]["functionDeclarations"].as_array().unwrap()[0];
         assert_eq!(func["name"], "read_file");
+
+        let mut complex = request.clone();
+        let schema = json!({"type":"object", "properties":{"path":{"$ref":"#/$defs/Path"}}, "$defs":{"Path":{"oneOf":[{"type":"string"},{"type":"integer"}]}}});
+        complex.tools.as_mut().unwrap()[0].function.parameters = schema.clone();
+        let body = provider.build_request_body(&complex).unwrap();
+        let func = &body["tools"][0]["functionDeclarations"][0];
+        assert_eq!(func["parametersJsonSchema"], schema);
+        assert!(func.get("parameters").is_none());
+
+        complex.tools.as_mut().unwrap()[0].function.parameters =
+            json!({"properties":{"path":{"type":"string"}}});
+        let body = provider.build_request_body(&complex).unwrap();
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["parameters"]["type"],
+            "object"
+        );
     }
 
     #[test]
