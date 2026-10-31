@@ -834,8 +834,6 @@ impl ToolProfile {
                 SnedTool::GetFunction,
                 SnedTool::GetFileSkeleton,
                 SnedTool::FindSymbolReferences,
-                SnedTool::ReplaceSymbol,
-                SnedTool::RenameSymbol,
                 SnedTool::UseSubagents,
                 SnedTool::UseSkill,
                 SnedTool::ListSkills,
@@ -1389,7 +1387,7 @@ mod tests {
         assert!(ToolProfile::CoreEdit.tools().len() >= 9);
         assert!(ToolProfile::Validate.tools().len() >= 11);
         assert!(ToolProfile::Symbol.tools().len() >= 9);
-        assert_eq!(ToolProfile::Plan.tools().len(), 17);
+        assert_eq!(ToolProfile::Plan.tools().len(), 15);
         assert_eq!(ToolProfile::Full.tools().len(), 20);
     }
 

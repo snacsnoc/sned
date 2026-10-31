@@ -282,7 +282,7 @@ pub(crate) fn prepare_tool_calls(
 }
 
 pub(crate) fn is_plan_mode_restricted(tool: SnedTool) -> bool {
-    matches!(tool, SnedTool::WriteToFile | SnedTool::EditFile)
+    matches!(tool.category(), super::ToolCategory::EditFiles)
 }
 
 /// Extract the first action path from tool params for per-path approval.

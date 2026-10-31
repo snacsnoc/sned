@@ -11493,6 +11493,8 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(is_plan_mode_restricted(SnedTool::WriteToFile));
         // EditFile is restricted in plan mode
         assert!(is_plan_mode_restricted(SnedTool::EditFile));
+        assert!(is_plan_mode_restricted(SnedTool::ReplaceSymbol));
+        assert!(is_plan_mode_restricted(SnedTool::RenameSymbol));
 
         // Read-only tools are NOT restricted
         assert!(!is_plan_mode_restricted(SnedTool::ReadFile));
