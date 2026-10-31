@@ -460,6 +460,7 @@ impl UseSubagentsHandler {
         cmd.arg("--prompt-file");
         cmd.arg(&prompt_path);
         cmd.arg("--is-subagent");
+        cmd.arg("--no-checkpoints");
         cmd.arg("--json");
         cmd.arg("--auto-approve-all");
         cmd.arg("--result-file");
