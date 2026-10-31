@@ -859,9 +859,17 @@ async fn refresh_slash_command_entries(
     app: &mut App,
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
 ) {
-    let state = state_handle.lock().await.clone();
+    let Ok(state_guard) = state_handle.try_lock() else {
+        app.slash_command_refresh_pending = true;
+        return;
+    };
+    let state = state_guard.clone();
+    drop(state_guard);
     let (skills, availability) = if let Some(state) = state {
-        let state = state.lock().await;
+        let Ok(state) = state.try_lock() else {
+            app.slash_command_refresh_pending = true;
+            return;
+        };
         (
             state.available_skills.clone(),
             crate::cli::slash_commands::SlashCommandAvailability::from_task_state(
@@ -882,6 +890,40 @@ async fn refresh_slash_command_entries(
     };
     app.slash_command_all_entries =
         crate::cli::slash_commands::build_available_slash_command_entries(&skills, availability);
+    app.slash_command_refresh_pending = false;
+}
+
+async fn retry_slash_command_refresh(
+    app: &mut App,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+) {
+    if !app.slash_command_active || !app.slash_command_refresh_pending {
+        return;
+    }
+    let selected = app
+        .slash_command_results
+        .get(app.slash_command_selected)
+        .map(|entry| entry.name.clone());
+    refresh_slash_command_entries(app, state_handle).await;
+    if app.slash_command_refresh_pending {
+        return;
+    }
+    let input = app.input.lines().join("\n");
+    let query = if app.slash_command_help_active {
+        input.trim().to_string()
+    } else {
+        crate::cli::slash_commands::extract_slash_query(&input).unwrap_or_default()
+    };
+    app.slash_command_results =
+        crate::cli::slash_commands::filter_slash_commands(&app.slash_command_all_entries, &query);
+    app.slash_command_selected = selected
+        .and_then(|name| {
+            app.slash_command_results
+                .iter()
+                .position(|entry| entry.name == name)
+        })
+        .unwrap_or(0);
+    app.needs_redraw = true;
 }
 
 fn open_slash_command_help(app: &mut App, query: &str) {
@@ -897,6 +939,7 @@ fn open_slash_command_help(app: &mut App, query: &str) {
 
 fn close_slash_command_mode(app: &mut App) {
     app.slash_command_active = false;
+    app.slash_command_refresh_pending = false;
     app.slash_command_help_active = false;
     app.slash_command_results.clear();
     app.slash_command_selected = 0;
@@ -5839,6 +5882,7 @@ async fn run_main_loop(
             }
         }
 
+        retry_slash_command_refresh(app, &state_handle).await;
         app.poll_layout_reflow();
         if app.has_resized {
             sync_scroll_viewport(terminal, app, task_opts.debug)?;
@@ -12869,6 +12913,51 @@ mod tests {
         assert!(app.model_picker_results.is_empty());
         crate::core::approval::set_followup_question_active(task_id, false);
         crate::core::approval::clear_followup_sender(task_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slash_completion_uses_cached_entries_while_state_is_locked() -> anyhow::Result<()> {
+        let (tx, _rx) = mpsc::channel(4);
+        let writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let task_state = Arc::new(Mutex::new(crate::core::agent_types::TaskState::default()));
+        let state_handle = Arc::new(Mutex::new(Some(task_state.clone())));
+        let mut app = App::new();
+        app.slash_command_all_entries =
+            crate::cli::slash_commands::build_available_slash_command_entries(
+                &[],
+                crate::cli::slash_commands::SlashCommandAvailability::default(),
+            );
+        app.slash_command_track_changes = true;
+        let guard = task_state.lock().await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_key_event(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty()),
+                &mut app,
+                &writer,
+                &state_handle,
+                "task",
+            ),
+        )
+        .await
+        .expect("slash completion must not wait for the task state")?;
+        assert!(app.slash_command_active);
+        assert!(!app.slash_command_results.is_empty());
+        assert!(app.slash_command_refresh_pending);
+        assert!(
+            !app.slash_command_results
+                .iter()
+                .any(|entry| entry.name == "commit")
+        );
+        drop(guard);
+        retry_slash_command_refresh(&mut app, &state_handle).await;
+        assert!(!app.slash_command_refresh_pending);
+        assert!(
+            app.slash_command_results
+                .iter()
+                .any(|entry| entry.name == "commit")
+        );
         Ok(())
     }
 

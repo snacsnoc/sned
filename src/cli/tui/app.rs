@@ -1123,6 +1123,7 @@ pub struct App {
     layout_rebuild_peak_us: u64,
     /// Whether the slash command picker is active.
     pub slash_command_active: bool,
+    pub(crate) slash_command_refresh_pending: bool,
     pub slash_command_help_active: bool,
     pub slash_command_track_changes: bool,
     /// Filtered slash command results for the current query.
@@ -1580,6 +1581,7 @@ impl App {
             mention_search_deadline: Instant::now(),
             context_usage: None,
             slash_command_active: false,
+            slash_command_refresh_pending: false,
             slash_command_help_active: false,
             slash_command_track_changes: false,
             slash_command_results: Vec::new(),
