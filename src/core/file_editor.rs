@@ -1625,6 +1625,40 @@ impl AnchorStateManager {
         self.check_transitions(transitions, false)
     }
 
+    /// Blocking file lock, shard reads, and serde stay on the blocking pool
+    /// so async tool handlers never park a tokio worker in anchor IO.
+    /// A pool failure maps to `Persistence`, keeping the fail-closed
+    /// contract: anchor state is unchanged and the handler reports applied
+    /// content with reread recovery.
+    pub async fn commit_transitions_checked_async(
+        &self,
+        transitions: Vec<AnchorTransition>,
+    ) -> Result<(), AnchorTransitionError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || manager.check_transitions(&transitions, true))
+            .await
+            .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?
+    }
+
+    /// Async counterpart to `validate_transitions_checked` with the same
+    /// blocking-pool discipline; the prewrite check also takes the file
+    /// lock and reads shards from disk.
+    pub async fn validate_transitions_checked_async(
+        &self,
+        transitions: Vec<AnchorTransition>,
+    ) -> Result<(), AnchorTransitionError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || manager.check_transitions(&transitions, false))
+            .await
+            .map_err(|error| AnchorTransitionError::Persistence(error.to_string()))?
+    }
+
     /// Discard this manager's view after content changed without anchor publication.
     /// Persistence may be unavailable, or another manager may have committed newer
     /// anchors. Never repair this failure with a best-effort cache write/delete:
@@ -3681,6 +3715,38 @@ mod tests {
             manager.get_anchors("duplicates", Some("staged")).unwrap(),
             transition.anchors
         );
+    }
+
+    #[tokio::test]
+    async fn async_commit_wrapper_publishes_and_rejects_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("anchors.json");
+        let manager = AnchorStateManager::with_cache_file(cache);
+        let transition = staged_edit(
+            &manager,
+            "async-path",
+            "alpha\nbeta",
+            &[(1, 1, "replace", "BETA")],
+        );
+        manager
+            .validate_transitions_checked_async(vec![transition.clone()])
+            .await
+            .unwrap();
+        manager
+            .commit_transitions_checked_async(vec![transition.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_anchors("async-path", Some("staged")).unwrap(),
+            transition.anchors
+        );
+        let stale = manager
+            .commit_transitions_checked_async(vec![transition])
+            .await;
+        assert!(matches!(
+            stale,
+            Err(AnchorTransitionError::StaleGeneration { .. })
+        ));
     }
 
     #[test]

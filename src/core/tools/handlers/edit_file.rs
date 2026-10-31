@@ -2674,7 +2674,7 @@ impl EditFileHandler {
             // Check generations against persisted state before the first write;
             // publication repeats this check after the write phase.
             let staged: Vec<_> = transitions.values().cloned().collect();
-            if let Err(error) = anchor_mgr.validate_transitions_checked(&staged) {
+            if let Err(error) = anchor_mgr.validate_transitions_checked_async(staged).await {
                 if matches!(
                     &error,
                     crate::core::file_editor::AnchorTransitionError::Persistence(_)
@@ -2858,7 +2858,7 @@ impl EditFileHandler {
                 manager.clear_state(path, task_id);
             }
             let staged: Vec<_> = transitions.values().cloned().collect();
-            if let Err(error) = anchor_mgr.commit_transitions_checked(&staged) {
+            if let Err(error) = anchor_mgr.commit_transitions_checked_async(staged).await {
                 for file_result in &file_results {
                     if !file_result.had_success {
                         continue;
