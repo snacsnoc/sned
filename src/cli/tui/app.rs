@@ -642,9 +642,15 @@ struct TextSelection {
 
 #[derive(Debug, Clone)]
 struct VisibleCell {
-    symbol: String,
+    symbol: CellSymbol,
     continuation: bool,
     hyperlink: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum CellSymbol {
+    Char(char),
+    Text(String),
 }
 
 #[derive(Debug, Clone)]
@@ -3111,7 +3117,10 @@ impl App {
             let mut text = String::new();
             for cell in &surface.rows[row][start..=end] {
                 if !cell.continuation {
-                    text.push_str(&cell.symbol);
+                    match &cell.symbol {
+                        CellSymbol::Char(ch) => text.push(*ch),
+                        CellSymbol::Text(value) => text.push_str(value),
+                    }
                 }
             }
             rows.push(text.trim_end_matches(char::is_whitespace).to_string());
@@ -3121,17 +3130,16 @@ impl App {
     }
 
     fn refresh_selection_surfaces(&mut self, buffer: &Buffer) {
-        self.selection_surfaces = self
-            .transcript_selection_area
-            .map(|area| {
-                self.snapshot_selection_surface(
-                    buffer,
-                    area,
-                    self.transcript_selection_row_sources.as_slice(),
-                )
-            })
-            .into_iter()
-            .collect();
+        let previous = self.selection_surfaces.pop();
+        if let Some(area) = self.transcript_selection_area {
+            let surface = self.snapshot_selection_surface(
+                buffer,
+                area,
+                self.transcript_selection_row_sources.as_slice(),
+                previous,
+            );
+            self.selection_surfaces.push(surface);
+        }
         if self.text_selection.as_ref().is_some_and(|selection| {
             let Some(surface) = self.selection_surface() else {
                 return true;
@@ -3148,14 +3156,20 @@ impl App {
         buffer: &Buffer,
         content_area: Rect,
         row_sources: &[Option<SelectionRowSource>],
+        previous: Option<SelectionSurface>,
     ) -> SelectionSurface {
-        let mut rows = Vec::with_capacity(content_area.height as usize);
-        for row in content_area.y..content_area.y.saturating_add(content_area.height) {
-            let mut cells = Vec::with_capacity(content_area.width as usize);
+        let mut rows = previous.map_or_else(Vec::new, |surface| surface.rows);
+        rows.resize_with(content_area.height as usize, Vec::new);
+        for (row_index, row) in
+            (content_area.y..content_area.y.saturating_add(content_area.height)).enumerate()
+        {
+            let cells = &mut rows[row_index];
+            cells.clear();
+            cells.reserve(content_area.width as usize);
             let mut continuation_cells = 0usize;
             for column in content_area.x..content_area.x.saturating_add(content_area.width) {
                 let cell = buffer.cell((column, row));
-                let symbol = cell.map_or_else(|| " ".to_string(), |cell| cell.symbol().to_string());
+                let symbol = cell.map_or(" ", |cell| cell.symbol());
                 let hyperlink = cell.and_then(|cell| {
                     Self::hyperlink_marker_index(cell.underline_color)
                         .and_then(|index| self.rendered_hyperlink_targets.get(index))
@@ -3165,15 +3179,19 @@ impl App {
                 if continuation {
                     continuation_cells -= 1;
                 } else {
-                    continuation_cells = UnicodeWidthStr::width(symbol.as_str()).saturating_sub(1);
+                    continuation_cells = UnicodeWidthStr::width(symbol).saturating_sub(1);
                 }
+                let mut chars = symbol.chars();
+                let symbol = match (chars.next(), chars.next()) {
+                    (Some(ch), None) => CellSymbol::Char(ch),
+                    _ => CellSymbol::Text(symbol.to_string()),
+                };
                 cells.push(VisibleCell {
                     symbol,
                     continuation,
                     hyperlink,
                 });
             }
-            rows.push(cells);
         }
         SelectionSurface {
             content_area,
@@ -5839,7 +5857,10 @@ mod tests {
             .expect("render should create a selection surface");
         for (row_index, row) in surface.rows.iter().enumerate() {
             for (column_index, cell) in row.iter().enumerate() {
-                if cell.symbol == text {
+                if match &cell.symbol {
+                    CellSymbol::Char(ch) => text.chars().eq(std::iter::once(*ch)),
+                    CellSymbol::Text(value) => value == text,
+                } {
                     return (
                         surface.content_area.x.saturating_add(column_index as u16),
                         surface.content_area.y.saturating_add(row_index as u16),
@@ -6114,6 +6135,31 @@ mod tests {
         assert_eq!(
             app.finish_text_selection(column + 3, row),
             Some("done".to_string())
+        );
+    }
+
+    #[test]
+    fn selection_surface_reuses_rows_and_preserves_combining_symbols() {
+        let mut app = App::new();
+        app.push_plain("e\u{301}界");
+        render_for_selection(&mut app);
+        let surface = app.selection_surface().unwrap();
+        let row_pointers: Vec<_> = surface.rows.iter().map(|row| row.as_ptr()).collect();
+        let (column, row) = selection_text_position(&app, "e\u{301}");
+        render_for_selection(&mut app);
+        let surface = app.selection_surface().unwrap();
+        assert_eq!(
+            row_pointers,
+            surface
+                .rows
+                .iter()
+                .map(|row| row.as_ptr())
+                .collect::<Vec<_>>()
+        );
+        assert!(app.begin_text_selection(column, row, Instant::now()));
+        assert_eq!(
+            app.finish_text_selection(column + 1, row),
+            Some("e\u{301}界".to_string())
         );
     }
 
