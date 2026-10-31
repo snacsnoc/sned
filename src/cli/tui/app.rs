@@ -16,7 +16,7 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
@@ -2060,6 +2060,86 @@ impl App {
         self.turn_indicator = Some(line);
     }
 
+    /// Rebuild the output triplet in one pass, dropping `remove` indices
+    /// and inserting `insert_lines` (each with a fresh id) at old-buffer
+    /// `insert_at`. Repeated `VecDeque::remove`/`insert` shift every later
+    /// element per call; the single pass moves each surviving line once.
+    /// Moved lines keep their ids, so the triplet stays in lockstep.
+    fn splice_output_triplet(
+        &mut self,
+        remove: &HashSet<usize>,
+        insert_at: usize,
+        insert_lines: Vec<Line<'static>>,
+        insert_kind: BlockKind,
+    ) {
+        let kept = self
+            .output_lines
+            .len()
+            .saturating_sub(remove.len())
+            .saturating_add(insert_lines.len());
+        let mut new_lines = VecDeque::with_capacity(kept);
+        let mut new_kinds = VecDeque::with_capacity(kept);
+        let mut new_ids = VecDeque::with_capacity(kept);
+        let mut insert_lines = insert_lines.into_iter();
+        let mut inserted = false;
+        let mut old_idx = 0;
+        while let (Some(line), Some(kind), Some(id)) = (
+            self.output_lines.pop_front(),
+            self.output_line_kinds.pop_front(),
+            self.output_line_ids.pop_front(),
+        ) {
+            if !inserted && old_idx >= insert_at {
+                // `insert_at` is the minimum removed index, so every
+                // earlier line was kept and this is the rendered position.
+                self.push_inserted_lines(
+                    &mut new_lines,
+                    &mut new_kinds,
+                    &mut new_ids,
+                    &mut insert_lines,
+                    insert_kind,
+                );
+                inserted = true;
+            }
+            if !remove.contains(&old_idx) {
+                new_lines.push_back(line);
+                new_kinds.push_back(kind);
+                new_ids.push_back(id);
+            }
+            old_idx += 1;
+        }
+        if !inserted {
+            self.push_inserted_lines(
+                &mut new_lines,
+                &mut new_kinds,
+                &mut new_ids,
+                &mut insert_lines,
+                insert_kind,
+            );
+        }
+        self.output_lines = new_lines;
+        self.output_line_kinds = new_kinds;
+        self.output_line_ids = new_ids;
+    }
+
+    /// Drain `insert_lines` into the rebuilt buffers with fresh ids.
+    /// Split out so the splice loop can borrow the buffers without
+    /// holding `self` across iterations.
+    fn push_inserted_lines(
+        &mut self,
+        new_lines: &mut VecDeque<Line<'static>>,
+        new_kinds: &mut VecDeque<BlockKind>,
+        new_ids: &mut VecDeque<OutputLineId>,
+        insert_lines: &mut std::vec::IntoIter<Line<'static>>,
+        insert_kind: BlockKind,
+    ) {
+        for rendered in insert_lines.by_ref() {
+            let line_id = self.allocate_output_line_id();
+            new_lines.push_back(rendered);
+            new_kinds.push_back(insert_kind);
+            new_ids.push_back(line_id);
+        }
+    }
+
     /// Remove model prose that preceded a terminal plan response.
     ///
     /// Some providers stream a natural-language answer before emitting the
@@ -2086,22 +2166,19 @@ impl App {
             return;
         }
 
-        for index in model_indices.iter().rev() {
-            self.output_lines.remove(*index);
-            self.output_line_ids.remove(*index);
-            self.output_line_kinds.remove(*index);
-        }
+        let remove: HashSet<usize> = model_indices.iter().copied().collect();
+        self.splice_output_triplet(&remove, 0, Vec::new(), BlockKind::Model);
 
+        let mut removed_sorted = model_indices;
+        removed_sorted.sort_unstable();
         let remaining_entries = entries
             .into_iter()
             .filter_map(|(index, kind)| {
                 if kind == StreamKind::Model || index >= original_len {
                     return None;
                 }
-                let removed_before = model_indices
-                    .iter()
-                    .filter(|removed_index| **removed_index < index)
-                    .count();
+                let removed_before =
+                    removed_sorted.partition_point(|removed_index| *removed_index < index);
                 Some((index - removed_before, kind))
             })
             .collect();
@@ -2318,23 +2395,9 @@ impl App {
                     .saturating_sub(1)
             });
 
-        // Pop only the Model entries from highest index to lowest to
-        // preserve the relative order of entries that come before.
-        // ToolOutput entries are NOT popped.  `output_line_kinds` is
-        // popped in lockstep so render-time grouping stays valid.
-        for &idx in model_entry_indices.iter().rev() {
-            self.output_lines.remove(idx);
-            self.output_line_ids.remove(idx);
-            self.output_line_kinds.remove(idx);
-        }
-
-        // The Model entry indices were contiguous in append order
-        // (model-streamed lines are emitted in sequence) but other
-        // events (RawAnsi code blocks, ToolOutput lines) may have
-        // interleaved.  The surviving lines between the popped region
-        // must be reindexed — since we popped from the highest index
-        // first, indices before any popped index remain valid. Indices
-        // after the popped region shift down by 1 per popped line.
+        // Drop only the Model entries; ToolOutput entries are NOT popped.
+        // The triplet is rebuilt in one pass so interleaved lines keep
+        // their relative order without per-line memmove chains.
         //
         // For simplicity, the markdown re-render is inserted at the
         // position of the FIRST popped Model line (the minimum index).
@@ -2361,12 +2424,8 @@ impl App {
             first.spans = new_spans;
         }
         let rendered_len = rendered.len();
-        for line in rendered.into_iter().rev() {
-            let line_id = self.allocate_output_line_id();
-            self.output_lines.insert(insert_at, line);
-            self.output_line_ids.insert(insert_at, line_id);
-            self.output_line_kinds.insert(insert_at, BlockKind::Model);
-        }
+        let remove: HashSet<usize> = model_entry_indices.iter().copied().collect();
+        self.splice_output_triplet(&remove, insert_at, rendered, BlockKind::Model);
         // Sanity: lengths should match exactly. If they ever diverge
         // (e.g. because some external mutation slipped through),
         // rebuild both from the same buffer to recover.
@@ -6470,6 +6529,47 @@ mod tests {
             .expect("manual viewport should remain on the model separator");
         assert!(anchor.separator_before);
         assert_eq!(anchor.text, "intro");
+    }
+
+    #[test]
+    fn test_finalize_splice_preserves_interleaved_order_and_lockstep() {
+        let mut app = App::new();
+        app.set_content_height(24);
+        app.set_content_width(80);
+        app.push_plain("history");
+        app.push_stream_line(Line::from("m1"), StreamKind::Model);
+        app.push_stream_line(Line::from("m2"), StreamKind::Model);
+        app.push_stream_line(Line::from("tool line"), StreamKind::ToolOutput);
+        app.push_stream_line(Line::from("m3"), StreamKind::Model);
+        let tool_id = app.output_line_ids[3];
+
+        // Rendered lines differ from streamed text so the splice path
+        // runs instead of the no-op-reinsert fast path.
+        app.finalize_turn_stream_with_rendered(
+            "m1\nm2\nm3",
+            vec![Line::from("R1"), Line::from("R2"), Line::from("R3")],
+            None,
+        );
+
+        // Triplet stays in lockstep.
+        assert_eq!(app.output_lines.len(), app.output_line_kinds.len());
+        assert_eq!(app.output_lines.len(), app.output_line_ids.len());
+        // Rendered block lands at the first popped index; the
+        // interleaved tool line survives after it with its original id.
+        let texts: Vec<String> =
+            app.output_lines.iter().map(App::line_to_string).collect();
+        assert_eq!(texts, vec!["history", "R1", "R2", "R3", "tool line"]);
+        assert_eq!(
+            app.output_line_kinds.iter().copied().collect::<Vec<_>>(),
+            vec![
+                BlockKind::ToolOutput,
+                BlockKind::Model,
+                BlockKind::Model,
+                BlockKind::Model,
+                BlockKind::ToolOutput,
+            ]
+        );
+        assert_eq!(app.output_line_ids[4], tool_id);
     }
 
     #[test]
