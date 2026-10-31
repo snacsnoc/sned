@@ -1672,6 +1672,74 @@ fn confirmation_is_approved(response: &str) -> bool {
     response.trim().eq_ignore_ascii_case("y")
 }
 
+fn read_local_prompt<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+    mut next_event: impl FnMut(Duration) -> std::io::Result<Option<Event>>,
+) -> anyhow::Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut answer = String::new();
+    app.force_bottom();
+    loop {
+        terminal.draw(|frame| app.render(frame))?;
+        if Instant::now() >= deadline {
+            answer.clear();
+            break;
+        }
+        let Some(event) = next_event(deadline.saturating_duration_since(Instant::now()))? else {
+            answer.clear();
+            break;
+        };
+        match event {
+            Event::Key(key) if key.kind == ratatui::crossterm::event::KeyEventKind::Press => {
+                match key.code {
+                    KeyCode::Enter => break,
+                    KeyCode::Esc => {
+                        answer.clear();
+                        break;
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        answer.clear();
+                        break;
+                    }
+                    KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        answer.push(ch)
+                    }
+                    KeyCode::Backspace => {
+                        answer.pop();
+                    }
+                    _ => {}
+                }
+                app.set_input_text_and_cursor(&answer, answer.len());
+            }
+            Event::Paste(text) => {
+                answer.push_str(&text);
+                app.set_input_text_and_cursor(&answer, answer.len());
+            }
+            _ => {}
+        }
+    }
+    app.input = App::new_textarea(Vec::new());
+    app.needs_redraw = true;
+    Ok(answer)
+}
+
+fn prompt_local_command(
+    terminal: Option<&mut ratatui::DefaultTerminal>,
+    app: &mut App,
+) -> anyhow::Result<String> {
+    let Some(terminal) = terminal else {
+        return Ok(String::new());
+    };
+    read_local_prompt(terminal, app, |timeout| {
+        if ratatui::crossterm::event::poll(timeout)? {
+            ratatui::crossterm::event::read().map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+}
+
 fn handle_copy_command(app: &mut App, copy: impl FnOnce(&str) -> std::io::Result<()>) {
     let Some(text) = app.last_completion_text().map(str::to_owned) else {
         app.push_styled(
@@ -3553,6 +3621,7 @@ async fn switch_to_fresh_task(
     Ok(())
 }
 
+#[cfg(test)]
 async fn handle_cli_only_command(
     cli_cmd: crate::cli::slash_commands::CliOnlyCommand,
     text: &str,
@@ -3566,8 +3635,45 @@ async fn handle_cli_only_command(
     agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
     queue_handle: &Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>>,
+    task_opts: &TaskOptions,
+    auto_approve: bool,
+) -> anyhow::Result<bool> {
+    handle_cli_only_command_with_terminal(
+        cli_cmd,
+        text,
+        app,
+        output_writer,
+        session,
+        task_id,
+        agent_busy,
+        agent_done,
+        agent_start_time,
+        agent_task,
+        state_handle,
+        queue_handle,
+        task_opts,
+        auto_approve,
+        None,
+    )
+    .await
+}
+
+async fn handle_cli_only_command_with_terminal(
+    cli_cmd: crate::cli::slash_commands::CliOnlyCommand,
+    text: &str,
+    app: &mut App,
+    output_writer: &OutputWriterArc,
+    session: &Arc<Mutex<InteractiveSession>>,
+    _task_id: &str,
+    agent_busy: &Arc<AtomicBool>,
+    agent_done: &Arc<tokio::sync::Notify>,
+    agent_start_time: &Arc<Mutex<Option<Instant>>>,
+    agent_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    queue_handle: &Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>>,
     _task_opts: &TaskOptions,
     auto_approve: bool,
+    mut terminal: Option<&mut ratatui::DefaultTerminal>,
 ) -> anyhow::Result<bool> {
     use crate::cli::slash_commands::{
         CliOnlyCommand, format_changes_text, format_settings_text, format_stats_text,
@@ -3972,22 +4078,7 @@ async fn handle_cli_only_command(
                 }
                 app.push_plain("Continue? (y/n): ");
 
-                let (sender, receiver) = std::sync::mpsc::channel();
-                crate::core::approval::set_followup_question_active(task_id, true);
-                app.followup_prompt_scroll_pending = true;
-                crate::core::approval::set_followup_sender(task_id, sender);
-
-                let response_result = tokio::task::spawn_blocking(move || {
-                    receiver.recv_timeout(std::time::Duration::from_secs(30))
-                })
-                .await;
-
-                crate::core::approval::set_followup_question_active(task_id, false);
-
-                let confirm = match response_result {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(_)) | Err(_) => String::new(),
-                };
+                let confirm = prompt_local_command(terminal.as_deref_mut(), app)?;
 
                 // Timeout or error: default to cancel (safe default)
                 if confirm.trim().is_empty() {
@@ -4025,7 +4116,7 @@ async fn handle_cli_only_command(
                             app.push_plain(format!("  - {f}"));
                         }
                     }
-                    let removed = sess.agent_loop().await.remove_last_turn().await;
+                    let removed = agent_guard.remove_last_turn().await;
                     if removed > 0 {
                         app.push_plain(format!(
                             "Removed {removed} message(s) from conversation history."
@@ -4115,26 +4206,8 @@ async fn handle_cli_only_command(
                                     }
                                     app.push_plain("Commit to your git repo? (y/n): ");
 
-                                    let (sender, receiver) = std::sync::mpsc::channel();
-                                    crate::core::approval::set_followup_question_active(
-                                        task_id, true,
-                                    );
-                                    app.followup_prompt_scroll_pending = true;
-                                    crate::core::approval::set_followup_sender(task_id, sender);
-
-                                    let response_result = tokio::task::spawn_blocking(move || {
-                                        receiver.recv_timeout(std::time::Duration::from_secs(30))
-                                    })
-                                    .await;
-
-                                    crate::core::approval::set_followup_question_active(
-                                        task_id, false,
-                                    );
-
-                                    let confirm = match response_result {
-                                        Ok(Ok(r)) => r,
-                                        Ok(Err(_)) | Err(_) => String::new(),
-                                    };
+                                    let confirm =
+                                        prompt_local_command(terminal.as_deref_mut(), app)?;
 
                                     // Timeout or error: default to cancel (safe default)
                                     if confirm.trim().is_empty() {
@@ -4238,23 +4311,7 @@ async fn handle_cli_only_command(
                 }
                 app.push_plain("Enter checkpoint number to restore:");
 
-                let (sender, receiver) = std::sync::mpsc::channel();
-                crate::core::approval::set_followup_question_active(task_id, true);
-                app.followup_prompt_scroll_pending = true;
-                crate::core::approval::set_followup_sender(task_id, sender);
-
-                let response_result = tokio::task::spawn_blocking(move || {
-                    receiver.recv_timeout(std::time::Duration::from_secs(30))
-                })
-                .await;
-
-                crate::core::approval::clear_followup_sender(task_id);
-                crate::core::approval::set_followup_question_active(task_id, false);
-
-                let input = match response_result {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(_)) | Err(_) => String::new(),
-                };
+                let input = prompt_local_command(terminal.as_deref_mut(), app)?;
                 input.trim().parse::<usize>().unwrap_or(0)
             };
 
@@ -4282,22 +4339,7 @@ async fn handle_cli_only_command(
                             }
                             app.push_plain("Continue? (y/n): ");
 
-                            let (sender, receiver) = std::sync::mpsc::channel();
-                            crate::core::approval::set_followup_question_active(task_id, true);
-                            app.followup_prompt_scroll_pending = true;
-                            crate::core::approval::set_followup_sender(task_id, sender);
-
-                            let response_result = tokio::task::spawn_blocking(move || {
-                                receiver.recv_timeout(std::time::Duration::from_secs(30))
-                            })
-                            .await;
-
-                            crate::core::approval::set_followup_question_active(task_id, false);
-
-                            let confirm = match response_result {
-                                Ok(Ok(r)) => r,
-                                Ok(Err(_)) | Err(_) => String::new(),
-                            };
+                            let confirm = prompt_local_command(terminal, app)?;
 
                             // Timeout or error: default to cancel (safe default)
                             if confirm.trim().is_empty() {
@@ -6007,7 +6049,7 @@ async fn run_main_loop(
                                 continue;
                             }
                             Action::PlanApprove => {
-                                handle_cli_only_command(
+                                handle_cli_only_command_with_terminal(
                                     crate::cli::slash_commands::CliOnlyCommand::PlanApprove,
                                     "y",
                                     app,
@@ -6022,6 +6064,7 @@ async fn run_main_loop(
                                     &queue_handle,
                                     task_opts,
                                     auto_approve,
+                                    Some(terminal),
                                 )
                                 .await?;
                                 continue;
@@ -6129,7 +6172,7 @@ async fn run_main_loop(
                                             .await?;
                                             continue;
                                         }
-                                        let should_exit = handle_cli_only_command(
+                                        let should_exit = handle_cli_only_command_with_terminal(
                                             cli_cmd,
                                             &text,
                                             app,
@@ -6144,6 +6187,7 @@ async fn run_main_loop(
                                             &queue_handle,
                                             task_opts,
                                             auto_approve,
+                                            Some(terminal),
                                         )
                                         .await?;
                                         if should_exit {
@@ -10282,6 +10326,70 @@ mod tests {
         }
         assert!(confirmation_is_approved("y"));
         assert!(confirmation_is_approved(" Y "));
+    }
+
+    #[test]
+    fn local_prompt_draws_and_accepts_confirmation_and_checkpoint_number() {
+        use ratatui::backend::TestBackend;
+        for (input, expected) in [
+            ("y", "y"),
+            ("n", "n"),
+            ("yes", "yes"),
+            ("no", "no"),
+            ("12", "12"),
+        ] {
+            let mut app = App::new();
+            app.push_plain("Continue? (y/n): ");
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut events = input
+                .chars()
+                .map(|ch| Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
+                .chain(std::iter::once(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                ))));
+            let answer = read_local_prompt(&mut terminal, &mut app, |_| Ok(events.next())).unwrap();
+            assert_eq!(answer, expected);
+            assert!(events.next().is_none());
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(screen.contains("Continue? (y/n):"));
+            assert!(app.input.lines().join("\n").is_empty());
+        }
+    }
+
+    #[test]
+    fn local_prompt_cancels_on_timeout_or_escape() {
+        use ratatui::backend::TestBackend;
+        for event in [
+            None,
+            Some(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+        ] {
+            let mut app = App::new();
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+            assert!(
+                read_local_prompt(&mut terminal, &mut app, |_| Ok(event.clone()))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn local_prompt_discards_unsubmitted_paste_on_timeout() {
+        let mut app = App::new();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut events = [Some(Event::Paste("y".to_string())), None].into_iter();
+        let answer =
+            read_local_prompt(&mut terminal, &mut app, |_| Ok(events.next().unwrap())).unwrap();
+        assert!(answer.is_empty());
+        assert!(!confirmation_is_approved(&answer));
     }
 
     #[cfg(not(windows))]
