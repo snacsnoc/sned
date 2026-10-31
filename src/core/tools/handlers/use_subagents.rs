@@ -1182,7 +1182,7 @@ mod tests {
                 OutputEvent::ModelUpdateLine(line) => line.to_string(),
                 OutputEvent::ToolOutputLine(line) => line.to_string(),
                 OutputEvent::RawAnsi(text) => text,
-                OutputEvent::Completion(_) => String::new(),
+                OutputEvent::Completion(_) | OutputEvent::CompletionAvailable(_) => String::new(),
                 OutputEvent::TurnEnd { .. } | OutputEvent::QueuedMessageStarted { .. } => {
                     return;
                 }

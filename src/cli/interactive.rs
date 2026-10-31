@@ -1404,6 +1404,9 @@ fn apply_output_event(
             flush_pending_model_update(app, pending_model_update, storage);
             app.finish_pending_approval(id);
         }
+        OutputEvent::CompletionAvailable(result) => {
+            app.set_last_completion_text(result);
+        }
         OutputEvent::Completion(result) => {
             flush_pending_model_update(app, pending_model_update, storage);
             app.set_last_completion_text(result.clone());
@@ -1945,6 +1948,7 @@ fn drain_output_queues_with_summary(
             &event.event,
             OutputEvent::ReasoningChunk(_)
                 | OutputEvent::Completion(_)
+                | OutputEvent::CompletionAvailable(_)
                 | OutputEvent::TurnEnd { .. }
                 | OutputEvent::ErrorBox(_)
         ) {
@@ -10477,6 +10481,34 @@ mod tests {
 
         app.clear_output().unwrap();
         assert_eq!(app.last_completion_text(), None);
+    }
+
+    #[test]
+    fn test_copy_command_uses_text_only_final_answer() {
+        let answer = "## Findings\n\n| A | B |\n|---|---|\n| 1 | 2 |";
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(OutputEvent::model_output("streamed answer").into())
+            .unwrap();
+        tx.try_send(OutputEvent::CompletionAvailable(answer.to_string()).into())
+            .unwrap();
+        tx.try_send(
+            OutputEvent::TurnEnd {
+                accumulated_text: answer.to_string(),
+                timing: None,
+            }
+            .into(),
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.set_last_completion_text("older completion".to_string());
+        drain_output(&mut rx, &mut app);
+
+        let copied = std::cell::RefCell::new(String::new());
+        handle_copy_command(&mut app, |text| {
+            copied.replace(text.to_string());
+            Ok(())
+        });
+        assert_eq!(*copied.borrow(), answer);
     }
 
     #[test]

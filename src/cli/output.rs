@@ -397,6 +397,8 @@ pub enum OutputEvent {
     RawAnsi(String),
     /// Task completion message retained in the interactive transcript.
     Completion(String),
+    /// A text-only final answer already shown in the transcript.
+    CompletionAvailable(String),
     /// Error message shown at the interactive transcript tail until the next prompt.
     ErrorBox(String),
     /// End of a streamed agent turn. The TUI uses this to re-render
@@ -753,6 +755,7 @@ impl OutputWriter for StderrOutputWriter {
                 request.fail("interactive approval UI is unavailable");
             }
             OutputEvent::TurnEnd { .. }
+            | OutputEvent::CompletionAvailable(_)
             | OutputEvent::TurnIndicator(_)
             | OutputEvent::QueuedMessageStarted { .. }
             | OutputEvent::ApprovalFinished { .. } => {}
@@ -1088,6 +1091,7 @@ impl ChannelOutputWriter {
             OutputEvent::ReasoningChunk(chunk)
             | OutputEvent::RawAnsi(chunk)
             | OutputEvent::Completion(chunk)
+            | OutputEvent::CompletionAvailable(chunk)
             | OutputEvent::ErrorBox(chunk) => chunk.len(),
             OutputEvent::TurnEnd {
                 accumulated_text, ..
@@ -1256,6 +1260,7 @@ impl OutputWriter for ChannelOutputWriter {
                 &dropped.event,
                 OutputEvent::TurnEnd { .. }
                     | OutputEvent::Completion(_)
+                    | OutputEvent::CompletionAvailable(_)
                     | OutputEvent::ErrorBox(_)
                     | OutputEvent::QueuedMessageStarted { .. }
                     | OutputEvent::UserPromptLine(_)

@@ -3975,6 +3975,16 @@ impl AgentLoop {
                 self.config
                     .output_writer
                     .emit(OutputEvent::Completion(result));
+            } else if self.config.interactive_mode
+                && !self.config.json_output
+                && text_only_completes_task
+                && let Some(result) = response_text
+                    .as_ref()
+                    .filter(|text| !text.trim().is_empty())
+            {
+                self.config
+                    .output_writer
+                    .emit(OutputEvent::CompletionAvailable(result.clone()));
             }
             // Force save on completion (async, non-blocking)
             if let Some(ref storage) = self.deps.task_storage {
@@ -8134,7 +8144,8 @@ mod tests {
                 }
                 crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
-                crate::cli::output::OutputEvent::TurnEnd { .. } => {}
+                crate::cli::output::OutputEvent::TurnEnd { .. }
+                | crate::cli::output::OutputEvent::CompletionAvailable(_) => {}
                 crate::cli::output::OutputEvent::QueuedMessageStarted { .. } => {}
                 crate::cli::output::OutputEvent::TurnIndicator(line) => {
                     rendered.push(line.to_string())
@@ -10124,6 +10135,31 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(rendered.contains("fn line_200()"));
         assert!(!rendered.contains("fn line_201()"));
         assert!(rendered.contains("[snipped from streamed display; use /full]"));
+    }
+
+    #[tokio::test]
+    async fn text_only_completion_emits_copyable_response() {
+        let answer = "## Findings\n\nA final answer.";
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response(answer),
+        ));
+        let (tx, mut rx) = mpsc::channel(32);
+        let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut priority_rx = writer.take_priority_rx().unwrap();
+        let mut config = test_agent_config(provider, "test-text-only-copy");
+        config.output_writer = writer;
+        let mut agent = AgentLoop::new(config);
+        agent.state.lock().await.text_only_turns = 1;
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
+        let events = drain_output_events(&mut priority_rx, &mut rx);
+        assert!(events.iter().any(
+            |event| matches!(event, OutputEvent::CompletionAvailable(text) if text == answer)
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, OutputEvent::Completion(_)))
+        );
     }
 
     #[tokio::test]
