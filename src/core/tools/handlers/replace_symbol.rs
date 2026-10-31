@@ -484,6 +484,11 @@ async fn prepare_batch(
 
     let mut current_content = original_content.clone();
     let mut symbols_applied: Vec<String> = Vec::new();
+    let (_, initial_format) = normalize_file_content(&current_content);
+    let mixed_endings = initial_format
+        .line_endings
+        .iter()
+        .any(|ending| *ending != initial_format.line_ending);
 
     for (replacement, range) in sorted_for_application {
         let new_text = strip_hashes(&replacement.text);
@@ -513,7 +518,11 @@ async fn prepare_batch(
             new_text.clone()
         };
 
-        let (_, file_format) = normalize_file_content(&current_content);
+        let file_format = if mixed_endings {
+            normalize_file_content(&current_content).1
+        } else {
+            initial_format.clone()
+        };
         let (normalized_new_text, _) = normalize_file_content(&adjusted_new_text);
         let replacement_format = FileTextFormat {
             line_ending: file_format.line_ending,
@@ -935,6 +944,31 @@ mod tests {
         assert_eq!(
             updated,
             b"fn foo() {\r\n    let value = 2;\r\n    let other = 3;\r\n}\r\nfn bar() {}\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_symbol_preserves_mixed_endings_across_batch() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("test.rs");
+        std::fs::write(&path, "fn foo() {}\r\nfn bar() {}\n").unwrap();
+        let handler = ReplaceSymbolHandler::new();
+        handler
+            .execute_with_workspace_root(
+                &mut TaskState::default(),
+                serde_json::json!({
+                    "replacements": [
+                        {"path":"test.rs", "symbol":"foo", "text":"fn foo() {\n    one();\n}"},
+                        {"path":"test.rs", "symbol":"bar", "text":"fn bar() {\n    two();\n}"}
+                    ]
+                }),
+                workspace.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"fn foo() {\r\n    one();\r\n}\r\nfn bar() {\r\n    two();\n}\n"
         );
     }
 
