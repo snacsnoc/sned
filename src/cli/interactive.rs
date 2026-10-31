@@ -60,6 +60,19 @@ const MAX_MAIN_EVENTS_PER_DRAIN: usize = 128;
 const MAX_ADAPTIVE_MAIN_EVENTS_PER_DRAIN: usize = 1_024;
 const DEFAULT_MOUSE_SCROLL_LINES: isize = 3;
 const MAX_MOUSE_SCROLL_LINES: isize = 100;
+const MAX_INPUT_EVENTS_PER_FRAME: usize = 64;
+
+fn busy_input_poll_delay(
+    interval: Duration,
+    elapsed: Option<Duration>,
+    redraw_pending: bool,
+) -> Duration {
+    if redraw_pending {
+        elapsed.map_or(Duration::ZERO, |elapsed| interval.saturating_sub(elapsed))
+    } else {
+        interval
+    }
+}
 
 fn adaptive_main_event_budget(backlog: usize) -> usize {
     if backlog <= MAX_MAIN_EVENTS_PER_DRAIN {
@@ -5988,158 +6001,190 @@ async fn run_main_loop(
             // frequency without allowing one frame to monopolize the TUI.
             Duration::from_millis(1)
         } else if app.agent_busy {
-            busy_redraw_interval
+            if let Some(retry_at) = draw_retry_at.filter(|retry| *retry > Instant::now()) {
+                busy_redraw_interval.min(retry_at.saturating_duration_since(Instant::now()))
+            } else {
+                busy_input_poll_delay(
+                    busy_redraw_interval,
+                    last_draw_at.map(|last| last.elapsed()),
+                    app.needs_redraw || app.has_resized,
+                )
+            }
         } else {
             IDLE_POLL_INTERVAL
         };
         let has_event = ratatui::crossterm::event::poll(poll_interval)
             .map_err(|error| tui_io_error("TUI input poll failed", error, task_opts.debug))?;
         if has_event {
-            match ratatui::crossterm::event::read()
-                .map_err(|error| tui_io_error("TUI input read failed", error, task_opts.debug))?
-            {
-                Event::Key(key) => {
-                    app.needs_redraw = true;
-                    if let Some(outcome) = handle_approval_key(app, &key) {
-                        if let ApprovalKeyOutcome::Resolved { result, delivered } = outcome {
-                            app.push_styled(
-                                format!(
-                                    "  ↳ {}",
-                                    match result {
-                                        ApprovalResult::Approved => "approved",
-                                        ApprovalResult::Denied => "denied",
-                                        ApprovalResult::Always => "always approve",
-                                        ApprovalResult::AllowExternalDirectory => {
-                                            "allowed external directory"
-                                        }
-                                    }
-                                ),
-                                Style::default().fg(theme::accent()),
-                            );
-                            if !delivered {
+            for event_index in 0..MAX_INPUT_EVENTS_PER_FRAME {
+                if event_index > 0
+                    && !ratatui::crossterm::event::poll(Duration::ZERO).map_err(|error| {
+                        tui_io_error("TUI input poll failed", error, task_opts.debug)
+                    })?
+                {
+                    break;
+                }
+                match ratatui::crossterm::event::read().map_err(|error| {
+                    tui_io_error("TUI input read failed", error, task_opts.debug)
+                })? {
+                    Event::Key(key) => {
+                        app.needs_redraw = true;
+                        if let Some(outcome) = handle_approval_key(app, &key) {
+                            if let ApprovalKeyOutcome::Resolved { result, delivered } = outcome {
                                 app.push_styled(
-                                    "Approval expired before the decision was delivered.",
-                                    Style::default().fg(theme::warning_fg()),
+                                    format!(
+                                        "  ↳ {}",
+                                        match result {
+                                            ApprovalResult::Approved => "approved",
+                                            ApprovalResult::Denied => "denied",
+                                            ApprovalResult::Always => "always approve",
+                                            ApprovalResult::AllowExternalDirectory => {
+                                                "allowed external directory"
+                                            }
+                                        }
+                                    ),
+                                    Style::default().fg(theme::accent()),
                                 );
-                            }
-
-                            if key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                            {
-                                app.force_bottom();
-                                request_agent_cancel(app, &state_handle, &agent_task, &agent_busy)?;
-                                app.push_plain("^C");
-                                app.agent_busy = false;
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Global Ctrl+C handling
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        app.clear_text_selection();
-                        // Loop-level keys never reach the inner disarm.
-                        app.pending_plan_approve = false;
-                        if app.pending_model_switch.is_some() {
-                            cancel_pending_model_switch(app);
-                            continue;
-                        }
-
-                        let now = std::time::Instant::now();
-                        let is_double_tap = {
-                            let last = last_ctrlc.lock().unwrap();
-                            is_ctrl_c_double_tap(*last, now)
-                        };
-                        let overlays_open = app.picker_active
-                            || app.slash_command_active
-                            || app.model_picker_active
-                            || app.reasoning_effort_picker_active;
-                        // Only cancelling the agent or idling arms the quit
-                        // timer; dismissing overlays never does.
-                        match decide_ctrl_c(
-                            is_double_tap,
-                            overlays_open,
-                            agent_busy.load(Ordering::Relaxed),
-                        ) {
-                            CtrlCDecision::ForceQuit => {
-                                // Force exit on second Ctrl+C
-                                clear_input_overlays(app);
-                                // Always export on exit, even if the agent errored out.
-                                if let Some(ref export_path) = task_opts.export {
-                                    let export_result =
-                                        export_conversation(&session, export_path).await;
-                                    report_conversation_export(
-                                        &output_writer,
-                                        task_opts.json,
-                                        &export_result,
-                                        true,
+                                if !delivered {
+                                    app.push_styled(
+                                        "Approval expired before the decision was delivered.",
+                                        Style::default().fg(theme::warning_fg()),
                                     );
                                 }
-                                let _ = app.flush_scrollback_pending();
-                                await_cancellation_cleanup(app).await;
-                                return Ok(());
-                            }
-                            CtrlCDecision::DismissOverlays => {
-                                clear_input_overlays(app);
-                                continue;
-                            }
-                            CtrlCDecision::CancelAgent => {
+
+                                if key.code == KeyCode::Char('c')
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)
                                 {
-                                    let mut last = last_ctrlc.lock().unwrap();
-                                    *last = Some(now);
+                                    app.force_bottom();
+                                    request_agent_cancel(
+                                        app,
+                                        &state_handle,
+                                        &agent_task,
+                                        &agent_busy,
+                                    )?;
+                                    app.push_plain("^C");
+                                    app.agent_busy = false;
                                 }
-                                request_agent_cancel(app, &state_handle, &agent_task, &agent_busy)?;
-                                app.agent_busy = false;
-                                app.push_styled(
-                                    "Press Ctrl+C again to quit.",
-                                    Style::default().fg(theme::warning_fg()),
-                                );
-                                continue;
                             }
-                            CtrlCDecision::Idle => {
-                                {
-                                    let mut last = last_ctrlc.lock().unwrap();
-                                    *last = Some(now);
+                            break;
+                        }
+
+                        // Global Ctrl+C handling
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            app.clear_text_selection();
+                            // Loop-level keys never reach the inner disarm.
+                            app.pending_plan_approve = false;
+                            if app.pending_model_switch.is_some() {
+                                cancel_pending_model_switch(app);
+                                break;
+                            }
+
+                            let now = std::time::Instant::now();
+                            let is_double_tap = {
+                                let last = last_ctrlc.lock().unwrap();
+                                is_ctrl_c_double_tap(*last, now)
+                            };
+                            let overlays_open = app.picker_active
+                                || app.slash_command_active
+                                || app.model_picker_active
+                                || app.reasoning_effort_picker_active;
+                            // Only cancelling the agent or idling arms the quit
+                            // timer; dismissing overlays never does.
+                            match decide_ctrl_c(
+                                is_double_tap,
+                                overlays_open,
+                                agent_busy.load(Ordering::Relaxed),
+                            ) {
+                                CtrlCDecision::ForceQuit => {
+                                    // Force exit on second Ctrl+C
+                                    clear_input_overlays(app);
+                                    // Always export on exit, even if the agent errored out.
+                                    if let Some(ref export_path) = task_opts.export {
+                                        let export_result =
+                                            export_conversation(&session, export_path).await;
+                                        report_conversation_export(
+                                            &output_writer,
+                                            task_opts.json,
+                                            &export_result,
+                                            true,
+                                        );
+                                    }
+                                    let _ = app.flush_scrollback_pending();
+                                    await_cancellation_cleanup(app).await;
+                                    return Ok(());
                                 }
-                                handle_idle_ctrl_c(app);
-                                continue;
+                                CtrlCDecision::DismissOverlays => {
+                                    clear_input_overlays(app);
+                                    break;
+                                }
+                                CtrlCDecision::CancelAgent => {
+                                    {
+                                        let mut last = last_ctrlc.lock().unwrap();
+                                        *last = Some(now);
+                                    }
+                                    request_agent_cancel(
+                                        app,
+                                        &state_handle,
+                                        &agent_task,
+                                        &agent_busy,
+                                    )?;
+                                    app.agent_busy = false;
+                                    app.push_styled(
+                                        "Press Ctrl+C again to quit.",
+                                        Style::default().fg(theme::warning_fg()),
+                                    );
+                                    break;
+                                }
+                                CtrlCDecision::Idle => {
+                                    {
+                                        let mut last = last_ctrlc.lock().unwrap();
+                                        *last = Some(now);
+                                    }
+                                    handle_idle_ctrl_c(app);
+                                    break;
+                                }
                             }
                         }
-                    }
 
-                    if let Some(action) =
-                        handle_key_event_inner(key, app, &output_writer, &state_handle, &task_id)
-                            .await?
-                    {
-                        app.clear_text_selection();
-                        match action {
-                            Action::ModelSwitch(request) => {
-                                request_model_switch(request, None, app, &session, &agent_busy)
-                                    .await;
-                                continue;
-                            }
-                            Action::SetReasoningEffort(effort) => {
-                                request_reasoning_effort(effort, app, &session, &agent_busy).await;
-                                continue;
-                            }
-                            Action::ModelApiKeySubmitted(request, api_key) => {
-                                let state_manager = {
-                                    let sess = session.lock().await;
-                                    Arc::clone(&sess.state_manager)
-                                };
-                                let Some(secret_key) =
-                                    crate::cli::runtime_provider_secret_key(&request.provider)
-                                else {
-                                    app.push_plain(format!(
-                                        "Unsupported provider: {}",
-                                        request.provider
-                                    ));
-                                    continue;
-                                };
-                                state_manager.set_secret(secret_key, api_key.clone());
-                                match crate::storage::state_manager::StateManager::persist_async(
+                        if let Some(action) = handle_key_event_inner(
+                            key,
+                            app,
+                            &output_writer,
+                            &state_handle,
+                            &task_id,
+                        )
+                        .await?
+                        {
+                            app.clear_text_selection();
+                            match action {
+                                Action::ModelSwitch(request) => {
+                                    request_model_switch(request, None, app, &session, &agent_busy)
+                                        .await;
+                                    break;
+                                }
+                                Action::SetReasoningEffort(effort) => {
+                                    request_reasoning_effort(effort, app, &session, &agent_busy)
+                                        .await;
+                                    break;
+                                }
+                                Action::ModelApiKeySubmitted(request, api_key) => {
+                                    let state_manager = {
+                                        let sess = session.lock().await;
+                                        Arc::clone(&sess.state_manager)
+                                    };
+                                    let Some(secret_key) =
+                                        crate::cli::runtime_provider_secret_key(&request.provider)
+                                    else {
+                                        app.push_plain(format!(
+                                            "Unsupported provider: {}",
+                                            request.provider
+                                        ));
+                                        break;
+                                    };
+                                    state_manager.set_secret(secret_key, api_key.clone());
+                                    match crate::storage::state_manager::StateManager::persist_async(
                                     Arc::clone(&state_manager),
                                 )
                                 .await
@@ -6159,59 +6204,59 @@ async fn run_main_loop(
                                         );
                                     }
                                 }
-                                request_model_switch(
-                                    request,
-                                    Some(api_key),
-                                    app,
-                                    &session,
-                                    &agent_busy,
-                                )
-                                .await;
-                                continue;
-                            }
-                            Action::PlanApprove => {
-                                handle_cli_only_command_with_terminal(
-                                    crate::cli::slash_commands::CliOnlyCommand::PlanApprove,
-                                    "y",
-                                    app,
-                                    &output_writer,
-                                    &session,
-                                    &task_id,
-                                    &agent_busy,
-                                    &agent_done,
-                                    &agent_start_time,
-                                    &agent_task,
-                                    &state_handle,
-                                    &queue_handle,
-                                    task_opts,
-                                    auto_approve,
-                                    Some(terminal),
-                                )
-                                .await?;
-                                continue;
-                            }
-                            Action::Submit { text, cli_cmd } => {
-                                // Make the echoed submit visible before any
-                                // command bookkeeping or agent startup work.
-                                drain_and_render_user_submit(
-                                    terminal,
-                                    app,
-                                    approval_output_rx,
-                                    priority_output_rx,
-                                    output_rx,
-                                    &task_storage,
-                                    task_opts.debug,
-                                    &mut terminal_desynced,
-                                )?;
+                                    request_model_switch(
+                                        request,
+                                        Some(api_key),
+                                        app,
+                                        &session,
+                                        &agent_busy,
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                Action::PlanApprove => {
+                                    handle_cli_only_command_with_terminal(
+                                        crate::cli::slash_commands::CliOnlyCommand::PlanApprove,
+                                        "y",
+                                        app,
+                                        &output_writer,
+                                        &session,
+                                        &task_id,
+                                        &agent_busy,
+                                        &agent_done,
+                                        &agent_start_time,
+                                        &agent_task,
+                                        &state_handle,
+                                        &queue_handle,
+                                        task_opts,
+                                        auto_approve,
+                                        Some(terminal),
+                                    )
+                                    .await?;
+                                    break;
+                                }
+                                Action::Submit { text, cli_cmd } => {
+                                    // Make the echoed submit visible before any
+                                    // command bookkeeping or agent startup work.
+                                    drain_and_render_user_submit(
+                                        terminal,
+                                        app,
+                                        approval_output_rx,
+                                        priority_output_rx,
+                                        output_rx,
+                                        &task_storage,
+                                        task_opts.debug,
+                                        &mut terminal_desynced,
+                                    )?;
 
-                                // Save to command history without rereading the
-                                // history file on the hot path.
-                                record_submit_history(app, &text);
+                                    // Save to command history without rereading the
+                                    // history file on the hot path.
+                                    record_submit_history(app, &text);
 
-                                // Check for CLI-only slash commands FIRST
-                                if let Some(cli_cmd) = cli_cmd {
-                                    // Handle /plan <prompt> specially: clear old plan, enter Plan mode, spawn agent
-                                    if let crate::cli::slash_commands::CliOnlyCommand::PlanPrompt(
+                                    // Check for CLI-only slash commands FIRST
+                                    if let Some(cli_cmd) = cli_cmd {
+                                        // Handle /plan <prompt> specially: clear old plan, enter Plan mode, spawn agent
+                                        if let crate::cli::slash_commands::CliOnlyCommand::PlanPrompt(
                                         ref prompt_text,
                                     ) = cli_cmd
                                     {
@@ -6220,7 +6265,7 @@ async fn run_main_loop(
                                                 "Agent is busy. Wait for it to finish before starting a new plan.",
                                                 Style::default().fg(theme::warning_fg()),
                                             );
-                                            continue;
+                                            break;
                                         }
 
                                         // Clear old plan state and restore strict plan mode restrictions
@@ -6267,247 +6312,258 @@ async fn run_main_loop(
                                         )
                                         .await?;
                                         app.agent_busy = true;
-                                        continue;
+                                        break;
                                     }
 
-                                    // Local commands execute immediately even when agent is busy
-                                    if cli_cmd.is_local_command() {
-                                        if matches!(
-                                            &cli_cmd,
-                                            crate::cli::slash_commands::CliOnlyCommand::New
-                                        ) {
-                                            switch_to_fresh_task(
-                                                app,
-                                                &output_writer,
-                                                &session,
-                                                &mut task_id,
-                                                &mut task_storage,
-                                                &agent_busy,
-                                                &state_handle,
-                                                &queue_handle,
-                                                approval_output_rx,
-                                                priority_output_rx,
-                                                output_rx,
-                                                task_opts,
-                                            )
-                                            .await?;
-                                            continue;
-                                        }
-                                        let should_exit = handle_cli_only_command_with_terminal(
-                                            cli_cmd,
-                                            &text,
-                                            app,
-                                            &output_writer,
-                                            &session,
-                                            &task_id,
-                                            &agent_busy,
-                                            &agent_done,
-                                            &agent_start_time,
-                                            &agent_task,
-                                            &state_handle,
-                                            &queue_handle,
-                                            task_opts,
-                                            auto_approve,
-                                            Some(terminal),
-                                        )
-                                        .await?;
-                                        if should_exit {
-                                            // Always export on exit, even if the agent errored out.
-                                            if let Some(ref export_path) = task_opts.export {
-                                                let export_result =
-                                                    export_conversation(&session, export_path)
-                                                        .await;
-                                                report_conversation_export(
+                                        // Local commands execute immediately even when agent is busy
+                                        if cli_cmd.is_local_command() {
+                                            if matches!(
+                                                &cli_cmd,
+                                                crate::cli::slash_commands::CliOnlyCommand::New
+                                            ) {
+                                                switch_to_fresh_task(
+                                                    app,
                                                     &output_writer,
-                                                    task_opts.json,
-                                                    &export_result,
-                                                    true,
-                                                );
+                                                    &session,
+                                                    &mut task_id,
+                                                    &mut task_storage,
+                                                    &agent_busy,
+                                                    &state_handle,
+                                                    &queue_handle,
+                                                    approval_output_rx,
+                                                    priority_output_rx,
+                                                    output_rx,
+                                                    task_opts,
+                                                )
+                                                .await?;
+                                                break;
                                             }
-                                            let _ = app.flush_scrollback_pending();
-                                            await_cancellation_cleanup(app).await;
-                                            return Ok(());
+                                            let should_exit =
+                                                handle_cli_only_command_with_terminal(
+                                                    cli_cmd,
+                                                    &text,
+                                                    app,
+                                                    &output_writer,
+                                                    &session,
+                                                    &task_id,
+                                                    &agent_busy,
+                                                    &agent_done,
+                                                    &agent_start_time,
+                                                    &agent_task,
+                                                    &state_handle,
+                                                    &queue_handle,
+                                                    task_opts,
+                                                    auto_approve,
+                                                    Some(terminal),
+                                                )
+                                                .await?;
+                                            if should_exit {
+                                                // Always export on exit, even if the agent errored out.
+                                                if let Some(ref export_path) = task_opts.export {
+                                                    let export_result =
+                                                        export_conversation(&session, export_path)
+                                                            .await;
+                                                    report_conversation_export(
+                                                        &output_writer,
+                                                        task_opts.json,
+                                                        &export_result,
+                                                        true,
+                                                    );
+                                                }
+                                                let _ = app.flush_scrollback_pending();
+                                                await_cancellation_cleanup(app).await;
+                                                return Ok(());
+                                            }
+                                            break;
                                         }
-                                        continue;
-                                    }
 
-                                    if app.has_pending_approval() {
-                                        app.push_styled(
+                                        if app.has_pending_approval() {
+                                            app.push_styled(
                                         "Blocked: cannot process commands while approval is pending.",
                                         theme::status_style(),
                                     );
-                                        continue;
-                                    }
+                                            break;
+                                        }
 
-                                    // Agent-required commands: check if agent is busy
-                                    if agent_busy.load(Ordering::Relaxed)
-                                        && cli_cmd.requires_agent_idle()
-                                    {
-                                        if app.cancellation_pending {
-                                            app.show_notification(
+                                        // Agent-required commands: check if agent is busy
+                                        if agent_busy.load(Ordering::Relaxed)
+                                            && cli_cmd.requires_agent_idle()
+                                        {
+                                            if app.cancellation_pending {
+                                                app.show_notification(
                                                 "Cancellation is still finishing; wait before submitting another task.",
                                                 NotificationKind::Info,
                                             );
-                                            continue;
+                                                break;
+                                            }
+                                            // Queue the command
+                                            if let Some(qh) = queue_handle.lock().await.as_ref() {
+                                                qh.enqueue_text_message(text.clone()).await;
+                                                let count = qh.queued_message_count().await;
+                                                app.set_pending_queued_prompts(count);
+                                            }
+                                            break;
                                         }
-                                        // Queue the command
-                                        if let Some(qh) = queue_handle.lock().await.as_ref() {
-                                            qh.enqueue_text_message(text.clone()).await;
-                                            let count = qh.queued_message_count().await;
-                                            app.set_pending_queued_prompts(count);
-                                        }
-                                        continue;
                                     }
-                                }
 
-                                let skills = {
-                                    let state = state_handle.lock().await.clone();
-                                    if let Some(state) = state {
-                                        state.lock().await.available_skills.clone()
-                                    } else {
-                                        Vec::new()
-                                    }
-                                };
-                                let processed = match resolve_interactive_model_input(
-                                    &text, &skills,
-                                ) {
-                                    Ok(processed) => processed,
-                                    Err(command) => {
-                                        app.push_styled(
+                                    let skills = {
+                                        let state = state_handle.lock().await.clone();
+                                        if let Some(state) = state {
+                                            state.lock().await.available_skills.clone()
+                                        } else {
+                                            Vec::new()
+                                        }
+                                    };
+                                    let processed = match resolve_interactive_model_input(
+                                        &text, &skills,
+                                    ) {
+                                        Ok(processed) => processed,
+                                        Err(command) => {
+                                            app.push_styled(
                                             format!(
                                                 "Unknown command /{command}. Type /help to list commands."
                                             ),
                                             Style::default().fg(theme::warning_fg()),
                                         );
-                                        continue;
-                                    }
-                                };
+                                            break;
+                                        }
+                                    };
 
-                                // If agent is busy, queue the message; otherwise spawn. A
-                                // cancelled task keeps the admission guard set until cleanup
-                                // publishes cancellation, but has no live queue consumer.
-                                let cancellation_pending = app.cancellation_pending;
-                                if cancellation_pending {
-                                    app.show_notification(
+                                    // If agent is busy, queue the message; otherwise spawn. A
+                                    // cancelled task keeps the admission guard set until cleanup
+                                    // publishes cancellation, but has no live queue consumer.
+                                    let cancellation_pending = app.cancellation_pending;
+                                    if cancellation_pending {
+                                        app.show_notification(
                                         "Cancellation is still finishing; wait before submitting another task.",
                                         NotificationKind::Info,
                                     );
-                                } else if agent_busy.load(Ordering::Relaxed)
-                                    && let Some(qh) = queue_handle.lock().await.as_ref()
-                                    && !processed.is_empty()
-                                {
-                                    qh.enqueue_text_message(processed).await;
-                                    let count = qh.queued_message_count().await;
-                                    app.set_pending_queued_prompts(count);
-                                } else {
-                                    app.set_pending_queued_prompts(0);
-                                    if let Some(acknowledgement) =
-                                        crate::cli::slash_commands::compact_acknowledgement(&text)
+                                    } else if agent_busy.load(Ordering::Relaxed)
+                                        && let Some(qh) = queue_handle.lock().await.as_ref()
+                                        && !processed.is_empty()
                                     {
-                                        app.push_plain(acknowledgement);
+                                        qh.enqueue_text_message(processed).await;
+                                        let count = qh.queued_message_count().await;
+                                        app.set_pending_queued_prompts(count);
+                                    } else {
+                                        app.set_pending_queued_prompts(0);
+                                        if let Some(acknowledgement) =
+                                            crate::cli::slash_commands::compact_acknowledgement(
+                                                &text,
+                                            )
+                                        {
+                                            app.push_plain(acknowledgement);
+                                        }
+                                        echo_agent_prompt(app, &text, &output_writer);
+                                        drain_and_render_user_submit(
+                                            terminal,
+                                            app,
+                                            approval_output_rx,
+                                            priority_output_rx,
+                                            output_rx,
+                                            &task_storage,
+                                            task_opts.debug,
+                                            &mut terminal_desynced,
+                                        )?;
+                                        spawn_agent_task(
+                                            &session,
+                                            &processed,
+                                            &agent_busy,
+                                            &agent_done,
+                                            &agent_start_time,
+                                            &agent_task,
+                                            output_writer.clone(),
+                                        )
+                                        .await?;
+                                        app.agent_busy = true;
                                     }
-                                    echo_agent_prompt(app, &text, &output_writer);
-                                    drain_and_render_user_submit(
-                                        terminal,
-                                        app,
-                                        approval_output_rx,
-                                        priority_output_rx,
-                                        output_rx,
-                                        &task_storage,
-                                        task_opts.debug,
-                                        &mut terminal_desynced,
-                                    )?;
-                                    spawn_agent_task(
-                                        &session,
-                                        &processed,
-                                        &agent_busy,
-                                        &agent_done,
-                                        &agent_start_time,
-                                        &agent_task,
-                                        output_writer.clone(),
-                                    )
-                                    .await?;
-                                    app.agent_busy = true;
                                 }
                             }
+                            break;
+                        }
+                        if matches!(
+                            key.code,
+                            KeyCode::Enter | KeyCode::Esc | KeyCode::PageUp | KeyCode::PageDown
+                        ) {
+                            break;
                         }
                     }
-                }
-                Event::Paste(content) => {
-                    app.clear_text_selection();
-                    app.needs_redraw = true;
-                    match apply_paste_event(app, &content, &state_handle).await {
-                        Some(PasteOutcome::Folded { char_count }) => {
-                            app.push_styled(
+                    Event::Paste(content) => {
+                        app.clear_text_selection();
+                        app.needs_redraw = true;
+                        match apply_paste_event(app, &content, &state_handle).await {
+                            Some(PasteOutcome::Folded { char_count }) => {
+                                app.push_styled(
                                 format!(
                                     "Large paste folded ({char_count} chars) - will expand on submit"
                                 ),
                                 theme::dim_style(),
                             );
-                        }
-                        Some(PasteOutcome::RejectedTooLarge { max_bytes }) => {
-                            app.push_styled(
+                            }
+                            Some(PasteOutcome::RejectedTooLarge { max_bytes }) => {
+                                app.push_styled(
                                 format!(
                                     "Paste rejected: input would exceed the {} MiB paste limit.",
                                     max_bytes / (1024 * 1024)
                                 ),
                                 Style::default().fg(theme::warning_fg()),
                             );
-                        }
-                        Some(PasteOutcome::RejectedTooManyChunks { max_chunks }) => {
-                            app.push_styled(
+                            }
+                            Some(PasteOutcome::RejectedTooManyChunks { max_chunks }) => {
+                                app.push_styled(
                                 format!(
                                     "Paste rejected: input already contains {max_chunks} folded pastes."
                                 ),
                                 Style::default().fg(theme::warning_fg()),
                             );
-                        }
-                        Some(PasteOutcome::Inserted) | None => {}
-                    }
-                }
-                Event::Resize(_, _) => {
-                    app.clear_text_selection();
-                    app.has_resized = true;
-                    app.needs_redraw = true;
-                    // Ratatui handles resize automatically on next draw
-                }
-                Event::Mouse(mouse_event) => {
-                    if handle_text_selection_mouse_event(
-                        app,
-                        mouse_event,
-                        copy_to_clipboard,
-                        |path| open_path_in_background(path, path_open_failure_tx.clone()),
-                    ) {
-                        continue;
-                    }
-                    if app.is_text_selection_dragging() {
-                        continue;
-                    }
-                    match mouse_event.kind {
-                        MouseEventKind::ScrollDown => {
-                            app.clear_text_selection();
-                            if !app.scroll_pending_approval_at(
-                                mouse_event.column,
-                                mouse_event.row,
-                                -mouse_scroll_lines,
-                            ) {
-                                app.scroll_lines(mouse_scroll_lines);
                             }
+                            Some(PasteOutcome::Inserted) | None => {}
                         }
-                        MouseEventKind::ScrollUp => {
-                            app.clear_text_selection();
-                            if !app.scroll_pending_approval_at(
-                                mouse_event.column,
-                                mouse_event.row,
-                                mouse_scroll_lines,
-                            ) {
-                                app.scroll_lines(-mouse_scroll_lines);
-                            }
-                        }
-                        _ => {}
                     }
+                    Event::Resize(_, _) => {
+                        app.clear_text_selection();
+                        app.has_resized = true;
+                        app.needs_redraw = true;
+                        // Ratatui handles resize automatically on next draw
+                    }
+                    Event::Mouse(mouse_event) => {
+                        if handle_text_selection_mouse_event(
+                            app,
+                            mouse_event,
+                            copy_to_clipboard,
+                            |path| open_path_in_background(path, path_open_failure_tx.clone()),
+                        ) {
+                            continue;
+                        }
+                        if app.is_text_selection_dragging() {
+                            continue;
+                        }
+                        match mouse_event.kind {
+                            MouseEventKind::ScrollDown => {
+                                app.clear_text_selection();
+                                if !app.scroll_pending_approval_at(
+                                    mouse_event.column,
+                                    mouse_event.row,
+                                    -mouse_scroll_lines,
+                                ) {
+                                    app.scroll_lines(mouse_scroll_lines);
+                                }
+                            }
+                            MouseEventKind::ScrollUp => {
+                                app.clear_text_selection();
+                                if !app.scroll_pending_approval_at(
+                                    mouse_event.column,
+                                    mouse_event.row,
+                                    mouse_scroll_lines,
+                                ) {
+                                    app.scroll_lines(-mouse_scroll_lines);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -10450,6 +10506,24 @@ mod tests {
         }
         assert!(confirmation_is_approved("y"));
         assert!(confirmation_is_approved(" Y "));
+    }
+
+    #[test]
+    fn busy_input_poll_waits_only_until_pending_redraw() {
+        let interval = Duration::from_millis(40);
+        assert_eq!(
+            busy_input_poll_delay(interval, Some(Duration::from_millis(15)), true),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            busy_input_poll_delay(interval, Some(Duration::from_millis(50)), true),
+            Duration::ZERO
+        );
+        assert_eq!(busy_input_poll_delay(interval, None, true), Duration::ZERO);
+        assert_eq!(
+            busy_input_poll_delay(interval, Some(Duration::from_secs(1)), false),
+            interval
+        );
     }
 
     #[test]

@@ -9,8 +9,8 @@ SNED_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/debug/sned"
 VERBOSE=0
 RUN_TEST=""
 
-ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-approval-scalar-command tui-approval-under-backpressure tui-long-completion-navigation tui-history-navigation tui-slash-commands tui-model-switch tui-plan-approve-act tui-plan-act tui-plan-abort tui-plan-act-no-state tui-plan-abort-no-state tui-plan-queued-input tui-busy-exit tui-cancel-agent-notice tui-approval-rejection tui-provider-error-box help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
-TOTAL_TESTS=26
+ALL_TEST_NAMES="tui-startup-exit tui-user-echo tui-turn-indicators tui-approval-scroll tui-approval-scalar-command tui-approval-under-backpressure tui-long-completion-navigation tui-history-navigation tui-slash-commands tui-model-switch tui-plan-approve-act tui-plan-act tui-plan-abort tui-plan-act-no-state tui-plan-abort-no-state tui-plan-queued-input tui-busy-exit tui-cancel-agent-notice tui-buffered-ctrlc tui-approval-rejection tui-provider-error-box help version invalid-flag yolo-help json-no-prompt ctrlc-quit-empty"
+TOTAL_TESTS=27
 PASS_COUNT=0
 FAIL_COUNT=0
 RESULTS=""
@@ -62,6 +62,7 @@ tui-plan-abort-no-state Exit with /plan abort before a plan exists, then execute
 tui-plan-queued-input Queue input during a busy plan, then exit to ACT safely
 tui-busy-exit         While mock provider streams output, send /exit and verify prompt shutdown
 tui-cancel-agent-notice While streaming output, send Ctrl+C and verify cancellation notice appears
+tui-buffered-ctrlc    Send two buffered Ctrl+C events and verify the cancellation prompt renders
 tui-approval-rejection Verify typing 'n' on approval prompt strictly prevents execution
 tui-provider-error-box Verify provider streaming errors render ErrorBox in transcript
 help                  --help shows usage
@@ -123,6 +124,7 @@ test_description() {
         tui-plan-queued-input) echo "Queue input during a busy plan, then exit to ACT safely" ;;
         tui-busy-exit) echo "While mock provider streams output, send /exit and verify prompt shutdown" ;;
         tui-cancel-agent-notice) echo "While streaming output, send Ctrl+C and verify cancellation notice appears" ;;
+        tui-buffered-ctrlc) echo "Send two buffered Ctrl+C events and verify the cancellation prompt renders" ;;
         tui-approval-rejection) echo "Verify typing 'n' on approval prompt strictly prevents execution" ;;
         tui-provider-error-box) echo "Verify provider streaming errors render ErrorBox in transcript" ;;
         help) echo "--help shows usage" ;;
@@ -155,6 +157,7 @@ test_source() {
         tui-plan-queued-input) echo "scripts/tui_smoke_harness.py plan_queued_input / src/providers/mock.rs plan_queued_input_scenario / src/core/agent_loop.rs message queue" ;;
         tui-busy-exit) echo "src/cli/interactive.rs busy-state shutdown path / src/providers/mock.rs busy_stream_scenario" ;;
         tui-cancel-agent-notice) echo "src/cli/interactive.rs cancel_agent notice path / src/core/agent_loop.rs abort task" ;;
+        tui-buffered-ctrlc) echo "src/cli/interactive.rs buffered Ctrl+C handling" ;;
         tui-approval-rejection) echo "src/cli/interactive.rs approval rejection routing 'n' / src/core/approval.rs" ;;
         tui-provider-error-box) echo "src/cli/interactive.rs drain_output ProviderError rendering / src/cli/tui/app.rs push_error" ;;
         help|version|invalid-flag|yolo-help|json-no-prompt) echo "src/cli/mod.rs CLI dispatch" ;;

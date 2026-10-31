@@ -696,9 +696,10 @@ def slash_commands():
     searched_help = False
     inserted_exit = False
     sent_exit = False
+    search_offset = 0
 
     def tick(session):
-        nonlocal sent_unknown, sent_help, searched_help, inserted_exit, sent_exit
+        nonlocal sent_unknown, sent_help, searched_help, inserted_exit, sent_exit, search_offset
         text = clean_output(session.buf)
         compact_text = re.sub(r"\s+", "", text)
         if "type a prompt" in text and not sent_unknown:
@@ -710,10 +711,13 @@ def slash_commands():
             sent_help = True
             return
         if sent_help and "CommandHelp" in compact_text and not searched_help:
+            search_offset = len(session.buf)
             session.send(b"exit")
             searched_help = True
             return
-        if searched_help and "Exittheinteractiveshell" in compact_text and not inserted_exit:
+        # Ratatui can redraw the selected title and detail as separate cursor updates.
+        search_output = clean_output(session.buf[search_offset:])
+        if searched_help and "Exit" in search_output and "interactive shell" in search_output and not inserted_exit:
             session.send(b"\r")
             inserted_exit = True
             return
@@ -782,11 +786,14 @@ def plan_approve_act():
     completion_seen = False
     command_executed_before_approval = False
     marker_path = None
+    approval_offset = 0
+    approval_attempts = 0
 
     def tick(session):
         nonlocal sent_prompt, sent_approve, sent_tool_approve, sent_exit
         nonlocal plan_generated, plan_approved, act_mode_seen, completion_seen
         nonlocal command_executed_before_approval
+        nonlocal approval_offset, approval_attempts
         clean = clean_output(session.buf)
         tail = visible_tail(clean)
 
@@ -796,8 +803,17 @@ def plan_approve_act():
         if sent_prompt and "Plan Generated" in clean:
             plan_generated = True
         if plan_generated and not sent_approve:
+            approval_offset = len(session.buf)
             session.send(b"/plan approve\r")
             sent_approve = True
+            approval_attempts += 1
+        if sent_approve and not plan_approved and approval_attempts < 3:
+            since_approval = clean_output(session.buf[approval_offset:])
+            if "Agent is busy" in since_approval:
+                time.sleep(0.3)
+                approval_offset = len(session.buf)
+                session.send(b"/plan approve\r")
+                approval_attempts += 1
         if sent_approve and (
             re.search(r"Plan\s*approved\..{0,80}Starting", clean)
             or "Execute this tool?" in clean
@@ -858,11 +874,14 @@ def plan_exit_active(command, env_name, expected_message, marker_name, completio
     marker_created_before_followup = False
     completion_seen = False
     sent_exit = False
+    command_offset = 0
+    command_attempts = 0
 
     def tick(session):
         nonlocal sent_prompt, plan_generated, sent_command, mode_transition_seen
         nonlocal mode_seen, sent_followup, marker_created_before_followup
         nonlocal completion_seen, sent_exit
+        nonlocal command_offset, command_attempts
         clean = clean_output(session.buf)
         tail = visible_tail(clean)
         compact_clean = compact_output(clean)
@@ -874,8 +893,17 @@ def plan_exit_active(command, env_name, expected_message, marker_name, completio
         if sent_prompt and "Plan Generated" in clean:
             plan_generated = True
         if plan_generated and not sent_command:
+            command_offset = len(session.buf)
             session.send((command + "\r").encode())
             sent_command = True
+            command_attempts += 1
+        if sent_command and not mode_transition_seen and command_attempts < 3:
+            since_command = clean_output(session.buf[command_offset:])
+            if "Agent is busy" in since_command:
+                time.sleep(0.3)
+                command_offset = len(session.buf)
+                session.send((command + "\r").encode())
+                command_attempts += 1
         if sent_command and all(
             compact_output(part) in compact_clean
             for part in expected_message.split(".")
@@ -1168,6 +1196,35 @@ def cancel_agent_notice():
         )
 
 
+def buffered_ctrlc_renders_cancellation():
+    sent_prompt = False
+    sent_cancel = False
+
+    def tick(session):
+        nonlocal sent_prompt, sent_cancel
+        text = clean_output(session.buf)
+        if "type a prompt" in text and not sent_prompt:
+            session.send(b"keep streaming for cancel\r")
+            sent_prompt = True
+        if "busy stream chunk 005" in text and not sent_cancel:
+            session.send(b"\x03\x03")
+            sent_cancel = True
+
+    with PtySession("sned-buffered-ctrlc.", {"SNED_MOCK_BUSY_STREAM": "1"}) as session:
+        session.run(10, tick)
+        session.dump_if_verbose()
+        clean = clean_output(session.buf)
+        report(
+            [
+                (sent_cancel, "buffered Ctrl+C events were not sent"),
+                ("Press Ctrl+C again to quit." in clean, "cancellation prompt was not rendered before exit"),
+                (not session.timed_out, "sned did not exit after the second Ctrl+C"),
+                (session.exit_code == 0, f"sned exited with {session.exit_code}"),
+            ],
+            "buffered Ctrl+C renders the cancellation prompt before exit",
+        )
+
+
 def approval_rejection():
     sent_prompt = False
     sent_reject = False
@@ -1259,6 +1316,7 @@ SCENARIOS = {
     "tui-plan-queued-input": plan_queued_input,
     "tui-busy-exit": busy_exit,
     "tui-cancel-agent-notice": cancel_agent_notice,
+    "tui-buffered-ctrlc": buffered_ctrlc_renders_cancellation,
     "tui-approval-rejection": approval_rejection,
     "tui-provider-error-box": provider_error_box,
     "json-no-prompt": json_no_prompt,
