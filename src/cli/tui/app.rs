@@ -16,6 +16,7 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -615,6 +616,24 @@ struct PendingApproval {
     scroll_from_bottom: usize,
     total_rows: usize,
     viewport_rows: usize,
+    cached_rows: Cell<Option<(usize, usize)>>,
+}
+
+impl PendingApproval {
+    fn visual_rows(&self, width: usize) -> usize {
+        if let Some((cached_width, rows)) = self.cached_rows.get()
+            && cached_width == width
+        {
+            return rows;
+        }
+        let rows = self
+            .lines
+            .iter()
+            .map(|line| App::line_visual_rows(line, width))
+            .sum();
+        self.cached_rows.set(Some((width, rows)));
+        rows
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1342,6 +1361,7 @@ impl App {
             scroll_from_bottom: 0,
             total_rows: 0,
             viewport_rows: 0,
+            cached_rows: Cell::new(None),
         });
         self.picker_active = false;
         self.mention_search_active = false;
@@ -1479,10 +1499,7 @@ impl App {
         // approval detail scrollbar; transcript padding does not apply here.
         let wrap_width = usize::from(input_width).saturating_sub(3).max(1);
         let detail_rows = pending
-            .lines
-            .iter()
-            .map(|line| Self::line_visual_rows(line, wrap_width))
-            .sum::<usize>()
+            .visual_rows(wrap_width)
             .clamp(1, APPROVAL_PANEL_MAX_DETAIL_ROWS);
         (detail_rows + 3).min(u16::MAX as usize) as u16
     }
@@ -4789,7 +4806,6 @@ impl App {
         };
         let id = pending.request.id();
         let title = pending.request.title().to_string();
-        let lines = pending.lines.clone();
         let choices = pending.request.choices().to_vec();
         let scroll_from_bottom = pending.scroll_from_bottom;
 
@@ -4820,10 +4836,23 @@ impl App {
             ..detail_area
         };
         let wrap_width = text_area.width as usize;
-        let total_rows = lines
+        let total_rows = pending.visual_rows(wrap_width);
+        let lines: Vec<Line<'_>> = pending
+            .lines
             .iter()
-            .map(|line| Self::line_visual_rows(line, wrap_width))
-            .sum::<usize>();
+            .map(|line| Line {
+                style: line.style,
+                alignment: line.alignment,
+                spans: line
+                    .spans
+                    .iter()
+                    .map(|span| Span {
+                        style: span.style,
+                        content: Cow::Borrowed(span.content.as_ref()),
+                    })
+                    .collect(),
+            })
+            .collect();
         let viewport_rows = detail_area.height as usize;
         let max_scroll = total_rows.saturating_sub(viewport_rows);
         let scroll_y = max_scroll.saturating_sub(scroll_from_bottom.min(max_scroll));
@@ -6980,6 +7009,15 @@ mod tests {
 
         // The input detail width is 40 - 2 border cells - 1 scrollbar cell.
         assert_eq!(app.approval_panel_height(40), 4);
+        assert_eq!(
+            app.pending_approval.as_ref().unwrap().cached_rows.get(),
+            Some((37, 1))
+        );
+        assert_eq!(app.approval_panel_height(20), 6);
+        assert_eq!(
+            app.pending_approval.as_ref().unwrap().cached_rows.get(),
+            Some((17, 3))
+        );
     }
 
     #[test]
