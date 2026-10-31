@@ -16,10 +16,11 @@ use crate::providers::{
     ThinkingConfig, gemini_format, is_retryable_stream_transport_error,
 };
 use futures::StreamExt;
+use indexmap::IndexMap;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Configuration for the Gemini provider.
 #[derive(Clone)]
@@ -470,7 +471,7 @@ async fn send_chunk(
 async fn process_gemini_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
-    accumulated_tool_calls: &mut HashMap<String, (String, String, String, Option<String>)>,
+    accumulated_tool_calls: &mut IndexMap<String, (String, String, String, Option<String>)>,
     completed_tool_call_ids: &mut HashSet<String>,
     last_stop_reason: &mut Option<String>,
     response_blocked: &mut bool,
@@ -541,6 +542,10 @@ async fn process_gemini_sse_line(
 
     // Process candidates
     for candidate in chunk.candidates {
+        let candidate_blocked = candidate
+            .finish_reason
+            .as_deref()
+            .is_some_and(|reason| gemini_candidate_block_error(reason).is_some());
         if let Some(content) = candidate.content {
             let mut current_thought_signature: Option<String> = None;
 
@@ -603,6 +608,23 @@ async fn process_gemini_sse_line(
                     });
 
                     if !completed_tool_call_ids.contains(&call_id) {
+                        if !accumulated_tool_calls.contains_key(&call_id)
+                            && !candidate_blocked
+                            && !*response_blocked
+                        {
+                            send_chunk(
+                                tx,
+                                ApiStreamChunk::ToolCallStarted {
+                                    call_id: call_id.clone(),
+                                    name: fc.name.clone(),
+                                },
+                                "tool_call_started",
+                            )
+                            .await;
+                            if tx.is_closed() {
+                                return;
+                            }
+                        }
                         // Enforce MAX_TOOL_ARGUMENT_SIZE — Gemini receives
                         // complete args in one chunk rather than streaming deltas,
                         // but the size limit still applies.
@@ -782,7 +804,7 @@ async fn process_gemini_sse_line(
 
 async fn finish_gemini_sse_to_chunks(
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
-    accumulated_tool_calls: &HashMap<String, (String, String, String, Option<String>)>,
+    accumulated_tool_calls: &IndexMap<String, (String, String, String, Option<String>)>,
     completed_tool_call_ids: &mut HashSet<String>,
     response_blocked: bool,
     last_grounding_metadata: &mut Option<serde_json::Value>,
@@ -886,10 +908,10 @@ impl Provider for GeminiProvider {
         tokio::spawn(async move {
             let mut stream = stream;
             let mut sse_buffer = SseLineBuffer::default();
-            let mut accumulated_tool_calls: HashMap<
+            let mut accumulated_tool_calls: IndexMap<
                 String,
                 (String, String, String, Option<String>),
-            > = HashMap::with_capacity(4);
+            > = IndexMap::with_capacity(4);
             let mut completed_tool_call_ids: HashSet<String> = HashSet::new();
             let mut last_stop_reason: Option<String> = None;
             let mut response_blocked = false;
@@ -1138,9 +1160,45 @@ mod tests {
     use crate::providers::{FunctionDefinition, MessageRole, StorageMessage, ToolDefinition};
 
     #[tokio::test]
+    async fn parallel_tool_calls_start_and_finish_in_arrival_order() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut calls = IndexMap::new();
+        let mut completed = HashSet::new();
+        let mut stop = None;
+        let mut blocked = false;
+        let mut grounding = None;
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"z","name":"first","args":{}}},{"functionCall":{"id":"a","name":"second","args":{}}}]}}],"responseId":"r"}"#;
+        process_gemini_sse_line(
+            line,
+            &tx,
+            &mut calls,
+            &mut completed,
+            &mut stop,
+            &mut blocked,
+            &mut grounding,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(ApiStreamChunk::ToolCallStarted { call_id, .. }) if call_id == "z")
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(ApiStreamChunk::ToolCallStarted { call_id, .. }) if call_id == "a")
+        );
+        assert!(rx.try_recv().is_err());
+        finish_gemini_sse_to_chunks(&tx, &calls, &mut completed, false, &mut grounding).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(ApiStreamChunk::ToolCalls(chunk)) if chunk.tool_call.call_id.as_deref() == Some("z"))
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(ApiStreamChunk::ToolCalls(chunk)) if chunk.tool_call.call_id.as_deref() == Some("a"))
+        );
+    }
+
+    #[tokio::test]
     async fn test_malformed_sse_emits_bounded_error_and_stops() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let mut calls = HashMap::new();
+        let mut calls = IndexMap::new();
         let mut completed = HashSet::new();
         let mut stop_reason = None;
         let mut blocked = false;
@@ -2031,7 +2089,7 @@ mod tests {
     async fn test_candidate_safety_and_recitation_emit_errors_without_tool_calls() {
         for finish_reason in ["SAFETY", "RECITATION"] {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(8);
-            let mut accumulated_tool_calls = HashMap::new();
+            let mut accumulated_tool_calls = IndexMap::new();
             let mut completed_tool_call_ids = HashSet::new();
             let mut last_stop_reason = None;
             let mut response_blocked = false;
@@ -2071,7 +2129,7 @@ mod tests {
     #[tokio::test]
     async fn test_prompt_safety_block_emits_error_without_candidates() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(4);
-        let mut accumulated_tool_calls = HashMap::new();
+        let mut accumulated_tool_calls = IndexMap::new();
         let mut completed_tool_call_ids = HashSet::new();
         let mut last_stop_reason = None;
         let mut response_blocked = false;
@@ -2106,7 +2164,7 @@ mod tests {
     #[tokio::test]
     async fn test_later_candidate_does_not_overwrite_blocked_stop_reason() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ApiStreamChunk>(4);
-        let mut accumulated_tool_calls = HashMap::new();
+        let mut accumulated_tool_calls = IndexMap::new();
         let mut completed_tool_call_ids = HashSet::new();
         let mut last_stop_reason = None;
         let mut response_blocked = false;
@@ -2142,7 +2200,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         let (tx, mut rx) = mpsc::channel::<ApiStreamChunk>(8);
-        let accumulated_tool_calls = HashMap::from([(
+        let accumulated_tool_calls = IndexMap::from([(
             "call-1".to_string(),
             (
                 "call-1".to_string(),
