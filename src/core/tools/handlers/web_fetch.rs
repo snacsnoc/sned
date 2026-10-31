@@ -7,7 +7,7 @@ use crate::core::agent_loop::TaskState;
 use crate::core::tools::{ToolContext, ToolError, ToolHandler};
 use futures::StreamExt;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use url::Url;
 
@@ -219,7 +219,7 @@ impl WebFetchHandler {
     /// Returns the first validated socket address for connection pinning.
     /// This prevents DNS rebinding attacks where a domain resolves to a
     /// private IP after URL validation passes.
-    fn resolve_and_validate(url: &Url) -> Result<SocketAddr, ToolError> {
+    async fn resolve_and_validate(url: &Url) -> Result<SocketAddr, ToolError> {
         let host = url
             .host_str()
             .ok_or_else(|| ToolError::InvalidInput("URL must have a valid hostname".to_string()))?;
@@ -237,12 +237,16 @@ impl WebFetchHandler {
 
         // Resolve hostname — this is the actual DNS lookup that an attacker
         // could race via rebinding. We validate every resolved IP.
-        let addrs: Vec<SocketAddr> = (host, port)
-            .to_socket_addrs()
-            .map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to resolve hostname '{host}': {e}"))
-            })?
-            .collect();
+        let addrs: Vec<SocketAddr> =
+            tokio::time::timeout(fetch_timeout(), tokio::net::lookup_host((host, port)))
+                .await
+                .map_err(|_| {
+                    ToolError::ExecutionFailed(format!("DNS resolution for '{host}' timed out"))
+                })?
+                .map_err(|e| {
+                    ToolError::ExecutionFailed(format!("Failed to resolve hostname '{host}': {e}"))
+                })?
+                .collect();
 
         if addrs.is_empty() {
             return Err(ToolError::ExecutionFailed(format!(
@@ -267,7 +271,7 @@ impl WebFetchHandler {
         let validated_url = Self::validate_url(url)?;
 
         // Resolve DNS and validate all IPs before connecting — prevents DNS rebinding
-        let pinned_addr = Self::resolve_and_validate(&validated_url)?;
+        let pinned_addr = Self::resolve_and_validate(&validated_url).await?;
 
         let host = validated_url
             .host_str()
@@ -329,7 +333,7 @@ impl WebFetchHandler {
                 // Validate the redirect URL and resolve its DNS — prevents
                 // rebinding on redirect targets
                 let validated_redirect = Self::validate_url(redirect_url.as_str())?;
-                let redirect_addr = Self::resolve_and_validate(&validated_redirect)?;
+                let redirect_addr = Self::resolve_and_validate(&validated_redirect).await?;
 
                 // Build a new client pinned to the redirect target's resolved IP
                 let redirect_host = validated_redirect
@@ -515,6 +519,19 @@ fn html_to_text(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn async_resolution_keeps_ip_validation() {
+        let public = Url::parse("https://8.8.8.8/").unwrap();
+        assert_eq!(
+            WebFetchHandler::resolve_and_validate(&public)
+                .await
+                .unwrap(),
+            "8.8.8.8:443".parse().unwrap()
+        );
+        let local = Url::parse("http://localhost/").unwrap();
+        assert!(WebFetchHandler::resolve_and_validate(&local).await.is_err());
+    }
 
     #[test]
     fn test_html_to_text_basic() {
