@@ -250,7 +250,7 @@ pub struct HookResult {
 }
 
 /// Hook discovery and execution
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HookManager {
     /// Global hooks directory (e.g., ~/Documents/Sned/Hooks or ~/.sned/hooks)
     global_hooks_dir: Option<PathBuf>,
@@ -268,6 +268,7 @@ pub struct HookManager {
     active_execution: Arc<Mutex<Option<HookExecution>>>,
     /// PID of the currently active child process
     active_child_pid: Arc<Mutex<Option<u32>>>,
+    execution_lock: Arc<Mutex<()>>,
     /// Optional cancellation token for hook execution
     cancel_token: Option<CancellationToken>,
     /// Flag indicating hook was cancelled externally
@@ -287,6 +288,7 @@ impl HookManager {
             user_id: user_id.into(),
             active_execution: Arc::new(Mutex::new(None)),
             active_child_pid: Arc::new(Mutex::new(None)),
+            execution_lock: Arc::new(Mutex::new(())),
             cancel_token: None,
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             workspace_hooks_opted_in: false,
@@ -324,6 +326,12 @@ impl HookManager {
     /// Set cancellation token for hook execution
     pub fn set_cancel_token(&mut self, token: CancellationToken) {
         self.cancel_token = Some(token);
+    }
+
+    pub(crate) fn child_cancel_token(&self) -> CancellationToken {
+        self.cancel_token
+            .as_ref()
+            .map_or_else(CancellationToken::new, CancellationToken::child_token)
     }
 
     /// Get the global hooks directory if set.
@@ -410,6 +418,10 @@ impl HookManager {
         input: &HookInput,
         stream_callback: Option<Arc<Mutex<HookStreamCallback>>>,
     ) -> HookResult {
+        // Active PID and cancellation state are shared by all hook calls.
+        let _execution = self.execution_lock.lock();
+        self.cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let hooks = self.discover_hooks(hook_name);
 
         if hooks.is_empty() {
@@ -427,6 +439,19 @@ impl HookManager {
         let mut errors = Vec::new();
 
         for hook_path in hooks {
+            if self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+                || self
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+            {
+                errors.push("Hook execution cancelled".to_string());
+                last_exit_code = 1;
+                if hook_name == HookName::PreToolUse {
+                    combined_output.cancel = Some(true);
+                }
+                break;
+            }
             match self.run_single_hook(&hook_path, input, stream_callback.clone()) {
                 Ok(output) => {
                     // Merge outputs
@@ -568,10 +593,6 @@ impl HookManager {
             let mut pid = self.active_child_pid.lock();
             *pid = Some(child.id());
         }
-        // Reset cancellation flag
-        self.cancelled
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-
         // Read stdout and stderr before waiting (avoids pipe buffer deadlock)
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
@@ -727,7 +748,9 @@ impl HookManager {
 
         let start = std::time::Instant::now();
         loop {
-            match rx.try_recv() {
+            match rx.recv_timeout(
+                Duration::from_millis(10).min(timeout.saturating_sub(start.elapsed())),
+            ) {
                 Ok(Ok(status)) => {
                     if cancelled_flag.load(std::sync::atomic::Ordering::SeqCst)
                         || cancel_token
@@ -738,13 +761,10 @@ impl HookManager {
                     return Ok(status);
                 }
                 Ok(Err(e)) => return Err(format!("Failed to wait for hook: {e}")),
-                Err(mpsc::TryRecvError::Disconnected) => {
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err("Hook wait thread disconnected".to_string());
                 }
-                Err(mpsc::TryRecvError::Empty) => {
-                    // Sleep to avoid busy-wait and reduce CPU usage
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
 
             if start.elapsed() >= timeout {
@@ -765,7 +785,8 @@ impl HookManager {
                                 Ok(
                                     nix::sys::wait::WaitStatus::Exited(_, _)
                                     | nix::sys::wait::WaitStatus::Signaled(_, _, _),
-                                ) => break,
+                                )
+                                | Err(nix::errno::Errno::ECHILD) => break,
                                 _ => std::thread::sleep(std::time::Duration::from_millis(100)),
                             }
                         }
@@ -801,7 +822,8 @@ impl HookManager {
                                 Ok(
                                     nix::sys::wait::WaitStatus::Exited(_, _)
                                     | nix::sys::wait::WaitStatus::Signaled(_, _, _),
-                                ) => break,
+                                )
+                                | Err(nix::errno::Errno::ECHILD) => break,
                                 _ => std::thread::sleep(std::time::Duration::from_millis(100)),
                             }
                         }
@@ -813,8 +835,6 @@ impl HookManager {
                 }
                 return Err("Hook execution cancelled".to_string());
             }
-
-            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -1070,7 +1090,8 @@ impl HookManager {
                         Ok(
                             nix::sys::wait::WaitStatus::Exited(_, _)
                             | nix::sys::wait::WaitStatus::Signaled(_, _, _),
-                        ) => break,
+                        )
+                        | Err(nix::errno::Errno::ECHILD) => break,
                         _ => std::thread::sleep(std::time::Duration::from_millis(50)),
                     }
                 }
@@ -1487,10 +1508,15 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
 
         // Cancel the token
+        let cancelled_at = std::time::Instant::now();
         token.cancel();
 
         // Wait for hook to finish (should be quick after cancellation)
         let result = handle.join().unwrap();
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(3),
+            "cancelled hook held its execution lock too long"
+        );
 
         // Should have failed due to cancellation
         assert!(result.error.is_some(), "Hook should have been cancelled");
@@ -1501,6 +1527,87 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_token_prevents_hook_from_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let hook = dir.path().join("TaskStart");
+        fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut manager = HookManager::new("test-user");
+        manager.set_runtime_hooks_dir(dir.path().to_path_buf());
+        let token = CancellationToken::new();
+        token.cancel();
+        manager.set_cancel_token(token);
+        assert_ne!(manager.task_start("test", "test").exit_code, 0);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn child_hook_token_follows_parent_cancellation() {
+        let mut manager = HookManager::new("test-user");
+        let parent = CancellationToken::new();
+        manager.set_cancel_token(parent.clone());
+        let child = manager.child_cancel_token();
+        parent.cancel();
+        assert!(child.is_cancelled());
+        let mut scoped = manager.clone();
+        scoped.set_cancel_token(child);
+        scoped.set_timeout(20_000);
+        assert_eq!(scoped.timeout_ms, 20_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_remaining_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let marker = dir.path().join("second-started");
+        fs::write(first.join("TaskStart"), "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::write(
+            second.join("TaskStart"),
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        for hook in [first.join("TaskStart"), second.join("TaskStart")] {
+            fs::set_permissions(hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for use_token in [true, false] {
+            let mut manager = HookManager::new("test-user");
+            manager.set_runtime_hooks_dir(first.clone());
+            manager.set_global_hooks_dir(second.clone());
+            let token = CancellationToken::new();
+            manager.set_cancel_token(token.clone());
+            let manager = Arc::new(manager);
+            let worker = {
+                let manager = manager.clone();
+                std::thread::spawn(move || manager.task_start("test", "test"))
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while manager.active_child_pid.lock().is_none() && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(manager.active_child_pid.lock().is_some());
+            if use_token {
+                token.cancel();
+            } else {
+                manager.cancel_hook_execution().unwrap();
+            }
+            assert_ne!(worker.join().unwrap().exit_code, 0);
+            assert!(!marker.exists());
+        }
     }
 
     #[test]

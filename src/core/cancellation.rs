@@ -102,7 +102,10 @@ impl CancellationHandler {
         if let Some(hook_mgr) = hook_manager
             && let Some(_execution) = hook_mgr.get_active_hook_execution()
         {
-            if let Err(e) = hook_mgr.cancel_hook_execution() {
+            let manager = hook_mgr.clone();
+            if let Ok(Err(e)) =
+                tokio::task::spawn_blocking(move || manager.cancel_hook_execution()).await
+            {
                 tracing::warn!("Failed to cancel hook execution: {}", e);
             }
             hook_mgr.clear_active_hook_execution();
@@ -151,7 +154,11 @@ impl CancellationHandler {
                     },
                 },
             };
-            let _ = hook_mgr.execute_hook(HookName::TaskCancel, &hook_input, None);
+            let hook_mgr = hook_mgr.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                hook_mgr.execute_hook(HookName::TaskCancel, &hook_input, None)
+            })
+            .await;
             tracing::info!("TaskCancel hook executed");
         }
 

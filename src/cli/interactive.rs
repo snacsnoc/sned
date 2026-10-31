@@ -483,7 +483,9 @@ impl InteractiveSession {
             agent.lock().await.load_file_context_tracker().await;
 
             // Fire TaskResume hook after loading state
-            let _ = self.hook_manager.task_resume(agent.lock().await.task_id());
+            let hook_manager = self.hook_manager.clone();
+            let task_id = agent.lock().await.task_id().to_string();
+            let _ = tokio::task::spawn_blocking(move || hook_manager.task_resume(&task_id)).await;
 
             if loaded && !self.task_opts.json {
                 let agent_lock = agent.lock().await;
@@ -6652,7 +6654,10 @@ pub async fn run_interactive_shell_inner(
             let loaded = agent.load_conversation_history().await;
             agent.load_file_context_tracker().await;
             if loaded {
-                let _ = sess.hook_manager.task_resume(agent.task_id());
+                let hook_manager = sess.hook_manager.clone();
+                let task_id = agent.task_id().to_string();
+                let _ =
+                    tokio::task::spawn_blocking(move || hook_manager.task_resume(&task_id)).await;
             }
         }
     }

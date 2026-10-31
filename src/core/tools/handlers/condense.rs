@@ -41,7 +41,15 @@ impl CondenseHandler {
         // Execute PreCompact hook BEFORE acquiring state lock to avoid holding lock during blocking I/O.
         let mut hook_context_modification: Option<String> = None;
         if let Some(ref hook_mgr) = ctx.hook_manager {
-            let result = hook_mgr.pre_compact(&ctx.task_id, "<conversation_history>");
+            let hook_mgr = hook_mgr.clone();
+            let task_id = ctx.task_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                hook_mgr.pre_compact(&task_id, "<conversation_history>")
+            })
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("PreCompact hook worker failed: {error}"))
+            })?;
 
             if let Some(output) = &result.output
                 && output.cancel == Some(true)

@@ -481,7 +481,23 @@ pub(crate) async fn execute_tool_with_hooks_internal(
     let mut params_for_execution = tool_params.clone();
     let mut hook_context = Vec::new();
     if let Some(ref hook_mgr) = hook_manager {
-        let pre_result = hook_mgr.pre_tool_use(&config.task_id, tool_name, tool_params);
+        let hook_mgr = hook_mgr.clone();
+        let task_id = config.task_id.clone();
+        let hook_tool_name = tool_name.to_string();
+        let hook_params = tool_params.clone();
+        let pre_result = match tokio::task::spawn_blocking(move || {
+            hook_mgr.pre_tool_use(&task_id, &hook_tool_name, &hook_params)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return ToolExecutionOutput::error(
+                    format!("PreToolUse hook worker failed: {error}"),
+                    None,
+                );
+            }
+        };
         if let Some(error) = pre_result.error.as_deref() {
             warn!(tool = tool_name, error, "PreToolUse hook reported an error");
         }
@@ -559,8 +575,27 @@ pub(crate) async fn execute_tool_with_hooks_internal(
             }
 
             if let Some(ref hook_mgr) = hook_manager {
-                let post_result =
-                    hook_mgr.post_tool_use(&config.task_id, tool_name, tool_params, &res_text);
+                let hook_mgr = hook_mgr.clone();
+                let task_id = config.task_id.clone();
+                let hook_tool_name = tool_name.to_string();
+                let hook_params = tool_params.clone();
+                let hook_result = res_text.clone();
+                let post_result = tokio::task::spawn_blocking(move || {
+                    hook_mgr.post_tool_use(&task_id, &hook_tool_name, &hook_params, &hook_result)
+                })
+                .await
+                .unwrap_or_else(|error| crate::core::hooks::HookResult {
+                    output: None,
+                    error: Some(format!("PostToolUse hook worker failed: {error}")),
+                    exit_code: -1,
+                    execution_time_ms: 0,
+                });
+                if let Some(error) = post_result.error.as_deref() {
+                    warn!(
+                        tool = tool_name,
+                        error, "PostToolUse hook reported an error"
+                    );
+                }
                 if let Some(post_output) = post_result.output
                     && let Some(modification) = post_output.context_modification
                 {

@@ -1490,10 +1490,16 @@ impl AgentLoop {
                 .filter(|&v| v > 0)
                 .unwrap_or(10_000);
             let timeout_duration = std::time::Duration::from_millis(timeout_ms);
+            let hook_to_cancel = hook_mgr.clone();
+            let timeout_token = hook_mgr.child_cancel_token();
+            let mut scoped_hook_mgr = (*hook_mgr).clone();
+            scoped_hook_mgr.set_cancel_token(timeout_token.clone());
+            scoped_hook_mgr.set_timeout(timeout_ms);
 
             // Note: HookManager::task_start is synchronous, so we use tokio::task::spawn_blocking
             let result = match tokio::time::timeout(timeout_duration, async {
-                tokio::task::spawn_blocking(move || hook_mgr.task_start(&task_id, &task)).await
+                tokio::task::spawn_blocking(move || scoped_hook_mgr.task_start(&task_id, &task))
+                    .await
             })
             .await
             {
@@ -1509,6 +1515,10 @@ impl AgentLoop {
                 }
                 Err(_) => {
                     error!("TaskStart hook timed out after {}ms", timeout_ms);
+                    timeout_token.cancel();
+                    let _ =
+                        tokio::task::spawn_blocking(move || hook_to_cancel.cancel_hook_execution())
+                            .await;
                     crate::core::hooks::HookResult {
                         output: None,
                         error: Some(format!("Hook execution timed out after {timeout_ms}ms")),
@@ -1872,9 +1882,21 @@ impl AgentLoop {
                     }
 
                     // Execute TaskComplete hook
-                    if let Some(ref hook_mgr) = self.deps.hook_manager {
-                        let task = task_text.as_deref().unwrap_or("");
-                        let result = hook_mgr.task_complete(&self.config.task_id, task, "");
+                    if let Some(hook_mgr) = self.deps.hook_manager.clone() {
+                        let task = task_text.clone().unwrap_or_default();
+                        let task_id = self.config.task_id.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            hook_mgr.task_complete(&task_id, &task, "")
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            crate::core::hooks::HookResult {
+                                output: None,
+                                error: Some(format!("TaskComplete hook worker failed: {error}")),
+                                exit_code: -1,
+                                execution_time_ms: 0,
+                            }
+                        });
                         if let Some(output) = result.output
                             && let Some(modification) = output.context_modification
                         {
