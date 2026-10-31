@@ -1084,7 +1084,15 @@ impl ToolHandler for UseSubagentsHandler {
         let handler = self.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
-            if !ctx.explicitly_approved {
+            let auto_approved = if let Some(manager) = &ctx.approval_manager {
+                let manager = manager.lock().await;
+                manager.is_yolo_mode()
+                    || manager.is_auto_approve_all()
+                    || manager.is_auto_approved("use_subagents", None)
+            } else {
+                false
+            };
+            if !(ctx.explicitly_approved || ctx.parent_yolo || auto_approved) {
                 let mut state = ctx.state.lock().await;
                 state.consecutive_mistakes += 1;
                 tracing::warn!(
@@ -1219,6 +1227,62 @@ mod tests {
         let params = serde_json::json!({});
         let prompts = UseSubagentsHandler::parse_prompts(&params);
         assert!(prompts.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn subagent_approval_accepts_explicit_and_authorized_modes() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _env = unsafe { EnvVarGuard::set("SNED_IS_SUBAGENT", "") };
+        let _approval_env = unsafe { EnvVarGuard::set("SNED_AUTO_APPROVE", "") };
+        // The recursion check considers even an empty value present.
+        unsafe { std::env::remove_var("SNED_IS_SUBAGENT") };
+        for mode in [
+            "denied",
+            "explicit",
+            "parent_yolo",
+            "manager_yolo",
+            "auto_all",
+            "always",
+        ] {
+            let mut manager = crate::core::approval::ApprovalManager::new()
+                .with_yolo(mode == "manager_yolo")
+                .with_auto_approve_all(mode == "auto_all");
+            if mode == "always" {
+                manager.auto_approve(crate::core::tools::SnedTool::UseSubagents, None);
+            }
+            let state = TaskState {
+                subagents_enabled: true,
+                ..Default::default()
+            };
+            let ctx = ToolContext::new(
+                Arc::new(Mutex::new(state)),
+                Some(Arc::new(Mutex::new(manager))),
+                std::env::current_dir().unwrap(),
+                crate::core::file_editor::AnchorStateManager::new(),
+                true,
+                "test".into(),
+                None,
+                mode == "explicit",
+                Arc::new(crate::cli::output::StderrOutputWriter),
+                mode == "parent_yolo",
+            );
+            let error =
+                ToolHandler::execute(&UseSubagentsHandler::new(), &ctx, serde_json::json!({}))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+            if mode == "denied" {
+                assert!(
+                    error.contains("requires explicit user approval"),
+                    "{mode}: {error}"
+                );
+            } else {
+                assert!(error.contains("at least one prompt"), "{mode}: {error}");
+            }
+        }
     }
 
     #[test]
