@@ -182,6 +182,14 @@ impl RenameSymbolHandler {
             }
         }
 
+        let language_parsers = load_required_language_parsers(
+            &expanded_paths
+                .iter()
+                .map(std::string::String::as_str)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}")))?;
+
         // Update symbol index with file contents (lock held briefly for HashMap/DB updates only)
         if let Some(ref mutex) = self.symbol_index_service
             && expanded_paths.len() <= 100
@@ -192,11 +200,11 @@ impl RenameSymbolHandler {
             )> = Vec::new();
 
             for (abs_path, content) in &file_contents {
-                if let Some(parsers) = load_required_language_parsers(&[abs_path.as_str()]).ok()
-                    && let Ok(symbols) = crate::services::symbol_index::extract_symbols_for_indexing(
-                        abs_path, content, &parsers,
-                    )
-                {
+                if let Ok(symbols) = crate::services::symbol_index::extract_symbols_for_indexing(
+                    abs_path,
+                    content,
+                    &language_parsers,
+                ) {
                     parsed_symbols.push((abs_path.as_str(), symbols));
                 }
             }
@@ -221,14 +229,6 @@ impl RenameSymbolHandler {
                 }
             }
         }
-
-        let language_parsers = load_required_language_parsers(
-            &expanded_paths
-                .iter()
-                .map(std::string::String::as_str)
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to load language parsers: {e}")))?;
 
         let mut locations_by_file: HashMap<String, FileData> =
             HashMap::with_capacity(paths.len().max(1));
