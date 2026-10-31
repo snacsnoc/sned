@@ -520,6 +520,8 @@ enum AnthropicStreamEvent {
     Ping,
     #[serde(rename = "error")]
     Error { error: AnthropicError },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -569,6 +571,8 @@ enum AnthropicContentBlock {
     ToolUse { id: String, name: String },
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -583,6 +587,8 @@ enum AnthropicContentDelta {
     TextDelta { text: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+    #[serde(other)]
+    Unknown,
 }
 
 impl Provider for AnthropicProvider {
@@ -983,6 +989,7 @@ async fn process_anthropic_event(
         AnthropicStreamEvent::MessageStop | AnthropicStreamEvent::Ping => {
             // Both are terminal/keepalive events, no action needed
         }
+        AnthropicStreamEvent::Unknown => tracing::debug!("Ignoring unknown Anthropic stream event"),
         AnthropicStreamEvent::Error { error } => {
             send_chunk(
                 tx,
@@ -995,6 +1002,9 @@ async fn process_anthropic_event(
             .await;
         }
         AnthropicStreamEvent::ContentBlockStart { content_block } => match content_block {
+            AnthropicContentBlock::Unknown => {
+                tracing::debug!("Ignoring unknown Anthropic content block")
+            }
             AnthropicContentBlock::Thinking {
                 thinking,
                 signature,
@@ -1081,6 +1091,9 @@ async fn process_anthropic_event(
             }
         },
         AnthropicStreamEvent::ContentBlockDelta { delta } => match delta {
+            AnthropicContentDelta::Unknown => {
+                tracing::debug!("Ignoring unknown Anthropic content delta")
+            }
             AnthropicContentDelta::ThinkingDelta { thinking } => {
                 send_chunk(
                     tx,
@@ -1383,6 +1396,23 @@ mod tests {
                 .any(|msg| {
                     msg["role"] == "user" && msg["content"][0]["text"] == "Please proceed."
                 })
+        );
+    }
+
+    #[test]
+    fn unknown_stream_types_are_ignored_but_malformed_known_types_fail() {
+        for event in [
+            json!({"type":"future_event"}),
+            json!({"type":"content_block_start", "content_block":{"type":"future_block"}}),
+            json!({"type":"content_block_delta", "delta":{"type":"future_delta"}}),
+        ] {
+            assert!(serde_json::from_value::<AnthropicStreamEvent>(event).is_ok());
+        }
+        assert!(
+            serde_json::from_value::<AnthropicStreamEvent>(json!({
+                "type":"content_block_delta", "delta":{"type":"text_delta"}
+            }))
+            .is_err()
         );
     }
 
