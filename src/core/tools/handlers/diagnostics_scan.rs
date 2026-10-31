@@ -44,6 +44,28 @@ fn diagnostics_output_limit() -> usize {
 }
 
 async fn capture_diagnostics_command(
+    command: Command,
+    limit: usize,
+) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+    capture_diagnostics_command_with_timeout(command, limit, Duration::from_secs(60)).await
+}
+
+async fn capture_diagnostics_command_with_timeout(
+    command: Command,
+    limit: usize,
+    deadline: Duration,
+) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+    timeout(deadline, capture_diagnostics_command_inner(command, limit))
+        .await
+        .map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "diagnostics command timed out after {}ms",
+                deadline.as_millis()
+            ))
+        })?
+}
+
+async fn capture_diagnostics_command_inner(
     mut command: Command,
     limit: usize,
 ) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
@@ -238,37 +260,49 @@ impl DiagnosticsScanHandler {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
 
-                if let Ok((_, stdout, stderr)) =
-                    capture_diagnostics_command(lint_command, diagnostics_output_limit()).await
-                {
-                    if !stdout.is_empty() {
-                        result.push_str(&stdout);
-                    }
-                    if !stderr.is_empty() {
-                        if !result.is_empty() {
-                            result.push('\n');
+                match capture_diagnostics_command(lint_command, diagnostics_output_limit()).await {
+                    Ok((_, stdout, stderr)) => {
+                        if !stdout.is_empty() {
+                            result.push_str(&stdout);
                         }
-                        result.push_str(&stderr);
+                        if !stderr.is_empty() {
+                            if !result.is_empty() {
+                                result.push('\n');
+                            }
+                            result.push_str(&stderr);
+                        }
                     }
-                } else {
-                    // Fall back to eslint on the specific file
-                    let mut eslint_command = Command::new("npx");
-                    eslint_command
-                        .args([
-                            "eslint",
-                            "--format=compact",
-                            file_path.to_string_lossy().as_ref(),
-                        ])
-                        .current_dir(&js_dir)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
+                    Err(lint_error) => {
+                        if lint_error
+                            .downcast_ref::<tokio::time::error::Elapsed>()
+                            .is_some()
+                        {
+                            return Err(lint_error);
+                        }
+                        // Fall back to eslint on the specific file
+                        let mut eslint_command = Command::new("npx");
+                        eslint_command
+                            .args([
+                                "eslint",
+                                "--format=compact",
+                                file_path.to_string_lossy().as_ref(),
+                            ])
+                            .current_dir(&js_dir)
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped());
 
-                    if let Ok((_, stdout, _)) =
-                        capture_diagnostics_command(eslint_command, diagnostics_output_limit())
-                            .await
-                        && !stdout.is_empty()
-                    {
+                        let (_, stdout, stderr) =
+                            capture_diagnostics_command(eslint_command, diagnostics_output_limit())
+                                .await
+                                .map_err(|error| {
+                                    anyhow::anyhow!(
+                                        "npm lint failed: {lint_error}; eslint failed: {error}"
+                                    )
+                                })?;
                         result.push_str(&stdout);
+                        if !stderr.is_empty() {
+                            result.push_str(&stderr);
+                        }
                     }
                 }
 
@@ -309,6 +343,13 @@ impl DiagnosticsScanHandler {
     pub async fn run_diagnostics_batch(
         files_by_project: &HashMap<(PathBuf, ProjectType), Vec<PathBuf>>,
     ) -> HashMap<PathBuf, String> {
+        Self::run_diagnostics_batch_with_timeout(files_by_project, Duration::from_secs(30)).await
+    }
+
+    async fn run_diagnostics_batch_with_timeout(
+        files_by_project: &HashMap<(PathBuf, ProjectType), Vec<PathBuf>>,
+        batch_timeout: Duration,
+    ) -> HashMap<PathBuf, String> {
         use futures::future::join_all;
 
         let mut results: HashMap<PathBuf, String> =
@@ -320,7 +361,7 @@ impl DiagnosticsScanHandler {
             .map(|((project_root, project_type), files)| async move {
                 // Run diagnostics once for the project root with the known project type
                 let diag_output = match timeout(
-                    Duration::from_secs(30),
+                    batch_timeout,
                     Self::run_diagnostics(*project_type, project_root),
                 )
                 .await
@@ -328,11 +369,14 @@ impl DiagnosticsScanHandler {
                     Ok(Ok(output)) => output,
                     Ok(Err(e)) => {
                         tracing::warn!("diagnostics failed for {:?}: {}", project_root, e);
-                        String::new()
+                        format!("error: diagnostics scan failed: {e}")
                     }
                     Err(_) => {
                         tracing::warn!("diagnostics timed out for {:?}", project_root);
-                        String::new()
+                        format!(
+                            "error: diagnostics scan timed out after {}ms",
+                            batch_timeout.as_millis()
+                        )
                     }
                 };
 
@@ -865,6 +909,25 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn diagnostics_timeout_cleans_up_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new("sh");
+        command
+            .current_dir(dir.path())
+            .args(["-c", "(sleep 0.5; printf x > child-marker) & wait"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let err =
+            capture_diagnostics_command_with_timeout(command, 1024, Duration::from_millis(150))
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!dir.path().join("child-marker").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn diagnostics_preserves_documented_toolchain_environment() {
         if std::env::var_os("SNED_TEST_DIAGNOSTIC_ENV").is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1156,6 +1219,43 @@ mod tests {
         assert!(output.contains("main.rs"), "Rust file should be in output");
         assert!(output.contains("script.js"), "JS file should be in output");
         assert_eq!(state.consecutive_mistakes, 0);
+    }
+
+    #[tokio::test]
+    async fn batch_timeout_is_reported_as_incomplete() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"slow_check\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("build.rs"),
+            "fn main() { std::thread::sleep(std::time::Duration::from_secs(5)); }",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        let file = root.join("src/lib.rs");
+        std::fs::write(&file, "pub fn example() {}\n").unwrap();
+        let files = HashMap::from([((root.to_path_buf(), ProjectType::Rust), vec![file.clone()])]);
+
+        let outputs = DiagnosticsScanHandler::run_diagnostics_batch_with_timeout(
+            &files,
+            Duration::from_millis(100),
+        )
+        .await;
+        let diagnostics = DiagnosticsScanHandler::parse_diagnostics(&outputs[&file], "src/lib.rs");
+        let formatted =
+            DiagnosticsScanHandler::format_diagnostics("src/lib.rs", &diagnostics, None);
+        assert!(
+            formatted.contains("diagnostics scan timed out"),
+            "{formatted}"
+        );
+        assert!(
+            !formatted.contains("No diagnostics issues found"),
+            "{formatted}"
+        );
     }
 
     #[tokio::test]

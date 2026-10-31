@@ -3075,7 +3075,19 @@ impl EditFileHandler {
                 continue;
             }
 
-            let diagnostics = if any_pre_errors {
+            let diagnostics_failure = pre_diagnostics
+                .get(&file_result.batch_absolute_path)
+                .into_iter()
+                .chain(post_diagnostics_by_file.get(&file_result.batch_absolute_path))
+                .flatten()
+                .find(|diagnostic| diagnostic.message.starts_with("error: diagnostics scan"));
+            if let Some(failure) = diagnostics_failure {
+                all_results.push(format!(
+                    "File {}: {}",
+                    file_result.batch_display_path, failure.message
+                ));
+            }
+            let diagnostics = if any_pre_errors && diagnostics_failure.is_none() {
                 let post_diagnostics = post_diagnostics_by_file
                     .get(&file_result.batch_absolute_path)
                     .cloned()
