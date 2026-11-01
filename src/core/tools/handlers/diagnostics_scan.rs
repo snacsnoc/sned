@@ -110,7 +110,7 @@ struct DiagnosticsProcessGroup(Option<u32>);
 #[cfg(unix)]
 impl Drop for DiagnosticsProcessGroup {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
+        if let Some(pid) = self.0.filter(|pid| *pid > 0 && *pid <= i32::MAX as u32) {
             // The child is the leader of the process group created above.
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGKILL);
