@@ -1433,7 +1433,7 @@ fn apply_output_event(
         OutputEvent::RawAnsi(s) => {
             flush_pending_model_update(app, pending_model_update, storage);
             let lines = ansi_to_ratatui_lines(&s);
-            let kind = if crate::core::approval::is_any_followup_question_active() {
+            let kind = if crate::core::approval::is_followup_question_active(&app.task_id) {
                 crate::cli::tui::BlockKind::BlockingPrompt
             } else {
                 crate::cli::tui::BlockKind::ToolOutput
@@ -2239,7 +2239,7 @@ fn drain_output_queues_with_summary(
     if app.followup_prompt_scroll_pending {
         app.followup_prompt_scroll_pending = false;
         app.pin_approval_bottom();
-    } else if crate::core::approval::is_any_followup_question_active() {
+    } else if crate::core::approval::is_followup_question_active(&app.task_id) {
         // Any interactive prompt that blocks progress must keep its input line
         // visible until the user responds, regardless of prior manual scroll.
         app.pin_approval_bottom();
@@ -9810,9 +9810,14 @@ mod tests {
     fn test_drain_output_preserves_manual_scroll_while_approval_is_pending() {
         use crate::cli::tui::app::ScrollMode;
 
+        let _lock = crate::core::approval::approval_test_guard();
+        reset_prompt_state();
+        crate::core::approval::set_followup_question_active("other-task", true);
+
         let (_tx, mut rx) = mpsc::channel(1);
 
         let mut app = App::new();
+        app.task_id = "current-task".to_string();
         app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 7;
         let (request, _response_rx) = crate::core::approval::approval_request_for_test(
@@ -9826,6 +9831,9 @@ mod tests {
 
         assert_eq!(app.scroll_mode, ScrollMode::Manual);
         assert_eq!(app.scroll_offset, 7);
+
+        crate::core::approval::set_followup_question_active("other-task", false);
+        reset_prompt_state();
     }
 
     #[test]
@@ -9840,6 +9848,7 @@ mod tests {
         crate::core::approval::set_followup_question_active("test-task", true);
 
         let mut app = App::new();
+        app.task_id = "test-task".to_string();
         app.scroll_mode = ScrollMode::Manual;
         app.scroll_offset = 7;
 
