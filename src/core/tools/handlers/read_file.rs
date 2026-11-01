@@ -1528,12 +1528,7 @@ impl ReadFileHandler {
         Self::track_read_files(state, &paths, &results, start_line, end_line);
         let mut warnings = Self::read_loop_warnings(state, &paths, &results);
         let output = Self::format_results(results.clone());
-        while Self::append_warnings(output.clone(), &warnings).len()
-            > crate::core::agent_loop::tool_result_history_limit()
-            && !warnings.is_empty()
-        {
-            warnings.pop();
-        }
+        Self::trim_warnings(&output, &mut warnings);
         // Read-loop detection follows each unchanged file across inspection turns.
         if let Some(writer) = output_writer {
             for warning in &warnings {
@@ -1638,6 +1633,18 @@ impl ReadFileHandler {
             output.push_str(warning);
         }
         output
+    }
+
+    fn trim_warnings(output: &str, warnings: &mut Vec<String>) {
+        let limit = crate::core::agent_loop::tool_result_history_limit();
+        while !warnings.is_empty()
+            && warnings.iter().fold(output.len(), |size, warning| {
+                size.saturating_add(if size > 0 { 5 } else { 0 })
+                    .saturating_add(warning.len())
+            }) > limit
+        {
+            warnings.pop();
+        }
     }
 }
 
@@ -1786,12 +1793,7 @@ impl ToolHandler for ReadFileHandler {
                 Self::track_read_files(&mut state, &paths, &results, start_line, end_line);
                 let mut warnings = Self::read_loop_warnings(&state, &paths, &results);
                 let output = Self::format_results(results.clone());
-                while Self::append_warnings(output.clone(), &warnings).len()
-                    > crate::core::agent_loop::tool_result_history_limit()
-                    && !warnings.is_empty()
-                {
-                    warnings.pop();
-                }
+                Self::trim_warnings(&output, &mut warnings);
                 Ok(serde_json::Value::String(Self::append_warnings(
                     output, &warnings,
                 )))
@@ -1809,6 +1811,15 @@ impl ToolHandler for ReadFileHandler {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trim_warnings_matches_formatted_size() {
+        let limit = crate::core::agent_loop::tool_result_history_limit();
+        let output = "x".repeat(limit.saturating_sub(8));
+        let mut warnings = vec!["abc".to_string(), "def".to_string()];
+        super::ReadFileHandler::trim_warnings(&output, &mut warnings);
+        assert_eq!(warnings, vec!["abc"]);
+        assert!(super::ReadFileHandler::append_warnings(output, &warnings).len() <= limit);
+    }
     use super::*;
     use crate::core::agent_loop::TaskState;
     use crate::core::file_editor::AnchorStateManager;
