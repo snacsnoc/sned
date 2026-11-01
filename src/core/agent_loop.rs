@@ -4486,13 +4486,21 @@ impl AgentLoop {
         let keep_from_base = history.len().saturating_sub(max_messages);
         let keep_from = Self::keep_from_preserving_tool_pairs(&history, keep_from_base);
 
-        // Preserve system prompt if it exists (first message with role=assistant)
-        let has_system_prompt = history
+        // Provider system prompts are sent separately. Preserve the original
+        // user task explicitly so pruning never turns it into an orphaned tail.
+        let has_root_user = history
             .first()
-            .is_some_and(|m| matches!(m.role, MessageRole::Assistant));
+            .is_some_and(|message| message.role == MessageRole::User);
+        let has_legacy_system_prompt = history
+            .first()
+            .is_some_and(|message| message.role == MessageRole::Assistant);
 
-        if has_system_prompt {
-            // Keep system prompt + most recent messages
+        if has_root_user && keep_from > 0 {
+            let mut pruned = Vec::with_capacity(max_messages + 1);
+            pruned.push(history[0].clone());
+            pruned.extend(history[keep_from..].iter().cloned());
+            pruned
+        } else if has_legacy_system_prompt {
             let mut pruned = Vec::with_capacity(max_messages + 1);
             pruned.push(history[0].clone());
             pruned.extend(history[keep_from..].iter().cloned());
@@ -7591,6 +7599,8 @@ mod tests {
             "replace_symbol",
             "rename_symbol",
             "execute_command",
+            "diagnostics_scan",
+            "condense",
             "definitely_not_a_tool",
             "",
         ] {
@@ -13502,6 +13512,43 @@ Irrespective of whether additional information or instructions are given, you ar
                 false
             }
         }));
+    }
+
+    #[tokio::test]
+    async fn test_prune_conversation_history_keeps_root_user_task() {
+        let agent = AgentLoop::new(AgentConfig {
+            max_context_turns: 2,
+            ..Default::default()
+        });
+        let mut history = Vec::new();
+        for i in 0..20 {
+            history.push(StorageMessage {
+                id: None,
+                role: if i % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content: MessageContent::Text(if i == 0 {
+                    "original task".to_string()
+                } else {
+                    format!("Message {i}")
+                }),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+        }
+
+        let result = agent.prune_conversation_history(history);
+        assert!(matches!(
+            result.first().map(|message| &message.content),
+            Some(MessageContent::Text(text)) if text == "original task"
+        ));
+        assert_eq!(
+            result.first().map(|message| message.role),
+            Some(MessageRole::User)
+        );
     }
 
     #[tokio::test]

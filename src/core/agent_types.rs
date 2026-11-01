@@ -357,7 +357,7 @@ pub struct AgentConfig {
     pub task_id: String,
     /// Whether to enable checkpoints.
     pub enable_checkpoints: bool,
-    /// Whether to use auto-condense for context management.
+    /// Whether to use the earlier context-truncation threshold.
     pub use_auto_condense: bool,
     /// Whether to show token usage after each turn.
     pub show_token_usage: bool,

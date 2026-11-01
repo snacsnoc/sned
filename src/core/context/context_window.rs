@@ -4,6 +4,13 @@
 use crate::providers::{Provider, ProviderRequest, Providers};
 
 const HARD_LIMIT: u64 = 1_000_000;
+const IMAGE_TOKEN_ESTIMATE_MAX: f64 = 8_192.0;
+
+fn estimate_base64_image_tokens(data: &str) -> f64 {
+    // Keep the shared estimate conservative for providers that retain more
+    // visual detail than the low-resolution default.
+    (data.len() as f64 / 3.0).clamp(85.0, IMAGE_TOKEN_ESTIMATE_MAX)
+}
 
 /// Estimate token count for a provider request.
 /// Uses rough heuristic: ~4 chars per token for English text.
@@ -31,7 +38,7 @@ pub fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
                                 crate::providers::ToolResultContentBlock::Image { source } => {
                                     match source {
                                         crate::providers::ImageSource::Base64 { data, .. } => {
-                                            (data.len() as f64 / 4.0).max(1000.0)
+                                            estimate_base64_image_tokens(data)
                                         }
                                         crate::providers::ImageSource::Url { .. } => 1000.0,
                                     }
@@ -41,7 +48,7 @@ pub fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
                     },
                     crate::providers::UserContentBlock::Image(img) => match &img.source {
                         crate::providers::ImageSource::Base64 { data, .. } => {
-                            (data.len() as f64 / 3.0).clamp(85.0, 1700.0)
+                            estimate_base64_image_tokens(data)
                         }
                         crate::providers::ImageSource::Url { .. } => 1000.0,
                     },
@@ -71,7 +78,7 @@ pub fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
                     }
                     crate::providers::AssistantContentBlock::Image(img) => match &img.source {
                         crate::providers::ImageSource::Base64 { data, .. } => {
-                            (data.len() as f64 / 4.0).max(1000.0)
+                            estimate_base64_image_tokens(data)
                         }
                         crate::providers::ImageSource::Url { .. } => 1000.0,
                     },
@@ -256,6 +263,61 @@ mod tests {
         let error = validate_context_window(&request, &provider).unwrap_err();
 
         assert!(error.contains("/compact"));
+    }
+
+    #[test]
+    fn test_image_tokens_are_capped_in_tool_and_assistant_blocks() {
+        let data = "x".repeat(30_000);
+        let source = || crate::providers::ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: data.clone(),
+        };
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            messages: vec![
+                crate::providers::StorageMessage {
+                    id: None,
+                    role: crate::providers::MessageRole::User,
+                    content: crate::providers::MessageContent::UserBlocks(vec![
+                        crate::providers::UserContentBlock::ToolResult(
+                            crate::providers::ToolResultBlock {
+                                tool_use_id: "call".to_string(),
+                                content: crate::providers::ToolResultContent::Blocks(vec![
+                                    crate::providers::ToolResultContentBlock::Image {
+                                        source: source(),
+                                    },
+                                ]),
+                                shared: Default::default(),
+                            },
+                        ),
+                    ]),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+                crate::providers::StorageMessage {
+                    id: None,
+                    role: crate::providers::MessageRole::Assistant,
+                    content: crate::providers::MessageContent::AssistantBlocks(vec![
+                        crate::providers::AssistantContentBlock::Image(
+                            crate::providers::ImageContentBlock {
+                                source: source(),
+                                shared: Default::default(),
+                            },
+                        ),
+                    ]),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                },
+            ],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+
+        assert_eq!(estimate_request_tokens(&request), 16_384);
     }
 
     #[test]

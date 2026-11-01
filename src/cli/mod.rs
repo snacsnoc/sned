@@ -341,7 +341,7 @@ pub struct TaskOptions {
     #[arg(long, hide_short_help = true)]
     pub double_check_completion: bool,
 
-    /// Enable adaptive context compaction instead of mechanical truncation (enabled by default)
+    /// Start context truncation earlier to leave more room for the next request (enabled by default)
     #[arg(long, default_value_t = true, hide_short_help = true)]
     pub auto_condense: bool,
 

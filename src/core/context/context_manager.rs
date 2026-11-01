@@ -242,9 +242,8 @@ pub fn get_new_context_messages_and_metadata(
     let mut new_deleted_range = conversation_history_deleted_range;
 
     if let Some(info) = api_req_info {
-        // Only count input tokens (tokens_in) for truncation decision.
-        // Output tokens (tokens_out) are from previous responses and don't
-        // contribute to the current request size that validate_context_window checks.
+        // Use the provider's full reported context usage. Output tokens from
+        // prior responses remain part of the conversation retained in history.
         let cache_tokens = effective_cache_tokens(info, provider_name);
         let total_tokens = (info.tokens_in.unwrap_or(0) as u64)
             + (info.tokens_out.unwrap_or(0) as u64)
@@ -435,9 +434,14 @@ fn apply_context_history_updates(
         );
     }
 
+    let first_retained_index = if compacted_summary.is_some() {
+        summary_insert_index.saturating_add(1)
+    } else {
+        2
+    };
     if start_from_index > 2
-        && messages_to_update.len() > 2
-        && let Some(first_message) = messages_to_update.get_mut(2)
+        && messages_to_update.len() > first_retained_index
+        && let Some(first_message) = messages_to_update.get_mut(first_retained_index)
         && first_message.role == MessageRole::User
         && let MessageContent::UserBlocks(blocks) = &first_message.content
     {
@@ -1419,6 +1423,61 @@ mod tests {
         ));
         assert!(
             matches!(truncated[3].content, MessageContent::Text(ref text) if text == "Test summary")
+        );
+    }
+
+    #[test]
+    fn test_summary_sanitizes_first_retained_tool_result() {
+        let messages = vec![
+            user_text_message("Initial task"),
+            StorageMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("Earlier response".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                    crate::providers::ToolResultBlock {
+                        tool_use_id: "discarded-call".to_string(),
+                        content: crate::providers::ToolResultContent::Text("stale".to_string()),
+                        shared: crate::providers::SharedContentFields::default(),
+                    },
+                )]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+            StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                    crate::providers::ToolResultBlock {
+                        tool_use_id: "retained-orphan".to_string(),
+                        content: crate::providers::ToolResultContent::Text("stale".to_string()),
+                        shared: crate::providers::SharedContentFields::default(),
+                    },
+                )]),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            },
+        ];
+        let truncated = get_truncated_messages(
+            &messages,
+            Some((2, 2)),
+            Some(&CompactedSummary::new("Earlier context".to_string(), 1)),
+        );
+
+        let MessageContent::UserBlocks(blocks) = &truncated[3].content else {
+            panic!("expected the retained message after the summary");
+        };
+        assert!(
+            matches!(blocks.first(), Some(UserContentBlock::Text(text)) if text.text == "[context truncated]")
         );
     }
 
