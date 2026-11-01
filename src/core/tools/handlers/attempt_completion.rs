@@ -143,9 +143,10 @@ mod tests {
     #[tokio::test]
     async fn test_double_check_first_attempt_rejected() {
         let handler = AttemptCompletionHandler::new();
-        let mut state = TaskState::default();
-        // double_check_completion_enabled defaults to true
-        assert!(state.double_check_completion_enabled);
+        let mut state = TaskState {
+            double_check_completion_enabled: true,
+            ..Default::default()
+        };
         assert!(!state.double_check_completion_pending);
 
         let result = handler.execute(&mut state, serde_json::json!({"result": "Done!"}));
@@ -202,7 +203,10 @@ mod tests {
     #[tokio::test]
     async fn test_double_check_resets_after_success() {
         let handler = AttemptCompletionHandler::new();
-        let mut state = TaskState::default();
+        let mut state = TaskState {
+            double_check_completion_enabled: true,
+            ..Default::default()
+        };
 
         // First attempt: rejected
         let result = handler.execute(&mut state, serde_json::json!({"result": "Done!"}));

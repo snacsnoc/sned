@@ -3144,7 +3144,9 @@ impl AgentLoop {
                 ts: Some(chrono::Utc::now().timestamp_millis() as u64),
             });
 
-            let text_without_tools = response_text.as_ref().is_some_and(|t| !t.is_empty())
+            let text_without_tools = response_text
+                .as_ref()
+                .is_some_and(|text| !text.trim().is_empty())
                 && prepared_tool_calls.is_empty();
 
             if !prepared_tool_calls.is_empty() {
@@ -3152,14 +3154,11 @@ impl AgentLoop {
                 state.text_only_turns = 0;
             } else if text_without_tools {
                 let mut state = state_clone.lock().await;
-                let first_task_turn = state.turns_completed == 0;
                 state.text_only_turns = state.text_only_turns.saturating_add(1);
                 let text_only_turns = state.text_only_turns;
                 drop(state);
 
-                let first_turn_direct_answer = first_task_turn
-                    && self.config.mode == AgentMode::Act
-                    && !self.config.interactive_mode;
+                let act_mode = self.config.mode == AgentMode::Act;
                 let plan_active = self.plan_execution_active().await;
 
                 let did_tool_work = history.iter().any(|message| {
@@ -3169,11 +3168,20 @@ impl AgentLoop {
                             .any(|block| matches!(block, UserContentBlock::ToolResult(_))))
                 });
 
-                if (first_turn_direct_answer || did_tool_work || text_only_turns > 1)
-                    && !plan_active
+                let can_escalate_profile = self
+                    .deps
+                    .tool_profile
+                    .is_some_and(|profile| profile.escalate().is_some());
+                let act_progress_response = act_mode
+                    && response_text
+                        .as_deref()
+                        .is_some_and(is_progress_only_response);
+                if !plan_active
+                    && !act_progress_response
+                    && (text_only_turns > 1 || (act_mode && !can_escalate_profile) || did_tool_work)
                 {
                     text_only_completes_task = true;
-                } else if text_only_turns == 1 {
+                } else if !plan_active && (text_only_turns == 1 || act_progress_response) {
                     if let Some(profile) = self.deps.tool_profile
                         && let Some(next) = profile.escalate()
                     {
@@ -3188,20 +3196,34 @@ impl AgentLoop {
                         // escalated tool schemas.
                         self.deps.cached_system_prompt = None;
                     }
-                    let completion_instruction = match self.config.mode {
-                        AgentMode::Plan => "call plan_mode_respond",
-                        AgentMode::Act => "call attempt_completion",
-                    };
-                    history.push(StorageMessage {
-                        id: Some(Self::next_message_id(&self.message_counter)),
-                        role: MessageRole::User,
-                        content: MessageContent::Text(format!(
-                            "You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, {completion_instruction}.",
-                        )),
-                        model_info: None,
-                        metrics: None,
-                        ts: Some(chrono::Utc::now().timestamp_millis() as u64),
-                    });
+                    if act_progress_response {
+                        history.push(StorageMessage {
+                            id: Some(Self::next_message_id(&self.message_counter)),
+                            role: MessageRole::User,
+                            content: MessageContent::Text(
+                                "Continue the requested task. Use available tools if more work is needed; when finished, provide the result."
+                                    .to_string(),
+                            ),
+                            model_info: None,
+                            metrics: None,
+                            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                        });
+                    } else if !act_mode || can_escalate_profile {
+                        let completion_instruction = match self.config.mode {
+                            AgentMode::Plan => "call plan_mode_respond",
+                            AgentMode::Act => "call attempt_completion",
+                        };
+                        history.push(StorageMessage {
+                            id: Some(Self::next_message_id(&self.message_counter)),
+                            role: MessageRole::User,
+                            content: MessageContent::Text(format!(
+                                "You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, {completion_instruction}.",
+                            )),
+                            model_info: None,
+                            metrics: None,
+                            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                        });
+                    }
                 }
             }
         }
@@ -4867,6 +4889,72 @@ impl AgentLoop {
         self.retry_message_ids.lock().await.clear();
         self.message_queue.lock().await.clear();
     }
+}
+
+// Brief future-tense announcements of tool work are progress, not final answers.
+fn is_progress_only_response(text: &str) -> bool {
+    let normalized = text.trim().to_lowercase().replace('’', "'");
+    if normalized.lines().count() != 1 {
+        return false;
+    }
+
+    let Some(intention) = [
+        "i'll ",
+        "i will ",
+        "let me ",
+        "let's ",
+        "i'm going to ",
+        "i am going to ",
+    ]
+    .iter()
+    .find_map(|prefix| normalized.strip_prefix(prefix)) else {
+        return false;
+    };
+
+    intention.split_whitespace().take(8).any(|word| {
+        let word = word.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+        [
+            "update",
+            "modify",
+            "edit",
+            "write",
+            "create",
+            "fix",
+            "implement",
+            "change",
+            "add",
+            "remove",
+            "delete",
+            "replace",
+            "refactor",
+            "patch",
+            "apply",
+            "work",
+            "inspect",
+            "read",
+            "check",
+            "search",
+            "look",
+            "open",
+            "review",
+            "run",
+            "test",
+            "verif",
+            "examin",
+            "trace",
+            "analyz",
+            "analys",
+            "investigat",
+            "list",
+            "find",
+            "scan",
+            "compar",
+            "build",
+            "compil",
+        ]
+        .iter()
+        .any(|verb| word.starts_with(verb))
+    })
 }
 
 fn resolve_tool_profile(
@@ -9523,7 +9611,7 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let result = agent.execute_turn().await;
 
-        assert!(matches!(result, TurnResult::Continue));
+        assert!(matches!(result, TurnResult::Complete));
         let rendered = drain_rendered_output(&mut rx);
         assert!(
             rendered
@@ -9569,7 +9657,7 @@ Irrespective of whether additional information or instructions are given, you ar
         config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
         let mut agent = AgentLoop::new(config);
 
-        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
 
         let rendered = drain_rendered_output(&mut rx);
         assert!(
@@ -9610,7 +9698,7 @@ Irrespective of whether additional information or instructions are given, you ar
         config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
         let mut agent = AgentLoop::new(config);
 
-        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
 
         let rendered = drain_rendered_output(&mut rx);
         assert!(
@@ -9659,7 +9747,7 @@ Irrespective of whether additional information or instructions are given, you ar
         config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
         let mut agent = AgentLoop::new(config);
 
-        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
 
         let rendered = drain_rendered_output(&mut rx);
         assert!(
@@ -9697,7 +9785,7 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let result = agent.execute_turn().await;
 
-        assert!(matches!(result, TurnResult::Continue));
+        assert!(matches!(result, TurnResult::Complete));
         let rendered = drain_rendered_output(&mut rx);
         assert!(
             !rendered
@@ -10233,7 +10321,7 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let mut agent = AgentLoop::new(config);
         let result = agent.execute_turn().await;
-        assert!(matches!(result, TurnResult::Continue));
+        assert!(matches!(result, TurnResult::Complete));
 
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(events.iter().any(|event| {
@@ -10313,7 +10401,6 @@ Irrespective of whether additional information or instructions are given, you ar
         let mut config = test_agent_config(provider, "test-text-only-copy");
         config.output_writer = writer;
         let mut agent = AgentLoop::new(config);
-        agent.state.lock().await.text_only_turns = 1;
         assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
         let events = drain_output_events(&mut priority_rx, &mut rx);
         assert!(events.iter().any(
@@ -10460,10 +10547,10 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
-    async fn test_later_text_only_response_gets_one_bounded_nudge() {
+    async fn test_act_text_only_response_completes_without_a_nudge() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(Providers::Mock(
-                crate::providers::mock::MockProvider::single_text_response_repeat("I checked it."),
+                crate::providers::mock::MockProvider::single_text_response("I checked it."),
             )))),
             mode: AgentMode::Act,
             task_id: "test-text-only-nudge".to_string(),
@@ -10487,27 +10574,8 @@ Irrespective of whether additional information or instructions are given, you ar
         };
 
         let mut agent = AgentLoop::new(config);
-        {
-            let mut state = agent.state.lock().await;
-            state.turns_completed = 1;
-        }
-
-        let first_result = agent.execute_turn().await;
-        assert!(matches!(first_result, TurnResult::Continue));
-
-        {
-            let history = agent.conversation_history.lock().await;
-            assert_eq!(history.len(), 2);
-            assert_eq!(history[1].role, MessageRole::User);
-            match &history[1].content {
-                MessageContent::Text(text) => assert!(text.contains("use the required tool")),
-                other => panic!("expected text nudge, got {other:?}"),
-            }
-        }
-
-        let second_result = agent.execute_turn().await;
-        assert!(matches!(second_result, TurnResult::Complete));
-
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Complete));
         let history = agent.conversation_history.lock().await;
         let nudge_count = history
             .iter()
@@ -10518,7 +10586,57 @@ Irrespective of whether additional information or instructions are given, you ar
                 )
             })
             .count();
-        assert_eq!(nudge_count, 1);
+        assert_eq!(nudge_count, 0);
+    }
+
+    #[tokio::test]
+    async fn act_progress_text_continues_without_claiming_completion() {
+        assert!(is_progress_only_response("I'll inspect both files."));
+        assert!(is_progress_only_response("I'll update the file now."));
+
+        let responses = vec![
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "I'll update the file now.".to_string(),
+                id: None,
+                signature: None,
+            })],
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "The requested change is complete.".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-act-progress-text"));
+        agent
+            .conversation_history
+            .lock()
+            .await
+            .push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("Fix the issue in these files.".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        {
+            let history = agent.conversation_history.lock().await;
+            assert!(matches!(
+                &history.last().expect("continuation message").content,
+                MessageContent::Text(text)
+                    if text.contains("Continue the requested task")
+                        && !text.contains("You returned text without using a tool")
+            ));
+        }
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -10606,13 +10724,14 @@ Irrespective of whether additional information or instructions are given, you ar
         let provider = Arc::new(Providers::RecordingChunk(
             crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
         ));
-        let mut agent = AgentLoop::new(test_agent_config(provider, "test-system-prompt-cache"))
-            .with_system_prompt_context(SystemPromptContext {
-                cwd: Some("/tmp/cache-first".to_string()),
-                active_shell_is_posix: true,
-                enable_parallel_tool_calling: true,
-                ..Default::default()
-            });
+        let mut config = test_agent_config(provider, "test-system-prompt-cache");
+        config.mode = AgentMode::Plan;
+        let mut agent = AgentLoop::new(config).with_system_prompt_context(SystemPromptContext {
+            cwd: Some("/tmp/cache-first".to_string()),
+            active_shell_is_posix: true,
+            enable_parallel_tool_calling: true,
+            ..Default::default()
+        });
 
         assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
         agent.deps.system_prompt_context = Some(SystemPromptContext {
@@ -14716,7 +14835,9 @@ Irrespective of whether additional information or instructions are given, you ar
         let provider = Arc::new(Providers::RecordingChunk(
             crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
         ));
-        let mut agent = AgentLoop::new(test_agent_config(provider, "test-cumulative-tokens"));
+        let mut config = test_agent_config(provider, "test-cumulative-tokens");
+        config.mode = AgentMode::Plan;
+        let mut agent = AgentLoop::new(config);
 
         // Execute turn 1
         let result1 = agent.execute_turn().await;
@@ -14852,7 +14973,7 @@ Irrespective of whether additional information or instructions are given, you ar
         ));
         let mut agent = AgentLoop::new(test_agent_config(provider, "test-split-usage-context"));
 
-        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
 
         let state = agent.state.lock().await;
         let usage = state.last_api_req_info.as_ref().unwrap();
@@ -15359,10 +15480,7 @@ Irrespective of whether additional information or instructions are given, you ar
 
     #[tokio::test]
     async fn test_text_only_turn_steers_with_mode_appropriate_tool() {
-        for (mode, expected_tool) in [
-            (AgentMode::Act, "call attempt_completion"),
-            (AgentMode::Plan, "call plan_mode_respond"),
-        ] {
+        for mode in [AgentMode::Act, AgentMode::Plan] {
             let responses = vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
                 text: "I am thinking about the problem.".to_string(),
                 id: None,
@@ -15398,18 +15516,25 @@ Irrespective of whether additional information or instructions are given, you ar
             };
 
             let mut agent = AgentLoop::new(config);
-            let _ = agent.execute_turn().await;
+            let result = agent.execute_turn().await;
 
             let history = agent.conversation_history.lock().await;
-            let steering = history.last().expect("steering message in history");
-            match &steering.content {
-                MessageContent::Text(text) => {
-                    assert!(
-                        text.contains(expected_tool),
-                        "mode {mode:?} should mention {expected_tool}, got: {text}"
-                    );
+            if mode == AgentMode::Act {
+                assert!(matches!(result, TurnResult::Complete));
+                assert!(!history.iter().any(|message| matches!(
+                    &message.content,
+                    MessageContent::Text(text) if text.contains("You returned text without using a tool")
+                )));
+            } else {
+                assert!(matches!(result, TurnResult::Continue));
+                let steering = history.last().expect("plan steering message in history");
+                match &steering.content {
+                    MessageContent::Text(text) => assert!(
+                        text.contains("call plan_mode_respond"),
+                        "plan mode should mention plan_mode_respond, got: {text}"
+                    ),
+                    other => panic!("expected Text message, got {:?}", other),
                 }
-                other => panic!("expected Text message, got {:?}", other),
             }
         }
     }
@@ -15468,7 +15593,7 @@ Irrespective of whether additional information or instructions are given, you ar
         }
 
         let result = agent.execute_turn().await;
-        assert!(matches!(result, TurnResult::Continue));
+        assert!(matches!(result, TurnResult::Complete));
 
         let requests = requests.lock().unwrap();
         assert!(

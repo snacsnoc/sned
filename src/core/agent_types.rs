@@ -108,7 +108,7 @@ pub struct TaskState {
     pub did_automatically_retry_failed_api_request: bool,
     /// Current conversation history deleted range.
     pub conversation_history_deleted_range: Option<(usize, usize)>,
-    /// Whether double-check completion is enabled (default: true).
+    /// Whether double-check completion is enabled (default: false).
     pub double_check_completion_enabled: bool,
     /// Whether a double-check completion is currently pending (waiting for re-verification).
     pub double_check_completion_pending: bool,
@@ -245,7 +245,7 @@ impl Default for TaskState {
             reasoning_active: false,
             did_automatically_retry_failed_api_request: false,
             conversation_history_deleted_range: None,
-            double_check_completion_enabled: true,
+            double_check_completion_enabled: false,
             double_check_completion_pending: false,
             text_only_turns: 0,
             last_tool_batch_signature: None,
@@ -331,7 +331,7 @@ impl Default for AgentConfig {
             json_output: false,
             max_turns: 100,
             max_consecutive_mistakes: Some(DEFAULT_MAX_CONSECUTIVE_MISTAKES),
-            double_check_completion: true,
+            double_check_completion: false,
             timeout_secs: 30,
             track_changes: false,
             is_subagent_execution: false,
@@ -493,6 +493,12 @@ pub enum AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_double_check_completion_is_opt_in() {
+        assert!(!TaskState::default().double_check_completion_enabled);
+        assert!(!AgentConfig::default().double_check_completion);
+    }
 
     #[test]
     fn test_insert_file_content_preserves_recently_used_entries() {

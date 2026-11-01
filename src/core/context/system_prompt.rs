@@ -142,9 +142,7 @@ impl PromptBuilder {
                 prompt.push_str(" Create or overwrite complete files with `write_to_file`.");
             }
             if self.has_tool(SnedTool::EditFile) {
-                prompt.push_str(
-                    " Change existing files with `edit_file` or an available AST-aware tool.",
-                );
+                prompt.push_str(" Change existing files with `edit_file`.");
             }
             prompt.push('\n');
         }
@@ -161,8 +159,7 @@ impl PromptBuilder {
         }
         if self.has_tool(SnedTool::EditFile) {
             prompt.push_str(
-                "- For `edit_file`, use exact block mode (`old_text` + `new_text`) to replace a unique block of lines without anchors, or anchored mode (`anchor` + `text`) copying the exact anchor prefix and content from read_file (read lines show a 1-indexed line number first; omit the number when copying).\n\
-                 - In exact block mode, include enough unique surrounding lines in `old_text` to match unambiguously. In anchored mode, different prefixes distinguish identical-content occurrences in the current tracked state. Prefer batching independent edits from the same snapshot in one `edit_file` call, including in sequential tool mode, unless the task requires sequential edits. Explicit workflow requirements override batching defaults. Unchanged tracked occurrences retain their anchors across edits; a fresh read is not required for each edit. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; its snapshot anchors are inspection-only.\n\
+                "- For `edit_file`, use top-level `{path, old_text, new_text}` for one unique block replacement; use `files[]` for batches and anchored or revision-checked edits. For anchors, copy the exact anchor prefix and content from read_file; omit displayed line numbers. Include enough context for `old_text` to match once. Independent edits from the same snapshot can share a call; dependent edits use the updated result. Untouched tracked anchors remain valid. For oversized files, use the ranged read's sha256 revision with start_line, end_line, and expected_text.\n\
                  - In an `edit_file` edit, put replacement text in `text`; the optional `content` field is only an exact array of interior lines for duplicate-anchor disambiguation, never a replacement string.\n\
                  - After a stale or unknown anchor error, call `read_file` again before retrying. Correct malformed input, whitespace mismatches, overlaps, and duplicate insertions without rereading unless the returned recovery metadata explicitly requires it.\n",
             );
@@ -186,7 +183,7 @@ impl PromptBuilder {
 
         if is_act && self.has_tool(SnedTool::AttemptCompletion) {
             prompt.push_str(
-                "- In ACT mode, perform the task and finish with `attempt_completion`.\n",
+                "- In ACT mode, complete the task using tools as needed, then provide a final text response or call `attempt_completion`.\n",
             );
         }
         if is_plan && self.has_tool(SnedTool::PlanModeRespond) {
@@ -341,10 +338,12 @@ mod tests {
             prompt.contains("Absolute paths outside the workspace require explicit user approval")
         );
         assert!(prompt.contains("If no tools are needed or available, answer directly in text"));
-        assert!(prompt.contains("copying the exact anchor prefix and content"));
-        assert!(prompt.contains("Unchanged tracked occurrences retain their anchors"));
+        assert!(prompt.contains("copy the exact anchor prefix and content"));
+        assert!(prompt.contains("Untouched tracked anchors remain valid"));
         assert!(!prompt.lines().any(|line| line.starts_with('\\')));
         assert!(prompt.contains("In ACT mode"));
+        assert!(prompt.contains("provide a final text response or call `attempt_completion`"));
+        assert!(!prompt.contains("finish with `attempt_completion`"));
         assert!(!prompt.contains("PLAN mode"));
         // Environment info is now provided by context_loader, not in system prompt
         assert!(!prompt.contains("ENVIRONMENT"));
@@ -547,9 +546,8 @@ mod tests {
         };
         let prompt = PromptBuilder::new(context).build();
         eprintln!("validate prompt bytes: {}", prompt.len());
-        assert!(prompt.contains("same snapshot in one `edit_file` call"));
-        assert!(prompt.contains("ranged read's complete sha256 revision"));
-        assert!(prompt.contains("snapshot anchors are inspection-only"));
+        assert!(prompt.contains("same snapshot can share"));
+        assert!(prompt.contains("ranged read's sha256 revision"));
         assert!(
             prompt.len() < 8850,
             "validate prompt is {} bytes, budget 8850",
@@ -605,10 +603,7 @@ mod tests {
         };
         let prompt = PromptBuilder::new(context).build();
         assert!(prompt.contains("Use tools sequentially"));
-        assert!(prompt.contains("including in sequential tool mode"));
-        assert!(prompt.contains("unless the task requires sequential edits"));
-        assert!(prompt.contains("Explicit workflow requirements override batching defaults"));
-        assert!(!prompt.contains("Prefer batching independent tool calls"));
+        assert!(!prompt.contains("Independent tool calls may be batched"));
     }
 
     #[test]

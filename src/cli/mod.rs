@@ -337,7 +337,7 @@ pub struct TaskOptions {
     #[arg(long, hide_short_help = true)]
     pub json: bool,
 
-    /// Reject first completion attempt to force re-verification
+    /// Reject first completion attempt to force re-verification (disabled by default)
     #[arg(long, hide_short_help = true)]
     pub double_check_completion: bool,
 
