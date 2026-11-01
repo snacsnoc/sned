@@ -14,12 +14,13 @@ use crate::core::tools::{
 use futures::stream::{self, StreamExt};
 use std::future::Future;
 use std::pin::Pin;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 
 use std::path::Path;
 
 const MAX_FILES_LIMIT: usize = 200;
 const MAX_CONCURRENT_LINE_COUNTS: usize = 32;
+const MAX_LINE_COUNT_BYTES: u64 = 512 * 1024;
 
 /// Information about a listed file or directory.
 #[derive(Debug, Clone)]
@@ -523,24 +524,26 @@ fn should_ignore_file(path: &Path) -> bool {
     false
 }
 
-/// Count lines in a file using BufReader (avoids loading entire file into memory).
-///
-/// Uses `tokio::io::BufReader` + `read_line` loop to count newlines
-/// without allocating the full file content.
 async fn count_lines_fast(path: &Path) -> Option<usize> {
-    let file = tokio::fs::File::open(path).await.ok()?;
-    let mut reader = BufReader::new(file);
-    let mut count: usize = 0;
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        match reader.read_line(&mut buf).await {
-            Ok(0) => break, // EOF
-            Ok(_) => count += 1,
-            Err(_) => return None,
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let metadata = tokio::fs::metadata(path).await.ok()?;
+        if !metadata.is_file() || metadata.len() > MAX_LINE_COUNT_BYTES {
+            return None;
         }
-    }
-    Some(count)
+        let file = tokio::fs::File::open(path).await.ok()?;
+        let mut bytes = Vec::new();
+        file.take(MAX_LINE_COUNT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .ok()?;
+        if bytes.len() as u64 > MAX_LINE_COUNT_BYTES {
+            return None;
+        }
+        Some(std::str::from_utf8(&bytes).ok()?.lines().count())
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]
@@ -550,6 +553,18 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn line_counts_are_bounded_and_preserve_text_semantics() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sample");
+        fs::write(&path, "first\nsecond").unwrap();
+        assert_eq!(count_lines_fast(&path).await, Some(2));
+        fs::write(&path, [0xff, b'\n']).unwrap();
+        assert_eq!(count_lines_fast(&path).await, None);
+        fs::write(&path, vec![b'x'; MAX_LINE_COUNT_BYTES as usize + 1]).unwrap();
+        assert_eq!(count_lines_fast(&path).await, None);
+    }
 
     #[tokio::test]
     async fn test_list_files_top_level() {
