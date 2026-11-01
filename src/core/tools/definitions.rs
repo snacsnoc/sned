@@ -66,6 +66,7 @@ impl ToolSchema {
         let parameters = if properties.is_empty() {
             serde_json::json!({
                 "type": "object",
+                "properties": {},
             })
         } else {
             serde_json::json!({
@@ -1045,6 +1046,15 @@ fn is_symbol_prompt(lower: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_parameter_schema_includes_properties() {
+        let schema = super::list_skills_schema()
+            .to_tool_definition()
+            .function
+            .parameters;
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"], serde_json::json!({}));
+    }
     use super::*;
 
     #[test]
