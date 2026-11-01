@@ -1692,6 +1692,23 @@ impl ExecuteCommandHandler {
         json_output: bool,
         output_writer: &crate::cli::output::OutputWriterArc,
     ) -> Result<String, ToolError> {
+        let commands_value = params.get("commands");
+        let script_value = params.get("script");
+        if commands_value.is_some() && script_value.is_some() {
+            return Err(ToolError::InvalidInput(
+                "Provide exactly one of {commands, script}".to_string(),
+            ));
+        }
+
+        if let Some(value) = commands_value
+            && let Some(values) = value.as_array()
+            && !values.iter().all(serde_json::Value::is_string)
+        {
+            return Err(ToolError::InvalidInput(
+                "`commands` must be a JSON array of command strings (e.g. `[\"ls\"]`)".to_string(),
+            ));
+        }
+
         if params
             .get("commands")
             .and_then(serde_json::Value::as_str)
@@ -1713,12 +1730,6 @@ impl ExecuteCommandHandler {
         let script = params["script"].as_str();
         let language = params["language"].as_str().unwrap_or("bash");
         let raw_output = params["raw_output"].as_bool().unwrap_or(false);
-
-        if commands.is_some() && script.is_some_and(|s| !s.trim().is_empty()) {
-            return Err(ToolError::InvalidInput(
-                "Provide exactly one of {commands, script}".to_string(),
-            ));
-        }
 
         let result = if let Some(cmds) = commands {
             self.execute_commands_with_safety(
@@ -2031,6 +2042,37 @@ mod tests {
             )
             .await
             .expect_err("providing both commands and script must fail");
+        assert!(
+            err.to_string()
+                .contains("Provide exactly one of {commands, script}"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_malformed_commands_with_script() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let params = serde_json::json!({
+            "commands": [1],
+            "script": "echo world"
+        });
+
+        let err = handler
+            .execute_without_state(
+                None,
+                params,
+                None,
+                false,
+                false,
+                None,
+                None,
+                false,
+                &output_writer,
+            )
+            .await
+            .expect_err("malformed commands plus script must fail before execution");
         assert!(
             err.to_string()
                 .contains("Provide exactly one of {commands, script}"),

@@ -847,28 +847,43 @@ async fn resolve_preflight(
     let command_scopes = (tool_name == "execute_command")
         .then(|| crate::core::approval::command_approval_scopes(tool_params))
         .flatten();
+
+    // Subagents are default-deny for shell commands. Treat a missing
+    // approval manager as non-YOLO instead of allowing the command through.
+    let is_subagent = if tool_name == "execute_command" {
+        inputs.state.lock().await.is_subagent_execution
+    } else {
+        false
+    };
+    let manager_is_yolo = if is_subagent {
+        match &inputs.approval_manager {
+            Some(approval_mgr) => approval_mgr.lock().await.is_yolo_mode(),
+            None => false,
+        }
+    } else {
+        false
+    };
+    if is_subagent && !manager_is_yolo {
+        let mut state = inputs.state.lock().await;
+        state.record_denied_tool_action(DeniedToolAction {
+            tool_name: tool_name.to_string(),
+            action_paths: action_paths.clone(),
+            params_fingerprint: params_fingerprint.clone(),
+        });
+        return PreflightDecision::Denied(ToolExecutionOutput::error(
+            crate::core::approval::format_denial_message_with_context(tool_name, true),
+            Some(ToolFailureMetadata {
+                class: ToolFailureClass::ApprovalDenied,
+                affected_paths: action_paths,
+                required_next_step: Some(ToolRequiredNextStep::AskUser),
+            }),
+        ));
+    }
+
     let approval_result = if let Some(ref approval_mgr) = inputs.approval_manager {
         tracing::debug!(tool = %tool_name, "waiting for approval manager");
         let mgr = approval_mgr.lock().await;
         tracing::debug!(tool = %tool_name, "acquired approval manager");
-        if tool_name == "execute_command" && !mgr.is_yolo_mode() {
-            let mut state = inputs.state.lock().await;
-            if state.is_subagent_execution {
-                state.record_denied_tool_action(DeniedToolAction {
-                    tool_name: tool_name.to_string(),
-                    action_paths: action_paths.clone(),
-                    params_fingerprint: params_fingerprint.clone(),
-                });
-                return PreflightDecision::Denied(ToolExecutionOutput::error(
-                    crate::core::approval::format_denial_message_with_context(tool_name, true),
-                    Some(ToolFailureMetadata {
-                        class: ToolFailureClass::ApprovalDenied,
-                        affected_paths: action_paths,
-                        required_next_step: Some(ToolRequiredNextStep::AskUser),
-                    }),
-                ));
-            }
-        }
         allowed_external_roots =
             mgr.external_directory_grants_for(tool.category(), &external_directories);
         let external_needs_prompt = !external_directories.is_empty()
@@ -1417,5 +1432,64 @@ mod tests {
         // A prepared call with no outcome at all fails closed, not dropped.
         assert_eq!(outcomes[2].tool_id, "call_3");
         assert!(outcomes[2].output.is_error);
+    }
+
+    #[tokio::test]
+    async fn subagent_command_denied_without_approval_manager() {
+        let state = Arc::new(Mutex::new(TaskState {
+            is_subagent_execution: true,
+            ..Default::default()
+        }));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let tool_context = Arc::new(ToolContext::new(
+            state.clone(),
+            None,
+            std::env::current_dir().unwrap(),
+            crate::core::file_editor::AnchorStateManager::new(),
+            false,
+            "subagent-command-denial".to_string(),
+            None,
+            false,
+            output_writer.clone(),
+            false,
+        ));
+        let inputs = ToolBatchInputs {
+            mode: AgentMode::Act,
+            state,
+            tool_profile: None,
+            registry: None,
+            approval_manager: None,
+            output_writer,
+            interactive_mode: false,
+            tool_context,
+            hook_manager: None,
+            config: AgentConfig::default(),
+            conversation_history: Arc::new(Mutex::new(Vec::new())),
+            task_storage: None,
+            scoped_rules_added: false,
+            parallel_enabled: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let decision = resolve_preflight(
+            &inputs,
+            SnedTool::ExecuteCommand,
+            "execute_command",
+            &serde_json::json!({"commands": ["echo ok"]}),
+            Arc::new(crate::core::tools::handlers::execute_command::ExecuteCommandHandler::new()),
+            vec![],
+            vec![],
+            "fingerprint".to_string(),
+        )
+        .await;
+
+        let PreflightDecision::Denied(output) = decision else {
+            panic!("subagent command must be denied without an approval manager");
+        };
+        assert!(output.is_error);
+        assert!(
+            output
+                .text
+                .contains("commands and external writes are disabled")
+        );
     }
 }
