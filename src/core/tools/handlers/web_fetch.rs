@@ -444,17 +444,37 @@ fn html_to_text(html: &str) -> String {
         let ch = chars[i];
 
         if ch == '<' {
-            let rest: String = chars[i + 1..].iter().take(20).collect();
-            let tag_start = rest.to_lowercase();
-
-            if tag_start.starts_with("script") {
+            let tag_is = |tag: &str| {
+                let tail = &chars[i + 1..];
+                tail.len() >= tag.len()
+                    && tail
+                        .iter()
+                        .zip(tag.chars())
+                        .all(|(a, b)| a.eq_ignore_ascii_case(&b))
+                    && tail
+                        .get(tag.len())
+                        .is_none_or(|c| c.is_whitespace() || *c == '>' || *c == '/')
+            };
+            if in_script {
+                if tag_is("/script") {
+                    in_script = false;
+                    in_tag = true;
+                }
+                i += 1;
+                continue;
+            }
+            if in_style {
+                if tag_is("/style") {
+                    in_style = false;
+                    in_tag = true;
+                }
+                i += 1;
+                continue;
+            }
+            if tag_is("script") {
                 in_script = true;
-            } else if tag_start.starts_with("style") {
+            } else if tag_is("style") {
                 in_style = true;
-            } else if tag_start.starts_with("/script") {
-                in_script = false;
-            } else if tag_start.starts_with("/style") {
-                in_style = false;
             }
 
             in_tag = true;
@@ -463,14 +483,6 @@ fn html_to_text(html: &str) -> String {
         }
 
         if in_script || in_style {
-            if ch == '>' {
-                let rest: String = chars[i + 1..].iter().take(10).collect();
-                if rest.to_lowercase().starts_with("</script") {
-                    in_script = false;
-                } else if rest.to_lowercase().starts_with("</style") {
-                    in_style = false;
-                }
-            }
             i += 1;
             continue;
         }
@@ -519,6 +531,12 @@ fn html_to_text(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_text_ignores_script_and_style_without_hiding_similar_tags() {
+        let html = "<p>before</p><script>const x = '<style>'; </SCRIPT><style>x{}</style><scripture>after</scripture>";
+        assert_eq!(html_to_text(html), "beforeafter");
+    }
 
     #[tokio::test]
     async fn async_resolution_keeps_ip_validation() {
