@@ -4098,7 +4098,7 @@ impl App {
         let Some(receiver) = self.layout_reflow_rx.as_ref() else {
             return;
         };
-        let result = match receiver.try_recv() {
+        let mut result = match receiver.try_recv() {
             Ok(result) => result,
             Err(std_mpsc::TryRecvError::Empty) => return,
             Err(std_mpsc::TryRecvError::Disconnected) => {
@@ -4131,8 +4131,117 @@ impl App {
             && result.error_lines.iter().eq(self.error_lines.iter());
 
         if !snapshot_matches {
-            self.needs_redraw = true;
-            return;
+            let current_len = self.output_lines.len();
+            let old_len = result.output_lines.len();
+            let can_reconcile = result.wrap_width == self.last_wrap_width()
+                && result.error_lines.is_empty()
+                && self.error_lines.is_empty()
+                && current_len == self.output_line_ids.len()
+                && current_len == self.output_line_kinds.len()
+                && old_len == result.output_ids.len()
+                && old_len == result.output_kinds.len();
+            let evicted = self
+                .output_line_ids
+                .front()
+                .and_then(|first| {
+                    result
+                        .output_ids
+                        .iter()
+                        .take(129)
+                        .position(|id| id == first)
+                })
+                .unwrap_or(0);
+            let retained_old_len = old_len.saturating_sub(evicted);
+            let common = if can_reconcile {
+                result
+                    .output_lines
+                    .iter()
+                    .skip(evicted)
+                    .zip(&self.output_lines)
+                    .zip(
+                        result
+                            .output_ids
+                            .iter()
+                            .skip(evicted)
+                            .zip(&self.output_line_ids),
+                    )
+                    .zip(
+                        result
+                            .output_kinds
+                            .iter()
+                            .skip(evicted)
+                            .zip(&self.output_line_kinds),
+                    )
+                    .take_while(|(((old, new), (old_id, new_id)), (old_kind, new_kind))| {
+                        old == new && old_id == new_id && old_kind == new_kind
+                    })
+                    .count()
+            } else {
+                0
+            };
+            // shortcut: large concurrent changes restart reflow; use chunked reconciliation if this stalls sustained bursts.
+            if !can_reconcile
+                || retained_old_len.saturating_sub(common) > 128
+                || current_len.saturating_sub(common) > 256
+            {
+                self.needs_redraw = true;
+                return;
+            }
+
+            for index in 0..evicted {
+                let separator = result.output_lines.get(index + 1).is_some_and(|next| {
+                    Self::should_insert_separator_for_lines(
+                        result.output_kinds[index],
+                        Some(&result.output_lines[index]),
+                        result.output_kinds[index + 1],
+                        next,
+                    )
+                });
+                if result
+                    .index
+                    .evict_front_output(result.wrap_width, old_len - index, separator)
+                    .is_none()
+                {
+                    self.needs_redraw = true;
+                    return;
+                }
+            }
+            if common < retained_old_len {
+                let mut start = result.index.output_entry_positions[common];
+                if start > result.index.front_entry
+                    && result.index.entries[start - 1].source == LayoutSource::Separator
+                {
+                    start -= 1;
+                }
+                result.index.entries.truncate(start);
+                while result.index.row_index.values.len() > start {
+                    result.index.row_index.truncate_last();
+                }
+                result.index.output_entry_positions.truncate(common);
+            }
+            for index in common..current_len {
+                let line = &self.output_lines[index];
+                let kind = self.output_line_kinds[index];
+                if index > 0
+                    && Self::should_insert_separator_for_lines(
+                        self.output_line_kinds[index - 1],
+                        Some(&self.output_lines[index - 1]),
+                        kind,
+                        line,
+                    )
+                {
+                    result.index.append_entry(LayoutEntry {
+                        source: LayoutSource::Separator,
+                        kind: BlockKind::Separator,
+                        rows: 1,
+                    });
+                }
+                result.index.append_output_entry(LayoutEntry {
+                    source: LayoutSource::Output(index + result.index.base_output_index),
+                    kind,
+                    rows: Self::output_row_visual_rows(Some(line), kind, result.wrap_width),
+                });
+            }
         }
 
         let total = result.index.total_rows();
@@ -6534,7 +6643,7 @@ mod tests {
     }
 
     #[test]
-    fn background_reflow_rejects_changed_output_with_same_line_id() {
+    fn background_reflow_reconciles_changed_output_with_same_line_id() {
         let mut app = App::new();
         app.set_content_width(120);
         for index in 0..ASYNC_LAYOUT_REFLOW_THRESHOLD.saturating_sub(2) {
@@ -6556,11 +6665,75 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(app.layout_reflow_rx.is_none());
-        assert!(
-            !app.visual_layout_index
-                .is_valid_for(App::content_wrap_width(24))
+        let width = App::content_wrap_width(24);
+        assert!(app.visual_layout_index.is_valid_for(width));
+        let expected = App::build_visual_layout_index(
+            app.output_lines.iter(),
+            app.output_line_kinds.iter().copied(),
+            app.error_lines.iter(),
+            width,
         );
+        assert_eq!(app.visual_layout_index, expected);
         assert!(app.needs_redraw);
+    }
+
+    #[test]
+    fn background_reflow_reconciles_streamed_tail() {
+        let mut app = App::new();
+        app.set_content_width(120);
+        for index in 0..ASYNC_LAYOUT_REFLOW_THRESHOLD {
+            app.push_plain(format!("row {index}"));
+        }
+        app.push_stream_line(Line::from("partial"), StreamKind::Model);
+        app.set_content_width(24);
+        let width = App::content_wrap_width(24);
+        assert!(app.start_layout_reflow(width));
+        app.replace_last_stream_line(
+            Line::from("updated streamed model output"),
+            StreamKind::Model,
+        );
+        app.push_output_with_kind(Line::from("tool output"), BlockKind::ToolOutput);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.layout_reflow_rx.is_some() && Instant::now() < deadline {
+            app.poll_layout_reflow();
+            std::thread::yield_now();
+        }
+        assert!(app.layout_reflow_rx.is_none());
+        assert!(app.visual_layout_index.is_valid_for(width));
+        let expected = App::build_visual_layout_index(
+            app.output_lines.iter(),
+            app.output_line_kinds.iter().copied(),
+            app.error_lines.iter(),
+            width,
+        );
+        assert_eq!(app.visual_layout_index, expected);
+    }
+
+    #[test]
+    fn background_reflow_reconciles_capped_transcript_eviction() {
+        let mut app = App::new();
+        app.set_content_width(120);
+        for index in 0..10_000 {
+            app.push_plain(format!("row {index}"));
+        }
+        app.set_content_width(24);
+        let width = App::content_wrap_width(24);
+        assert!(app.start_layout_reflow(width));
+        app.push_plain("new streamed line");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.layout_reflow_rx.is_some() && Instant::now() < deadline {
+            app.poll_layout_reflow();
+            std::thread::yield_now();
+        }
+        assert!(app.layout_reflow_rx.is_none());
+        assert!(app.visual_layout_index.is_valid_for(width));
+        let expected = App::build_visual_layout_index(
+            app.output_lines.iter(),
+            app.output_line_kinds.iter().copied(),
+            app.error_lines.iter(),
+            width,
+        );
+        assert_eq!(app.visual_layout_index, expected);
     }
 
     #[test]
