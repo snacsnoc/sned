@@ -770,6 +770,7 @@ pub fn get_active_tool_definitions() -> Vec<ToolDefinition> {
 /// model-side planning, which directly reduces wall time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ToolProfile {
+    LeanAct,
     DirectAnswer,
     AnswerOnly,
     WriteOnly,
@@ -789,13 +790,36 @@ impl ToolProfile {
             Self::DirectAnswer => Some(Self::AnswerOnly),
             Self::AnswerOnly => Some(Self::WriteOnly),
             Self::WriteOnly => Some(Self::CoreEdit),
-            Self::CoreEdit | Self::Validate | Self::Symbol | Self::Plan | Self::Full => None,
+            Self::LeanAct
+            | Self::CoreEdit
+            | Self::Validate
+            | Self::Symbol
+            | Self::Plan
+            | Self::Full => None,
         }
     }
 
     #[must_use]
     pub fn tools(self) -> &'static [SnedTool] {
         match self {
+            Self::LeanAct => &[
+                SnedTool::ReadFile,
+                SnedTool::WriteToFile,
+                SnedTool::ListFiles,
+                SnedTool::SearchFiles,
+                SnedTool::EditFile,
+                SnedTool::ExecuteCommand,
+                SnedTool::AskFollowupQuestion,
+                SnedTool::AttemptCompletion,
+                SnedTool::ReplaceSymbol,
+                SnedTool::RenameSymbol,
+                SnedTool::UseSubagents,
+                SnedTool::UseSkill,
+                SnedTool::ListSkills,
+                SnedTool::DiagnosticsScan,
+                SnedTool::Condense,
+                SnedTool::WebFetch,
+            ],
             Self::DirectAnswer => &[],
             Self::AnswerOnly => &[SnedTool::AttemptCompletion, SnedTool::AskFollowupQuestion],
             Self::WriteOnly => &[
@@ -893,173 +917,32 @@ pub fn get_tool_definitions_for_profile(profile: ToolProfile) -> Vec<ToolDefinit
         .collect()
 }
 
-/// Selects a tool profile based on the user prompt and mode.
-///
-/// Heuristic classification:
-/// - DirectAnswer: obvious answer-only prompts (math, factual, greetings)
-/// - WriteOnly: "create/write/generate file(s)" without mention of existing code
-/// - CoreEdit: "modify/fix/refactor/patch" existing files
-/// - Validate: tasks requesting validation (run tests, lint, check)
-/// - Symbol: rename/reference/symbol tasks
-/// - Full: anything complex, multi-step, or ambiguous
+/// Selects the compact ACT profile unless the prompt explicitly asks for a
+/// symbol tool; those requests need the larger profile, which keeps command access.
 #[must_use]
 pub fn select_tool_profile(prompt: &str, mode: &str) -> ToolProfile {
-    let lower = prompt.to_lowercase();
-
     if mode == "plan" {
         return ToolProfile::Plan;
     }
-
-    let is_answer_only = is_answer_only_prompt(&lower);
-    let is_write_only = is_write_only_prompt(&lower);
-    let is_edit_task = is_edit_prompt(&lower);
-    let is_validate_task = is_validate_prompt(&lower);
-    let is_symbol_task = is_symbol_prompt(&lower);
-
-    if is_symbol_task && !is_edit_task && !is_write_only {
-        return ToolProfile::Symbol;
-    }
-    if is_validate_task && !is_write_only {
-        return ToolProfile::Validate;
-    }
-    if lower.contains("execute_command")
-        || lower.contains("execute ")
-        || lower.contains("run ")
-        || lower.contains("psql")
+    let lower = prompt.to_lowercase();
+    if [
+        "get_function",
+        "get_file_skeleton",
+        "find_symbol_references",
+        "rename_symbol",
+        "replace_symbol",
+        "symbol references",
+        "file skeleton",
+        "rename symbol",
+        "replace symbol",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
     {
-        return ToolProfile::Full;
+        ToolProfile::Full
+    } else {
+        ToolProfile::LeanAct
     }
-    if is_edit_task && !is_write_only {
-        return ToolProfile::CoreEdit;
-    }
-    if is_write_only && !is_edit_task {
-        return ToolProfile::WriteOnly;
-    }
-    if is_answer_only && !is_write_only && !is_edit_task {
-        return ToolProfile::DirectAnswer;
-    }
-
-    ToolProfile::Full
-}
-
-fn is_answer_only_prompt(lower: &str) -> bool {
-    let short = lower.len() < 120;
-    let needs_context_or_execution = lower.contains("file")
-        || lower.contains("create")
-        || lower.contains("write")
-        || lower.contains("generate")
-        || lower.contains("implement")
-        || lower.contains("build")
-        || lower.contains("refactor")
-        || lower.contains("fix")
-        || lower.contains("debug")
-        || lower.contains("patch")
-        || lower.contains("modify")
-        || lower.contains("database")
-        || lower.contains("postgres")
-        || lower.contains("sql")
-        || lower.contains("query")
-        || lower.contains("command")
-        || lower.contains("shell");
-
-    if !short || needs_context_or_execution {
-        return false;
-    }
-
-    let math_like = lower.contains("what is ")
-        || lower.contains("calculate")
-        || lower.contains("compute")
-        || lower.contains(" + ")
-        || lower.contains(" - ")
-        || lower.contains(" * ")
-        || lower.contains(" / ")
-        || lower.contains("how many")
-        || lower.contains("how much");
-
-    let factual = lower.starts_with("who ")
-        || lower.starts_with("what ")
-        || lower.starts_with("where ")
-        || lower.starts_with("when ")
-        || lower.starts_with("why ")
-        || lower.starts_with("is ")
-        || lower.starts_with("are ")
-        || lower.starts_with("does ")
-        || lower.starts_with("can ")
-        || lower.starts_with("explain ")
-        || lower.starts_with("define ")
-        || lower.starts_with("describe ")
-        || lower.starts_with("tell me ");
-
-    math_like || factual
-}
-
-fn is_write_only_prompt(lower: &str) -> bool {
-    let has_create = lower.contains("create")
-        || lower.contains("write")
-        || lower.contains("generate")
-        || lower.contains("scaffold");
-    let has_file = lower.contains("file")
-        || lower.contains(".py")
-        || lower.contains(".rs")
-        || lower.contains(".ts")
-        || lower.contains(".js")
-        || lower.contains(".go")
-        || lower.contains(".java")
-        || lower.contains("source file")
-        || lower.contains("named `");
-
-    let has_edit_keywords = lower.contains("modify")
-        || lower.contains("edit")
-        || lower.contains("fix")
-        || lower.contains("refactor")
-        || lower.contains("patch")
-        || lower.contains("update")
-        || lower.contains("change existing")
-        || lower.contains("in the existing")
-        || lower.contains("read_file")
-        || lower.contains("edit_file");
-
-    has_create && has_file && !has_edit_keywords
-}
-
-fn is_edit_prompt(lower: &str) -> bool {
-    lower.contains("modify")
-        || lower.contains("edit ")
-        || lower.contains("fix ")
-        || lower.contains("refactor")
-        || lower.contains("patch")
-        || lower.contains("update the")
-        || lower.contains("change the")
-        || lower.contains("change existing")
-        || lower.contains("in the existing")
-        || lower.contains("update existing")
-}
-
-fn is_validate_prompt(lower: &str) -> bool {
-    if ["do not", "don't", "never", "avoid", "without"]
-        .iter()
-        .any(|phrase| lower.contains(phrase))
-    {
-        return false;
-    }
-    lower.contains("run test")
-        || lower.contains("run the test")
-        || lower.contains("lint")
-        || lower.contains("check if")
-        || lower.contains("validate")
-        || lower.contains("verify")
-        || lower.contains("diagnostics")
-}
-
-fn is_symbol_prompt(lower: &str) -> bool {
-    lower.contains("rename ")
-        || lower.contains("find all references")
-        || lower.contains("find references")
-        || lower.contains("symbol reference")
-        || lower.contains("replace symbol")
-        || lower.contains("rename symbol")
-        || lower.contains("find where ")
-            && (lower.contains("used") || lower.contains("called") || lower.contains("referenced"))
 }
 
 #[cfg(test)]
@@ -1433,6 +1316,19 @@ mod tests {
         assert!(ToolProfile::Symbol.tools().len() >= 9);
         assert_eq!(ToolProfile::Plan.tools().len(), 15);
         assert_eq!(ToolProfile::Full.tools().len(), 19);
+        assert_eq!(ToolProfile::LeanAct.tools().len(), 16);
+        assert!(
+            ToolProfile::LeanAct
+                .tools()
+                .contains(&SnedTool::ExecuteCommand)
+        );
+        for ast_tool in [
+            SnedTool::GetFunction,
+            SnedTool::GetFileSkeleton,
+            SnedTool::FindSymbolReferences,
+        ] {
+            assert!(!ToolProfile::LeanAct.tools().contains(&ast_tool));
+        }
     }
 
     #[test]
@@ -1441,6 +1337,7 @@ mod tests {
         let answer = get_tool_definitions_for_profile(ToolProfile::AnswerOnly);
         let write = get_tool_definitions_for_profile(ToolProfile::WriteOnly);
         let core = get_tool_definitions_for_profile(ToolProfile::CoreEdit);
+        let lean_act = get_tool_definitions_for_profile(ToolProfile::LeanAct);
         let validate = get_tool_definitions_for_profile(ToolProfile::Validate);
         let symbol = get_tool_definitions_for_profile(ToolProfile::Symbol);
         let full = get_tool_definitions_for_profile(ToolProfile::Full);
@@ -1455,6 +1352,7 @@ mod tests {
         let answer_bytes = json_bytes(&answer);
         let write_bytes = json_bytes(&write);
         let core_bytes = json_bytes(&core);
+        let lean_act_bytes = json_bytes(&lean_act);
         let validate_bytes = json_bytes(&validate);
         let symbol_bytes = json_bytes(&symbol);
         let full_bytes = json_bytes(&full);
@@ -1537,6 +1435,7 @@ mod tests {
         assert!(answer_bytes < write_bytes);
         assert!(write_bytes < core_bytes);
         assert!(core_bytes <= validate_bytes);
+        assert!(lean_act_bytes < full_bytes);
         assert!(validate_bytes <= full_bytes);
     }
 
@@ -1563,19 +1462,21 @@ mod tests {
     }
 
     #[test]
-    fn test_select_tool_profile_direct_answer() {
-        assert_eq!(
-            select_tool_profile("What is 2 + 2?", "act"),
-            ToolProfile::DirectAnswer
-        );
-        assert_eq!(
-            select_tool_profile("how many legs does a dog have?", "act"),
-            ToolProfile::DirectAnswer
-        );
-        assert_eq!(
-            select_tool_profile("is Rust memory safe?", "act"),
-            ToolProfile::DirectAnswer
-        );
+    fn ordinary_act_requests_keep_the_default_tool_profile() {
+        for prompt in [
+            "What is 2 + 2?",
+            "How many legs does a dog have?",
+            "Is Rust memory safe?",
+            "Create a Rust source file named `even_sum.rs`.",
+            "Fix the off-by-one error in main.rs",
+            "Run the tests and fix any failures",
+        ] {
+            assert_eq!(
+                select_tool_profile(prompt, "act"),
+                ToolProfile::LeanAct,
+                "{prompt}"
+            );
+        }
     }
 
     #[test]
@@ -1591,67 +1492,71 @@ mod tests {
                 profile.tools().contains(&SnedTool::ExecuteCommand),
                 "{prompt}: {profile:?}"
             );
-            if prompt.starts_with("Read-only") {
-                assert_eq!(profile, ToolProfile::Full);
-            }
+            assert_eq!(profile, ToolProfile::LeanAct);
         }
     }
 
     #[test]
-    fn test_select_tool_profile_write_only() {
+    fn write_requests_keep_the_default_tool_profile() {
         assert_eq!(
             select_tool_profile("Create a Rust source file named `even_sum.rs`.", "act"),
-            ToolProfile::WriteOnly
+            ToolProfile::LeanAct
         );
         assert_eq!(
             select_tool_profile(
                 "Create exactly these source files in the current directory:\n- async_user_api.py\n- test_async_user_api.py",
                 "act"
             ),
-            ToolProfile::WriteOnly
+            ToolProfile::LeanAct
         );
     }
 
     #[test]
-    fn test_select_tool_profile_core_edit() {
+    fn edit_requests_keep_the_default_tool_profile() {
         assert_eq!(
             select_tool_profile("Fix the off-by-one error in main.rs", "act"),
-            ToolProfile::CoreEdit
+            ToolProfile::LeanAct
         );
         assert_eq!(
             select_tool_profile("Refactor the auth module to use traits", "act"),
-            ToolProfile::CoreEdit
+            ToolProfile::LeanAct
         );
         assert_eq!(
             select_tool_profile("Modify the config parser to accept YAML", "act"),
-            ToolProfile::CoreEdit
+            ToolProfile::LeanAct
         );
     }
 
     #[test]
-    fn test_select_tool_profile_validate() {
+    fn validation_requests_keep_the_default_tool_profile() {
         assert_eq!(
             select_tool_profile("Run the tests and fix any failures", "act"),
-            ToolProfile::Validate
+            ToolProfile::LeanAct
         );
         assert_eq!(
             select_tool_profile("Lint the codebase and fix warnings", "act"),
-            ToolProfile::Validate
+            ToolProfile::LeanAct
         );
     }
 
     #[test]
-    fn test_select_tool_profile_symbol() {
+    fn explicit_symbol_tool_requests_get_full_profile_with_command_access() {
         assert_eq!(
-            select_tool_profile(
-                "Rename `get_user` to `fetch_user` across the codebase",
-                "act"
-            ),
-            ToolProfile::Symbol
+            select_tool_profile("Use rename_symbol to rename get_user to fetch_user", "act"),
+            ToolProfile::Full
         );
         assert_eq!(
-            select_tool_profile("Find all references to `DatabasePool`", "act"),
-            ToolProfile::Symbol
+            select_tool_profile("Find symbol references to DatabasePool", "act"),
+            ToolProfile::Full
+        );
+        assert_eq!(
+            select_tool_profile("Find all references to DatabasePool", "act"),
+            ToolProfile::LeanAct
+        );
+        assert!(
+            ToolProfile::Full
+                .tools()
+                .contains(&SnedTool::ExecuteCommand)
         );
     }
 
@@ -1711,26 +1616,24 @@ mod tests {
     }
 
     #[test]
-    fn test_select_tool_profile_complex_defaults_to_full() {
+    fn ambiguous_act_requests_use_the_default_profile() {
         assert_eq!(
             select_tool_profile(
                 "Create a full web application with authentication, database, and deployment",
                 "act"
             ),
-            ToolProfile::Full
+            ToolProfile::LeanAct
         );
     }
 
     #[test]
-    fn test_answer_only_rejects_file_keywords() {
-        assert_ne!(
-            select_tool_profile("What is the create_file function?", "act"),
-            ToolProfile::AnswerOnly
-        );
-        assert_ne!(
-            select_tool_profile("Can you write a test for this?", "act"),
-            ToolProfile::AnswerOnly
-        );
+    fn text_questions_and_write_requests_use_the_same_act_profile() {
+        for prompt in [
+            "What is the create_file function?",
+            "Can you write a test for this?",
+        ] {
+            assert_eq!(select_tool_profile(prompt, "act"), ToolProfile::LeanAct);
+        }
     }
 
     /// Audit (Fix 1): the `end_anchor` schema description must explicitly

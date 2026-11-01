@@ -70,12 +70,14 @@ pub fn tool_examples_for_model(
             && has(SnedTool::EditFile)
             && has(SnedTool::WriteToFile))
         .then_some(CORE_EDIT_TOOL_EXAMPLES),
-        ToolProfile::Validate | ToolProfile::Full => (has(SnedTool::ReadFile)
-            && has(SnedTool::SearchFiles)
-            && has(SnedTool::EditFile)
-            && has(SnedTool::WriteToFile)
-            && has(SnedTool::ExecuteCommand))
-        .then_some(COMMON_TOOL_EXAMPLES),
+        ToolProfile::LeanAct | ToolProfile::Validate | ToolProfile::Full => {
+            (has(SnedTool::ReadFile)
+                && has(SnedTool::SearchFiles)
+                && has(SnedTool::EditFile)
+                && has(SnedTool::WriteToFile)
+                && has(SnedTool::ExecuteCommand))
+            .then_some(COMMON_TOOL_EXAMPLES)
+        }
         ToolProfile::Plan => (has(SnedTool::ReadFile)
             && has(SnedTool::SearchFiles)
             && has(SnedTool::ExecuteCommand)

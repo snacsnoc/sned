@@ -4884,10 +4884,9 @@ fn resolve_tool_profile(
         return crate::core::tools::definitions::ToolProfile::Full;
     }
 
-    // Keyword guesses cannot reliably determine which tools a task needs.
     match cached {
         Some(profile) => profile,
-        None => crate::core::tools::definitions::ToolProfile::Full,
+        None => crate::core::tools::definitions::select_tool_profile(prompt, "act"),
     }
 }
 
@@ -8209,6 +8208,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_resolve_tool_profile_uses_lean_act_and_keeps_symbol_tools_targeted() {
+        use crate::core::tools::SnedTool;
+        use crate::core::tools::definitions::ToolProfile;
+
+        assert_eq!(
+            resolve_tool_profile(None, "Fix the parser bug", "act"),
+            ToolProfile::LeanAct
+        );
+        for prompt in [
+            "Rename symbol ParserState and run tests",
+            "Find symbol references to ParserState",
+            "Show the file skeleton",
+            "Use get_function for parse_input",
+        ] {
+            let profile = resolve_tool_profile(None, prompt, "act");
+            assert_eq!(profile, ToolProfile::Full, "{prompt:?}");
+            assert!(profile.tools().contains(&SnedTool::ExecuteCommand));
+        }
+    }
+
     #[tokio::test]
     async fn act_requests_expose_tools_for_ambiguous_tasks() {
         for prompt in [
@@ -8247,6 +8267,16 @@ mod tests {
                 assert!(
                     tools.iter().any(|tool| tool.function.name == name),
                     "{prompt:?} missing {name}"
+                );
+            }
+            for name in [
+                "get_function",
+                "get_file_skeleton",
+                "find_symbol_references",
+            ] {
+                assert!(
+                    !tools.iter().any(|tool| tool.function.name == name),
+                    "{prompt:?} unexpectedly includes {name}"
                 );
             }
         }
