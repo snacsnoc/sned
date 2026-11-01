@@ -98,9 +98,15 @@ impl ReplaceSymbolHandler {
                 None,
             )
             .await;
-        *state = Arc::try_unwrap(shared_state)
-            .expect("replace symbol state should have no remaining owners")
-            .into_inner();
+        *state = match Arc::try_unwrap(shared_state) {
+            Ok(state) => state.into_inner(),
+            Err(shared) => {
+                *state = std::mem::take(&mut *shared.lock().await);
+                return Err(ToolError::ExecutionFailed(
+                    "replace symbol state is still in use".to_string(),
+                ));
+            }
+        };
         result
     }
 

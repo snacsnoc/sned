@@ -642,9 +642,15 @@ impl DiagnosticsScanHandler {
         let result = self
             .execute_with_shared_state(shared_state.clone(), workspace_root, &[], params)
             .await;
-        *state = Arc::try_unwrap(shared_state)
-            .expect("diagnostics scan state should have no remaining owners")
-            .into_inner();
+        *state = match Arc::try_unwrap(shared_state) {
+            Ok(state) => state.into_inner(),
+            Err(shared) => {
+                *state = std::mem::take(&mut *shared.lock().await);
+                return Err(ToolError::ExecutionFailed(
+                    "diagnostics scan state is still in use".to_string(),
+                ));
+            }
+        };
         result
     }
 
@@ -665,9 +671,15 @@ impl DiagnosticsScanHandler {
                 params,
             )
             .await;
-        *state = Arc::try_unwrap(shared_state)
-            .expect("diagnostics scan state should have no remaining owners")
-            .into_inner();
+        *state = match Arc::try_unwrap(shared_state) {
+            Ok(state) => state.into_inner(),
+            Err(shared) => {
+                *state = std::mem::take(&mut *shared.lock().await);
+                return Err(ToolError::ExecutionFailed(
+                    "diagnostics scan state is still in use".to_string(),
+                ));
+            }
+        };
         result
     }
 
