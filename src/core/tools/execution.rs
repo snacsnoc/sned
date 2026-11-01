@@ -351,10 +351,11 @@ pub(crate) fn is_mutating_file_tool(tool_name: &str) -> bool {
 /// concurrent batch.
 pub(crate) fn tool_is_schedulable_read(tool_name: &str) -> bool {
     SnedTool::from_name(tool_name).is_some_and(|tool| {
-        matches!(
-            tool.category(),
-            super::ToolCategory::ReadOnly | super::ToolCategory::ReadFiles
-        )
+        !matches!(tool, SnedTool::DiagnosticsScan | SnedTool::Condense)
+            && matches!(
+                tool.category(),
+                super::ToolCategory::ReadOnly | super::ToolCategory::ReadFiles
+            )
     })
 }
 
@@ -850,6 +851,24 @@ async fn resolve_preflight(
         tracing::debug!(tool = %tool_name, "waiting for approval manager");
         let mgr = approval_mgr.lock().await;
         tracing::debug!(tool = %tool_name, "acquired approval manager");
+        if tool_name == "execute_command" && !mgr.is_yolo_mode() {
+            let mut state = inputs.state.lock().await;
+            if state.is_subagent_execution {
+                state.record_denied_tool_action(DeniedToolAction {
+                    tool_name: tool_name.to_string(),
+                    action_paths: action_paths.clone(),
+                    params_fingerprint: params_fingerprint.clone(),
+                });
+                return PreflightDecision::Denied(ToolExecutionOutput::error(
+                    crate::core::approval::format_denial_message_with_context(tool_name, true),
+                    Some(ToolFailureMetadata {
+                        class: ToolFailureClass::ApprovalDenied,
+                        affected_paths: action_paths,
+                        required_next_step: Some(ToolRequiredNextStep::AskUser),
+                    }),
+                ));
+            }
+        }
         allowed_external_roots =
             mgr.external_directory_grants_for(tool.category(), &external_directories);
         let external_needs_prompt = !external_directories.is_empty()

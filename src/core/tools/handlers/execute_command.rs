@@ -1714,6 +1714,12 @@ impl ExecuteCommandHandler {
         let language = params["language"].as_str().unwrap_or("bash");
         let raw_output = params["raw_output"].as_bool().unwrap_or(false);
 
+        if commands.is_some() && script.is_some_and(|s| !s.trim().is_empty()) {
+            return Err(ToolError::InvalidInput(
+                "Provide exactly one of {commands, script}".to_string(),
+            ));
+        }
+
         let result = if let Some(cmds) = commands {
             self.execute_commands_with_safety(
                 cmds,
@@ -1998,6 +2004,37 @@ mod tests {
         assert!(
             err_text.contains("[\"ls\"]"),
             "error must include a correct-shape example, got: {err_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_both_commands_and_script() {
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let params = serde_json::json!({
+            "commands": ["echo hello"],
+            "script": "echo world"
+        });
+
+        let err = handler
+            .execute_without_state(
+                None,
+                params,
+                None,
+                false,
+                false,
+                None,
+                None,
+                false,
+                &output_writer,
+            )
+            .await
+            .expect_err("providing both commands and script must fail");
+        assert!(
+            err.to_string()
+                .contains("Provide exactly one of {commands, script}"),
+            "unexpected error: {err}"
         );
     }
 
