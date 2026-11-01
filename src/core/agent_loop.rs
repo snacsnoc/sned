@@ -49,8 +49,8 @@ const DEFAULT_MESSAGE_QUEUE_MAX_LEN: usize = 1000;
 const MESSAGE_QUEUE_MAX_LEN_ENV: &str = "SNED_AGENT_MAX_QUEUED_MESSAGES";
 const MAX_QUEUED_MESSAGE_PREVIEW_CHARS: usize = 256;
 
-/// Default token limit for tool results stored in history (~5000 tokens / ~20KB)
-const DEFAULT_TOOL_RESULT_HISTORY_LIMIT: usize = 20_000;
+/// Default byte limit for an individual tool result stored in history.
+const DEFAULT_TOOL_RESULT_HISTORY_LIMIT: usize = 150_000;
 /// Environment variable to configure tool result history limit
 const TOOL_RESULT_HISTORY_LIMIT_ENV: &str = "SNED_TOOL_RESULT_HISTORY_LIMIT";
 
@@ -150,24 +150,32 @@ pub(crate) fn tool_result_history_limit() -> usize {
 }
 
 pub(crate) fn truncate_tool_result(result: &str) -> String {
-    let limit = tool_result_history_limit();
+    truncate_tool_result_to_limit(result, tool_result_history_limit())
+}
 
+fn truncate_tool_result_to_limit(result: &str, limit: usize) -> String {
     if result.len() <= limit {
         return result.to_string();
     }
 
-    // Truncate at byte boundary and add marker
-    let truncated_len = limit.saturating_sub(50); // Reserve space for marker
-    let boundary = result
-        .floor_char_boundary(truncated_len.min(result.len()))
-        .min(result.len());
-
-    let truncated = &result[..boundary];
     let original_lines = result.lines().count();
-    let truncated_lines = truncated.lines().count();
-    let remaining_lines = original_lines - truncated_lines;
-
-    format!("{truncated}\n\n[{remaining_lines} lines truncated, use read_file to see full content]")
+    let fallback = "[truncated]";
+    let mut prefix_len = limit.saturating_sub(80).min(result.len());
+    loop {
+        let boundary = result.floor_char_boundary(prefix_len);
+        let truncated = &result[..boundary];
+        let remaining_lines = original_lines.saturating_sub(truncated.lines().count());
+        let marker =
+            format!("\n\n[{remaining_lines} lines truncated, use read_file to see full content]");
+        if marker.len() > limit {
+            return fallback[..fallback.floor_char_boundary(limit.min(fallback.len()))].to_string();
+        }
+        let prefix_budget = limit - marker.len();
+        if boundary <= prefix_budget {
+            return format!("{truncated}{marker}");
+        }
+        prefix_len = prefix_budget;
+    }
 }
 
 fn code_fence_language(line: &str) -> &str {
@@ -716,6 +724,33 @@ impl AgentLoop {
         state.recent_read_windows.clear();
         state.read_file_coverage.clear();
         state.pending_read_coverage.clear();
+    }
+
+    fn clear_collapsed_read_state(
+        state: &mut TaskState,
+        collapsed_paths: &HashSet<String>,
+        unknown_path: bool,
+    ) {
+        if unknown_path {
+            Self::clear_history_dependent_read_state(state);
+            return;
+        }
+        let was_collapsed = |path: &str| {
+            collapsed_paths.contains(&crate::core::tool_output::normalize_path_for_matching(path))
+        };
+        state
+            .consecutive_reads
+            .retain(|path, _| !was_collapsed(path));
+        state.last_read_turn.retain(|path, _| !was_collapsed(path));
+        state
+            .recent_read_windows
+            .retain(|path, _| !was_collapsed(path));
+        state
+            .read_file_coverage
+            .retain(|path, _| !was_collapsed(path));
+        state
+            .pending_read_coverage
+            .retain(|candidate| !was_collapsed(&candidate.canonical_path));
     }
 
     fn current_turn_retry_candidate(history: &[StorageMessage]) -> Option<StorageMessage> {
@@ -2092,8 +2127,6 @@ impl AgentLoop {
             // Pass history by reference to context_manager — saves a full deep clone
             // of every message/tool-result per turn.
             let mut conversation_guard = self.conversation_history.lock().await;
-            let compaction = compact_old_tool_results(&mut conversation_guard);
-            let read_coverage_compacted = compaction.collapsed > 0;
             close_dangling_tool_calls(&mut conversation_guard);
             let original_history_len = conversation_guard.len();
             let result = context_manager::get_new_context_messages_and_metadata(
@@ -2110,11 +2143,6 @@ impl AgentLoop {
                     .name(),
             );
             drop(conversation_guard);
-
-            if read_coverage_compacted {
-                let mut state = self.state.lock().await;
-                state.read_file_coverage.clear();
-            }
 
             // Update state if deleted range changed, then persist the
             // range without holding the state guard across disk IO.
@@ -2289,6 +2317,63 @@ impl AgentLoop {
             use_response_api: None,
             max_tokens: self.config.max_tokens,
         };
+
+        let context_info = {
+            let provider = self.config.provider.lock().expect("provider poisoned");
+            crate::core::context::get_context_window_info(provider.as_ref())
+        };
+        if should_compact_tool_history(
+            context_window::estimate_request_tokens(&request),
+            context_info.context_window,
+        ) {
+            let original = request.messages.clone();
+            let workspace_root = self.resolve_workspace_root();
+            let compaction = compact_old_tool_results(&mut request.messages, &workspace_root);
+            if compaction.collapsed > 0 {
+                let mut history = self.conversation_history.lock().await;
+                persist_compacted_tool_blocks(&original, &request.messages, &mut history);
+            }
+            if compaction.read_results_collapsed > 0 {
+                let (paths, unknown_path) =
+                    canonical_read_state_paths(&workspace_root, &compaction.collapsed_read_paths)
+                        .await;
+                let mut state = self.state.lock().await;
+                Self::clear_collapsed_read_state(
+                    &mut state,
+                    &paths,
+                    compaction.collapsed_unknown_read || unknown_path,
+                );
+            }
+        }
+
+        if context_window::estimate_request_tokens(&request) > context_info.max_allowed_size {
+            let before_fresh_result_trim = request.messages.clone();
+            let fresh_result_trim =
+                trim_fresh_tool_results_to_fit(&mut request, context_info.max_allowed_size);
+            if fresh_result_trim.collapsed > 0 {
+                let workspace_root = self.resolve_workspace_root();
+                let mut history = self.conversation_history.lock().await;
+                persist_compacted_tool_blocks(
+                    &before_fresh_result_trim,
+                    &request.messages,
+                    &mut history,
+                );
+                drop(history);
+                if fresh_result_trim.read_results_collapsed > 0 {
+                    let (paths, unknown_path) = canonical_read_state_paths(
+                        &workspace_root,
+                        &fresh_result_trim.collapsed_read_paths,
+                    )
+                    .await;
+                    let mut state = self.state.lock().await;
+                    Self::clear_collapsed_read_state(
+                        &mut state,
+                        &paths,
+                        fresh_result_trim.collapsed_unknown_read || unknown_path,
+                    );
+                }
+            }
+        }
 
         // Emergency truncation: if the request exceeds context limits, aggressively
         // truncate to the last N messages to break the deadlock (e.g., /compact failing
@@ -5098,24 +5183,237 @@ fn close_dangling_tool_calls(history: &mut Vec<StorageMessage>) {
 /// What one compaction pass removed, so callers and tests can observe
 /// it without parsing debug logs. `collapsed` counts segments (one per
 /// result text or call body), not tool calls.
+#[derive(Default)]
 struct CompactionSummary {
     collapsed: usize,
+    read_results_collapsed: usize,
+    collapsed_read_paths: HashSet<String>,
+    collapsed_unknown_read: bool,
     bytes_saved: usize,
+}
+
+fn should_compact_tool_history(tokens: u64, context_window: u64) -> bool {
+    let pressure = context_window.saturating_mul(70) / 100;
+    tokens >= 40_000.min(pressure) && (tokens >= pressure || tokens >= 120_000)
+}
+
+// Only copy blocks whose unmodified contents still match the stored history.
+fn persist_compacted_tool_blocks(
+    before: &[StorageMessage],
+    after: &[StorageMessage],
+    history: &mut [StorageMessage],
+) {
+    for (old, new) in before.iter().zip(after) {
+        match (&old.content, &new.content) {
+            (MessageContent::UserBlocks(old), MessageContent::UserBlocks(new)) => {
+                for (old, new) in old.iter().zip(new) {
+                    let (UserContentBlock::ToolResult(old), UserContentBlock::ToolResult(new)) =
+                        (old, new)
+                    else {
+                        continue;
+                    };
+                    if old.content == new.content {
+                        continue;
+                    }
+                    for message in history.iter_mut() {
+                        if let MessageContent::UserBlocks(blocks) = &mut message.content {
+                            for block in blocks {
+                                if let UserContentBlock::ToolResult(result) = block
+                                    && result.tool_use_id == old.tool_use_id
+                                    && result.content == old.content
+                                {
+                                    result.content = new.content.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            (MessageContent::AssistantBlocks(old), MessageContent::AssistantBlocks(new)) => {
+                for (old, new) in old.iter().zip(new) {
+                    let (AssistantContentBlock::ToolUse(old), AssistantContentBlock::ToolUse(new)) =
+                        (old, new)
+                    else {
+                        continue;
+                    };
+                    if old.input == new.input {
+                        continue;
+                    }
+                    for message in history.iter_mut() {
+                        if let MessageContent::AssistantBlocks(blocks) = &mut message.content {
+                            for block in blocks {
+                                if let AssistantContentBlock::ToolUse(call) = block
+                                    && call.id == old.id
+                                    && call.input == old.input
+                                {
+                                    call.input = new.input.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn trim_fresh_tool_results_to_fit(
+    request: &mut ProviderRequest,
+    max_allowed_tokens: u64,
+) -> CompactionSummary {
+    let bytes_before =
+        tool_result_text_bytes(&request.messages) + tool_call_arg_bytes(&request.messages);
+    let mut summary = CompactionSummary::default();
+    let Some((tool_use_index, tool_ids, read_arguments)) = request
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            if message.role != MessageRole::Assistant {
+                return None;
+            }
+            let MessageContent::AssistantBlocks(blocks) = &message.content else {
+                return None;
+            };
+            let mut tool_ids = HashSet::new();
+            let mut read_arguments = std::collections::HashMap::new();
+            for block in blocks {
+                if let AssistantContentBlock::ToolUse(tool) = block {
+                    tool_ids.insert(tool.id.clone());
+                    if tool.name == "read_file" {
+                        read_arguments.insert(tool.id.clone(), tool.input.clone());
+                    }
+                }
+            }
+            (!tool_ids.is_empty()).then_some((index, tool_ids, read_arguments))
+        })
+    else {
+        return summary;
+    };
+
+    loop {
+        let estimated = context_window::estimate_request_tokens(request);
+        if estimated <= max_allowed_tokens {
+            break;
+        }
+        let mut largest = None;
+        for (message_index, message) in request.messages.iter().enumerate().skip(tool_use_index + 1)
+        {
+            let MessageContent::UserBlocks(blocks) = &message.content else {
+                continue;
+            };
+            for (block_index, block) in blocks.iter().enumerate() {
+                let UserContentBlock::ToolResult(result) = block else {
+                    continue;
+                };
+                if !tool_ids.contains(&result.tool_use_id) {
+                    continue;
+                }
+                match &result.content {
+                    ToolResultContent::Text(text) if text.len() > "[truncated]".len() => {
+                        if largest.is_none_or(|(_, _, _, len)| text.len() > len) {
+                            largest = Some((message_index, block_index, None, text.len()));
+                        }
+                    }
+                    ToolResultContent::Blocks(content) => {
+                        for (text_index, content_block) in content.iter().enumerate() {
+                            if let ToolResultContentBlock::Text { text } = content_block
+                                && text.len() > "[truncated]".len()
+                                && largest.is_none_or(|(_, _, _, len)| text.len() > len)
+                            {
+                                largest = Some((
+                                    message_index,
+                                    block_index,
+                                    Some(text_index),
+                                    text.len(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some((message_index, block_index, text_index, old_len)) = largest else {
+            break;
+        };
+        let excess_bytes = usize::try_from(estimated.saturating_sub(max_allowed_tokens))
+            .unwrap_or(usize::MAX)
+            .saturating_mul(4)
+            .saturating_add(16);
+        let limit = old_len
+            .saturating_sub(excess_bytes.max(1))
+            .max("[truncated]".len());
+        let MessageContent::UserBlocks(blocks) = &mut request.messages[message_index].content
+        else {
+            unreachable!("selected tool result disappeared from request")
+        };
+        let UserContentBlock::ToolResult(result) = &mut blocks[block_index] else {
+            unreachable!("selected block is not a tool result")
+        };
+        let old_text = match (&mut result.content, text_index) {
+            (ToolResultContent::Text(text), None) => text,
+            (ToolResultContent::Blocks(content), Some(text_index)) => {
+                let ToolResultContentBlock::Text { text } = &mut content[text_index] else {
+                    unreachable!("selected result block is not text")
+                };
+                text
+            }
+            _ => unreachable!("selected result shape changed"),
+        };
+        let read_paths =
+            if read_arguments.contains_key(&result.tool_use_id) || is_read_result_text(old_text) {
+                read_result_paths_from_texts(
+                    &[old_text.as_str()],
+                    read_arguments.get(&result.tool_use_id),
+                )
+            } else {
+                Vec::new()
+            };
+        let replacement = truncate_tool_result_to_limit(old_text, limit);
+        if replacement.len() >= old_text.len() {
+            break;
+        }
+        *old_text = replacement;
+        summary.collapsed += 1;
+        if !read_paths.is_empty() || read_arguments.contains_key(&result.tool_use_id) {
+            summary.read_results_collapsed += 1;
+            if read_paths.is_empty() {
+                summary.collapsed_unknown_read = true;
+            } else {
+                summary.collapsed_read_paths.extend(read_paths);
+            }
+        }
+    }
+
+    let bytes_after =
+        tool_result_text_bytes(&request.messages) + tool_call_arg_bytes(&request.messages);
+    summary.bytes_saved = bytes_before.saturating_sub(bytes_after);
+    summary
 }
 
 /// Compacts older tool results in the conversation history, preserving
 /// the most recent `RECENT_TO_PRESERVE` reads and shell outputs in full.
 /// Stale bulk output costs tokens on every later turn without adding new
 /// information, so earlier large results collapse to a placeholder.
-fn compact_old_tool_results(history: &mut [StorageMessage]) -> CompactionSummary {
+fn compact_old_tool_results(
+    history: &mut [StorageMessage],
+    workspace_cwd: &Path,
+) -> CompactionSummary {
     const RECENT_TO_PRESERVE: usize = 2;
     const MIN_BYTES_TO_COMPACT: usize = 1000;
 
     let bytes_before = tool_result_text_bytes(history) + tool_call_arg_bytes(history);
     let mut collapsed = 0;
+    let mut read_results_collapsed = 0;
+    let mut collapsed_read_paths = HashSet::new();
+    let mut collapsed_unknown_read = false;
 
     let mut tool_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut read_arguments = std::collections::HashMap::new();
     for message in history.iter() {
         if message.role != MessageRole::Assistant {
             continue;
@@ -5126,6 +5424,9 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) -> CompactionSummary
         for block in blocks {
             if let AssistantContentBlock::ToolUse(tool_use) = block {
                 tool_names.insert(tool_use.id.clone(), tool_use.name.clone());
+                if tool_use.name == "read_file" {
+                    read_arguments.insert(tool_use.id.clone(), tool_use.input.clone());
+                }
             }
         }
     }
@@ -5134,6 +5435,70 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) -> CompactionSummary
     let mut shell_result_count = 0;
     let mut search_result_count = 0;
     let mut edit_result_count = 0;
+
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut preserve_reads = std::collections::HashSet::new();
+    for message in history.iter().rev() {
+        let MessageContent::UserBlocks(blocks) = &message.content else {
+            continue;
+        };
+        for block in blocks.iter().rev() {
+            let UserContentBlock::ToolResult(result) = block else {
+                continue;
+            };
+            let texts: Vec<&str> = match &result.content {
+                ToolResultContent::Text(text) => vec![text],
+                ToolResultContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ToolResultContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+            };
+            if !texts.iter().any(|text| is_read_result_text(text)) {
+                continue;
+            }
+            if texts.iter().all(|text| text.contains(COLLAPSED_MARKER)) {
+                continue;
+            }
+            // Legacy pruned sections do not carry a reliable path. Keep the
+            // whole batch when its original argument list is unavailable.
+            if texts.iter().any(|text| {
+                text.lines().any(|line| {
+                    line.starts_with("[Context pruned:") && path_from_pruned_header(line).is_none()
+                })
+            }) && !read_arguments
+                .get(&result.tool_use_id)
+                .is_some_and(|input| {
+                    input
+                        .get("paths")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some()
+                        || (input.get("_compacted").is_none()
+                            && input
+                                .get("path")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some())
+                })
+            {
+                preserve_reads.insert(result.tool_use_id.clone());
+                continue;
+            }
+            let paths = read_result_paths(&result.content, read_arguments.get(&result.tool_use_id));
+            if paths.is_empty() {
+                preserve_reads.insert(result.tool_use_id.clone());
+                continue;
+            }
+            let mut newest = false;
+            for path in paths {
+                newest |= seen_paths.insert(workspace_path_key(workspace_cwd, &path));
+            }
+            if newest {
+                preserve_reads.insert(result.tool_use_id.clone());
+            }
+        }
+    }
 
     // The newest tool-result batch has never appeared in a provider request:
     // compaction runs before the request is built. Everything after the
@@ -5206,12 +5571,24 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) -> CompactionSummary
             };
 
             *counter += 1;
-            if *counter <= RECENT_TO_PRESERVE {
+            if *counter <= RECENT_TO_PRESERVE
+                || (is_read_result && preserve_reads.contains(&tr.tool_use_id))
+            {
                 continue;
             }
 
             match &mut tr.content {
                 ToolResultContent::Text(text) => {
+                    let read_paths = if is_read_result {
+                        read_result_paths_from_texts(
+                            &[text.as_str()],
+                            read_arguments.get(&tr.tool_use_id),
+                        )
+                        .into_iter()
+                        .collect::<HashSet<_>>()
+                    } else {
+                        HashSet::new()
+                    };
                     let did_collapse = if is_read_result {
                         compact_single_read_text(text, MIN_BYTES_TO_COMPACT)
                     } else if is_search_result {
@@ -5223,11 +5600,29 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) -> CompactionSummary
                     };
                     if did_collapse {
                         collapsed += 1;
+                        if is_read_result {
+                            read_results_collapsed += 1;
+                            if read_paths.is_empty() {
+                                collapsed_unknown_read = true;
+                            } else {
+                                collapsed_read_paths.extend(read_paths);
+                            }
+                        }
                     }
                 }
                 ToolResultContent::Blocks(b) => {
                     for cb in b.iter_mut() {
                         if let ToolResultContentBlock::Text { text } = cb {
+                            let read_paths = if is_read_result {
+                                read_result_paths_from_texts(
+                                    &[text.as_str()],
+                                    read_arguments.get(&tr.tool_use_id),
+                                )
+                                .into_iter()
+                                .collect::<HashSet<_>>()
+                            } else {
+                                HashSet::new()
+                            };
                             let did_collapse = if is_read_result {
                                 compact_single_read_text(text, MIN_BYTES_TO_COMPACT)
                             } else if is_search_result {
@@ -5239,6 +5634,14 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) -> CompactionSummary
                             };
                             if did_collapse {
                                 collapsed += 1;
+                                if is_read_result {
+                                    read_results_collapsed += 1;
+                                    if read_paths.is_empty() {
+                                        collapsed_unknown_read = true;
+                                    } else {
+                                        collapsed_read_paths.extend(read_paths);
+                                    }
+                                }
                             }
                         }
                     }
@@ -5300,6 +5703,9 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) -> CompactionSummary
     let bytes_after = tool_result_text_bytes(history) + tool_call_arg_bytes(history);
     let summary = CompactionSummary {
         collapsed,
+        read_results_collapsed,
+        collapsed_read_paths,
+        collapsed_unknown_read,
         bytes_saved: bytes_before.saturating_sub(bytes_after),
     };
     tracing::debug!(
@@ -5310,6 +5716,99 @@ fn compact_old_tool_results(history: &mut [StorageMessage]) -> CompactionSummary
         "history compaction collapsed stale tool results"
     );
     summary
+}
+
+fn read_result_paths(
+    content: &ToolResultContent,
+    input: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let texts: Vec<&str> = match content {
+        ToolResultContent::Text(text) => vec![text],
+        ToolResultContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ToolResultContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect(),
+    };
+    read_result_paths_from_texts(&texts, input)
+}
+
+fn read_result_paths_from_texts(texts: &[&str], input: Option<&serde_json::Value>) -> Vec<String> {
+    let mut paths: Vec<String> = texts
+        .iter()
+        .flat_map(|text| text.lines())
+        .filter_map(|line| {
+            if line.starts_with("[File: ") && line.contains(", Hash: ") {
+                path_from_read_file_header(line)
+            } else {
+                path_from_pruned_header(line)
+            }
+        })
+        .map(str::to_owned)
+        .collect();
+    if let Some(input) = input
+        && (paths.is_empty() || texts.iter().any(|text| text.contains("[Context pruned:")))
+    {
+        paths.extend(crate::core::tools::coerce_string_array(
+            input, "paths", "path",
+        ));
+    }
+    paths
+}
+
+fn workspace_path_key(workspace_cwd: &Path, path: &str) -> String {
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_cwd.join(path)
+    };
+    crate::core::tool_output::normalize_path_for_matching(
+        &lexically_normalize_path(&path).to_string_lossy(),
+    )
+}
+
+fn lexically_normalize_path(path: &Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+async fn canonical_read_state_paths(
+    workspace_cwd: &Path,
+    displayed_paths: &HashSet<String>,
+) -> (HashSet<String>, bool) {
+    let mut paths = HashSet::with_capacity(displayed_paths.len());
+    let mut unknown_path = false;
+    for path in displayed_paths {
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace_cwd.join(path)
+        };
+        let path = match tokio::fs::canonicalize(&path).await {
+            Ok(path) => path,
+            Err(_) => {
+                unknown_path = true;
+                lexically_normalize_path(&path)
+            }
+        };
+        paths.insert(crate::core::tool_output::normalize_path_for_matching(
+            &path.to_string_lossy(),
+        ));
+    }
+    (paths, unknown_path)
 }
 
 fn tool_call_arg_bytes(history: &[StorageMessage]) -> usize {
@@ -5385,9 +5884,20 @@ fn compact_single_shell_text(text: &mut String, min_bytes: usize) -> bool {
 fn is_read_result_text(text: &str) -> bool {
     // Re-reads of edited files come back section-summarized without a
     // file header; without this they would never collapse.
-    text.starts_with("[File: ")
-        || text.contains("\n[File: ")
-        || text.starts_with("[Context pruned:")
+    text.lines()
+        .any(|line| line.starts_with("[File: ") || line.starts_with("[Context pruned:"))
+}
+
+fn path_from_pruned_header(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("[Context pruned: ")?;
+    let (path, _) = rest
+        .split_once(", Hash: ")
+        .or_else(|| rest.split_once(']'))?;
+    if path.is_empty() || path.split_whitespace().next()?.parse::<usize>().is_ok() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 fn compact_single_read_text(text: &mut String, min_bytes: usize) -> bool {
@@ -7523,7 +8033,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_third_request_collapses_old_call_arguments() {
+    async fn test_third_request_preserves_call_arguments_without_pressure() {
         let big_content = "x".repeat(5000);
         let responses = vec![
             tool_call_chunks(&[(
@@ -7562,10 +8072,10 @@ mod tests {
         assert_eq!(captured.len(), 3);
         let third = serde_json::to_string(&captured[2].messages).unwrap();
         assert!(
-            !third.contains(&"x".repeat(5000)),
-            "old call content must not ride along"
+            third.contains(&"x".repeat(5000)),
+            "small conversations must retain call arguments"
         );
-        assert!(third.contains("_compacted"), "collapsed call must say so");
+        assert!(!third.contains("_compacted"));
         assert!(third.contains("\"c1\""), "call id linkage must survive");
         assert!(
             third.contains("written"),
@@ -13766,7 +14276,7 @@ Irrespective of whether additional information or instructions are given, you ar
     #[test]
     fn test_truncate_tool_result_large() {
         // Large results should be truncated with marker
-        let large = "line 1\n".repeat(10000); // ~70KB
+        let large = "line 1\n".repeat(30000);
         let result = truncate_tool_result(&large);
 
         // Should be truncated
@@ -13787,7 +14297,7 @@ Irrespective of whether additional information or instructions are given, you ar
         }
         let large = "x".repeat(500);
         let result = truncate_tool_result(&large);
-        assert!(result.len() < 150); // 100 limit + marker
+        assert!(result.len() <= 100);
         // SAFETY: single-threaded test; restoring env after test
         unsafe {
             std::env::remove_var(TOOL_RESULT_HISTORY_LIMIT_ENV);
@@ -13797,7 +14307,7 @@ Irrespective of whether additional information or instructions are given, you ar
     #[test]
     fn test_truncate_tool_result_preserves_unicode() {
         // Truncation should preserve Unicode boundaries
-        let large = "Hello 🌍 ".repeat(5000);
+        let large = "Hello 🌍 ".repeat(20000);
         let result = truncate_tool_result(&large);
         // Should not end with a partial emoji (which is 4 bytes)
         assert!(!result.ends_with("�"));
@@ -14002,6 +14512,215 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[test]
+    fn tool_history_compaction_respects_small_and_large_windows() {
+        assert!(!should_compact_tool_history(22_936, 32_768));
+        assert!(should_compact_tool_history(22_937, 32_768));
+        assert!(!should_compact_tool_history(119_999, 1_000_000));
+        assert!(should_compact_tool_history(120_000, 1_000_000));
+        assert!(!should_compact_tool_history(39_999, 100_000));
+        assert!(!should_compact_tool_history(69_999, 100_000));
+        assert!(should_compact_tool_history(70_000, 100_000));
+    }
+
+    #[test]
+    fn compaction_estimate_uses_retained_history_and_summary() {
+        let message = |role, text: String| StorageMessage {
+            id: None,
+            role,
+            content: MessageContent::Text(text),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        };
+        let history = vec![
+            message(MessageRole::User, "task".into()),
+            message(MessageRole::Assistant, "response".into()),
+            message(MessageRole::User, "x".repeat(800_000)),
+            message(MessageRole::User, "current".into()),
+        ];
+        let summary = context_manager::CompactedSummary::new("retained summary".into(), 1);
+        let active =
+            context_manager::get_truncated_messages(&history, Some((2, 2)), Some(&summary));
+        let request = ProviderRequest {
+            system_prompt: "system".into(),
+            messages: active,
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+        assert!(request.messages.iter().any(
+            |m| matches!(&m.content, MessageContent::Text(text) if text == "retained summary")
+        ));
+        assert!(!should_compact_tool_history(
+            context_window::estimate_request_tokens(&request),
+            1_000_000
+        ));
+    }
+
+    #[test]
+    fn compaction_retains_newest_batched_files_and_only_persists_active_changes() {
+        assert_eq!(
+            path_from_pruned_header("[Context pruned: src/a.rs]"),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            path_from_pruned_header("[Context pruned: 83 lines, ~5KB. Hash: a]"),
+            None
+        );
+        let payload = "source\n".repeat(300);
+        let read = |id: &str, text: String| tool_result_msg(id, &text);
+        let a = format!("[File: a.rs, Hash: a]\n{payload}");
+        let batch = format!(
+            "[Note: example]\n[File: a.rs, Hash: a]\n{payload}\n---\n[File: b.rs, Hash: b]\n{payload}"
+        );
+        let c = format!("[File: c.rs, Hash: c]\n{payload}");
+        let mut active = vec![
+            read("old", a),
+            read("batch", batch),
+            read("c1", c.clone()),
+            read("c2", c),
+        ];
+        let original = active.clone();
+        let hidden = read("hidden", format!("[File: hidden.rs, Hash: h]\n{payload}"));
+        let mut history = vec![hidden.clone()];
+        history.extend(original.clone());
+        let summary = compact_old_tool_results(&mut active, Path::new("/workspace"));
+        assert_eq!(summary.read_results_collapsed, 1);
+        assert_eq!(
+            summary.collapsed_read_paths,
+            HashSet::from(["a.rs".to_string()])
+        );
+        assert!(!summary.collapsed_unknown_read);
+        assert_ne!(active[0], original[0]);
+        assert_eq!(active[1], original[1]);
+        persist_compacted_tool_blocks(&original, &active, &mut history);
+        assert_eq!(history[0], hidden);
+        assert_eq!(history[1], active[0]);
+        assert_eq!(history[2], original[1]);
+
+        let mut state = TaskState::default();
+        for path in ["/workspace/a.rs", "/workspace/b.rs"] {
+            state.consecutive_reads.insert(path.to_string(), 3);
+            state.last_read_turn.insert(path.to_string(), 4);
+            state
+                .recent_read_windows
+                .insert(path.to_string(), VecDeque::from([(1, 10)]));
+            state.read_file_coverage.insert(
+                path.to_string(),
+                crate::core::agent_types::ReadCoverage {
+                    revision: "rev".to_string(),
+                    total_lines: Some(10),
+                    ranges: vec![(1, 10)],
+                },
+            );
+            state
+                .pending_read_coverage
+                .push(crate::core::agent_types::ReadCoverageCandidate {
+                    canonical_path: path.to_string(),
+                    revision: "rev".to_string(),
+                    total_lines: 10,
+                    range: (1, 10),
+                });
+        }
+        let collapsed_keys = summary
+            .collapsed_read_paths
+            .iter()
+            .map(|path| workspace_path_key(Path::new("/workspace"), path))
+            .collect();
+        AgentLoop::clear_collapsed_read_state(
+            &mut state,
+            &collapsed_keys,
+            summary.collapsed_unknown_read,
+        );
+        assert!(!state.read_file_coverage.contains_key("/workspace/a.rs"));
+        assert!(state.read_file_coverage.contains_key("/workspace/b.rs"));
+        assert!(!state.consecutive_reads.contains_key("/workspace/a.rs"));
+        assert!(state.consecutive_reads.contains_key("/workspace/b.rs"));
+        assert!(!state.last_read_turn.contains_key("/workspace/a.rs"));
+        assert!(state.last_read_turn.contains_key("/workspace/b.rs"));
+        assert!(!state.recent_read_windows.contains_key("/workspace/a.rs"));
+        assert!(state.recent_read_windows.contains_key("/workspace/b.rs"));
+        assert_eq!(state.pending_read_coverage.len(), 1);
+        assert_eq!(
+            state.pending_read_coverage[0].canonical_path,
+            "/workspace/b.rs"
+        );
+    }
+
+    #[test]
+    fn compaction_path_keys_use_workspace_and_normalize_lexically() {
+        assert_eq!(
+            workspace_path_key(Path::new("/workspace"), "src/../src/a.rs"),
+            workspace_path_key(Path::new("/workspace"), "/workspace/src/a.rs")
+        );
+    }
+
+    #[test]
+    fn fresh_tool_results_are_trimmed_to_fit_small_provider_contexts() {
+        let result = format!("[File: src/a.rs, Hash: a]\n{}", "x".repeat(150_000));
+        let mut request = ProviderRequest {
+            system_prompt: "system prompt".to_string(),
+            messages: vec![
+                assistant_call_msg(
+                    "read-a",
+                    "read_file",
+                    serde_json::json!({"path": "src/a.rs"}),
+                ),
+                tool_result_msg("read-a", &result),
+            ],
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+        let max_allowed = 26_214;
+        assert!(context_window::estimate_request_tokens(&request) > max_allowed);
+
+        let summary = trim_fresh_tool_results_to_fit(&mut request, max_allowed);
+
+        assert_eq!(summary.read_results_collapsed, 1);
+        assert_eq!(
+            summary.collapsed_read_paths,
+            HashSet::from(["src/a.rs".to_string()])
+        );
+        assert!(context_window::estimate_request_tokens(&request) <= max_allowed);
+        let results = stored_tool_results(&request.messages);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.starts_with("[File: src/a.rs, Hash: a]"));
+        assert!(results[0].1.contains("lines truncated"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collapsed_symlink_read_paths_match_canonical_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.rs");
+        let alias = directory.path().join("alias.rs");
+        std::fs::write(&target, "source").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let displayed_paths = HashSet::from(["alias.rs".to_string()]);
+
+        let (canonical_paths, unknown_path) =
+            canonical_read_state_paths(directory.path(), &displayed_paths).await;
+        assert!(!unknown_path);
+        let canonical_target = crate::core::tool_output::normalize_path_for_matching(
+            &std::fs::canonicalize(target).unwrap().to_string_lossy(),
+        );
+        assert_eq!(canonical_paths, HashSet::from([canonical_target]));
+    }
+
+    #[tokio::test]
+    async fn missing_collapsed_read_paths_use_unknown_state_invalidation() {
+        let directory = tempfile::tempdir().unwrap();
+        let displayed_paths = HashSet::from(["removed.rs".to_string()]);
+        let (paths, unknown_path) =
+            canonical_read_state_paths(directory.path(), &displayed_paths).await;
+        assert!(unknown_path);
+        assert!(!paths.is_empty());
+    }
+
+    #[test]
     fn test_compact_old_tool_results_preserves_recent_reads() {
         let make_read_msg = |file: &str, size: usize| StorageMessage {
             id: None,
@@ -14030,7 +14749,7 @@ Irrespective of whether additional information or instructions are given, you ar
             make_read_msg("file3.rs", 5000),
         ];
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
 
         // Most recent two reads (file2 and file3) must be preserved in full
         let get_text = |msg: &StorageMessage| match &msg.content {
@@ -14055,11 +14774,10 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let file1_text = get_text(&history[0]);
         assert!(
-            !file1_text.contains(&"x".repeat(5000)),
-            "Oldest read should be compacted"
+            file1_text.contains(&"x".repeat(5000)),
+            "Newest read of each file must be preserved"
         );
         assert!(file1_text.starts_with("[File: file1.rs, Hash: abc12345] (100 lines total)"));
-        assert!(file1_text.contains("Earlier read content"));
     }
 
     fn assistant_call_msg(id: &str, name: &str, input: serde_json::Value) -> StorageMessage {
@@ -14105,7 +14823,7 @@ Irrespective of whether additional information or instructions are given, you ar
             assistant_call_msg("c2", "read_file", serde_json::json!({"paths": ["a.txt"]})),
         ];
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
 
         let old_input = call_input(&history[0]);
         assert_eq!(
@@ -14131,7 +14849,7 @@ Irrespective of whether additional information or instructions are given, you ar
             assistant_call_msg("c2", "read_file", serde_json::json!({"paths": ["a.txt"]})),
         ];
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
 
         match &history[0].content {
             MessageContent::AssistantBlocks(blocks) => match &blocks[0] {
@@ -14156,7 +14874,7 @@ Irrespective of whether additional information or instructions are given, you ar
             assistant_call_msg("c2", "read_file", serde_json::json!({"paths": ["a.txt"]})),
         ];
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
 
         assert_eq!(
             call_input(&history[0])["commands"],
@@ -14200,7 +14918,7 @@ Irrespective of whether additional information or instructions are given, you ar
             assistant_call_msg("c3", "read_file", serde_json::json!({"paths": ["a.txt"]})),
         ];
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
 
         assert_eq!(call_input(&history[0])["path"], "big.c");
         assert_eq!(
@@ -14232,8 +14950,9 @@ Irrespective of whether additional information or instructions are given, you ar
             ));
         }
 
-        let summary = compact_old_tool_results(&mut history);
+        let summary = compact_old_tool_results(&mut history, Path::new("/workspace"));
         assert_eq!(summary.collapsed, 2);
+        assert_eq!(summary.read_results_collapsed, 0);
         assert!(
             summary.bytes_saved >= 8000,
             "one 5KB call body plus one 5KB result must register bulk savings, got {}",
@@ -14249,7 +14968,7 @@ Irrespective of whether additional information or instructions are given, you ar
             "exactly one result body must collapse"
         );
 
-        let quiet = compact_old_tool_results(&mut history);
+        let quiet = compact_old_tool_results(&mut history, Path::new("/workspace"));
         assert_eq!(quiet.collapsed, 0);
         assert_eq!(quiet.bytes_saved, 0);
     }
@@ -14271,9 +14990,9 @@ Irrespective of whether additional information or instructions are given, you ar
             history.push(tool_result_msg(&format!("s{n}"), &body));
         }
 
-        let first = compact_old_tool_results(&mut history);
+        let first = compact_old_tool_results(&mut history, Path::new("/workspace"));
         assert_eq!(first.collapsed, 1);
-        let second = compact_old_tool_results(&mut history);
+        let second = compact_old_tool_results(&mut history, Path::new("/workspace"));
         assert_eq!(
             second.collapsed, 0,
             "already-collapsed output must not count again"
@@ -14289,7 +15008,7 @@ Irrespective of whether additional information or instructions are given, you ar
             serde_json::json!({"path": "big.c", "content": "x".repeat(5000)}),
         )];
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
         close_dangling_tool_calls(&mut history);
         assert_eq!(history.len(), 2, "interrupted call must be closed");
         assert_eq!(
@@ -14304,7 +15023,7 @@ Irrespective of whether additional information or instructions are given, you ar
             serde_json::json!({"paths": ["big.c"]}),
         ));
         history.push(tool_result_msg("c2", "read back"));
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
         close_dangling_tool_calls(&mut history);
         assert_eq!(history.len(), 4, "repair must not run twice");
         assert!(
@@ -14319,12 +15038,12 @@ Irrespective of whether additional information or instructions are given, you ar
             .map(|n| format!("{n}: ABC{n:04}X§line content number {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let make_old_read = |file: &str| StorageMessage {
+        let make_old_read = |file: &str, id: &str| StorageMessage {
             id: None,
             role: MessageRole::User,
             content: MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
                 crate::providers::ToolResultBlock {
-                    tool_use_id: format!("call_{file}"),
+                    tool_use_id: format!("call_{id}"),
                     content: crate::providers::ToolResultContent::Text(format!(
                         "[File: {file}, Hash: abc12345] (85 lines total)\n[Anchors: ...]\n{anchored_body}"
                     )),
@@ -14340,12 +15059,12 @@ Irrespective of whether additional information or instructions are given, you ar
         };
 
         let mut history = vec![
-            make_old_read("old1.rs"),
-            make_old_read("old2.rs"),
-            make_old_read("old3.rs"),
+            make_old_read("old1.rs", "1"),
+            make_old_read("old1.rs", "2"),
+            make_old_read("old3.rs", "3"),
         ];
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
 
         let get_text = |msg: &StorageMessage| match &msg.content {
             MessageContent::UserBlocks(blocks) => match &blocks[0] {
@@ -14372,7 +15091,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[test]
-    fn test_compact_old_tool_results_collapses_pruned_rereads() {
+    fn test_compact_old_tool_results_preserves_unidentified_pruned_reads() {
         let anchored_body: String = (1..=80)
             .map(|n| format!("{n}: ABC{n:04}X§line content number {n}"))
             .collect::<Vec<_>>()
@@ -14403,7 +15122,7 @@ Irrespective of whether additional information or instructions are given, you ar
             make_pruned_read("cccc3333"),
         ];
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
 
         let get_text = |msg: &StorageMessage| match &msg.content {
             MessageContent::UserBlocks(blocks) => match &blocks[0] {
@@ -14418,12 +15137,8 @@ Irrespective of whether additional information or instructions are given, you ar
 
         let aged = get_text(&history[0]);
         assert!(aged.starts_with("[Context pruned: 83 lines"));
-        assert!(aged.contains("Earlier read content"));
-        assert!(
-            aged.len() < 1000,
-            "aged pruned re-read must collapse near header size, got {} bytes",
-            aged.len()
-        );
+        assert!(!aged.contains("Earlier read content"));
+        assert!(aged.contains("line content number 80"));
         assert!(
             get_text(&history[2]).contains("line content number 80"),
             "most recent pruned re-read must keep full content"
@@ -14482,7 +15197,7 @@ Irrespective of whether additional information or instructions are given, you ar
             history.extend(make_search_pair(n, 5000));
         }
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
 
         let get_result_text = |idx: usize| match &history[idx].content {
             MessageContent::UserBlocks(blocks) => match &blocks[0] {
@@ -14563,7 +15278,7 @@ Irrespective of whether additional information or instructions are given, you ar
             history.extend(make_skeleton_pair(n, 5000));
         }
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
 
         let get_result_text = |idx: usize| match &history[idx].content {
             MessageContent::UserBlocks(blocks) => match &blocks[0] {
@@ -14644,7 +15359,7 @@ Irrespective of whether additional information or instructions are given, you ar
             history.extend(make_edit_pair(n, 5000));
         }
 
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
 
         let get_result_text = |idx: usize| match &history[idx].content {
             MessageContent::UserBlocks(blocks) => match &blocks[0] {
@@ -14739,7 +15454,7 @@ Irrespective of whether additional information or instructions are given, you ar
         }
 
         let bytes_before = tool_result_text_bytes(&history);
-        compact_old_tool_results(&mut history);
+        compact_old_tool_results(&mut history, Path::new("/workspace"));
         let bytes_after = tool_result_text_bytes(&history);
         assert!(
             bytes_before - bytes_after >= 4000,

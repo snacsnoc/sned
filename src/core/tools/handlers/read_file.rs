@@ -750,11 +750,23 @@ impl ReadFileHandler {
         let total_lines = all_lines.len();
 
         let original_start = start_line.unwrap_or(1);
-        let mut clamped_start = original_start;
         let mut clamped_end = end_line;
 
-        if clamped_start > total_lines {
-            clamped_start = total_lines.saturating_sub(50).max(1);
+        if original_start > total_lines {
+            return Err(FileReadResult {
+                path: path.to_string(),
+                canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
+                content: String::new(),
+                hash: String::new(),
+                revision: None,
+                success: false,
+                refreshes_edit_context: false,
+                visible_range: None,
+                source_range: None,
+                error: Some(format!(
+                    "start_line {original_start} is beyond EOF (file has {total_lines} lines); no requested lines were available."
+                )),
+            });
         }
         if let Some(ref mut e) = clamped_end
             && *e > total_lines
@@ -762,7 +774,7 @@ impl ReadFileHandler {
             *e = total_lines;
         }
 
-        let start_idx = clamped_start.saturating_sub(1);
+        let start_idx = original_start.saturating_sub(1);
         let end_exclusive = clamped_end.unwrap_or(total_lines);
 
         let collected_lines: Vec<String> = if start_idx >= end_exclusive || start_idx >= total_lines
@@ -772,19 +784,11 @@ impl ReadFileHandler {
             all_lines[start_idx..end_exclusive.min(total_lines)].to_vec()
         };
 
-        let clamping_note = if clamped_start == original_start {
-            None
-        } else {
-            Some(format!(
-                "[Note: start_line was clamped from {original_start} to {clamped_start} (file has {total_lines} lines)]"
-            ))
-        };
-
         let hash_content = collected_lines.join("\n");
         Ok((
             hash_content,
             collected_lines,
-            clamping_note,
+            None,
             Some(all_lines),
             start_idx,
             end_exclusive,
@@ -978,16 +982,27 @@ impl ReadFileHandler {
             }
         }
 
+        if requested_start > line_no {
+            return Err(FileReadResult {
+                path: path.to_string(),
+                canonical_path: Some(canonical_path.to_string_lossy().into_owned()),
+                content: String::new(),
+                hash: String::new(),
+                revision: None,
+                success: false,
+                refreshes_edit_context: false,
+                visible_range: None,
+                source_range: None,
+                error: Some(format!(
+                    "start_line {requested_start} is beyond EOF (file has {line_no} lines); no requested lines were available."
+                )),
+            });
+        }
+
         let revision = format!("sha256:{:x}", revision.finalize());
-        let clamping_note = if requested_start > line_no && line_no > 0 {
-            Some(format!(
-                "[Revision: {revision}]\n[Note: start_line was beyond the end of this large file (file has {line_no} lines); no requested lines were available.]"
-            ))
-        } else {
-            Some(format!(
-                "[Revision: {revision}]\n[Note: This file exceeds the full-read limit. Use expected_file_hash with revision-checked line ranges for a targeted edit; ordinary Word§ anchors remain inspection-only for this snapshot.]"
-            ))
-        };
+        let clamping_note = Some(format!(
+            "[Revision: {revision}]\n[Note: This file exceeds the full-read limit. Use expected_file_hash with revision-checked line ranges for a targeted edit; ordinary Word§ anchors remain inspection-only for this snapshot.]"
+        ));
 
         let hash_content = selected_lines.join("\n");
         let range_end = selected_lines.len();
@@ -1555,8 +1570,26 @@ impl ReadFileHandler {
             ));
         }
 
-        let start_line = params["start_line"].as_u64().map(|n| n as usize);
-        let end_line = params["end_line"].as_u64().map(|n| n as usize);
+        let parse_line = |name: &str| -> Result<Option<usize>, ToolError> {
+            let Some(value) = params.get(name).filter(|value| !value.is_null()) else {
+                return Ok(None);
+            };
+            let line = value
+                .as_u64()
+                .and_then(|line| usize::try_from(line).ok())
+                .filter(|line| *line > 0)
+                .ok_or_else(|| {
+                    ToolError::InvalidInput(format!("'{name}' must be a positive integer"))
+                })?;
+            Ok(Some(line))
+        };
+        let start_line = parse_line("start_line")?;
+        let end_line = parse_line("end_line")?;
+        if paths.len() > 1 && (start_line.is_some() || end_line.is_some()) {
+            return Err(ToolError::InvalidInput(
+                "Line ranges require a single path. Request each range separately or read multiple files without ranges.".to_string(),
+            ));
+        }
         if let (Some(start), Some(end)) = (start_line, end_line)
             && start > end
         {
@@ -1812,6 +1845,45 @@ impl ToolHandler for ReadFileHandler {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn ranged_batch_requests_are_rejected() {
+        let params = serde_json::json!({"paths": ["a", "b"], "start_line": 66});
+        let error = super::ReadFileHandler::parse_params(&params).unwrap_err();
+        assert!(error.to_string().contains("single path"));
+        assert!(
+            super::ReadFileHandler::parse_params(
+                &serde_json::json!({"paths": ["a", "b"], "start_line": "66"})
+            )
+            .is_err()
+        );
+        assert!(
+            super::ReadFileHandler::parse_params(&serde_json::json!({"paths": ["a", "b"]})).is_ok()
+        );
+        assert!(
+            super::ReadFileHandler::parse_params(
+                &serde_json::json!({"paths": ["a"], "end_line": 20})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn null_ranges_are_absent_and_invalid_ranges_are_rejected() {
+        assert_eq!(
+            super::ReadFileHandler::parse_params(&serde_json::json!({
+                "paths": ["a", "b"], "start_line": null, "end_line": null
+            }))
+            .unwrap(),
+            (vec!["a".to_string(), "b".to_string()], None, None)
+        );
+        for params in [
+            serde_json::json!({"path": "a", "start_line": "66"}),
+            serde_json::json!({"path": "a", "end_line": 1.5}),
+            serde_json::json!({"paths": ["a", "b"], "start_line": "66"}),
+        ] {
+            assert!(super::ReadFileHandler::parse_params(&params).is_err());
+        }
+    }
+    #[test]
     fn trim_warnings_matches_formatted_size() {
         let limit = crate::core::agent_loop::tool_result_history_limit();
         let output = "x".repeat(limit.saturating_sub(8));
@@ -1874,7 +1946,7 @@ mod tests {
     async fn limited_range_reports_absolute_source_boundaries() {
         let directory = tempfile::tempdir().unwrap();
         let source = (1..=1000)
-            .map(|line| format!("line {line:04} {}", "雪".repeat(30)))
+            .map(|line| format!("line {line:04} {}", "雪".repeat(90)))
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(directory.path().join("a]b.txt"), source).unwrap();
@@ -1918,7 +1990,7 @@ mod tests {
     #[tokio::test]
     async fn limited_read_with_no_source_omits_anchor_guidance() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("long.txt"), "x".repeat(30_000)).unwrap();
+        std::fs::write(directory.path().join("long.txt"), "x".repeat(180_000)).unwrap();
         let context = coverage_context(&directory);
         let output = ToolHandler::execute(
             &ReadFileHandler::new(),
@@ -1936,10 +2008,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_full_read_does_not_claim_hidden_lines_are_visible() {
+    async fn ordinary_full_read_covers_a_later_subset() {
         let directory = tempfile::tempdir().unwrap();
         let content = (1..=974)
             .map(|line| format!("line {line:04} {}", "x".repeat(40)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(directory.path().join("file.swift"), content).unwrap();
+        let context = coverage_context(&directory);
+        let handler = ReadFileHandler::new();
+        let first = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["file.swift"]}),
+        )
+        .await
+        .unwrap();
+        let text = first.as_str().unwrap();
+        assert!(text.contains("§line 0974"));
+        assert!(!text.contains("[Output limited."));
+        commit_coverage(&context).await;
+        let subset = ToolHandler::execute(
+            &handler,
+            &context,
+            serde_json::json!({"paths": ["file.swift"], "start_line": 730, "end_line": 780}),
+        )
+        .await
+        .unwrap();
+        assert!(subset.as_str().unwrap().starts_with("Already read:"));
+    }
+
+    #[tokio::test]
+    async fn oversized_full_read_does_not_claim_hidden_lines_are_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let content = (1..=974)
+            .map(|line| format!("line {line:04} {}", "x".repeat(220)))
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(directory.path().join("WaterfallViewModel.swift"), content).unwrap();
@@ -2145,7 +2248,8 @@ mod tests {
         .unwrap();
         let text = clamped.as_str().unwrap();
         assert!(!text.starts_with("Already read:"), "{text}");
-        assert!(text.contains("§line 0451"), "{text}");
+        assert!(text.contains("beyond EOF"), "{text}");
+        assert!(!text.contains("§line 0451"), "{text}");
     }
 
     #[tokio::test]
@@ -3211,7 +3315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_start_line_exceeds_length_clamps() {
+    async fn test_read_file_start_line_exceeds_length_reports_eof() {
         let mut temp_file = NamedTempFile::new().unwrap();
         for i in 1..=10 {
             writeln!(temp_file, "line {}", i).unwrap();
@@ -3230,16 +3334,9 @@ mod tests {
             )
             .await;
 
-        assert!(
-            result.success,
-            "expected success, got error: {:?}",
-            result.error
-        );
-        assert!(
-            result
-                .content
-                .contains("[Note: start_line was clamped from 999 to 1 (file has 11 lines)]")
-        );
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("beyond EOF"));
+        assert!(result.content.is_empty());
     }
 
     #[tokio::test]
@@ -3348,7 +3445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file_start_line_clamped_shows_last_50() {
+    async fn test_read_file_start_line_beyond_eof_does_not_return_last_50() {
         let mut temp_file = NamedTempFile::new().unwrap();
         for i in 1..=100 {
             writeln!(temp_file, "line {}", i).unwrap();
@@ -3367,14 +3464,38 @@ mod tests {
             )
             .await;
 
-        assert!(result.success);
-        assert!(result.content.contains("line 100"));
-        assert!(result.content.contains("line 51"));
-        assert!(!result.content.contains("line 50"));
+        assert!(!result.success);
+        assert!(result.content.is_empty());
+        assert!(result.error.unwrap().contains("beyond EOF"));
+    }
+
+    #[tokio::test]
+    async fn oversized_read_start_line_beyond_eof_is_an_error() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let line = format!("{}\n", "x".repeat(16));
+        for _ in 0..33_000 {
+            temp_file.write_all(line.as_bytes()).unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let result = ReadFileHandler::new()
+            .read_file(
+                temp_file.path().to_str().unwrap(),
+                Some(33_002),
+                None,
+                &AnchorStateManager::new(),
+                Some("test-task"),
+                None,
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.content.is_empty());
         assert!(
             result
-                .content
-                .contains("[Note: start_line was clamped from 200 to 51 (file has 101 lines)]")
+                .error
+                .unwrap()
+                .contains("start_line 33002 is beyond EOF")
         );
     }
 
