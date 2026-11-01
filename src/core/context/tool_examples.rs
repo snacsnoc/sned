@@ -9,46 +9,46 @@ use crate::core::tools::definitions::ToolProfile;
 
 const COMMON_TOOL_EXAMPLES: &str = "\
 EXAMPLE TOOL CALLS
-- File workflow: inspect first with read_file, then make the smallest file change with the matching file tool, then re-read or run a focused check.
-- inspect/read: tool=read_file args={\"paths\": [\"src/main.rs\"]}
-- search/find: tool=search_files args={\"regex\": \"fn handle_error\", \"path\": \"src\"}
-- edit block (preferred): tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"old_text\": \"use std::io;\\n\\nfn main() {\", \"new_text\": \"use std::io;\\nuse std::fs;\\n\\nfn main() {\"}]}]} (each files[] item contains path and edits; copy 2-4 lines of source exactly; omit the NNN: line numbers and anchor prefixes; old_text must match exactly one block in the file)
-- edit anchored (fallback for single-line targeting): tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (anchor/edit_type/text belong inside edits[], never alongside path; copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
-- create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
-- run/test: tool=execute_command args={\"commands\": [\"cargo test --no-fail-fast\"]} (commands is a literal JSON array, not a string containing an array)
+- File workflow: inspect relevant context and make the requested change.
+- inspect/read: tool=read_file args={\"paths\": [\"notes.txt\"]}
+- search/find: tool=search_files args={\"regex\": \"TODO\", \"path\": \".\"}
+- edit one block (preferred): tool=edit_file args={\"path\": \"settings.conf\", \"old_text\": \"mode=dev\\n\", \"new_text\": \"mode=prod\\n\"} (copy exact source without line numbers or anchor prefixes; old_text must match one block)
+- batch or anchored edits: tool=edit_file args={\"files\": [{\"path\": \"settings.conf\", \"edits\": [{\"anchor\": \"Mode§mode=dev\", \"text\": \"mode=prod\"}]}]} (with files[], keep selectors such as anchor/edit_type/text inside edits[]; copy anchors from the current tracked state)
+- create or overwrite a complete file: tool=write_to_file args={\"path\": \"notes.txt\", \"content\": \"...complete desired file contents...\"}
+- inspect workspace location: tool=execute_command args={\"commands\": [\"pwd\"]} (commands is a literal JSON array, not a string containing an array)
 - complex run-only logic: tool=execute_command args={\"script\": \"...\", \"language\": \"python\"}
 - dependent shell statements: tool=execute_command args={\"commands\": [\"value='ready'\\nprintf '%s\\\\n' \\\"$value\\\"\"]} (each commands[] entry starts a fresh shell; keep assignment and use in one entry)
 - quoted multiline shell text: tool=execute_command args={\"commands\": [\"cat <<'EOF'\\nquoted \\\"value\\\"\\nEOF\"]} (preserve the `\\n` escapes and quoted heredoc delimiter)
-- Delete a range: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"anchor\": \"First§// obsolete\", \"end_anchor\": \"Last§old_call();\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read; each selector is one line, never a pasted block).
+- Delete a range: tool=edit_file args={\"files\": [{\"path\": \"notes.txt\", \"edits\": [{\"anchor\": \"Start§obsolete setting\", \"end_anchor\": \"End§end obsolete setting\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read).
 - edit_file uses text for replacement source without anchor prefixes; ordinary range deletion does not need the optional content field.
 - Use file tools for workspace changes. Use execute_command for inspection, builds, tests, and other execution; do not replace a file edit with shell redirection, a heredoc, or an ad-hoc Python/sed rewrite.
-- retry after tool failure: read the complete error, correct the named argument, and call the same tool again. Only stale or unknown anchor recovery requires read_file; malformed input, whitespace mismatch, overlap, and duplicate insertion do not.
+- retry after tool failure: read the error, correct the named argument, and call the same tool again. Only stale or unknown anchor recovery requires read_file.
 ";
 
 const WRITE_ONLY_TOOL_EXAMPLES: &str = "\
 EXAMPLE TOOL CALLS
-- create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
-- File tools are the workspace actions available in this turn. After writing, call attempt_completion with a concise result.
+- create or overwrite a complete file: tool=write_to_file args={\"path\": \"notes.txt\", \"content\": \"...complete desired file contents...\"}
+- File tools are the workspace actions available in this turn. Report the result in text or call attempt_completion.
 ";
 
 const CORE_EDIT_TOOL_EXAMPLES: &str = "\
 EXAMPLE TOOL CALLS
-- File workflow: inspect first with read_file, then make the smallest file change with the matching file tool, then re-read or run a focused check.
-- inspect/read: tool=read_file args={\"paths\": [\"src/main.rs\"]}
-- search/find: tool=search_files args={\"regex\": \"fn handle_error\", \"path\": \"src\"}
-- edit block (preferred): tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"old_text\": \"use std::io;\\n\\nfn main() {\", \"new_text\": \"use std::io;\\nuse std::fs;\\n\\nfn main() {\"}]}]} (each files[] item contains path and edits; copy 2-4 lines of source exactly; omit the NNN: line numbers and anchor prefixes; old_text must match exactly one block in the file)
-- edit anchored (fallback for single-line targeting): tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"edit_type\": \"replace\", \"anchor\": \"Import§use std::io;\", \"text\": \"use std::io;\\nuse std::fs;\"}]}]} (anchor/edit_type/text belong inside edits[], never alongside path; copy an exact full anchor from the current tracked state established by read_file or a successful edit result; never invent the prefix)
-- create or overwrite a complete file: tool=write_to_file args={\"path\": \"src/generated.rs\", \"content\": \"...complete desired file contents...\"}
-- Delete a range: tool=edit_file args={\"files\": [{\"path\": \"src/main.rs\", \"edits\": [{\"anchor\": \"First§// obsolete\", \"end_anchor\": \"Last§old_call();\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read; each selector is one line, never a pasted block).
+- File workflow: inspect relevant context and make the requested change.
+- inspect/read: tool=read_file args={\"paths\": [\"notes.txt\"]}
+- search/find: tool=search_files args={\"regex\": \"TODO\", \"path\": \".\"}
+- edit one block (preferred): tool=edit_file args={\"path\": \"settings.conf\", \"old_text\": \"mode=dev\\n\", \"new_text\": \"mode=prod\\n\"} (copy exact source without line numbers or anchor prefixes; old_text must match one block)
+- batch or anchored edits: tool=edit_file args={\"files\": [{\"path\": \"settings.conf\", \"edits\": [{\"anchor\": \"Mode§mode=dev\", \"text\": \"mode=prod\"}]}]} (with files[], keep selectors such as anchor/edit_type/text inside edits[]; copy anchors from the current tracked state)
+- create or overwrite a complete file: tool=write_to_file args={\"path\": \"notes.txt\", \"content\": \"...complete desired file contents...\"}
+- Delete a range: tool=edit_file args={\"files\": [{\"path\": \"notes.txt\", \"edits\": [{\"anchor\": \"Start§obsolete setting\", \"end_anchor\": \"End§end obsolete setting\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read).
 - edit_file uses text for replacement source without anchor prefixes; ordinary range deletion does not need the optional content field.
 - retry after a stale or unknown edit anchor: call read_file again before retrying. Correct validation-only failures without rereading.
 ";
 
 const PLAN_TOOL_EXAMPLES: &str = "\
 EXAMPLE TOOL CALLS
-- inspect/read: tool=read_file args={\"paths\": [\"src/main.rs\"]}
-- search/find: tool=search_files args={\"regex\": \"fn handle_error\", \"path\": \"src\"}
-- run/test: tool=execute_command args={\"commands\": [\"cargo test --no-fail-fast\"]} (commands is a literal JSON array, not a string containing an array)
+- inspect/read: tool=read_file args={\"paths\": [\"notes.txt\"]}
+- search/find: tool=search_files args={\"regex\": \"TODO\", \"path\": \".\"}
+- inspect workspace location: tool=execute_command args={\"commands\": [\"pwd\"]} (commands is a literal JSON array, not a string containing an array)
 - PLAN MODE is read-only: gather evidence and finish with plan_mode_respond; do not modify files.
 ";
 
@@ -98,8 +98,20 @@ mod tests {
     }
 
     #[test]
+    fn test_examples_use_neutral_command_and_flat_edit_shapes() {
+        for profile in [ToolProfile::LeanAct, ToolProfile::Plan] {
+            let examples = tool_examples_for_model(None, Some(profile)).unwrap();
+            assert!(examples.contains("\"commands\": [\"pwd\"]"));
+            assert!(!examples.contains("cargo test"));
+        }
+        let act = tool_examples_for_model(None, Some(ToolProfile::LeanAct)).unwrap();
+        assert!(act.contains("\"path\": \"settings.conf\", \"old_text\""));
+    }
+
+    #[test]
     fn test_edit_examples_use_current_state_anchors() {
         for profile in [
+            ToolProfile::LeanAct,
             ToolProfile::CoreEdit,
             ToolProfile::Symbol,
             ToolProfile::Validate,
@@ -107,7 +119,9 @@ mod tests {
         ] {
             let examples = tool_examples_for_model(None, Some(profile)).unwrap();
             assert!(examples.contains("current tracked state"));
-            assert!(examples.contains("anchor/edit_type/text belong inside edits[]"));
+            assert!(
+                examples.contains("keep selectors such as anchor/edit_type/text inside edits[]")
+            );
             assert!(!examples.contains("Word§"));
             assert!(!examples.contains("immediately preceding"));
         }

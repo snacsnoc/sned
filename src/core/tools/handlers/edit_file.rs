@@ -551,6 +551,20 @@ impl EditFileHandler {
     pub(crate) fn normalize_stringified_files_param(
         params: &mut serde_json::Value,
     ) -> Result<bool, String> {
+        let has_flat_source = ["old_text", "old_str", "search"]
+            .iter()
+            .any(|key| params.get(key).is_some());
+        let has_flat_replacement = ["new_text", "new_str", "text", "replace"]
+            .iter()
+            .any(|key| params.get(key).is_some());
+        if params.get("files").is_some()
+            && (has_flat_source
+                || has_flat_replacement
+                || params.get("edits").is_some()
+                || params.get("paths").is_some())
+        {
+            return Err("Use either flat edit arguments or 'files', not both.".to_string());
+        }
         if let Some(raw) = params.get("files").and_then(serde_json::Value::as_str) {
             let files = Self::parse_stringified_files_array(raw).map_err(|error| {
                 format!(
@@ -565,15 +579,25 @@ impl EditFileHandler {
         if params.get("files").is_some() {
             return Ok(false);
         }
-        if params.get("path").is_some()
-            && (params.get("old_text").is_some()
-                || params.get("old_str").is_some()
-                || params.get("search").is_some())
-        {
+        if has_flat_source || has_flat_replacement {
+            if params.get("path").is_none() {
+                return Err("Flat edit arguments require a nonempty 'path'.".to_string());
+            }
+            if !has_flat_source {
+                return Err(
+                    "Flat edit arguments require 'old_text' (or its supported alias).".to_string(),
+                );
+            }
+            if !has_flat_replacement {
+                return Err(
+                    "Flat edit arguments require 'new_text'; use an empty string to delete."
+                        .to_string(),
+                );
+            }
             if params.get("paths").is_some() {
                 return Err("Ambiguous edit_file arguments: use either 'paths' or top-level 'path' with 'old_text'.".to_string());
             }
-            if params.get("edits").is_some() || params.get("files").is_some() {
+            if params.get("edits").is_some() {
                 return Err("Ambiguous edit_file arguments: use either top-level 'path' with 'old_text' or 'files'/'edits', not both.".to_string());
             }
             let path = params
@@ -594,7 +618,9 @@ impl EditFileHandler {
                 .or_else(|| params.get("text"))
                 .or_else(|| params.get("replace"))
                 .cloned()
-                .unwrap_or_else(|| serde_json::json!(""));
+                .ok_or(
+                    "Missing replacement text: provide 'new_text' (use an empty string to delete).",
+                )?;
             let object = params
                 .as_object_mut()
                 .ok_or("edit_file arguments must be a JSON object")?;
@@ -4614,6 +4640,51 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(file_path).unwrap(),
             "replaced\nsecond\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_flat_block_mode_allows_empty_replacement() {
+        let _guard = TEST_MUTEX.lock().await;
+        let (_dir, file_path, _, ctx) =
+            setup_test_ctx("remove this\nkeep this\n", "flat-block-delete").await;
+        let result = ToolHandler::execute(
+            &EditFileHandler::new(),
+            &ctx,
+            serde_json::json!({
+                "path": "test.txt",
+                "old_text": "remove this\n",
+                "new_text": ""
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), "keep this\n");
+    }
+
+    #[test]
+    fn test_edit_file_flat_shape_requires_replacement_and_rejects_mixed_shapes() {
+        let mut missing_replacement = serde_json::json!({
+            "path": "test.txt",
+            "old_text": "before"
+        });
+        assert!(
+            EditFileHandler::normalize_stringified_files_param(&mut missing_replacement)
+                .unwrap_err()
+                .contains("require 'new_text'")
+        );
+
+        let mut mixed = serde_json::json!({
+            "path": "test.txt",
+            "old_text": "before",
+            "new_text": "after",
+            "files": []
+        });
+        assert!(
+            EditFileHandler::normalize_stringified_files_param(&mut mixed)
+                .unwrap_err()
+                .contains("either flat edit arguments or 'files'")
         );
     }
 

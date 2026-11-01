@@ -232,81 +232,107 @@ pub fn search_files_schema() -> ToolSchema {
 pub fn edit_file_schema() -> ToolSchema {
     ToolSchema {
         name: "edit_file",
-        description: "Edit existing files; does not create files. Each files[] item must contain path and edits. Put anchor, edit_type, text, start_line, end_line, and expected_text inside an edits[] item, never directly alongside path. Use exact anchors from reads or successful edits. Untouched tracked anchors remain valid. For oversized files, use the complete sha256 revision from a ranged read with start_line/end_line/expected_text. Failures withhold that file; other anchored files may apply. Reread only when recovery metadata requires it. Use write_to_file to create/full-rewrite.",
-        parameters: vec![ToolParameter {
-            name: "files",
-            required: true,
-            param_type: "array",
-            description: "Files to edit.",
-            items: Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path of an existing file relative to workspace root; create via write_to_file."
-                    },
-                    "expected_file_hash": {
-                        "type": "string",
-                        "description": "Optional sha256:<digest> from large ranged read. Use with line-range selectors instead of anchors."
-                    },
-                    "edits": {
-                        "type": "array",
-                        "description": "Edits for this file: 'old_text' + 'new_text' (block replace), 'anchor' + 'text' (anchored edit), or 'start_line' + 'expected_text' (revision-checked).",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "old_text": {
-                                    "type": "string",
-                                    "description": "Exact unique block of source lines to replace. Replaced with 'new_text' without anchors. Omit read-output 'NNN: ' line-number prefixes."
-                                },
-                                "new_text": {
-                                    "type": "string",
-                                    "description": "Replacement source text for 'old_text'. 'text' is accepted as an alias."
-                                },
-                                "edit_type": {
-                                    "type": "string",
-                                    "enum": ["replace", "insert_after", "insert_before"],
-                                    "description": "Default replace. Inserts preserve anchor; wrap with range replace. Reject adjacent duplicates."
-                                },
-                                "anchor": {
-                                    "type": "string",
-                                    "description": "Copy anchor lines from read_file or edit output (form `<id>§<source>`, e.g. `AxD6h8§    lock.withLock {`; omit the 'NNN: ' line-number prefix). For replace, anchor and end_anchor may be consecutive multiline blocks. Or use old_text or start_line."
-                                },
-                                "end_anchor": {
-                                    "type": "string",
-                                    "description": "Inclusive endpoint for a multi-line range. WARNING: Everything between anchor and end_anchor is replaced by text. NEVER set end_anchor if you only want to modify or replace a single line."
-                                },
-                                "start_line": {
-                                    "type": "integer",
-                                    "minimum": 1,
-                                    "description": "1-based inclusive start line for revision-checked editing; use only with expected_file_hash."
-                                },
-                                "end_line": {
-                                    "type": "integer",
-                                    "minimum": 1,
-                                    "description": "1-based inclusive end line; use only with expected_file_hash. Ignored when editing by anchor."
-                                },
-                                "expected_text": {
-                                    "type": "string",
-                                    "description": "Exact selected logical lines joined with LF. Required with start_line; whitespace is significant."
-                                },
-                                "content": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description": "Optional exact interior lines for duplicate-line fingerprint. Use only with replace and end_anchor."
-                                },
-                                "text": {
-                                    "type": "string",
-                                    "description": "Replacement source without anchor prefixes; use \\n for new lines. Use \"\" to delete range."
+        description: "Edit existing files; does not create files. Use {path, old_text, new_text} for one exact block replacement, or files[] with path and edits for batches, anchors, and revision-checked changes. In files[] entries, put selectors inside edits[]. Copy exact source from reads or successful edits; untouched tracked anchors remain valid. For oversized files, use the revision from a ranged read. Reread only when recovery metadata requires it. Use write_to_file to create or fully replace a file.",
+        parameters: vec![
+            ToolParameter {
+                name: "path",
+                required: false,
+                param_type: "string",
+                description: "Existing file for a single block replacement.",
+                items: None,
+                extra: None,
+            },
+            ToolParameter {
+                name: "old_text",
+                required: false,
+                param_type: "string",
+                description: "Unique source block to replace.",
+                items: None,
+                extra: None,
+            },
+            ToolParameter {
+                name: "new_text",
+                required: false,
+                param_type: "string",
+                description: "Replacement block; use an empty string to delete.",
+                items: None,
+                extra: None,
+            },
+            ToolParameter {
+                name: "files",
+                required: false,
+                param_type: "array",
+                description: "Files to edit.",
+                items: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path of an existing file relative to workspace root; create via write_to_file."
+                        },
+                        "expected_file_hash": {
+                            "type": "string",
+                            "description": "Optional sha256:<digest> from large ranged read. Use with line-range selectors instead of anchors."
+                        },
+                        "edits": {
+                            "type": "array",
+                            "description": "Edits for this file: 'old_text' + 'new_text' (block replace), 'anchor' + 'text' (anchored edit), or 'start_line' + 'expected_text' (revision-checked).",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old_text": {
+                                        "type": "string",
+                                        "description": "Exact unique block of source lines to replace. Replaced with 'new_text' without anchors. Omit read-output 'NNN: ' line-number prefixes."
+                                    },
+                                    "new_text": {
+                                        "type": "string",
+                                        "description": "Replacement source text for 'old_text'. 'text' is accepted as an alias."
+                                    },
+                                    "edit_type": {
+                                        "type": "string",
+                                        "enum": ["replace", "insert_after", "insert_before"],
+                                        "description": "Default replace. Inserts preserve anchor; wrap with range replace. Reject adjacent duplicates."
+                                    },
+                                    "anchor": {
+                                        "type": "string",
+                                        "description": "Copy anchor lines from read_file or edit output (form `<id>§<source>`, e.g. `AxD6h8§    lock.withLock {`; omit the 'NNN: ' line-number prefix). For replace, anchor and end_anchor may be consecutive multiline blocks. Or use old_text or start_line."
+                                    },
+                                    "end_anchor": {
+                                        "type": "string",
+                                        "description": "Inclusive endpoint for a multi-line range. WARNING: Everything between anchor and end_anchor is replaced by text. NEVER set end_anchor if you only want to modify or replace a single line."
+                                    },
+                                    "start_line": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "description": "1-based inclusive start line for revision-checked editing; use only with expected_file_hash."
+                                    },
+                                    "end_line": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "description": "1-based inclusive end line; use only with expected_file_hash. Ignored when editing by anchor."
+                                    },
+                                    "expected_text": {
+                                        "type": "string",
+                                        "description": "Exact selected logical lines joined with LF. Required with start_line; whitespace is significant."
+                                    },
+                                    "content": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Optional exact interior lines for duplicate-line fingerprint. Use only with replace and end_anchor."
+                                    },
+                                    "text": {
+                                        "type": "string",
+                                        "description": "Replacement source without anchor prefixes; use \\n for new lines. Use \"\" to delete range."
+                                    }
                                 }
                             }
                         }
-                    }
-                },
-                "required": ["path", "edits"]
-            })),
-            extra: None,
-        }],
+                    },
+                    "required": ["path", "edits"]
+                })),
+                extra: None,
+            },
+        ],
     }
 }
 
@@ -1000,6 +1026,10 @@ mod tests {
         let params = def.function.parameters.as_object().unwrap();
         let properties = params["properties"].as_object().unwrap();
         assert!(properties.contains_key("files"));
+        for field in ["path", "old_text", "new_text"] {
+            assert!(properties.contains_key(field), "missing flat field {field}");
+        }
+        assert_eq!(params["required"], serde_json::json!([]));
 
         let files_param = properties["files"].as_object().unwrap();
         assert_eq!(files_param["type"], "array");
@@ -1069,7 +1099,7 @@ mod tests {
         assert!(
             schema
                 .description
-                .contains("Untouched tracked anchors remain valid")
+                .contains("untouched tracked anchors remain valid")
         );
         assert!(schema.description.contains("revision from a ranged read"));
         assert!(schema.description.contains("recovery metadata requires it"));
@@ -1164,14 +1194,19 @@ mod tests {
         assert!(
             schema
                 .description
-                .contains("files[] item must contain path and edits")
+                .contains("Use {path, old_text, new_text} for one exact block replacement")
         );
-        assert!(schema.description.contains(
-            "anchor, edit_type, text, start_line, end_line, and expected_text inside an edits[] item"
-        ));
-        assert!(schema.description.contains("never directly alongside path"));
+        assert!(
+            schema
+                .description
+                .contains("In files[] entries, put selectors inside edits[]")
+        );
 
-        let file_items = schema.parameters[0]
+        let file_items = schema
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "files")
+            .unwrap()
             .items
             .as_ref()
             .expect("files should define item schema");
@@ -1406,18 +1441,19 @@ mod tests {
             write_bytes
         );
         assert!(
-            core_bytes < 7300,
-            "CoreEdit should be under 7300 bytes: got {}",
+            core_bytes < 7600,
+            "CoreEdit should be under 7600 bytes: got {}",
             core_bytes
         );
+        assert!(lean_act_bytes < full_bytes);
         assert!(
-            validate_bytes < 8800,
-            "Validate should be under 8800 bytes: got {}",
+            validate_bytes < 9100,
+            "Validate should be under 9100 bytes: got {}",
             validate_bytes
         );
         assert!(
-            symbol_bytes < 8950,
-            "Symbol should be under 8950 bytes: got {}",
+            symbol_bytes < 9300,
+            "Symbol should be under 9300 bytes: got {}",
             symbol_bytes
         );
         assert!(
@@ -1435,7 +1471,6 @@ mod tests {
         assert!(answer_bytes < write_bytes);
         assert!(write_bytes < core_bytes);
         assert!(core_bytes <= validate_bytes);
-        assert!(lean_act_bytes < full_bytes);
         assert!(validate_bytes <= full_bytes);
     }
 
@@ -1648,7 +1683,11 @@ mod tests {
     #[test]
     fn edit_file_schema_warns_against_single_line_end_anchor() {
         let schema = edit_file_schema();
-        let file_items = schema.parameters[0]
+        let file_items = schema
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "files")
+            .unwrap()
             .items
             .as_ref()
             .expect("files should define item schema");
