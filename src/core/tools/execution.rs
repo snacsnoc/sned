@@ -690,7 +690,17 @@ async fn prepare_tool_tasks(
                 false
             };
 
-            if profile_denied {
+            if inputs.mode == AgentMode::Act && tool == SnedTool::PlanModeRespond {
+                ToolExecutionOutput::error(
+                    "Tool 'plan_mode_respond' is only available in PLAN MODE. In ACT MODE, perform the task and finish with 'attempt_completion'.".to_string(),
+                    None,
+                )
+            } else if inputs.mode == AgentMode::Plan && tool == SnedTool::AttemptCompletion {
+                ToolExecutionOutput::error(
+                    "Tool 'attempt_completion' is only available in ACT MODE. In PLAN MODE, gather needed context and finish with 'plan_mode_respond'.".to_string(),
+                    None,
+                )
+            } else if profile_denied {
                 ToolExecutionOutput::error(
                     format!(
                         "Tool '{tool_name}' is not available in the current tool profile. Use one of the tools listed for this turn."

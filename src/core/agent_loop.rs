@@ -464,9 +464,6 @@ struct AgentLoopDeps {
     approval_manager: Option<Arc<tokio::sync::Mutex<crate::core::approval::ApprovalManager>>>,
     checkpoint_manager: Option<crate::core::checkpoints::TaskCheckpointManager>,
     tool_profile: Option<crate::core::tools::definitions::ToolProfile>,
-    /// When true, the tool profile is forced to at least `Validate` so
-    /// `execute_command` is available. This is the explicit opt-in for
-    /// shell execution (paired with `--yolo` / `--auto-approve-all`).
     yolo: bool,
 }
 
@@ -945,8 +942,7 @@ impl AgentLoop {
         }
     }
 
-    /// Enable yolo mode — forces tool profile to `Validate` so
-    /// `execute_command` is available (explicit shell opt-in).
+    /// Enable automatic approval without changing the selected tool profile.
     #[must_use]
     pub fn with_yolo(mut self, yolo: bool) -> Self {
         self.deps.yolo = yolo;
@@ -1681,6 +1677,7 @@ impl AgentLoop {
                 if let Some(queued_message) = mq.pop_front() {
                     let queue_remaining = mq.len();
                     drop(mq);
+                    self.deps.tool_profile = None;
                     let queued_is_retry = if let Some(id) = queued_message.id.as_ref() {
                         self.retry_message_ids.lock().await.remove(id)
                     } else {
@@ -1797,6 +1794,7 @@ impl AgentLoop {
                         if let Some(queued_message) = mq.pop_front() {
                             let queue_remaining = mq.len();
                             drop(mq);
+                            self.deps.tool_profile = None;
                             let queued_is_retry = if let Some(id) = queued_message.id.as_ref() {
                                 self.retry_message_ids.lock().await.remove(id)
                             } else {
@@ -2175,9 +2173,7 @@ impl AgentLoop {
             }
         }
 
-        // 3. Select the tool profile before building the system prompt. The
-        // prompt's examples and the request's schemas must describe the same
-        // inventory, especially for reduced profiles such as DirectAnswer.
+        // 3. Select the profile before building the matching system prompt.
         let profile = {
             let mode_str = match self.config.mode {
                 crate::core::agent_types::AgentMode::Plan => "plan",
@@ -2191,8 +2187,7 @@ impl AgentLoop {
                     _ => None,
                 })
                 .unwrap_or("");
-            let profile =
-                resolve_tool_profile(self.deps.tool_profile, self.deps.yolo, prompt, mode_str);
+            let profile = resolve_tool_profile(self.deps.tool_profile, prompt, mode_str);
             let profile_changed = self.deps.tool_profile != Some(profile);
             self.deps.tool_profile = Some(profile);
             if profile_changed {
@@ -2222,6 +2217,7 @@ impl AgentLoop {
                     model_id: self.resolve_active_model_id(),
                     ..Default::default()
                 });
+        context.agent_mode = Some(self.config.mode);
         context.tool_profile = Some(profile);
         let workspace_root = context
             .cwd
@@ -3192,11 +3188,15 @@ impl AgentLoop {
                         // escalated tool schemas.
                         self.deps.cached_system_prompt = None;
                     }
+                    let completion_instruction = match self.config.mode {
+                        AgentMode::Plan => "call plan_mode_respond",
+                        AgentMode::Act => "call attempt_completion",
+                    };
                     history.push(StorageMessage {
                         id: Some(Self::next_message_id(&self.message_counter)),
                         role: MessageRole::User,
-                        content: MessageContent::Text(String::from(
-                            "You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, call attempt_completion or plan_mode_respond.",
+                        content: MessageContent::Text(format!(
+                            "You returned text without using a tool. If this task requires workspace changes or verification, use the required tool. If the task is complete, {completion_instruction}.",
                         )),
                         model_info: None,
                         metrics: None,
@@ -3907,12 +3907,13 @@ impl AgentLoop {
         // completion_result unset, and a failure elsewhere in the batch
         // must not be hidden by a completion request.
         let completion_candidate = completion_result.is_some() || text_only_completes_task;
-        let plan_mode_responded = prepared_tool_calls.iter().any(|prepared| {
-            matches!(
-                SnedTool::from_name(&prepared.tool_name),
-                Some(SnedTool::PlanModeRespond)
-            )
-        });
+        let plan_mode_responded = self.config.mode == AgentMode::Plan
+            && prepared_tool_calls.iter().any(|prepared| {
+                matches!(
+                    SnedTool::from_name(&prepared.tool_name),
+                    Some(SnedTool::PlanModeRespond)
+                )
+            });
         let is_completion = tool_failure_count == 0
             && (completion_candidate || plan_mode_responded)
             && !plan_active
@@ -4862,7 +4863,6 @@ impl AgentLoop {
 
 fn resolve_tool_profile(
     cached: Option<crate::core::tools::definitions::ToolProfile>,
-    yolo: bool,
     prompt: &str,
     mode_str: &str,
 ) -> crate::core::tools::definitions::ToolProfile {
@@ -4871,21 +4871,15 @@ fn resolve_tool_profile(
     }
 
     // /compact injects an explicit condense instruction. The model must
-    // receive the condense tool schema; reduced profiles (especially YOLO's
-    // Validate) omit it and force the model to hallucinate a tool name.
+    // receive the condense tool schema; reduced profiles omit it.
     if prompt.contains("type=\"condense\"") {
         return crate::core::tools::definitions::ToolProfile::Full;
     }
 
-    let selected = match cached {
+    // Keyword guesses cannot reliably determine which tools a task needs.
+    match cached {
         Some(profile) => profile,
-        None => crate::core::tools::definitions::select_tool_profile(prompt, mode_str),
-    };
-
-    if yolo {
-        crate::core::tools::definitions::ToolProfile::Validate
-    } else {
-        selected
+        None => crate::core::tools::definitions::ToolProfile::Full,
     }
 }
 
@@ -8192,25 +8186,113 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_tool_profile_applies_yolo_over_cached_profile() {
+    fn test_resolve_tool_profile_preserves_cached_profile() {
         let profile = resolve_tool_profile(
             Some(crate::core::tools::definitions::ToolProfile::WriteOnly),
-            true,
             "write a file",
             "act",
         );
 
         assert_eq!(
             profile,
-            crate::core::tools::definitions::ToolProfile::Validate
+            crate::core::tools::definitions::ToolProfile::WriteOnly
         );
     }
 
+    #[tokio::test]
+    async fn act_requests_expose_tools_for_ambiguous_tasks() {
+        for prompt in [
+            "Explain this repository",
+            "Fix the parser bug",
+            "Create a report file from the current inventory",
+        ] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = Arc::new(Providers::RecordingChunk(
+                crate::providers::RecordingChunkProvider::new(
+                    vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                        text: "I'll inspect the task.".into(),
+                        id: None,
+                        signature: None,
+                    })]],
+                    requests.clone(),
+                ),
+            ));
+            let mut agent = AgentLoop::new(test_agent_config(provider, "act-full-tools"));
+            agent
+                .conversation_history
+                .lock()
+                .await
+                .push(StorageMessage {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text(prompt.into()),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                });
+            let _ = agent.execute_turn().await;
+            let requests = requests.lock().unwrap();
+            let tools = requests[0].tools.as_ref().unwrap();
+            for name in ["read_file", "edit_file", "execute_command", "write_to_file"] {
+                assert!(
+                    tools.iter().any(|tool| tool.function.name == name),
+                    "{prompt:?} missing {name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn yolo_keeps_task_tool_profile_and_neutral_prompt() {
+        let mut observed = Vec::new();
+        for yolo in [false, true] {
+            let responses = vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "I will inspect the database.".to_string(),
+                id: None,
+                signature: None,
+            })]];
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = Arc::new(Providers::RecordingChunk(
+                crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
+            ));
+            let mut agent =
+                AgentLoop::new(test_agent_config(provider, "read-only-analysis")).with_yolo(yolo);
+            agent
+                .conversation_history
+                .lock()
+                .await
+                .push(StorageMessage {
+                    id: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text(
+                        "Read-only PostgreSQL analysis. Do not run pytest, lint, build, diagnostics, or any test command. Execute the PostgreSQL query and report Friday's trades.".to_string(),
+                    ),
+                    model_info: None,
+                    metrics: None,
+                    ts: None,
+                });
+            let _ = agent.execute_turn().await;
+            let requests = requests.lock().unwrap();
+            let request = &requests[0];
+            let tools: Vec<_> = request
+                .tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|tool| tool.function.name.clone())
+                .collect();
+            assert!(tools.iter().any(|name| name == "execute_command"));
+            assert!(!request.system_prompt.contains("cargo test"));
+            assert!(!request.system_prompt.contains("baseline status"));
+            observed.push(tools);
+        }
+        assert_eq!(observed[0], observed[1]);
+    }
+
     #[test]
-    fn test_resolve_tool_profile_plan_mode_ignores_cached_profile_and_yolo() {
+    fn test_resolve_tool_profile_plan_mode_ignores_cached_profile() {
         let profile = resolve_tool_profile(
             Some(crate::core::tools::definitions::ToolProfile::Full),
-            true,
             "inspect the workspace",
             "plan",
         );
@@ -8219,30 +8301,27 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_tool_profile_compact_instruction_ignores_yolo_and_cached_profile() {
+    fn test_resolve_tool_profile_compact_instruction_ignores_cached_profile() {
         // /compact injects <explicit_instructions type="condense">. The model
-        // must receive the condense tool schema even in YOLO mode (which
-        // otherwise forces Validate and omits condense).
+        // must receive the condense tool schema regardless of the cached profile.
         let prompt = r#"<explicit_instructions type="condense">
 The user has explicitly asked you to create a detailed summary of the conversation so far.
 Irrespective of whether additional information or instructions are given, you are only allowed to respond to this message by calling the condense tool.
 </explicit_instructions>
 "#;
 
-        let profile_yolo = resolve_tool_profile(
+        let profile_write_only = resolve_tool_profile(
             Some(crate::core::tools::definitions::ToolProfile::WriteOnly),
-            true,
             prompt,
             "act",
         );
         assert_eq!(
-            profile_yolo,
+            profile_write_only,
             crate::core::tools::definitions::ToolProfile::Full
         );
 
         let profile_cached = resolve_tool_profile(
             Some(crate::core::tools::definitions::ToolProfile::CoreEdit),
-            false,
             prompt,
             "act",
         );
@@ -8256,9 +8335,9 @@ Irrespective of whether additional information or instructions are given, you ar
     fn test_compact_profile_includes_condense_tool() {
         // Regression guard: a /compact turn must expose the condense tool.
         // The qwen bug was that the model hallucinated `condense_tool`
-        // because Validate (YOLO's forced profile) omitted `condense`.
+        // because the Validate profile omitted `condense`.
         let prompt = "<explicit_instructions type=\"condense\">compact now</explicit_instructions>";
-        let profile = resolve_tool_profile(None, true, prompt, "act");
+        let profile = resolve_tool_profile(None, prompt, "act");
         let has_condense = profile.tools().iter().any(|t| t.name() == "condense");
         assert!(
             has_condense,
@@ -8305,6 +8384,46 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(
             tools.iter().any(|tool| tool.function.name == "edit_file"),
             "ACT profile should be selected from the current task, not the first historical prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_tasks_recompute_the_tool_profile() {
+        let responses = (0..2)
+            .map(|_| {
+                vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                    text: "Done.".into(),
+                    id: None,
+                    signature: None,
+                })]
+            })
+            .collect();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "queued-profile"));
+        agent.enqueue_text_message("What is 2 + 2?".into()).await;
+        agent
+            .enqueue_text_message("Edit the configuration parser".into())
+            .await;
+        let _ = agent
+            .run(Vec::new(), Arc::new(StateManager::new().unwrap()))
+            .await;
+
+        let requests = requests.lock().unwrap();
+        assert!(requests.len() >= 2);
+        assert!(
+            requests[0]
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool.function.name == "read_file"))
+        );
+        assert!(
+            requests[1]
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool.function.name == "edit_file"))
         );
     }
 
@@ -8356,7 +8475,12 @@ Irrespective of whether additional information or instructions are given, you ar
             .expect("edit task should complete");
 
         let requests = requests.lock().unwrap();
-        assert!(requests[0].tools.is_none());
+        assert!(
+            requests[0]
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool.function.name == "read_file"))
+        );
         let tools = requests[1]
             .tools
             .as_ref()
@@ -14975,6 +15099,242 @@ Irrespective of whether additional information or instructions are given, you ar
         assert_eq!(plan.steps.len(), 3);
         assert!(!plan.approved);
         assert!(plan.format_state().contains("mode: APPROVAL"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_mode_respond_in_act_mode_is_rejected() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::plan_mode_respond::PlanModeRespondHandler;
+
+        let plan_json = serde_json::json!({
+            "response": "1. Inspect the codebase\n2. Write the implementation",
+            "needs_more_exploration": false,
+        });
+
+        let responses = vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call_plan".to_string()),
+                function: crate::providers::ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("plan_mode_respond".to_string()),
+                    arguments: Some(plan_json.to_string()),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        })]];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
+        ));
+
+        let config = AgentConfig {
+            provider: Arc::new(std::sync::Mutex::new(provider)),
+            mode: AgentMode::Act,
+            task_id: "test-plan-respond-act".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            show_thinking: true,
+            verbose: false,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: Some(3),
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::PlanModeRespond,
+            Arc::new(PlanModeRespondHandler::new()),
+        );
+
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        let result = agent.execute_turn().await;
+        // In ACT mode, calling plan_mode_respond must be rejected and must NOT complete the task
+        assert!(matches!(result, TurnResult::Continue));
+
+        let state = agent.state.lock().await;
+        assert!(
+            state.plan_state.is_none(),
+            "PlanState must not be created in ACT mode"
+        );
+
+        let history = agent.conversation_history.lock().await;
+        let last_message = history.last().expect("history must have tool result");
+        match &last_message.content {
+            MessageContent::UserBlocks(blocks) => {
+                let error_text = blocks
+                    .iter()
+                    .find_map(|b| match b {
+                        UserContentBlock::ToolResult(r) => match &r.content {
+                            crate::providers::ToolResultContent::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .expect("tool result block");
+                assert!(
+                    error_text.contains("only available in PLAN MODE"),
+                    "unexpected error text: {error_text}"
+                );
+            }
+            other => panic!("expected UserBlocks, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_attempt_completion_in_plan_mode_is_rejected() {
+        use crate::core::tools::ToolRegistry;
+        use crate::core::tools::handlers::attempt_completion::AttemptCompletionHandler;
+
+        let completion_json = serde_json::json!({
+            "result": "I completed the plan",
+        });
+
+        let responses = vec![vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call_complete".to_string()),
+                function: crate::providers::ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some("attempt_completion".to_string()),
+                    arguments: Some(completion_json.to_string()),
+                },
+                signature: None,
+            },
+            id: None,
+            signature: None,
+        })]];
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
+        ));
+
+        let config = AgentConfig {
+            provider: Arc::new(std::sync::Mutex::new(provider)),
+            mode: AgentMode::Plan,
+            task_id: "test-attempt-completion-plan".to_string(),
+            enable_checkpoints: false,
+            use_auto_condense: false,
+            show_token_usage: false,
+            show_thinking: true,
+            verbose: false,
+            json_output: false,
+            max_turns: 10,
+            max_consecutive_mistakes: Some(3),
+            double_check_completion: false,
+            timeout_secs: 300,
+            track_changes: false,
+            is_subagent_execution: false,
+            max_context_turns: 50,
+            max_tokens: None,
+            interactive_mode: true,
+            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+            strict_plan_mode_enabled: true,
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            crate::core::tools::SnedTool::AttemptCompletion,
+            Arc::new(AttemptCompletionHandler::new()),
+        );
+
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+
+        let result = agent.execute_turn().await;
+        // In PLAN mode, calling attempt_completion must be rejected and must NOT complete the task
+        assert!(matches!(result, TurnResult::Continue));
+
+        let history = agent.conversation_history.lock().await;
+        let last_message = history.last().expect("history must have tool result");
+        match &last_message.content {
+            MessageContent::UserBlocks(blocks) => {
+                let error_text = blocks
+                    .iter()
+                    .find_map(|b| match b {
+                        UserContentBlock::ToolResult(r) => match &r.content {
+                            crate::providers::ToolResultContent::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .expect("tool result block");
+                assert!(
+                    error_text.contains("only available in ACT MODE"),
+                    "unexpected error text: {error_text}"
+                );
+            }
+            other => panic!("expected UserBlocks, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_text_only_turn_steers_with_mode_appropriate_tool() {
+        for (mode, expected_tool) in [
+            (AgentMode::Act, "call attempt_completion"),
+            (AgentMode::Plan, "call plan_mode_respond"),
+        ] {
+            let responses = vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "I am thinking about the problem.".to_string(),
+                id: None,
+                signature: None,
+            })]];
+
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = Arc::new(Providers::RecordingChunk(
+                crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
+            ));
+
+            let config = AgentConfig {
+                provider: Arc::new(std::sync::Mutex::new(provider)),
+                mode,
+                task_id: format!("test-text-steering-{mode:?}"),
+                enable_checkpoints: false,
+                use_auto_condense: false,
+                show_token_usage: false,
+                show_thinking: true,
+                verbose: false,
+                json_output: false,
+                max_turns: 10,
+                max_consecutive_mistakes: Some(3),
+                double_check_completion: false,
+                timeout_secs: 300,
+                track_changes: false,
+                is_subagent_execution: false,
+                max_context_turns: 50,
+                max_tokens: None,
+                interactive_mode: true,
+                output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
+                strict_plan_mode_enabled: true,
+            };
+
+            let mut agent = AgentLoop::new(config);
+            let _ = agent.execute_turn().await;
+
+            let history = agent.conversation_history.lock().await;
+            let steering = history.last().expect("steering message in history");
+            match &steering.content {
+                MessageContent::Text(text) => {
+                    assert!(
+                        text.contains(expected_tool),
+                        "mode {mode:?} should mention {expected_tool}, got: {text}"
+                    );
+                }
+                other => panic!("expected Text message, got {:?}", other),
+            }
+        }
     }
 
     #[tokio::test]

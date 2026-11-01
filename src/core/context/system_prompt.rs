@@ -39,6 +39,8 @@ pub struct SystemPromptContext {
     /// Tool inventory active for this request. Examples are omitted when the
     /// profile is unknown so prompts cannot advertise unavailable tools.
     pub tool_profile: Option<ToolProfile>,
+    /// Operating mode (Plan or Act).
+    pub agent_mode: Option<crate::core::agent_types::AgentMode>,
     pub active_shell_type: Option<String>,
     pub active_shell_path: Option<String>,
     pub active_shell_is_posix: bool,
@@ -99,39 +101,6 @@ impl PromptBuilder {
         format!("{custom}\n\n---\n\n{prompt}")
     }
 
-    fn model_specific_section(&self) -> String {
-        match self.context.model_id.as_deref() {
-            Some(m) if super::model_detect::is_qwen_model(m) => {
-                Self::qwen_section(self.context.tool_profile)
-            }
-            _ => String::new(),
-        }
-    }
-
-    fn qwen_section(profile: Option<ToolProfile>) -> String {
-        let mut section = String::from(
-            "QWEN MODEL GUIDANCE\n\
-- Call an available tool explicitly when the task advances by inspecting, editing, running, or searching; do not describe execution in prose instead of acting.\n\
-- Tool arguments must be valid JSON that matches the tool's schema; double-check field names and required keys before submitting.\n",
-        );
-        if let Some(profile) = profile {
-            let has = |tool| profile.tools().contains(&tool);
-            if has(SnedTool::ReadFile) && has(SnedTool::EditFile) {
-                section.push_str(
-                    "- Use exact anchors from the current tracked state. Prefer batching independent edits from the same snapshot unless the task requires sequential edits; read again when an error requires it or the needed context is missing.\n",
-                );
-            } else if has(SnedTool::ReadFile) {
-                section.push_str(
-                    "- Execute inspection in small, verifiable steps and use the available read/search tools for current workspace state.\n",
-                );
-            }
-        }
-        section.push_str(
-            "- When a tool returns an error, read the error text, fix the failing argument, and call the same tool again. Do not guess a corrected result.\n",
-        );
-        section
-    }
-
     fn has_tool(&self, tool: SnedTool) -> bool {
         self.context
             .tool_profile
@@ -141,27 +110,19 @@ impl PromptBuilder {
     fn render_template(&self) -> String {
         let skills_section = self.format_skills_section();
 
-        let model_section = self.model_specific_section();
-
-        let mut prompt = "You are Sned, a terminal-first coding agent.\n\n".to_string();
-
-        if !model_section.is_empty() {
-            prompt.push('\n');
-            prompt.push_str(&model_section);
-            prompt.push('\n');
-        }
+        let mut prompt = "You are Sned, a terminal assistant.\n\n".to_string();
 
         prompt.push_str(
             "PRIME DIRECTIVES\n\
              - Complete the user's task directly.\n\
              - Minimize turns and load only the context you need.\n\
-             - Be concise, deterministic, and finish with the mode-appropriate completion tool.\n\n",
+             - Be concise and direct.\n\n",
         );
         prompt.push_str("EXECUTION\n");
 
         if self.context.enable_parallel_tool_calling {
             prompt.push_str(
-                "- Prefer batching independent work in one response unless the task requires sequential execution; edits within one file can share one edit_file call with edits based on the same snapshot.\n",
+                "- Independent tool calls may be batched; edits based on the same snapshot can share one edit_file call.\n",
             );
         }
         if !self.context.enable_parallel_tool_calling {
@@ -200,7 +161,7 @@ impl PromptBuilder {
         }
         if self.has_tool(SnedTool::EditFile) {
             prompt.push_str(
-                "- For `edit_file`, you may use either exact block mode (`old_text` + `new_text`) to replace a unique block of source lines without anchors, or anchored mode (`anchor` + `text`) copying the exact anchor prefix and content from read_file (read lines show a 1-indexed line number first; omit the number when copying). Block mode (`old_text` + `new_text`) is recommended for structural edits and brace fixes.\n\
+                "- For `edit_file`, use exact block mode (`old_text` + `new_text`) to replace a unique block of lines without anchors, or anchored mode (`anchor` + `text`) copying the exact anchor prefix and content from read_file (read lines show a 1-indexed line number first; omit the number when copying).\n\
                  - In exact block mode, include enough unique surrounding lines in `old_text` to match unambiguously. In anchored mode, different prefixes distinguish identical-content occurrences in the current tracked state. Prefer batching independent edits from the same snapshot in one `edit_file` call, including in sequential tool mode, unless the task requires sequential edits. Explicit workflow requirements override batching defaults. Unchanged tracked occurrences retain their anchors across edits; a fresh read is not required for each edit. Dependent edits use the updated result. For oversized files, use the ranged read's complete sha256 revision with start_line, end_line, and expected_text; its snapshot anchors are inspection-only.\n\
                  - In an `edit_file` edit, put replacement text in `text`; the optional `content` field is only an exact array of interior lines for duplicate-anchor disambiguation, never a replacement string.\n\
                  - After a stale or unknown anchor error, call `read_file` again before retrying. Correct malformed input, whitespace mismatches, overlaps, and duplicate insertions without rereading unless the returned recovery metadata explicitly requires it.\n",
@@ -213,31 +174,28 @@ impl PromptBuilder {
         }
         if self.has_tool(SnedTool::ExecuteCommand) {
             prompt.push_str(
-                "- Use `execute_command` for inspection, builds, tests, and other execution; do not use shell redirection, heredocs, or ad-hoc Python/sed scripts as a substitute for workspace file tools. Sandboxed commands receive a filtered environment; to pass non-sensitive variables, set SNED_ALLOW_ENV=VAR1,VAR2.\n\
+                "- Sandboxed commands receive a filtered environment; to pass non-sensitive variables, set SNED_ALLOW_ENV=VAR1,VAR2.\n\
                  - For `execute_command`, send `commands` as a JSON array of strings, not a string containing an array; use `script` for complex run-only logic.\n\
                  - Each `commands[]` entry runs in a fresh shell, so variables, `cd`, and other shell state do not persist between entries or tool calls. Keep dependent statements in one multiline entry or use `script`. Preserve `\\n` escapes and quoted delimiters when a JSON command string contains multiline shell text such as a heredoc.\n",
             );
         }
-        if self.has_tool(SnedTool::WriteToFile) && self.has_tool(SnedTool::EditFile) {
-            prompt.push_str(
-                "- For large generated files, write a small skeleton first and fill sections with `edit_file` instead of sending one huge payload.\n",
-            );
-        }
-        if self.has_tool(SnedTool::AttemptCompletion) {
+        let is_act = self.context.agent_mode == Some(crate::core::agent_types::AgentMode::Act)
+            || (self.context.agent_mode.is_none() && self.has_tool(SnedTool::AttemptCompletion));
+        let is_plan = self.context.agent_mode == Some(crate::core::agent_types::AgentMode::Plan)
+            || (self.context.agent_mode.is_none() && self.has_tool(SnedTool::PlanModeRespond));
+
+        if is_act && self.has_tool(SnedTool::AttemptCompletion) {
             prompt.push_str(
                 "- In ACT mode, perform the task and finish with `attempt_completion`.\n",
             );
         }
-        if self.has_tool(SnedTool::PlanModeRespond) {
+        if is_plan && self.has_tool(SnedTool::PlanModeRespond) {
             prompt.push_str(
                 "- In PLAN mode, gather needed context and finish with `plan_mode_respond` without modifying files.\n",
             );
         }
         prompt.push_str(
-            "- Keep validation focused, but run the checks needed for code/workspace changes or required by project instructions.\n\
-             - When tasked with checking if code works or fixing bugs, run the project's build or test command via `execute_command` early to establish baseline status. Do not read the entire codebase or conduct endless exploratory searches; inspect only the specific files relevant to build/test failures or explicit user instructions.\n\
-             - Avoid planning text, broad validation, and extra file reads unless they are necessary, cheap, or user-requested.\n\n\
-             SAFETY AND REFUSAL\n\
+            "SAFETY AND REFUSAL\n\
              - Refuse unsafe or disallowed requests.\n\
              - Do not delete, reset, overwrite user work, or run destructive commands unless the user explicitly requested it and tool approvals allow it.\n\
              - If required information is missing and available tools cannot get it, ask one focused follow-up question.\n",
@@ -246,17 +204,7 @@ impl PromptBuilder {
         prompt.push_str(
             "\nOUTPUT FORMAT\n\
               - Keep responses short and CLI-friendly.\n\
-              - Use tools instead of long prose whenever possible.\n\
-              - If no tools are needed or available, answer directly in text and keep it brief.\n\
-              - When the task is complete, return the result through the required completion tool.\n\n\
-              CODE GENERATION\n\
-              - Only create the files and abstractions explicitly requested.\n\
-              - Do not add docstrings unless requested.\n\
-              - Do not add sync wrappers for async code unless requested.\n\
-              - Do not add main()/CLI entry points unless requested.\n\
-              - Do not add extra helpers, config objects, or custom error types unless needed to satisfy the prompt.\n\
-              - Prefer standard library solutions over hand-rolled utilities.\n\
-              - Match the requested shape exactly: if asked for a function, write a function, not a framework.\n",
+              - If no tools are needed or available, answer directly in text and keep it brief.\n",
         );
 
         prompt.push_str(&skills_section);
@@ -271,14 +219,6 @@ impl PromptBuilder {
             for instructions in custom_instructions {
                 prompt.push_str(&format!("\n{instructions}\n"));
             }
-        }
-
-        if let Some(examples) = super::tool_examples::tool_examples_for_model(
-            self.context.model_id.as_deref(),
-            self.context.tool_profile,
-        ) {
-            prompt.push_str("\n\n");
-            prompt.push_str(examples);
         }
 
         prompt
@@ -405,10 +345,21 @@ mod tests {
         assert!(prompt.contains("Unchanged tracked occurrences retain their anchors"));
         assert!(!prompt.lines().any(|line| line.starts_with('\\')));
         assert!(prompt.contains("In ACT mode"));
-        assert!(prompt.contains("PLAN mode"));
+        assert!(!prompt.contains("PLAN mode"));
         // Environment info is now provided by context_loader, not in system prompt
         assert!(!prompt.contains("ENVIRONMENT"));
         assert!(!prompt.contains("Current Working Directory:"));
+    }
+
+    #[test]
+    fn test_system_prompt_plan_mode_guidance() {
+        let context = SystemPromptContext {
+            tool_profile: Some(ToolProfile::Plan),
+            ..Default::default()
+        };
+        let prompt = PromptBuilder::new(context).build();
+        assert!(prompt.contains("In PLAN mode"));
+        assert!(!prompt.contains("In ACT mode"));
     }
 
     #[test]
@@ -607,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_builder_large_file_guidance() {
+    fn test_prompt_builder_does_not_prescribe_file_creation_workflow() {
         let context = SystemPromptContext {
             tool_profile: Some(ToolProfile::Full),
             ..Default::default()
@@ -615,8 +566,7 @@ mod tests {
         let builder = PromptBuilder::new(context);
         let prompt = builder.build();
 
-        assert!(prompt.contains("write a small skeleton first"));
-        assert!(prompt.contains("fill sections with `edit_file`"));
+        assert!(!prompt.contains("write a small skeleton first"));
     }
 
     #[test]
@@ -642,8 +592,7 @@ mod tests {
             ..Default::default()
         };
         let prompt = PromptBuilder::new(context).build();
-        assert!(prompt.contains("Prefer batching independent work in one response"));
-        assert!(prompt.contains("unless the task requires sequential execution"));
+        assert!(prompt.contains("Independent tool calls may be batched"));
         assert!(prompt.contains("edits based on the same snapshot"));
     }
 
@@ -663,83 +612,44 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen_model_id_injects_qwen_section() {
-        let context = SystemPromptContext {
-            model_id: Some("qwen3.6-35b-a3b".to_string()),
+    fn direct_answer_prompt_does_not_require_a_completion_tool() {
+        let prompt = PromptBuilder::new(SystemPromptContext {
+            tool_profile: Some(ToolProfile::DirectAnswer),
             ..Default::default()
-        };
-        let prompt = PromptBuilder::new(context).build();
-        assert!(prompt.contains("QWEN MODEL GUIDANCE"));
-        assert!(!prompt.contains("re-read with read_file before edit_file"));
-        assert!(prompt.contains("Call an available tool explicitly"));
+        })
+        .build();
+        assert!(prompt.contains("No tools are available"));
+        assert!(!prompt.contains("completion tool"));
+        assert!(!prompt.contains("attempt_completion"));
     }
 
     #[test]
-    fn test_qwen_model_id_injects_tool_examples() {
-        let context = SystemPromptContext {
-            model_id: Some("qwen3.5-27b".to_string()),
-            tool_profile: Some(ToolProfile::Full),
-            ..Default::default()
-        };
-        let prompt = PromptBuilder::new(context).build();
-        assert!(prompt.contains("EXAMPLE TOOL CALLS"));
-        assert!(prompt.contains("tool=read_file"));
-    }
-
-    #[test]
-    fn test_qwen_routed_model_id_injects() {
-        let context = SystemPromptContext {
-            model_id: Some("openrouter/qwen/qwen3.6-35b-a3b".to_string()),
-            tool_profile: Some(ToolProfile::Full),
-            ..Default::default()
-        };
-        let prompt = PromptBuilder::new(context).build();
-        assert!(prompt.contains("QWEN MODEL GUIDANCE"));
-        assert!(prompt.contains("EXAMPLE TOOL CALLS"));
-    }
-
-    #[test]
-    fn test_non_qwen_model_id_no_section() {
-        let context = SystemPromptContext {
-            model_id: Some("gpt-4o".to_string()),
-            tool_profile: Some(ToolProfile::Full),
-            ..Default::default()
-        };
-        let prompt = PromptBuilder::new(context).build();
-        assert!(!prompt.contains("QWEN MODEL GUIDANCE"));
-        assert!(prompt.contains("EXAMPLE TOOL CALLS"));
-        assert!(prompt.contains("tool=edit_file"));
-    }
-
-    #[test]
-    fn test_model_id_none_no_section_without_active_profile() {
-        let context = SystemPromptContext::default();
-        let prompt = PromptBuilder::new(context).build();
-        assert!(!prompt.contains("QWEN MODEL GUIDANCE"));
-        assert!(!prompt.contains("EXAMPLE TOOL CALLS"));
-    }
-
-    #[test]
-    fn test_non_qwen_prompts_share_common_tool_examples() {
-        let ctx_none = SystemPromptContext {
-            cwd: Some("/tmp/test".to_string()),
-            ide: "vscode".to_string(),
-            enable_parallel_tool_calling: true,
-            tool_profile: Some(ToolProfile::Full),
-            ..Default::default()
-        };
-        let ctx_gpt = SystemPromptContext {
-            cwd: Some("/tmp/test".to_string()),
-            ide: "vscode".to_string(),
-            enable_parallel_tool_calling: true,
-            model_id: Some("gpt-4o".to_string()),
-            tool_profile: Some(ToolProfile::Full),
-            ..Default::default()
-        };
-        let prompt_none = PromptBuilder::new(ctx_none).build();
-        let prompt_gpt = PromptBuilder::new(ctx_gpt).build();
-        assert!(prompt_none.contains("EXAMPLE TOOL CALLS"));
-        assert!(prompt_gpt.contains("EXAMPLE TOOL CALLS"));
+    fn generated_prompts_are_neutral_across_models_and_profiles() {
+        for model in [None, Some("qwen3.5-27b"), Some("gpt-4o")] {
+            for profile in [ToolProfile::Validate, ToolProfile::Full, ToolProfile::Plan] {
+                let context = SystemPromptContext {
+                    model_id: model.map(str::to_string),
+                    tool_profile: Some(profile),
+                    ..Default::default()
+                };
+                let prompt = PromptBuilder::new(context).build();
+                for unwanted in [
+                    "cargo test",
+                    "EXAMPLE TOOL CALLS",
+                    "QWEN MODEL GUIDANCE",
+                    "baseline status",
+                    "CODE GENERATION",
+                    "write a small skeleton first",
+                ] {
+                    assert!(
+                        !prompt.contains(unwanted),
+                        "unexpected guidance {unwanted:?} in {model:?}/{profile:?}"
+                    );
+                }
+                assert!(prompt.contains("terminal assistant"));
+                assert!(prompt.contains("Each `commands[]` entry runs in a fresh shell"));
+            }
+        }
     }
 
     /// Process-global mutex to serialize env var tests. `cargo test` runs

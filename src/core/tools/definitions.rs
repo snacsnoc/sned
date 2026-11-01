@@ -867,7 +867,6 @@ impl ToolProfile {
                 SnedTool::ExecuteCommand,
                 SnedTool::AskFollowupQuestion,
                 SnedTool::AttemptCompletion,
-                SnedTool::PlanModeRespond,
                 SnedTool::GetFunction,
                 SnedTool::GetFileSkeleton,
                 SnedTool::FindSymbolReferences,
@@ -923,6 +922,13 @@ pub fn select_tool_profile(prompt: &str, mode: &str) -> ToolProfile {
     if is_validate_task && !is_write_only {
         return ToolProfile::Validate;
     }
+    if lower.contains("execute_command")
+        || lower.contains("execute ")
+        || lower.contains("run ")
+        || lower.contains("psql")
+    {
+        return ToolProfile::Full;
+    }
     if is_edit_task && !is_write_only {
         return ToolProfile::CoreEdit;
     }
@@ -938,7 +944,7 @@ pub fn select_tool_profile(prompt: &str, mode: &str) -> ToolProfile {
 
 fn is_answer_only_prompt(lower: &str) -> bool {
     let short = lower.len() < 120;
-    let has_file_keywords = lower.contains("file")
+    let needs_context_or_execution = lower.contains("file")
         || lower.contains("create")
         || lower.contains("write")
         || lower.contains("generate")
@@ -948,9 +954,15 @@ fn is_answer_only_prompt(lower: &str) -> bool {
         || lower.contains("fix")
         || lower.contains("debug")
         || lower.contains("patch")
-        || lower.contains("modify");
+        || lower.contains("modify")
+        || lower.contains("database")
+        || lower.contains("postgres")
+        || lower.contains("sql")
+        || lower.contains("query")
+        || lower.contains("command")
+        || lower.contains("shell");
 
-    if !short || has_file_keywords {
+    if !short || needs_context_or_execution {
         return false;
     }
 
@@ -1024,6 +1036,12 @@ fn is_edit_prompt(lower: &str) -> bool {
 }
 
 fn is_validate_prompt(lower: &str) -> bool {
+    if ["do not", "don't", "never", "avoid", "without"]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+    {
+        return false;
+    }
     lower.contains("run test")
         || lower.contains("run the test")
         || lower.contains("lint")
@@ -1323,7 +1341,7 @@ mod tests {
     #[test]
     fn test_active_tools_count() {
         let defs = get_active_tool_definitions();
-        assert_eq!(defs.len(), 20);
+        assert_eq!(defs.len(), 19);
     }
 
     #[test]
@@ -1414,7 +1432,7 @@ mod tests {
         assert!(ToolProfile::Validate.tools().len() >= 11);
         assert!(ToolProfile::Symbol.tools().len() >= 9);
         assert_eq!(ToolProfile::Plan.tools().len(), 15);
-        assert_eq!(ToolProfile::Full.tools().len(), 20);
+        assert_eq!(ToolProfile::Full.tools().len(), 19);
     }
 
     #[test]
@@ -1561,6 +1579,25 @@ mod tests {
     }
 
     #[test]
+    fn database_and_command_requests_have_execution_tools() {
+        for prompt in [
+            "What are Friday's completed PostgreSQL trades?",
+            "What does this database query return?",
+            "Fix the script and run ./verify.sh",
+            "Read-only PostgreSQL analysis. Do not run pytest, lint, build, diagnostics, or any test command. Execute the PostgreSQL query and report Friday's trades.",
+        ] {
+            let profile = select_tool_profile(prompt, "act");
+            assert!(
+                profile.tools().contains(&SnedTool::ExecuteCommand),
+                "{prompt}: {profile:?}"
+            );
+            if prompt.starts_with("Read-only") {
+                assert_eq!(profile, ToolProfile::Full);
+            }
+        }
+    }
+
+    #[test]
     fn test_select_tool_profile_write_only() {
         assert_eq!(
             select_tool_profile("Create a Rust source file named `even_sum.rs`.", "act"),
@@ -1638,6 +1675,18 @@ mod tests {
         assert!(!names.contains(&"attempt_completion"));
         assert!(!names.contains(&"replace_symbol"));
         assert!(!names.contains(&"rename_symbol"));
+    }
+
+    #[test]
+    fn test_full_profile_excludes_plan_mode_respond() {
+        let names = ToolProfile::Full
+            .tools()
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"attempt_completion"));
+        assert!(!names.contains(&"plan_mode_respond"));
     }
 
     #[test]
