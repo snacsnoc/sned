@@ -1445,7 +1445,11 @@ impl AnchorStateManager {
                 retired_anchors: VecDeque::new(),
             };
             for _ in 0..document.hashes.len() {
-                let identity = Self::allocate_identity(&mut document, false)?;
+                // Fresh namespace, counter from zero, monotonic: nothing minted can
+                // collide, so the collision scan can only ever miss. Skip it — this is
+                // provably wasted work per line, not a measured win (first-persist
+                // cost lives elsewhere).
+                let identity = Self::allocate_identity(&mut document, true)?;
                 document.anchors.push(identity);
             }
             document
@@ -2081,8 +2085,10 @@ impl AnchorStateManager {
                 next_anchor_id: 0,
                 retired_anchors: VecDeque::new(),
             };
+            // Fresh namespace, counter from zero, monotonic: nothing minted
+            // can collide, so the collision scan can only ever miss. Skip it.
             for _ in 0..tracked.hashes.len() {
-                let identity = Self::allocate_identity(&mut tracked, false)?;
+                let identity = Self::allocate_identity(&mut tracked, true)?;
                 tracked.anchors.push(identity);
             }
             let anchors = tracked.anchors.clone();
