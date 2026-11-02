@@ -171,6 +171,7 @@ pub struct InteractiveSession {
     task_storage: TaskStorage,
     provider_api_keys: HashMap<String, String>,
     task_opts: TaskOptions,
+    pending_reasoning_effort: Option<crate::cli::ReasoningEffort>,
     root_opts: RootOnlyOptions,
     tool_registry: Arc<crate::core::tools::ToolRegistry>,
     context_loader: crate::core::context::ContextLoader,
@@ -259,6 +260,7 @@ impl InteractiveSession {
             task_storage,
             provider_api_keys,
             task_opts,
+            pending_reasoning_effort: None,
             root_opts,
             tool_registry,
             context_loader,
@@ -325,6 +327,7 @@ impl InteractiveSession {
             task_storage,
             provider_api_keys: self.provider_api_keys.clone(),
             task_opts: self.task_opts.clone(),
+            pending_reasoning_effort: None,
             root_opts: self.root_opts.clone(),
             tool_registry: Arc::clone(&self.tool_registry),
             context_loader: self.context_loader.clone(),
@@ -708,6 +711,13 @@ async fn request_model_switch(
     session: &Arc<Mutex<InteractiveSession>>,
     agent_busy: &Arc<AtomicBool>,
 ) {
+    if app.cancellation_pending {
+        app.show_notification(
+            "Cancellation is still finishing. Wait before switching models.",
+            NotificationKind::Info,
+        );
+        return;
+    }
     if agent_busy.load(Ordering::Relaxed) {
         app.show_notification(
             "Agent is busy. Wait for it to finish before switching models.",
@@ -764,12 +774,17 @@ async fn request_reasoning_effort(
     agent_busy: &Arc<AtomicBool>,
 ) {
     if agent_busy.load(Ordering::Relaxed) {
+        session.lock().await.pending_reasoning_effort = Some(effort.clone());
         app.show_notification(
-            "Agent is busy. Wait for it to finish before changing reasoning effort.",
-            NotificationKind::Warning,
+            format!(
+                "Reasoning effort {} queued for after the current run.",
+                effort.as_provider_str()
+            ),
+            NotificationKind::Info,
         );
         return;
     }
+    session.lock().await.pending_reasoning_effort = None;
 
     let (provider_name, model_id, task_opts, state_manager) = {
         let sess = session.lock().await;
@@ -831,6 +846,32 @@ async fn request_reasoning_effort(
                 NotificationKind::Error,
             );
         }
+    }
+}
+
+async fn apply_pending_reasoning_effort(
+    app: &mut App,
+    session: &Arc<Mutex<InteractiveSession>>,
+    agent_busy: &Arc<AtomicBool>,
+) {
+    if agent_busy.load(Ordering::Relaxed) {
+        return;
+    }
+    let effort = session.lock().await.pending_reasoning_effort.take();
+    if let Some(effort) = effort {
+        request_reasoning_effort(effort, app, session, agent_busy).await;
+    }
+}
+
+async fn finish_cancellation_cleanup(
+    app: &mut App,
+    session: &Arc<Mutex<InteractiveSession>>,
+    agent_busy: &Arc<AtomicBool>,
+) {
+    if app.cancellation_pending && !agent_busy.load(Ordering::Acquire) {
+        app.cancellation_pending = false;
+        app.needs_redraw = true;
+        apply_pending_reasoning_effort(app, session, agent_busy).await;
     }
 }
 
@@ -3619,6 +3660,13 @@ async fn switch_to_fresh_task(
     output_rx: &mut mpsc::Receiver<SequencedOutputEvent>,
     task_opts: &TaskOptions,
 ) -> anyhow::Result<()> {
+    if app.cancellation_pending {
+        app.show_notification(
+            "Cancellation is still finishing; wait before starting a new conversation.",
+            NotificationKind::Info,
+        );
+        return Ok(());
+    }
     if agent_busy.load(Ordering::Relaxed) {
         app.push_styled(
             "Agent is busy. Wait for it to finish before starting a new conversation.",
@@ -3782,10 +3830,11 @@ async fn handle_cli_only_command_with_terminal(
         return Ok(false);
     }
 
-    if agent_busy.load(Ordering::Relaxed) && matches!(&cli_cmd, CliOnlyCommand::ReasoningEffort(_))
+    if agent_busy.load(Ordering::Relaxed)
+        && matches!(&cli_cmd, CliOnlyCommand::ReasoningEffort(argument) if argument.trim().is_empty())
     {
         app.show_notification(
-            "Agent is busy. Wait for it to finish before changing reasoning effort.",
+            "Agent is busy. Use `/effort <level>` to queue a change; the picker is available when idle.",
             NotificationKind::Warning,
         );
         return Ok(false);
@@ -5653,10 +5702,7 @@ async fn run_main_loop(
     let mut discarded_render_generations = std::collections::HashSet::new();
 
     loop {
-        if app.cancellation_pending && !agent_busy.load(Ordering::Acquire) {
-            app.cancellation_pending = false;
-            app.needs_redraw = true;
-        }
+        finish_cancellation_cleanup(app, &session, &agent_busy).await;
         let (render_us, syntax_highlight_us, apply_us, render_count, apply_peak_us, render_metrics) =
             turn_render_worker.apply_ready(app);
         timing.turn_render_total_us = timing.turn_render_total_us.saturating_add(render_us);
@@ -6103,9 +6149,13 @@ async fn run_main_loop(
                 {
                     break;
                 }
-                match ratatui::crossterm::event::read().map_err(|error| {
+                let event = ratatui::crossterm::event::read().map_err(|error| {
                     tui_io_error("TUI input read failed", error, task_opts.debug)
-                })? {
+                })?;
+                // Cancellation cleanup can finish while poll/read waits. Apply
+                // queued settings before dispatching input against the idle session.
+                finish_cancellation_cleanup(app, &session, &agent_busy).await;
+                match event {
                     Event::Key(key) => {
                         if !accept_input_key(&key, &mut ctrl_c_held) {
                             continue;
@@ -6319,6 +6369,13 @@ async fn run_main_loop(
                                     break;
                                 }
                                 Action::Submit { text, cli_cmd } => {
+                                    if app.cancellation_pending {
+                                        app.show_notification(
+                                            "Cancellation is still finishing; wait before submitting another command.",
+                                            NotificationKind::Info,
+                                        );
+                                        break;
+                                    }
                                     // Make the echoed submit visible before any
                                     // command bookkeeping or agent startup work.
                                     drain_and_render_user_submit(
@@ -6678,6 +6735,10 @@ async fn run_main_loop(
                 // Turn separator after agent completion
                 app.push_turn_separator();
             }
+        }
+
+        if !app.cancellation_pending {
+            apply_pending_reasoning_effort(app, &session, &agent_busy).await;
         }
 
         // Export conversation after each completed turn when --export is set.
@@ -13611,6 +13672,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_effort_change_queues_while_busy_and_applies_when_idle() -> anyhow::Result<()> {
+        use crate::cli::slash_commands::CliOnlyCommand;
+
+        let mut task_opts = retry_test_task_opts();
+        task_opts.provider = Some("openrouter".to_string());
+        task_opts.model = Some("openai/gpt-5.4".to_string());
+        task_opts.api_key = Some("sk-test123".to_string());
+        task_opts.reasoning_effort = Some(crate::cli::ReasoningEffort::High);
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let agent_done = Arc::new(tokio::sync::Notify::new());
+        let agent_start_time = Arc::new(Mutex::new(None));
+        let agent_task = Arc::new(Mutex::new(None));
+        let state_handle = Arc::new(Mutex::new(None));
+        let queue_handle = Arc::new(Mutex::new(None));
+        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
+        let task_id = {
+            let sess = session.lock().await;
+            sess.agent_loop().await.task_id().to_string()
+        };
+
+        handle_cli_only_command(
+            CliOnlyCommand::ReasoningEffort(String::new()),
+            "/effort",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle,
+            &queue_handle,
+            &task_opts,
+            false,
+        )
+        .await?;
+        assert!(app.reasoning_effort_picker_active);
+        assert_eq!(app.reasoning_effort_picker_selected, 3);
+
+        agent_busy.store(true, Ordering::Relaxed);
+        handle_cli_only_command(
+            CliOnlyCommand::ReasoningEffort("low".to_string()),
+            "/effort low",
+            &mut app,
+            &output_writer,
+            &session,
+            &task_id,
+            &agent_busy,
+            &agent_done,
+            &agent_start_time,
+            &agent_task,
+            &state_handle,
+            &queue_handle,
+            &task_opts,
+            false,
+        )
+        .await?;
+
+        {
+            let sess = session.lock().await;
+            assert_eq!(
+                sess.pending_reasoning_effort,
+                Some(crate::cli::ReasoningEffort::Low)
+            );
+            assert_eq!(
+                sess.task_opts.reasoning_effort,
+                Some(crate::cli::ReasoningEffort::High)
+            );
+        }
+
+        app.cancellation_pending = true;
+        agent_busy.store(false, Ordering::Release);
+        finish_cancellation_cleanup(&mut app, &session, &agent_busy).await;
+
+        let sess = session.lock().await;
+        assert_eq!(
+            sess.task_opts.reasoning_effort,
+            Some(crate::cli::ReasoningEffort::Low)
+        );
+        assert!(sess.pending_reasoning_effort.is_none());
+        let agent = sess.agent_loop().await;
+        let provider = agent.get_provider();
+        let crate::providers::Providers::OpenRouter(openrouter) = provider.as_ref() else {
+            panic!("expected OpenRouter provider");
+        };
+        let request = crate::providers::ProviderRequest {
+            system_prompt: "You are helpful.".to_string(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+        };
+        assert_eq!(
+            openrouter.build_request_body_for_test(&request)?["reasoning_effort"],
+            "low"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_effort_command_accepts_released_minimax_flash_id() -> anyhow::Result<()> {
         let mut task_opts = retry_test_task_opts();
         task_opts.provider = Some("minimax".to_string());
@@ -14056,58 +14231,6 @@ mod tests {
         assert!(app.picker_results.is_empty());
         assert!(!app.mention_search_active);
         assert!(app.mention_search_query.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_bare_effort_opens_picker_with_current_selection() -> anyhow::Result<()> {
-        use crate::cli::slash_commands::CliOnlyCommand;
-
-        let task_opts = retry_test_task_opts();
-        let session = Arc::new(Mutex::new(
-            InteractiveSession::build_with_writer(
-                task_opts.clone(),
-                RootOnlyOptions {
-                    session_id: None,
-                    continue_session: false,
-                },
-                None,
-            )
-            .await?,
-        ));
-        session.lock().await.task_opts.reasoning_effort = Some(crate::cli::ReasoningEffort::High);
-        let mut app = App::new();
-        let agent_busy = Arc::new(AtomicBool::new(false));
-        let agent_done = Arc::new(tokio::sync::Notify::new());
-        let agent_start_time = Arc::new(Mutex::new(None));
-        let agent_task = Arc::new(Mutex::new(None));
-        let state_handle = Arc::new(Mutex::new(None));
-        let output_writer: OutputWriterArc = Arc::new(crate::cli::output::StderrOutputWriter);
-        let task_id = {
-            let sess = session.lock().await;
-            sess.agent_loop().await.task_id().to_string()
-        };
-
-        handle_cli_only_command(
-            CliOnlyCommand::ReasoningEffort(String::new()),
-            "/effort",
-            &mut app,
-            &output_writer,
-            &session,
-            &task_id,
-            &agent_busy,
-            &agent_done,
-            &agent_start_time,
-            &agent_task,
-            &state_handle,
-            &Arc::new(Mutex::new(None)),
-            &task_opts,
-            false,
-        )
-        .await?;
-
-        assert!(app.reasoning_effort_picker_active);
-        assert_eq!(app.reasoning_effort_picker_selected, 3);
         Ok(())
     }
 
