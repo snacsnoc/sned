@@ -1761,9 +1761,10 @@ impl App {
                     has_separator_after_front,
                 )
             });
-            let evicted_rows = incremental_eviction
-                .flatten()
-                .unwrap_or_else(fallback_evicted_rows);
+            // A refused incremental eviction is `Some(None)`: the row count
+            // still falls back, but the index must not be trusted.
+            let incremental_evicted_rows = incremental_eviction.flatten();
+            let evicted_rows = incremental_evicted_rows.unwrap_or_else(fallback_evicted_rows);
             // Evict front line and buffer it for batched scrollback append.
             if let Some(line) = self.output_lines.front() {
                 let text = Self::line_to_string(line);
@@ -1814,7 +1815,7 @@ impl App {
             self.selection_surfaces.clear();
             self.rendered_hyperlink_targets.clear();
             self.transcript_selection_area = None;
-            if incremental_eviction.is_some() {
+            if incremental_evicted_rows.is_some() {
                 self.cached_visual_rows = self.visual_layout_index.total_rows();
                 self.cached_wrap_width = Some(wrap_width);
             } else {
@@ -7158,6 +7159,40 @@ mod tests {
         assert!(
             seen_marker,
             "early marker should appear while paging up through the transcript; last frame:\n{last_rendered}"
+        );
+    }
+
+    #[test]
+    fn test_refused_incremental_eviction_invalidates_layout() {
+        // A refused incremental eviction leaves entries for popped lines;
+        // trusting that index desyncs every transcript row until a resize
+        // or error path forces recovery, so refusal must invalidate.
+        let mut app = App::new();
+        app.set_content_height(24);
+        app.set_content_width(80);
+        let wrap_width = app.last_wrap_width();
+        for index in 0..10_000 {
+            app.push_output_with_kind(
+                Line::from(format!("evict probe {index}")),
+                BlockKind::Model,
+            );
+        }
+        // The next cap eviction cannot take the increment once position
+        // tracking drifts from the buffer.
+        let _ = app.output_visual_rows(wrap_width);
+        assert!(app.visual_layout_index.is_valid_for(wrap_width));
+        app.visual_layout_index.output_entry_positions.pop_front();
+        app.push_output_with_kind(Line::from("evict probe overflow"), BlockKind::Model);
+        assert_eq!(app.output_lines.len(), 10_000);
+        assert!(
+            !app.visual_layout_index.is_valid_for(wrap_width),
+            "refused eviction must invalidate the layout index"
+        );
+        app.ensure_visual_layout_index(wrap_width);
+        assert_eq!(
+            app.total_visual_rows(wrap_width),
+            app.total_visual_rows_for_width(wrap_width),
+            "recovered index must match a fresh rescan"
         );
     }
 
