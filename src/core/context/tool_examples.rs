@@ -22,7 +22,7 @@ EXAMPLE TOOL CALLS
 - Delete a range: tool=edit_file args={\"files\": [{\"path\": \"notes.txt\", \"edits\": [{\"anchor\": \"Start§obsolete setting\", \"end_anchor\": \"End§end obsolete setting\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read).
 - edit_file uses text for replacement source without anchor prefixes; ordinary range deletion does not need the optional content field.
 - Use file tools for workspace changes. Use execute_command for inspection, builds, tests, and other execution; do not replace a file edit with shell redirection, a heredoc, or an ad-hoc Python/sed rewrite.
-- retry after tool failure: read the error, correct the named argument, and call the same tool again. Only stale or unknown anchor recovery requires read_file.
+- retry after tool failure: read the error, correct the named argument, and call the same tool again. If the same error repeats after correcting it, stop retrying and report the error and what was attempted. Only stale or unknown anchor recovery requires read_file.
 ";
 
 const WRITE_ONLY_TOOL_EXAMPLES: &str = "\
@@ -41,7 +41,7 @@ EXAMPLE TOOL CALLS
 - create or overwrite a complete file: tool=write_to_file args={\"path\": \"notes.txt\", \"content\": \"...complete desired file contents...\"}
 - Delete a range: tool=edit_file args={\"files\": [{\"path\": \"notes.txt\", \"edits\": [{\"anchor\": \"Start§obsolete setting\", \"end_anchor\": \"End§end obsolete setting\", \"text\": \"\"}]}]} (inclusive endpoints copied from your read).
 - edit_file uses text for replacement source without anchor prefixes; ordinary range deletion does not need the optional content field.
-- retry after a stale or unknown edit anchor: call read_file again before retrying. Correct validation-only failures without rereading.
+- retry after a stale or unknown edit anchor: call read_file again before retrying. Correct validation-only failures without rereading. If the same error repeats after correcting it, stop retrying and report the error and what was attempted.
 ";
 
 const PLAN_TOOL_EXAMPLES: &str = "\
