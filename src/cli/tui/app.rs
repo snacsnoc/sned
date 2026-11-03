@@ -1171,7 +1171,8 @@ pub struct App {
     pending_transcript_model_line: Option<Line<'static>>,
     /// Reasoning blocks awaiting a non-reasoning event or TurnEnd. Keeping
     /// the rendered blocks together preserves chunk coalescing on replay.
-    pending_transcript_reasoning_lines: Option<Vec<Line<'static>>>,
+    pending_transcript_reasoning_lines: Option<Vec<(OutputLineId, Line<'static>)>>,
+    last_persisted_reasoning_line_id: Option<OutputLineId>,
     reasoning_stream_generation: u64,
     last_persisted_reasoning_generation: u64,
     pub(crate) deferred_priority_events: VecDeque<crate::cli::output::SequencedOutputEvent>,
@@ -1598,6 +1599,7 @@ impl App {
             last_turn_render_generation: None,
             pending_transcript_model_line: None,
             pending_transcript_reasoning_lines: None,
+            last_persisted_reasoning_line_id: None,
             reasoning_stream_generation: 0,
             last_persisted_reasoning_generation: 0,
             deferred_priority_events: VecDeque::new(),
@@ -1681,11 +1683,16 @@ impl App {
         self.pending_transcript_model_line = Some(line);
     }
 
-    pub(crate) fn take_pending_transcript_reasoning_lines(&mut self) -> Option<Vec<Line<'static>>> {
+    pub(crate) fn take_pending_transcript_reasoning_lines(
+        &mut self,
+    ) -> Option<Vec<(OutputLineId, Line<'static>)>> {
         self.pending_transcript_reasoning_lines.take()
     }
 
-    pub(crate) fn set_pending_transcript_reasoning_lines(&mut self, lines: Vec<Line<'static>>) {
+    pub(crate) fn set_pending_transcript_reasoning_lines(
+        &mut self,
+        lines: Vec<(OutputLineId, Line<'static>)>,
+    ) {
         self.pending_transcript_reasoning_lines = Some(lines);
     }
 
@@ -1697,12 +1704,33 @@ impl App {
         self.last_persisted_reasoning_generation = self.reasoning_stream_generation;
     }
 
-    pub(crate) fn reasoning_stream_lines(&self) -> Vec<Line<'static>> {
+    pub(crate) fn reasoning_stream_lines(&self) -> Vec<(OutputLineId, Line<'static>)> {
         self.turn_stream_entries
             .iter()
             .filter(|(_, kind)| *kind == StreamKind::Reasoning)
-            .filter_map(|(index, _)| self.output_lines.get(*index).cloned())
+            .filter_map(|(index, _)| {
+                let line = self.output_lines.get(*index)?.clone();
+                let id = *self.output_line_ids.get(*index)?;
+                Some((id, line))
+            })
             .collect()
+    }
+
+    /// High-water mark of persisted reasoning lines. Line ids grow forever
+    /// and eviction only drops the oldest, so the mark stays valid across
+    /// turns, eviction, and finalize drops without a reset site.
+    pub(crate) fn reasoning_line_persisted(&self, id: OutputLineId) -> bool {
+        self.last_persisted_reasoning_line_id
+            .is_some_and(|persisted| id <= persisted)
+    }
+
+    pub(crate) fn mark_reasoning_line_persisted(&mut self, id: OutputLineId) {
+        if self
+            .last_persisted_reasoning_line_id
+            .is_none_or(|persisted| id > persisted)
+        {
+            self.last_persisted_reasoning_line_id = Some(id);
+        }
     }
 
     /// Internal: push a single pre-wrapped line to the buffer with a

@@ -6,7 +6,9 @@
 use crate::cli::output::{
     ChannelOutputWriter, OutputEvent, OutputWriter, OutputWriterArc, SequencedOutputEvent,
 };
-use crate::cli::tui::app::{NotificationKind, PasteOutcome, PendingModelSwitch, TurnRenderRequest};
+use crate::cli::tui::app::{
+    NotificationKind, OutputLineId, PasteOutcome, PendingModelSwitch, TurnRenderRequest,
+};
 use crate::cli::tui::history::append_to_history;
 use crate::cli::tui::{App, ansi_to_ratatui_lines, format_duration, theme};
 use crate::cli::{RootOnlyOptions, TaskOptions};
@@ -1281,14 +1283,25 @@ fn flush_pending_model_update(
 
 fn flush_pending_reasoning_lines(
     app: &mut App,
-    pending: &mut Option<Vec<Line<'static>>>,
+    pending: &mut Option<Vec<(OutputLineId, Line<'static>)>>,
     storage: Option<&TaskStorage>,
 ) {
     let mut persisted = true;
     if let Some(lines) = pending.take() {
-        for line in lines {
-            persisted &=
-                persist_transcript_line(app, storage, crate::cli::tui::BlockKind::Reasoning, &line);
+        for (id, line) in lines {
+            if app.reasoning_line_persisted(id) {
+                continue;
+            }
+            if !persist_transcript_line(
+                app,
+                storage,
+                crate::cli::tui::BlockKind::Reasoning,
+                &line,
+            ) {
+                persisted = false;
+                break;
+            }
+            app.mark_reasoning_line_persisted(id);
         }
     }
     if persisted {
@@ -1374,7 +1387,7 @@ fn apply_output_event(
     app: &mut App,
     event: OutputEvent,
     pending_model_update: &mut Option<ratatui::text::Line<'static>>,
-    pending_reasoning_lines: &mut Option<Vec<Line<'static>>>,
+    pending_reasoning_lines: &mut Option<Vec<(OutputLineId, Line<'static>)>>,
     storage: Option<&TaskStorage>,
     turn_render_worker: Option<&TurnRenderWorker>,
 ) {
@@ -8280,6 +8293,70 @@ mod tests {
                 total_applied,
                 writer.dropped_count(),
                 writer.drop_summary(),
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_flush_persists_only_new_lines() {
+        // A second reasoning burst after an interleaved event must not
+        // re-persist the first burst: the persisted transcript would
+        // duplicate every reasoning block on resume.
+        let temp_dir = tempfile::TempDir::new().expect("tempdir should create");
+        let storage =
+            crate::storage::task_storage::TaskStorage::new_with_dir("reasoning-delta", temp_dir.path())
+                .expect("task storage should open");
+        let mut app = App::new();
+        app.set_content_height(24);
+        app.set_content_width(80);
+        let mut pending_model_update = None;
+        let mut pending_reasoning_lines = None;
+        for chunk in ["alpha\n", "bravo\n", "charlie\n"] {
+            apply_output_event(
+                &mut app,
+                OutputEvent::ReasoningChunk(chunk.to_string()),
+                &mut pending_model_update,
+                &mut pending_reasoning_lines,
+                Some(&storage),
+                None,
+            );
+        }
+        apply_output_event(
+            &mut app,
+            OutputEvent::Line(Line::from("separator")),
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            Some(&storage),
+            None,
+        );
+        for chunk in ["delta\n", "echo\n"] {
+            apply_output_event(
+                &mut app,
+                OutputEvent::ReasoningChunk(chunk.to_string()),
+                &mut pending_model_update,
+                &mut pending_reasoning_lines,
+                Some(&storage),
+                None,
+            );
+        }
+        apply_output_event(
+            &mut app,
+            OutputEvent::Line(Line::from("separator")),
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            Some(&storage),
+            None,
+        );
+        let entries = storage.read_transcript(10_000).expect("transcript should read");
+        let reasoning: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.kind == BlockKind::Reasoning)
+            .collect();
+        assert_eq!(reasoning.len(), 5, "second flush must persist only its delta");
+        for marker in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            assert!(
+                reasoning.iter().any(|entry| entry.markdown.contains(marker)),
+                "missing persisted reasoning line {marker}"
             );
         }
     }
