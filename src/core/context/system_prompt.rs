@@ -216,7 +216,7 @@ impl PromptBuilder {
         if !custom_instructions.is_empty() {
             prompt.push_str("\n\n# USER'S CUSTOM INSTRUCTIONS\n\n");
             prompt.push_str(
-                "Follow these task, user, and project instructions unless they conflict with safety or required tool protocol.\n",
+                "Follow these task, user, and project instructions unless they conflict with safety or with the request formats a tool requires.\n",
             );
 
             for instructions in custom_instructions {
