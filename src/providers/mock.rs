@@ -488,17 +488,27 @@ impl MockProvider {
     }
 
     #[must_use]
-    pub fn long_completion_navigation_scenario() -> Self {
-        let mut transcript = String::new();
+    /// Transcript filler for the long-completion navigation scenario.
+    ///
+    /// A leading Text response would complete an ACT task outright under
+    /// current turn-end rules, so the completion tool call that used to
+    /// follow it would never run. Emitting the transcript through a real
+    /// command keeps the transcript tall without ending the turn early.
+    fn transcript_command() -> String {
+        let mut command = String::from("printf '");
         for i in 1..=20 {
-            transcript.push_str(&format!("completion navigation transcript {i:02}\n\n"));
+            command.push_str(&format!("completion navigation transcript {i:02}\\n"));
         }
-        transcript.push_str("TRANSCRIPT_NAV_OLDER\n\n");
+        command.push_str("TRANSCRIPTNAVOLDER\\n");
         for i in 21..=24 {
-            transcript.push_str(&format!("completion navigation transcript {i:02}\n\n"));
+            command.push_str(&format!("completion navigation transcript {i:02}\\n"));
         }
-        transcript.push_str("TRANSCRIPT_NAV_RECENT\n");
+        command.push_str("TRANSCRIPTNAVRECENT\\n");
+        command.push('\'');
+        command
+    }
 
+    pub fn long_completion_navigation_scenario() -> Self {
         let mut completion = String::from("COMPLETION_NAV_TOP\n");
         for i in 1..=28 {
             completion.push_str(&format!("completion navigation result {i:02}\n"));
@@ -506,7 +516,11 @@ impl MockProvider {
         completion.push_str("COMPLETION_NAV_BOTTOM");
 
         Self::new_with_repeat(vec![
-            MockResponse::Text(transcript),
+            MockResponse::ToolCalls(vec![MockToolCall {
+                call_id: "long-completion-navigation-exec".to_string(),
+                name: "execute_command".to_string(),
+                arguments: serde_json::json!({ "commands": [Self::transcript_command()] }),
+            }]),
             MockResponse::ToolCalls(vec![MockToolCall {
                 call_id: "long-completion-navigation".to_string(),
                 name: "attempt_completion".to_string(),

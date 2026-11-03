@@ -539,8 +539,12 @@ def long_completion_navigation():
                 session.send(b"/exit\r")
                 sent_exit = True
 
+    # Yolo: the transcript filler is a real execute_command, which would
+    # otherwise block on an approval prompt no test input ever answers.
     with PtySession(
-        "sned-long-completion.", {"SNED_MOCK_LONG_COMPLETION": "1"}
+        "sned-long-completion.",
+        {"SNED_MOCK_LONG_COMPLETION": "1", "SNED_SAFE_COMMANDS": "printf"},
+        args=["--provider", "mock", "--yolo"],
     ) as session:
         session.run(24, tick, interval=0.05, read_size=8192)
         clean = clean_output(session.buf)

@@ -7058,6 +7058,105 @@ mod tests {
     }
 
     #[test]
+    fn test_finalize_then_scroll_reveals_early_marker() {
+        // Pins the smoke fall-through: without it, finalize-then-scroll
+        // regressions surface only in PTY timing tests.
+        let mut app = App::new();
+        app.set_content_height(24);
+        app.set_content_width(80);
+        for i in 1..=20 {
+            app.push_stream_line(
+                Line::from(format!("completion navigation transcript {i:02}")),
+                StreamKind::Model,
+            );
+            app.push_stream_line(Line::from(""), StreamKind::Model);
+        }
+        app.push_stream_line(Line::from("TRANSCRIPTNAVOLDER"), StreamKind::Model);
+        app.push_stream_line(Line::from(""), StreamKind::Model);
+        for i in 21..=24 {
+            app.push_stream_line(
+                Line::from(format!("completion navigation transcript {i:02}")),
+                StreamKind::Model,
+            );
+            app.push_stream_line(Line::from(""), StreamKind::Model);
+        }
+        app.push_stream_line(Line::from("TRANSCRIPTNAVRECENT"), StreamKind::Model);
+        app.push_stream_line(Line::from(""), StreamKind::Model);
+        app.push_turn_indicator(Line::from("test indicator"));
+        // Blank-line placement decides the finalize path (skip vs splice),
+        // so the payload must match the smoke mock exactly.
+        let mut markdown = String::new();
+        for i in 1..=20 {
+            markdown.push_str(&format!("completion navigation transcript {i:02}\n\n"));
+        }
+        markdown.push_str("TRANSCRIPTNAVOLDER\n\n");
+        for i in 21..=24 {
+            markdown.push_str(&format!("completion navigation transcript {i:02}\n\n"));
+        }
+        markdown.push_str("TRANSCRIPTNAVRECENT\n");
+        app.finalize_turn_stream(&markdown);
+        let wrap_width = app.last_wrap_width();
+        assert_eq!(
+            app.total_visual_rows(wrap_width),
+            app.total_visual_rows_for_width(wrap_width),
+            "cached total must match a fresh rescan after finalize"
+        );
+        let incremental = app.visual_layout_index.clone();
+        app.visual_layout_index.invalidate();
+        app.rebuild_visual_layout_index(wrap_width);
+        assert_eq!(
+            incremental, app.visual_layout_index,
+            "sync index must equal a full rebuild"
+        );
+        app.push_output_with_kind(
+            Line::from("attempt_completion tool call"),
+            BlockKind::ToolHeader,
+        );
+        app.push_output_with_kind(Line::from("tool result"), BlockKind::ToolOutput);
+        let (generation, placeholder) = app.reserve_completion_render();
+        let completion: Vec<Line<'static>> = (1..=28)
+            .map(|i| Line::from(format!("completion navigation result {i:02}")))
+            .chain(std::iter::once(Line::from("COMPLETIONNAV BOTTOM")))
+            .collect();
+        assert!(
+            app.apply_completion_render(generation, placeholder, completion),
+            "completion render should apply"
+        );
+        let texts: Vec<String> = app
+            .output_lines
+            .iter()
+            .map(App::line_to_string)
+            .collect();
+        assert!(
+            texts.iter().any(|line| line.contains("TRANSCRIPTNAVOLDER")),
+            "marker must survive finalize plus completion render; got {} lines",
+            texts.len()
+        );
+
+        // Scroll up in page steps like the smoke harness (PageUp x3) and
+        // require the marker to appear in at least one rendered frame,
+        // the same fall-through the smoke test asserts.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        let mut seen_marker = false;
+        let mut last_rendered = String::new();
+        for _ in 0..4 {
+            app.scroll_pages(-1);
+            terminal
+                .draw(|frame| app.render(frame))
+                .expect("scrolled render should succeed");
+            last_rendered = rendered_rows(terminal.backend().buffer()).join("\n");
+            if last_rendered.contains("TRANSCRIPTNAVOLDER") {
+                seen_marker = true;
+            }
+        }
+        assert!(
+            seen_marker,
+            "early marker should appear while paging up through the transcript; last frame:\n{last_rendered}"
+        );
+    }
+
+    #[test]
     fn test_finalize_turn_stream_preserves_duplicate_model_line_occurrence() {
         let mut app = App::new();
         app.set_content_height(1);
