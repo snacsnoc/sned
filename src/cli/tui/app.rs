@@ -1121,6 +1121,7 @@ pub struct App {
     layout_rebuild_total_us: u64,
     layout_rebuild_count: u64,
     layout_rebuild_peak_us: u64,
+    layout_rebuild_peak_lines: usize,
     /// Whether the slash command picker is active.
     pub slash_command_active: bool,
     pub(crate) slash_command_refresh_pending: bool,
@@ -1630,6 +1631,7 @@ impl App {
             layout_rebuild_total_us: 0,
             layout_rebuild_count: 0,
             layout_rebuild_peak_us: 0,
+            layout_rebuild_peak_lines: 0,
             output_overflow: false,
             output_overflow_count: 0,
             output_overflow_summary: String::new(),
@@ -4121,9 +4123,7 @@ impl App {
         self.cached_visual_rows = total;
         self.cached_wrap_width = Some(wrap_width);
         let elapsed_us = started.elapsed().as_micros() as u64;
-        self.layout_rebuild_total_us = self.layout_rebuild_total_us.saturating_add(elapsed_us);
-        self.layout_rebuild_count = self.layout_rebuild_count.saturating_add(1);
-        self.layout_rebuild_peak_us = self.layout_rebuild_peak_us.max(elapsed_us);
+        self.record_layout_rebuild(elapsed_us);
     }
 
     /// Keep the layout index in sync after a splice while measuring
@@ -4230,20 +4230,29 @@ impl App {
         self.cached_visual_rows = total;
         self.cached_wrap_width = Some(wrap_width);
         let elapsed_us = started.elapsed().as_micros() as u64;
-        self.layout_rebuild_total_us = self.layout_rebuild_total_us.saturating_add(elapsed_us);
-        self.layout_rebuild_count = self.layout_rebuild_count.saturating_add(1);
-        self.layout_rebuild_peak_us = self.layout_rebuild_peak_us.max(elapsed_us);
+        self.record_layout_rebuild(elapsed_us);
     }
 
-    pub(crate) fn take_layout_rebuild_timing(&mut self) -> (u64, u64, u64) {
+    fn record_layout_rebuild(&mut self, elapsed_us: u64) {
+        self.layout_rebuild_total_us = self.layout_rebuild_total_us.saturating_add(elapsed_us);
+        self.layout_rebuild_count = self.layout_rebuild_count.saturating_add(1);
+        if elapsed_us > self.layout_rebuild_peak_us {
+            self.layout_rebuild_peak_us = elapsed_us;
+            self.layout_rebuild_peak_lines = self.output_lines.len();
+        }
+    }
+
+    pub(crate) fn take_layout_rebuild_timing(&mut self) -> (u64, u64, u64, usize) {
         let timing = (
             self.layout_rebuild_total_us,
             self.layout_rebuild_count,
             self.layout_rebuild_peak_us,
+            self.layout_rebuild_peak_lines,
         );
         self.layout_rebuild_total_us = 0;
         self.layout_rebuild_count = 0;
         self.layout_rebuild_peak_us = 0;
+        self.layout_rebuild_peak_lines = 0;
         timing
     }
 
@@ -4404,11 +4413,7 @@ impl App {
         self.visual_layout_index = result.index;
         self.cached_visual_rows = total;
         self.cached_wrap_width = Some(result.wrap_width);
-        self.layout_rebuild_total_us = self
-            .layout_rebuild_total_us
-            .saturating_add(result.elapsed_us);
-        self.layout_rebuild_count = self.layout_rebuild_count.saturating_add(1);
-        self.layout_rebuild_peak_us = self.layout_rebuild_peak_us.max(result.elapsed_us);
+        self.record_layout_rebuild(result.elapsed_us);
         self.cached_visible_window = None;
         self.needs_redraw = true;
     }
@@ -10526,10 +10531,11 @@ mod tests {
         app.push_plain("layout timing");
         let _ = app.output_visual_rows(80);
 
-        let (total_us, count, peak_us) = app.take_layout_rebuild_timing();
+        let (total_us, count, peak_us, peak_lines) = app.take_layout_rebuild_timing();
         assert_eq!(count, 1);
         assert_eq!(peak_us, total_us);
-        assert_eq!(app.take_layout_rebuild_timing(), (0, 0, 0));
+        assert_eq!(peak_lines, 1);
+        assert_eq!(app.take_layout_rebuild_timing(), (0, 0, 0, 0));
     }
 
     #[test]

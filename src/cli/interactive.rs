@@ -5509,6 +5509,7 @@ async fn run_main_loop(
         layout_rebuild_total_us: u64,
         layout_rebuild_count: u64,
         layout_rebuild_peak_us: u64,
+        layout_rebuild_peak_lines: usize,
     }
 
     struct TuiTurnTiming {
@@ -5610,10 +5611,11 @@ async fn run_main_loop(
                 self.reasoning_chunks_received, self.reasoning_pending_bytes_peak,
             ));
             crate::cli::output::emit_timing_text(&format!(
-                "[timing] layout_rebuild: total={}us count={} peak={}us",
+                "[timing] layout_rebuild: total={}us count={} peak={}us peak_lines={}",
                 self.layout_rebuild_total_us,
                 self.layout_rebuild_count,
                 self.layout_rebuild_peak_us,
+                self.layout_rebuild_peak_lines,
             ));
             crate::cli::output::emit_timing_text(&format!(
                 "[timing] turn_render: worker_total={}us syntax_highlight={}us apply_total={}us count={} apply_peak={}us",
@@ -5689,6 +5691,7 @@ async fn run_main_loop(
         layout_rebuild_total_us: 0,
         layout_rebuild_count: 0,
         layout_rebuild_peak_us: 0,
+        layout_rebuild_peak_lines: 0,
         turn_render_total_us: 0,
         turn_render_syntax_highlight_us: 0,
         turn_render_apply_total_us: 0,
@@ -6005,15 +6008,17 @@ async fn run_main_loop(
                     {
                         timing.first_render_time = Some(std::time::Instant::now());
                     }
-                    let (layout_total_us, layout_count, layout_peak_us) =
+                    let (layout_total_us, layout_count, layout_peak_us, layout_peak_lines) =
                         app.take_layout_rebuild_timing();
                     timing.layout_rebuild_total_us = timing
                         .layout_rebuild_total_us
                         .saturating_add(layout_total_us);
                     timing.layout_rebuild_count =
                         timing.layout_rebuild_count.saturating_add(layout_count);
-                    timing.layout_rebuild_peak_us =
-                        timing.layout_rebuild_peak_us.max(layout_peak_us);
+                    if layout_peak_us > timing.layout_rebuild_peak_us {
+                        timing.layout_rebuild_peak_us = layout_peak_us;
+                        timing.layout_rebuild_peak_lines = layout_peak_lines;
+                    }
                     tui_turn.layout_rebuild_us =
                         tui_turn.layout_rebuild_us.saturating_add(layout_total_us);
                     tui_turn.layout_rebuild_count =
