@@ -5649,7 +5649,9 @@ async fn run_main_loop(
     }
 
     const BUSY_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
-    const LARGE_TRANSCRIPT_REDRAW_INTERVAL: Duration = Duration::from_millis(32);
+    // Experiment: match the busy cadence until a timing re-run decides whether
+    // the size step buys anything; then revert or drop the branch entirely.
+    const LARGE_TRANSCRIPT_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
     const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
     const MAX_DRAW_RETRY_DELAY: Duration = Duration::from_secs(1);
     let mouse_scroll_lines = mouse_scroll_lines();
