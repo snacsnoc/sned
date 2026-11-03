@@ -2794,7 +2794,7 @@ impl App {
         }) else {
             return false;
         };
-        let manual_anchor = self.manual_viewport_anchor(self.last_wrap_width());
+        let mut manual_anchor = self.manual_viewport_anchor(self.last_wrap_width());
 
         // Materialized now: the iterator borrows `self`, and the mutation
         // loop below needs that borrow released first.
@@ -2818,6 +2818,7 @@ impl App {
             )
         });
 
+        let rendered_len = rendered.len();
         for line in rendered.into_iter().rev() {
             let id = self.allocate_output_line_id();
             self.output_lines.insert(insert_at, line);
@@ -2836,7 +2837,9 @@ impl App {
         {
             self.completed_completion_renders.remove(&predecessor);
         }
+        let mut evicted = 0usize;
         while self.output_lines.len() > 10_000 {
+            evicted = evicted.saturating_add(1);
             if let Some(line) = self.output_lines.pop_front() {
                 self.scrollback_pending
                     .push_str(&Self::line_to_string(&line));
@@ -2852,6 +2855,14 @@ impl App {
             let _ =
                 self.visual_layout_index
                     .evict_front_output(self.last_wrap_width(), 10_000, false);
+        }
+        // The anchor captured above is a buffer index: rebase it across
+        // the insert and any eviction so restore resolves the same line.
+        if let Some(anchor) = manual_anchor.as_mut() {
+            if insert_at <= anchor.output_index {
+                anchor.output_index = anchor.output_index.saturating_add(rendered_len);
+            }
+            anchor.output_index = anchor.output_index.saturating_sub(evicted);
         }
 
         self.turn_stream_entries = saved_entries
@@ -7194,6 +7205,91 @@ mod tests {
             app.total_visual_rows_for_width(wrap_width),
             "recovered index must match a fresh rescan"
         );
+    }
+
+    #[test]
+    fn test_completion_insert_rebases_manual_anchor() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // A mid-buffer completion insert must keep the manual viewport
+        // on the same line; restoring the stale index jumps the viewport.
+        let mut app = App::new();
+        app.set_content_height(24);
+        app.set_content_width(80);
+        for index in 0..40 {
+            app.push_output_with_kind(
+                Line::from(format!("probe {index}")),
+                BlockKind::ToolOutput,
+            );
+        }
+        let wrap_width = app.last_wrap_width();
+        let _ = app.output_visual_rows(wrap_width);
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 10;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+        let before = rendered_rows(terminal.backend().buffer());
+        let row_before = before
+            .iter()
+            .position(|row| row.contains("probe 10"))
+            .expect("anchored line should be visible");
+        let (generation, placeholder) = app.reserve_completion_render();
+        let predecessor = app.output_line_ids[2];
+        app.pending_completion_renders
+            .insert(placeholder, (Some(predecessor), 0));
+        let applied = app.apply_completion_render(
+            generation,
+            placeholder,
+            vec![Line::from("C1"), Line::from("C2")],
+        );
+        assert!(applied);
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+        let after = rendered_rows(terminal.backend().buffer());
+        let row_after = after
+            .iter()
+            .position(|row| row.contains("probe 10"))
+            .expect("anchored line should stay visible");
+        assert_eq!(
+            row_before, row_after,
+            "manual viewport must not jump on insert"
+        );
+    }
+
+    #[test]
+    fn test_completion_eviction_rebases_manual_anchor() {
+        // Front eviction during a completion render shifts the buffer
+        // under a manual anchor; saturate instead of pointing past it.
+        let mut app = App::new();
+        app.set_content_height(24);
+        app.set_content_width(80);
+        for index in 0..10_000 {
+            app.push_output_with_kind(
+                Line::from(format!("probe {index}")),
+                BlockKind::ToolOutput,
+            );
+        }
+        let wrap_width = app.last_wrap_width();
+        let _ = app.output_visual_rows(wrap_width);
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 1;
+        let (generation, placeholder) = app.reserve_completion_render();
+        let predecessor = app.output_line_ids[5000];
+        app.pending_completion_renders
+            .insert(placeholder, (Some(predecessor), 0));
+        let applied = app.apply_completion_render(
+            generation,
+            placeholder,
+            vec![Line::from("C1"), Line::from("C2")],
+        );
+        assert!(applied);
+        assert_eq!(app.output_lines.len(), 10_000);
+        assert_eq!(App::line_to_string(&app.output_lines[0]), "probe 2");
+        assert_eq!(app.scroll_offset, 0);
     }
 
     #[test]
