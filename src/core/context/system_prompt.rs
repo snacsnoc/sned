@@ -118,6 +118,12 @@ impl PromptBuilder {
              - Minimize turns and load only the context you need.\n\
              - Be concise and direct.\n\n",
         );
+        prompt.push_str(
+            "STRATEGY\n\
+             - Before finishing, check the result against what was asked; state what changed and how it was verified.\n\
+             - If a required choice is not specified, pick the conservative option and state the assumption.\n\
+             - If the task needs a capability this turn's tools do not include, say which one rather than working around it in prose.\n\n",
+        );
         prompt.push_str("EXECUTION\n");
 
         if self.context.enable_parallel_tool_calling {
@@ -616,6 +622,43 @@ mod tests {
         assert!(prompt.contains("No tools are available"));
         assert!(!prompt.contains("completion tool"));
         assert!(!prompt.contains("attempt_completion"));
+    }
+
+    #[test]
+    fn strategy_guidance_appears_in_every_profile() {
+        for profile in [
+            ToolProfile::LeanAct,
+            ToolProfile::DirectAnswer,
+            ToolProfile::AnswerOnly,
+            ToolProfile::WriteOnly,
+            ToolProfile::CoreEdit,
+            ToolProfile::Validate,
+            ToolProfile::Symbol,
+            ToolProfile::Plan,
+            ToolProfile::Full,
+        ] {
+            let context = SystemPromptContext {
+                tool_profile: Some(profile),
+                ..Default::default()
+            };
+            let prompt = PromptBuilder::new(context).build();
+            for line in [
+                "check the result against what was asked",
+                "pick the conservative option and state the assumption",
+                "say which one rather than working around it in prose",
+            ] {
+                assert!(
+                    prompt.contains(line),
+                    "{profile:?} prompt must include strategy guidance: {line}"
+                );
+            }
+        }
+        let direct = PromptBuilder::new(SystemPromptContext {
+            tool_profile: Some(ToolProfile::DirectAnswer),
+            ..Default::default()
+        })
+        .build();
+        assert!(direct.contains("No tools are available for this turn"));
     }
 
     #[test]
