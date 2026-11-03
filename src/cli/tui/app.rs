@@ -2300,6 +2300,15 @@ impl App {
                     spans.extend(first.spans.iter().cloned());
                     first.spans = spans;
                 }
+                let wrap_width = self.last_wrap_width();
+                let layout_base = self.output_lines.len();
+                let can_sync_layout = self.visual_layout_index.is_valid_for(wrap_width)
+                    && self.error_lines.is_empty()
+                    && self
+                        .visual_layout_index
+                        .output_entry_positions
+                        .len()
+                        == layout_base;
                 for line in rendered {
                     let line_id = self.allocate_output_line_id();
                     self.output_lines.push_back(line);
@@ -2308,7 +2317,7 @@ impl App {
                 }
                 self.needs_redraw = true;
                 self.cached_wrap_width = None;
-                self.rebuild_visual_row_cache(self.last_wrap_width());
+                self.sync_visual_layout_after_splice(layout_base, wrap_width, can_sync_layout);
                 self.refresh_pending_manual_viewport_anchor(self.last_wrap_width());
             }
             return;
@@ -2375,7 +2384,38 @@ impl App {
             }
             self.needs_redraw = true;
             self.cached_wrap_width = None;
-            self.rebuild_visual_row_cache(wrap_width);
+            // Skipped lines are byte-identical unless the turn indicator
+            // was prepended, so only that single row can have changed.
+            // A Model row cannot flip its neighbors' separators (those
+            // rules only inspect same-kind header content), making a
+            // single-row update equivalent to a full rebuild here.
+            let can_keep_layout = self.visual_layout_index.is_valid_for(wrap_width)
+                && self.error_lines.is_empty()
+                && self.visual_layout_index.output_entry_positions.len()
+                    == self.output_lines.len();
+            if prefixed_turn_indicator {
+                let replacement_rows = Self::output_row_visual_rows(
+                    self.output_lines.get(model_entry_indices[0]),
+                    BlockKind::Model,
+                    wrap_width,
+                );
+                if can_keep_layout
+                    && self
+                        .visual_layout_index
+                        .replace_output_rows(wrap_width, model_entry_indices[0], replacement_rows)
+                        .is_some()
+                {
+                    self.cached_visual_rows = self.visual_layout_index.total_rows();
+                    self.cached_wrap_width = Some(wrap_width);
+                } else {
+                    self.rebuild_visual_layout_index(wrap_width);
+                }
+            } else if can_keep_layout {
+                self.cached_visual_rows = self.visual_layout_index.total_rows();
+                self.cached_wrap_width = Some(wrap_width);
+            } else {
+                self.rebuild_visual_layout_index(wrap_width);
+            }
             if let Some(anchor) = manual_anchor.as_ref() {
                 self.restore_manual_viewport_anchor(anchor, wrap_width);
             }
@@ -2455,6 +2495,13 @@ impl App {
         }
         let rendered_len = rendered.len();
         let remove: HashSet<usize> = model_entry_indices.iter().copied().collect();
+        // Capture splice eligibility before the buffers move; lines below
+        // `insert_at` survive untouched and keep their layout entries.
+        let can_sync_layout = self.visual_layout_index.is_valid_for(wrap_width)
+            && self.error_lines.is_empty()
+            && self.visual_layout_index.output_entry_positions.len() == self.output_lines.len()
+            && self.output_line_kinds.len() == self.output_lines.len()
+            && self.output_line_ids.len() == self.output_lines.len();
         self.splice_output_triplet(&remove, insert_at, rendered, BlockKind::Model);
         // Sanity: lengths should match exactly. If they ever diverge
         // (e.g. because some external mutation slipped through),
@@ -2475,7 +2522,7 @@ impl App {
         // Invalidate the visual-row cache: the line count and content
         // changed, so the cached row count is stale.
         self.cached_wrap_width = None;
-        self.rebuild_visual_row_cache(wrap_width);
+        self.sync_visual_layout_after_splice(insert_at, wrap_width, can_sync_layout);
 
         if self.output_line_ids.len() != self.output_lines.len() {
             debug_assert_eq!(
@@ -4071,6 +4118,115 @@ impl App {
         );
         let total = index.total_rows();
         self.visual_layout_index = index;
+        self.cached_visual_rows = total;
+        self.cached_wrap_width = Some(wrap_width);
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        self.layout_rebuild_total_us = self.layout_rebuild_total_us.saturating_add(elapsed_us);
+        self.layout_rebuild_count = self.layout_rebuild_count.saturating_add(1);
+        self.layout_rebuild_peak_us = self.layout_rebuild_peak_us.max(elapsed_us);
+    }
+
+    /// Keep the layout index in sync after a splice while measuring
+    /// only the changed tail, under the same separator rules as a full
+    /// rebuild; any structural doubt falls back to a full rebuild.
+    fn sync_visual_layout_after_splice(
+        &mut self,
+        from_output: usize,
+        wrap_width: usize,
+        can_extend: bool,
+    ) {
+        let started = Instant::now();
+        let new_len = self.output_lines.len();
+        let from_output = from_output.min(new_len);
+        let split = if can_extend
+            && self.visual_layout_index.is_valid_for(wrap_width)
+            && self.error_lines.is_empty()
+            && new_len == self.output_line_kinds.len()
+            && self.visual_layout_index.entries.len()
+                == self.visual_layout_index.row_index.values.len()
+            && self
+                .visual_layout_index
+                .output_entry_positions
+                .len()
+                >= from_output
+        {
+            let mut start = if from_output
+                < self.visual_layout_index.output_entry_positions.len()
+            {
+                self.visual_layout_index.output_entry_positions[from_output]
+            } else {
+                self.visual_layout_index.entries.len()
+            };
+            if start > self.visual_layout_index.front_entry
+                && self
+                    .visual_layout_index
+                    .entries
+                    .get(start.saturating_sub(1))
+                    .is_some_and(|entry| entry.source == LayoutSource::Separator)
+            {
+                start -= 1;
+            }
+            (start >= self.visual_layout_index.front_entry
+                && start <= self.visual_layout_index.entries.len())
+            .then_some(start)
+        } else {
+            None
+        };
+        let Some(start) = split else {
+            self.rebuild_visual_layout_index(wrap_width);
+            return;
+        };
+        // Retained entries keep their row counts; only the suffix needs
+        // fresh wrap measurements, computed before any mutable borrow.
+        let mut previous_kind = None;
+        let mut previous_line = None;
+        if from_output > 0 {
+            previous_kind = self.output_line_kinds.get(from_output - 1).copied();
+            previous_line = self.output_lines.get(from_output - 1);
+        }
+        let mut suffix = Vec::with_capacity(new_len - from_output);
+        for (line, kind) in self
+            .output_lines
+            .iter()
+            .skip(from_output)
+            .zip(self.output_line_kinds.iter().skip(from_output))
+        {
+            let separator_before = previous_kind.is_some_and(|previous| {
+                Self::should_insert_separator_for_lines(previous, previous_line, *kind, line)
+            });
+            suffix.push((
+                separator_before,
+                *kind,
+                Self::output_row_visual_rows(Some(line), *kind, wrap_width),
+            ));
+            previous_kind = Some(*kind);
+            previous_line = Some(line);
+        }
+        self.visual_layout_index.entries.truncate(start);
+        while self.visual_layout_index.row_index.values.len() > start {
+            self.visual_layout_index.row_index.truncate_last();
+        }
+        self.visual_layout_index
+            .output_entry_positions
+            .truncate(from_output);
+        let base_output_index = self.visual_layout_index.base_output_index;
+        for (offset, (separator_before, kind, rows)) in suffix.into_iter().enumerate() {
+            if separator_before {
+                self.visual_layout_index.append_entry(LayoutEntry {
+                    source: LayoutSource::Separator,
+                    kind: BlockKind::Separator,
+                    rows: 1,
+                });
+            }
+            self.visual_layout_index.append_output_entry(LayoutEntry {
+                source: LayoutSource::Output(
+                    base_output_index.saturating_add(from_output.saturating_add(offset)),
+                ),
+                kind,
+                rows,
+            });
+        }
+        let total = self.visual_layout_index.total_rows();
         self.cached_visual_rows = total;
         self.cached_wrap_width = Some(wrap_width);
         let elapsed_us = started.elapsed().as_micros() as u64;
@@ -6845,6 +7001,11 @@ mod tests {
         app.push_stream_line(Line::from("m3"), StreamKind::Model);
         let tool_id = app.output_line_ids[3];
 
+        // Warm the layout index so finalize exercises the incremental
+        // suffix sync instead of falling back to a full rebuild.
+        let _ = app.total_visual_rows(app.last_wrap_width());
+        assert!(app.visual_layout_index.is_valid_for(app.last_wrap_width()));
+
         // Rendered lines differ from streamed text so the splice path
         // runs instead of the no-op-reinsert fast path.
         app.finalize_turn_stream_with_rendered(
@@ -6871,6 +7032,29 @@ mod tests {
             ]
         );
         assert_eq!(app.output_line_ids[4], tool_id);
+
+        // The incremental suffix sync must leave the same layout rows a
+        // full rebuild would: pin totals against an independent rescan,
+        // the index against a from-scratch rebuild, and the visible
+        // window over the spliced rows.
+        let wrap_width = app.last_wrap_width();
+        assert!(app.visual_layout_index.is_valid_for(wrap_width));
+        assert_eq!(
+            app.visual_layout_index.output_entry_positions.len(),
+            app.output_lines.len()
+        );
+        assert_eq!(
+            app.total_visual_rows(wrap_width),
+            app.total_visual_rows_for_width(wrap_width)
+        );
+        let incremental = app.visual_layout_index.clone();
+        app.visual_layout_index.invalidate();
+        app.rebuild_visual_layout_index(wrap_width);
+        assert_eq!(incremental, app.visual_layout_index);
+        let total = app.total_visual_rows(wrap_width);
+        let (start, count, _) = app.visible_output_window(wrap_width, 0, 24);
+        assert_eq!(start, 0);
+        assert!(count > 0 && count <= total);
     }
 
     #[test]
