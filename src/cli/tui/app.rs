@@ -7321,6 +7321,22 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_finalize_drops_entries_keeps_lines() {
+        // An empty turn end flushes stream bookkeeping without touching
+        // the transcript: stale entries must not leak into the next turn.
+        let mut app = App::new();
+        app.set_content_height(24);
+        app.set_content_width(80);
+        app.push_stream_line(Line::from("stale prose"), StreamKind::Model);
+        app.push_stream_line(Line::from("tool line"), StreamKind::ToolOutput);
+        assert!(!app.turn_stream_entries.is_empty());
+        let lines_before = app.output_lines.len();
+        app.finalize_turn_stream("");
+        assert!(app.turn_stream_entries.is_empty());
+        assert_eq!(app.output_lines.len(), lines_before);
+    }
+
+    #[test]
     fn test_finalize_turn_stream_preserves_duplicate_model_line_occurrence() {
         let mut app = App::new();
         app.set_content_height(1);

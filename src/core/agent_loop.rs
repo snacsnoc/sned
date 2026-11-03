@@ -893,6 +893,15 @@ impl AgentLoop {
 
         let accumulated_text = crate::core::stream_parsing::strip_tool_call_lines(markdown_text);
         if accumulated_text.is_empty() {
+            // Flush stream bookkeeping even when a turn produced no prose;
+            // otherwise the next turn's finalize consumes stale entries.
+            if self.config.interactive_mode {
+                let timing = self.capture_turn_end_timing().await;
+                self.config.output_writer.emit(OutputEvent::TurnEnd {
+                    accumulated_text: String::new(),
+                    timing,
+                });
+            }
             return;
         }
 
@@ -1965,6 +1974,9 @@ impl AgentLoop {
                 }
                 TurnResult::Cancelled => {
                     self.current_turn_retry_candidate = None;
+                    // Flush any streamed entries so the next turn's
+                    // finalize does not consume this turn's leftovers.
+                    self.emit_turn_end("").await;
                     if !self.config.json_output {
                         self.config
                             .output_writer
@@ -2000,6 +2012,9 @@ impl AgentLoop {
                 }
                 TurnResult::Error(e) => {
                     self.current_turn_retry_candidate = None;
+                    // Flush any streamed entries so the next turn's
+                    // finalize does not consume this turn's leftovers.
+                    self.emit_turn_end("").await;
                     self.config.output_writer.emit(OutputEvent::error_box(&e));
 
                     // Rollback the user message that was never processed by the model.
@@ -4111,16 +4126,7 @@ impl AgentLoop {
             // thinking tags which pulldown_cmark treats as raw HTML and
             // emits as raw text, defeating the markdown render.
             let markdown_text = response_text.as_deref().unwrap_or("");
-            if self.config.interactive_mode && !self.config.json_output && markdown_text.is_empty()
-            {
-                let timing = self.capture_turn_end_timing().await;
-                self.config.output_writer.emit(OutputEvent::TurnEnd {
-                    accumulated_text: String::new(),
-                    timing,
-                });
-            } else {
-                self.emit_turn_end(markdown_text).await;
-            }
+            self.emit_turn_end(markdown_text).await;
             if !self.config.interactive_mode
                 && !self.config.json_output
                 && crate::cli::output::timing_enabled()
