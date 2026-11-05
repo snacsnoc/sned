@@ -45,6 +45,8 @@ const ASYNC_LAYOUT_REFLOW_THRESHOLD: usize = 512;
 const STATUS_NOTIFICATION_DURATION: Duration = Duration::from_secs(4);
 const PICKER_MAX_VISIBLE_ROWS: usize = 8;
 const TRANSCRIPT_RIGHT_PADDING: u16 = 1;
+const PLAN_PANEL_WIDTH: usize = 35;
+const PLAN_MAIN_MIN_WIDTH: usize = 40;
 const OSC8_PREFIX: &str = "\x1b]8;;";
 const HYPERLINK_MARKER_RED: u8 = 0xFE;
 static NEXT_PASTE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -3802,6 +3804,37 @@ impl App {
         }
     }
 
+    pub(crate) fn has_active_plan(&self) -> bool {
+        self.plan_state_cache.as_ref().is_some_and(|p| !p.complete)
+    }
+
+    /// Content geometry the transcript area will have for a terminal size.
+    /// Mirrors the layout splits in `render` so resize handling agrees with
+    /// the first render on wrap width instead of using full-terminal size.
+    pub(crate) fn content_size_for_terminal(
+        &self,
+        terminal_width: u16,
+        terminal_height: u16,
+    ) -> (usize, usize) {
+        // The solver keeps Min before Length when space runs short, so the
+        // helper must grant the main area the same minimum to stay equal.
+        let width = if self.has_active_plan() {
+            (terminal_width as usize)
+                .saturating_sub(PLAN_PANEL_WIDTH)
+                .max(PLAN_MAIN_MIN_WIDTH)
+                .min(terminal_width as usize)
+        } else {
+            terminal_width as usize
+        };
+        let height = (terminal_height as usize).saturating_sub(
+            self.queued_preview_height() as usize
+                + 1
+                + self.render_input_height_for_width(width.min(u16::MAX as usize) as u16) as usize
+                + 2,
+        );
+        (width, height)
+    }
+
     /// Synchronize the cached plan panel state with the current task state.
     pub fn sync_plan_state_cache(
         &mut self,
@@ -4968,13 +5001,16 @@ impl App {
 
     /// Render the application state to the frame.
     pub fn render(&mut self, frame: &mut Frame) {
-        let has_plan = self.plan_state_cache.as_ref().is_some_and(|p| !p.complete);
+        let has_plan = self.has_active_plan();
 
         // Reserve the plan area even when no plan is active so the
         // Clear widget below can wipe stale plan content from the
         // right 35 columns after the plan is dismissed.
-        let [plan_main_area, plan_area] =
-            Layout::horizontal([Constraint::Min(40), Constraint::Length(35)]).areas(frame.area());
+        let [plan_main_area, plan_area] = Layout::horizontal([
+            Constraint::Min(PLAN_MAIN_MIN_WIDTH as u16),
+            Constraint::Length(PLAN_PANEL_WIDTH as u16),
+        ])
+        .areas(frame.area());
         let main_area = if has_plan {
             plan_main_area
         } else {
@@ -6651,6 +6687,55 @@ mod tests {
         assert_eq!(app.scroll_offset, 12);
         assert_eq!(app.unseen_output_count, 1);
         assert_eq!(app.resolved_scroll_y_for(app.output_lines.len(), 5), 12);
+    }
+
+    #[test]
+    fn test_content_size_accounts_for_plan_panel() {
+        let mut app = App::new();
+        let (plain_width, plain_height) = app.content_size_for_terminal(100, 30);
+        assert_eq!(plain_width, 100);
+        app.plan_state_cache = Some(crate::core::plan_state::PlanState::create_plan(vec![
+            "Inspect the current behavior".to_string(),
+        ]));
+        let (plan_width, plan_height) = app.content_size_for_terminal(100, 30);
+        assert_eq!(plan_width, 65);
+        assert_eq!(plan_height, plain_height);
+    }
+
+    #[test]
+    fn test_render_geometry_matches_content_size_helper() {
+        let mut app = App::new();
+        app.push_plain("alpha");
+        app.plan_state_cache = Some(crate::core::plan_state::PlanState::create_plan(vec![
+            "Inspect the current behavior".to_string(),
+        ]));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+        assert_eq!(
+            (app.last_content_width, app.last_content_height),
+            app.content_size_for_terminal(100, 30)
+        );
+    }
+
+    #[test]
+    fn test_render_geometry_matches_helper_on_narrow_terminal_with_plan() {
+        let mut app = App::new();
+        app.push_plain("alpha");
+        app.plan_state_cache = Some(crate::core::plan_state::PlanState::create_plan(vec![
+            "Inspect the current behavior".to_string(),
+        ]));
+        let backend = TestBackend::new(70, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal should initialize");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render should succeed");
+        assert_eq!(
+            (app.last_content_width, app.last_content_height),
+            app.content_size_for_terminal(70, 30)
+        );
     }
 
     #[test]

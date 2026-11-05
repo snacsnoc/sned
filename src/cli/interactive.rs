@@ -2340,8 +2340,8 @@ fn drain_output(rx: &mut mpsc::Receiver<SequencedOutputEvent>, app: &mut App) {
     );
 }
 
-fn sync_scroll_viewport(
-    terminal: &ratatui::DefaultTerminal,
+fn sync_scroll_viewport<B: ratatui::backend::Backend>(
+    terminal: &ratatui::Terminal<B>,
     app: &mut App,
     debug: bool,
 ) -> anyhow::Result<()> {
@@ -2349,9 +2349,9 @@ fn sync_scroll_viewport(
     let terminal_size = terminal
         .size()
         .map_err(|error| tui_io_error("TUI terminal size query failed", error, debug))?;
-    let terminal_height = terminal_size.height;
-    let content_height = terminal_height.saturating_sub(6) as usize;
-    app.set_content_width(terminal_size.width as usize);
+    let (content_width, content_height) =
+        app.content_size_for_terminal(terminal_size.width, terminal_size.height);
+    app.set_content_width(content_width);
     app.set_content_height(content_height);
     app.has_resized = false;
     Ok(())
@@ -9542,6 +9542,27 @@ mod tests {
             .chunks(width)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .any(|row| row.contains("Execute this tool?"))
+    }
+
+    #[test]
+    fn test_sync_scroll_viewport_uses_plan_panel_geometry() {
+        use crate::cli::tui::app::ScrollMode;
+        use crate::core::plan_state::PlanState;
+        use ratatui::Terminal;
+
+        let mut app = App::new();
+        let plan = PlanState::create_plan(vec!["First step".to_string()]);
+        assert!(app.sync_plan_state_cache(Some(&plan)));
+        app.scroll_mode = ScrollMode::Manual;
+        app.scroll_offset = 5;
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(100, 30)).expect("terminal should initialize");
+        sync_scroll_viewport(&mut terminal, &mut app, false).expect("sync should succeed");
+
+        assert_eq!(app.last_content_width, 65);
+        assert_eq!(app.scroll_mode, ScrollMode::Manual);
+        assert_eq!(app.scroll_offset, 5);
     }
 
     #[tokio::test]
