@@ -66,9 +66,10 @@ const SAFE_BASE_COMMANDS: &[&str] = &[
     "diff", "rg", "cut", "which", "type", "false",
 ];
 
-const SAFE_GIT_SUBCOMMANDS: &[&str] = &["status", "log", "diff", "branch", "show", "remote"];
+pub(crate) const SAFE_GIT_SUBCOMMANDS: &[&str] =
+    &["status", "log", "diff", "branch", "show", "remote"];
 
-const DANGEROUS_FIND_FLAGS: &[&str] = &[
+pub(crate) const DANGEROUS_FIND_FLAGS: &[&str] = &[
     "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf",
 ];
 

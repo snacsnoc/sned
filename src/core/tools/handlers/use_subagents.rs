@@ -1183,7 +1183,9 @@ mod tests {
                 OutputEvent::ToolOutputLine(line) => line.to_string(),
                 OutputEvent::RawAnsi(text) => text,
                 OutputEvent::Completion(_) | OutputEvent::CompletionAvailable(_) => String::new(),
-                OutputEvent::TurnEnd { .. } | OutputEvent::QueuedMessageStarted { .. } => {
+                OutputEvent::TurnEnd { .. }
+                | OutputEvent::QueuedMessageStarted { .. }
+                | OutputEvent::ReasoningAttemptReset => {
                     return;
                 }
                 OutputEvent::TurnIndicator(line) => line.to_string(),

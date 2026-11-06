@@ -2470,6 +2470,7 @@ mod tests {
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
                 crate::cli::output::OutputEvent::CompletionAvailable(_)
                 | crate::cli::output::OutputEvent::TurnEnd { .. }
+                | crate::cli::output::OutputEvent::ReasoningAttemptReset
                 | crate::cli::output::OutputEvent::QueuedMessageStarted { .. } => {}
                 crate::cli::output::OutputEvent::TurnIndicator(line) => {
                     rendered.push(line.to_string())

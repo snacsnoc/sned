@@ -13,6 +13,9 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 
+const ANTHROPIC_CLIENT_TOTAL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(600);
+
 /// Configuration for the Anthropic provider.
 #[derive(Clone)]
 pub struct AnthropicConfig {
@@ -48,7 +51,7 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(config: AnthropicConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(ANTHROPIC_CLIENT_TOTAL_TIMEOUT)
             .connect_timeout(std::time::Duration::from_secs(10))
             .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
             .tcp_nodelay(true)
@@ -1203,6 +1206,14 @@ async fn process_anthropic_event(
 mod tests {
     use super::*;
     use crate::providers::{FunctionDefinition, MessageRole, StorageMessage, ToolDefinition};
+
+    #[test]
+    fn test_anthropic_client_total_timeout_matches_openai() {
+        assert_eq!(
+            ANTHROPIC_CLIENT_TOTAL_TIMEOUT,
+            std::time::Duration::from_secs(600)
+        );
+    }
 
     #[tokio::test]
     async fn test_malformed_sse_emits_bounded_error_and_stops() {

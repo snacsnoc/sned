@@ -97,6 +97,11 @@ pub struct TranscriptEntry {
     /// styles were persisted; replay falls back to unstyled text then.
     #[serde(default)]
     pub spans: Vec<TranscriptSpan>,
+    /// Stream attempt that produced a reasoning row. Retried attempts bump
+    /// it; replay keeps only the latest attempt per transcript segment so a
+    /// failed attempt's thinking stays hidden after resume.
+    #[serde(default)]
+    pub attempt: Option<u32>,
 }
 
 /// One styled run inside a transcript line. Colors ride as names so the
@@ -2781,18 +2786,21 @@ mod tests {
                 ts: 1,
                 markdown: "model".to_string(),
                 spans: Vec::new(),
+                attempt: None,
             },
             TranscriptEntry {
                 kind: BlockKind::ToolHeader,
                 ts: 2,
                 markdown: "▶ read_file".to_string(),
                 spans: Vec::new(),
+                attempt: None,
             },
             TranscriptEntry {
                 kind: BlockKind::ToolOutput,
                 ts: 3,
                 markdown: "file contents".to_string(),
                 spans: Vec::new(),
+                attempt: None,
             },
         ];
 
@@ -2819,6 +2827,7 @@ mod tests {
                     ts: index,
                     markdown: format!("line {index}"),
                     spans: Vec::new(),
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -2844,6 +2853,7 @@ mod tests {
                 ts: index as u64,
                 markdown: format!("line {index}"),
                 spans: Vec::new(),
+                attempt: None,
             })
             .collect::<Vec<_>>();
 
@@ -2912,6 +2922,7 @@ mod tests {
                 ts: index as u64,
                 markdown: format!("initial {index}"),
                 spans: Vec::new(),
+                attempt: None,
             })
             .collect::<Vec<_>>();
         storage.write_transcript_entries(&initial).unwrap();
@@ -2923,6 +2934,7 @@ mod tests {
                     ts: 10_000 + index as u64,
                     markdown: format!("append {index}"),
                     spans: Vec::new(),
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -2948,6 +2960,7 @@ mod tests {
                     ts: index as u64,
                     markdown: format!("line {index}"),
                     spans: Vec::new(),
+                    attempt: None,
                 }])
                 .unwrap();
         }
@@ -2973,6 +2986,7 @@ mod tests {
             ts: index,
             markdown: "x".repeat(100),
             spans: Vec::new(),
+            attempt: None,
         };
         storage
             .write_transcript_entries(
@@ -3016,6 +3030,7 @@ mod tests {
                 ts: index as u64,
                 markdown: "small".to_string(),
                 spans: Vec::new(),
+                attempt: None,
             })
             .collect::<Vec<_>>();
         storage.write_transcript_entries(&initial).unwrap();
@@ -3027,6 +3042,7 @@ mod tests {
                 ts: 1_000,
                 markdown: "x".repeat(1_100_000),
                 spans: Vec::new(),
+                attempt: None,
             }])
             .unwrap();
         writer.flush().unwrap();
@@ -3054,6 +3070,7 @@ mod tests {
                         ts: index as u64,
                         markdown: format!("line {index}"),
                         spans: Vec::new(),
+                        attempt: None,
                     })
                     .collect(),
             )
@@ -3084,6 +3101,7 @@ mod tests {
                 ts: index as u64,
                 markdown: format!("line {index}"),
                 spans: Vec::new(),
+                attempt: None,
             })
             .collect::<Vec<_>>();
         fs::write(
@@ -3119,12 +3137,14 @@ mod tests {
             ts: 1,
             markdown: "before".to_string(),
             spans: Vec::new(),
+            attempt: None,
         };
         let after = TranscriptEntry {
             kind: BlockKind::ToolOutput,
             ts: 2,
             markdown: "after".to_string(),
             spans: Vec::new(),
+            attempt: None,
         };
         fs::write(
             &path,
@@ -3158,6 +3178,7 @@ mod tests {
                 ts: index as u64,
                 markdown: format!("line {index}"),
                 spans: Vec::new(),
+                attempt: None,
             })
             .collect::<Vec<_>>();
         let mut contents = entries
@@ -3196,6 +3217,7 @@ mod tests {
                         ts: 1,
                         markdown: "transient".to_string(),
                         spans: Vec::new(),
+                        attempt: None,
                     })
                     .is_err()
             );
@@ -3222,6 +3244,7 @@ mod tests {
                 ts: 1,
                 markdown: "future".to_string(),
                 spans: Vec::new(),
+                attempt: None,
             })
             .unwrap();
         storage
@@ -3577,6 +3600,7 @@ mod tests {
                 ts: 1,
                 markdown: "old".to_string(),
                 spans: Vec::new(),
+                attempt: None,
             })
             .unwrap();
         let path = task_dir.join(GlobalFileNames::TRANSCRIPT);
@@ -3606,12 +3630,14 @@ mod tests {
                 ts: 1,
                 markdown: "first".to_string(),
                 spans: Vec::new(),
+                attempt: None,
             },
             TranscriptEntry {
                 kind: BlockKind::Model,
                 ts: 2,
                 markdown: "second".to_string(),
                 spans: Vec::new(),
+                attempt: None,
             },
         ];
         let mut appends = 0usize;
@@ -3632,12 +3658,14 @@ mod tests {
                     ts: 1,
                     markdown: "first".to_string(),
                     spans: Vec::new(),
+                    attempt: None,
                 },
                 TranscriptEntry {
                     kind: BlockKind::Model,
                     ts: 2,
                     markdown: "second".to_string(),
                     spans: Vec::new(),
+                    attempt: None,
                 },
             ]
         );
@@ -3661,6 +3689,7 @@ mod tests {
                         ts: index as u64,
                         markdown: format!("pending {index}"),
                         spans: Vec::new(),
+                        attempt: None,
                     })
                     .collect(),
             )
@@ -3700,6 +3729,7 @@ mod tests {
                 ts: index as u64,
                 markdown: "x".repeat(1100),
                 spans: Vec::new(),
+                attempt: None,
             })
             .collect::<Vec<_>>();
         fs::write(
@@ -3721,6 +3751,7 @@ mod tests {
                     ts: 10_000 + index,
                     markdown: "small".to_string(),
                     spans: Vec::new(),
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -3746,6 +3777,7 @@ mod tests {
                 ts: index,
                 markdown: "small".to_string(),
                 spans: Vec::new(),
+                attempt: None,
             })
             .collect::<Vec<_>>();
         storage.write_transcript_entries(&small).unwrap();
@@ -3755,6 +3787,7 @@ mod tests {
                 ts: DEFAULT_TRANSCRIPT_CAP as u64,
                 markdown: "x".repeat(1_100_000),
                 spans: Vec::new(),
+                attempt: None,
             })
             .unwrap();
 
@@ -3771,6 +3804,7 @@ mod tests {
                 ts: DEFAULT_TRANSCRIPT_CAP as u64 + 1,
                 markdown: "small".to_string(),
                 spans: Vec::new(),
+                attempt: None,
             })
             .unwrap();
         assert_eq!(count_lines(), DEFAULT_TRANSCRIPT_CAP + 1);

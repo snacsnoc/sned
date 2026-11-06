@@ -386,6 +386,10 @@ pub enum OutputEvent {
     CommandOutputLine(Line<'static>),
     /// Raw streamed reasoning text, styled and assembled by the renderer.
     ReasoningChunk(String),
+    /// A failed stream attempt's reasoning must vanish: the TUI drops its
+    /// live lines and bumps its attempt tag so persisted rows from the
+    /// failed attempt stay hidden on resume.
+    ReasoningAttemptReset,
     /// User-submitted prompt line ("❯ ..." with aligned continuation lines).
     UserPromptLine(Line<'static>),
     /// A queued user message is about to begin a new agent turn. The TUI uses
@@ -758,6 +762,7 @@ impl OutputWriter for StderrOutputWriter {
             | OutputEvent::CompletionAvailable(_)
             | OutputEvent::TurnIndicator(_)
             | OutputEvent::QueuedMessageStarted { .. }
+            | OutputEvent::ReasoningAttemptReset
             | OutputEvent::ApprovalFinished { .. } => {}
         }
     }
@@ -1099,6 +1104,7 @@ impl ChannelOutputWriter {
             OutputEvent::QueuedMessageStarted { .. } | OutputEvent::ApprovalFinished { .. } => {
                 std::mem::size_of::<usize>()
             }
+            OutputEvent::ReasoningAttemptReset => 0,
             OutputEvent::ApprovalRequested(_) => 1024,
         }
     }

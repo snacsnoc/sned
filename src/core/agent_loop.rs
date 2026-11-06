@@ -705,6 +705,8 @@ pub struct AgentLoop {
     message_counter: Arc<std::sync::atomic::AtomicUsize>,
     current_turn_retry_candidate: Option<StorageMessage>,
     retry_mode: bool,
+    inspection_streak: u32,
+    inspection_reminder_sent: bool,
 }
 
 impl AgentLoop {
@@ -983,6 +985,8 @@ impl AgentLoop {
             message_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             current_turn_retry_candidate: None,
             retry_mode: false,
+            inspection_streak: 0,
+            inspection_reminder_sent: false,
         }
     }
 
@@ -1313,6 +1317,184 @@ impl AgentLoop {
         }
     }
 
+    const INSPECTION_REMINDER_ROUNDS: u32 = 5;
+
+    const CHANGE_REQUEST_WORDS: &[&str] = &[
+        "fix", "fixes", "fixed", "fixing", "implement", "implements", "implemented",
+        "implementing", "refactor", "refactors", "refactored", "refactoring", "add",
+        "adds", "added", "adding", "change", "update", "create", "creates", "created",
+        "creating", "write", "writes", "wrote", "written", "writing", "remove", "removes",
+        "removed", "removing", "delete", "deletes", "deleted", "deleting", "modify",
+        "modifies", "modified", "modifying", "improve", "improves", "improved", "improving",
+        "optimize", "optimizes", "optimized", "optimizing", "optimise", "optimising",
+        "optimization", "optimisation", "patch", "patches", "patched", "patching",
+        "build", "builds", "built", "building", "migrate", "migrates", "migrated",
+        "migrating", "upgrade", "upgrades", "upgraded", "upgrading",
+    ];
+
+    const CHANGE_REQUEST_PHRASES: &[&str] = &["increase performance"];
+
+    fn reset_inspection_state(&mut self) {
+        self.inspection_streak = 0;
+        self.inspection_reminder_sent = false;
+    }
+
+    fn user_text_requests_change(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        if Self::CHANGE_REQUEST_PHRASES
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+        {
+            return true;
+        }
+        lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| Self::CHANGE_REQUEST_WORDS.contains(&word))
+    }
+
+    async fn task_requests_change(&self) -> bool {
+        let history = self.conversation_history.lock().await;
+        history.iter().any(|message| {
+            if message.role != MessageRole::User {
+                return false;
+            }
+            match &message.content {
+                MessageContent::Text(text) => Self::user_text_requests_change(text),
+                MessageContent::UserBlocks(blocks) => blocks.iter().any(|block| match block {
+                    crate::providers::UserContentBlock::Text(text) => {
+                        Self::user_text_requests_change(&text.text)
+                    }
+                    _ => false,
+                }),
+                _ => false,
+            }
+        })
+    }
+
+    fn tool_call_is_inspection(
+        tool_name: &str,
+        args: &Result<serde_json::Value, String>,
+    ) -> bool {
+        use crate::core::tools::ToolCategory;
+        let Some(tool) = SnedTool::from_name(tool_name) else {
+            return false;
+        };
+        match tool.category() {
+            ToolCategory::ReadOnly | ToolCategory::ReadFiles | ToolCategory::WebFetch => true,
+            ToolCategory::ExecuteCommand => {
+                let Ok(args) = args else {
+                    return false;
+                };
+                if args.get("script").is_some() {
+                    return false;
+                }
+                let Some(commands) = args.get("commands").and_then(|value| value.as_array())
+                else {
+                    return false;
+                };
+                !commands.is_empty()
+                    && commands
+                        .iter()
+                        .all(|command| command.as_str().is_some_and(Self::is_inspection_command))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_inspection_command(command: &str) -> bool {
+        use crate::core::tools::handlers::execute_command::{split_shell_command, stage_executable};
+        let mut command = command.trim();
+        if let Some(stripped) = command.strip_suffix("2>/dev/null") {
+            command = stripped.trim();
+        }
+        if command.contains('>') || command.contains("<<") {
+            return false;
+        }
+        let Some(segments) = split_shell_command(command, false) else {
+            return false;
+        };
+        if segments.len() != 1 {
+            return false;
+        }
+        let Some(stages) = split_shell_command(segments[0].trim(), true) else {
+            return false;
+        };
+        stages.iter().all(|stage| {
+            let Some(argv0) = stage_executable(stage) else {
+                return false;
+            };
+            Self::is_inspection_binary(&argv0, stage)
+        })
+    }
+
+    fn is_inspection_binary(name: &str, stage: &str) -> bool {
+        match name {
+            "ls" | "cat" | "grep" | "egrep" | "fgrep" | "rg" | "file" | "stat" | "head"
+            | "tail" | "wc" | "uniq" | "cut" | "diff" => true,
+            "sort" => !stage
+                .split_whitespace()
+                .any(|word| word == "-o" || word.starts_with("--output")),
+            "find" => !stage.split_whitespace().any(|word| {
+                const EXTRA_DANGEROUS_FIND_FLAGS: &[&str] =
+                    &["-fprint0", "-fprintf0", "-fprint", "-fprintf"];
+                crate::core::approval::DANGEROUS_FIND_FLAGS
+                    .iter()
+                    .chain(EXTRA_DANGEROUS_FIND_FLAGS.iter())
+                    .any(|flag| flag.eq_ignore_ascii_case(word))
+            }),
+            "git" => {
+                if stage
+                    .split_whitespace()
+                    .any(|word| word.starts_with("--output"))
+                {
+                    return false;
+                }
+                let mut words = stage.split_whitespace().skip(1).filter(|word| {
+                    !word.starts_with('-') || word.len() == 1
+                });
+                match words.next() {
+                    None => true,
+                    Some(subcommand)
+                        if crate::core::approval::SAFE_GIT_SUBCOMMANDS
+                            .contains(&subcommand) =>
+                    {
+                        match subcommand {
+                            "branch" | "remote" => words.next().is_none(),
+                            _ => true,
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    async fn update_inspection_streak(
+        &mut self,
+        tool_calls: &[crate::core::tools::execution::PreparedToolCall],
+    ) {
+        if tool_calls
+            .iter()
+            .all(|call| Self::tool_call_is_inspection(&call.tool_name, &call.parsed_args))
+        {
+            self.inspection_streak = self.inspection_streak.saturating_add(1);
+            if self.inspection_streak >= Self::INSPECTION_REMINDER_ROUNDS
+                && !self.inspection_reminder_sent
+                && self.task_requests_change().await
+            {
+                self.inspection_reminder_sent = true;
+                if !self.config.json_output {
+                    self.config.output_writer.emit(OutputEvent::info(
+                        "Five straight rounds of read-only inspection with no edits yet. If this task needs a code change, consider acting on what you have learned or asking the user for direction.",
+                    ));
+                }
+            }
+        } else {
+            self.reset_inspection_state();
+        }
+    }
+
     async fn record_task_history(&self, state_manager: &Arc<StateManager>, task_text: &str) {
         let workspace_root_str = self.resolve_workspace_root().to_str().map(String::from);
         let state_guard = self.state.lock().await;
@@ -1381,6 +1563,7 @@ impl AgentLoop {
     ) -> Result<(), AgentError> {
         tracing::debug!(target: "sned::agent_loop", "AgentLoop::run() called with {} initial messages", initial_messages.len());
         if !self.retry_mode {
+            self.reset_inspection_state();
             for message in &mut initial_messages {
                 if message.role == MessageRole::User && message.id.is_none() {
                     message.id = Some(Self::next_message_id(&self.message_counter));
@@ -1728,6 +1911,7 @@ impl AgentLoop {
                         false
                     };
                     if !queued_is_retry {
+                        self.reset_inspection_state();
                         self.current_turn_retry_candidate = Some(queued_message.clone());
                     }
                     if !self.config.json_output {
@@ -2898,8 +3082,18 @@ impl AgentLoop {
                             error: err,
                             retryable,
                             substantive_output,
+                            visible_output,
                         } => {
-                            if retryable && substantive_output && !self.config.json_output {
+                            let tui_mode =
+                                self.config.interactive_mode && !self.config.json_output;
+                            let show_notice = retryable
+                                && !self.config.json_output
+                                && if tui_mode {
+                                    visible_output
+                                } else {
+                                    substantive_output
+                                };
+                            if show_notice {
                                 self.config.output_writer.emit(OutputEvent::error(format!(
                                     "Provider stream error: {err}"
                                 )));
@@ -2928,6 +3122,7 @@ impl AgentLoop {
                 substantive_output: _,
                 errored: stream_errored,
                 retryable_error_before_output: retryable_stream_error_before_output,
+                retryable_error_before_visible_output,
                 non_retryable_error: non_retryable_stream_error,
             } = outcome;
 
@@ -3001,7 +3196,13 @@ impl AgentLoop {
                 return TurnResult::Error(err);
             }
 
-            if let Some(err) = retryable_stream_error_before_output {
+            let tui_retry_mode = self.config.interactive_mode && !self.config.json_output;
+            let retryable_err = if tui_retry_mode {
+                retryable_error_before_visible_output
+            } else {
+                retryable_stream_error_before_output
+            };
+            if let Some(err) = retryable_err {
                 if preoutput_deadline_exceeded || stream_retry_attempt >= MAX_STREAM_RETRY_ATTEMPTS
                 {
                     tracing::error!(
@@ -3035,6 +3236,11 @@ impl AgentLoop {
                     error = %err,
                     "retrying provider stream after pre-output transport failure"
                 );
+                if tui_retry_mode {
+                    self.config
+                        .output_writer
+                        .emit(OutputEvent::ReasoningAttemptReset);
+                }
                 if !self.config.json_output {
                     self.config
                         .output_writer
@@ -3426,6 +3632,10 @@ impl AgentLoop {
             // Track tool execution statistics for consecutive_mistakes tracking
             let tools_called = batch_output.tools_called;
             tool_failure_count = batch_output.tool_failure_count;
+
+            if self.config.mode == AgentMode::Act && !prepared_tool_calls.is_empty() {
+                self.update_inspection_streak(&prepared_tool_calls).await;
+            }
 
             let all_executed = batch_output.outcomes.iter().all(|outcome| outcome.executed);
             identical_batch_streak = if all_executed {
@@ -8752,7 +8962,8 @@ mod tests {
                 crate::cli::output::OutputEvent::RawAnsi(raw) => rendered.push(raw),
                 crate::cli::output::OutputEvent::Completion(text) => rendered.push(text),
                 crate::cli::output::OutputEvent::TurnEnd { .. }
-                | crate::cli::output::OutputEvent::CompletionAvailable(_) => {}
+                | crate::cli::output::OutputEvent::CompletionAvailable(_)
+                | crate::cli::output::OutputEvent::ReasoningAttemptReset => {}
                 crate::cli::output::OutputEvent::QueuedMessageStarted { .. } => {}
                 crate::cli::output::OutputEvent::TurnIndicator(line) => {
                     rendered.push(line.to_string())
@@ -10191,6 +10402,105 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    async fn test_retryable_stream_error_after_visible_reasoning_retries_once() {
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![
+                crate::providers::mock::MockResponse::Stream(vec![
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Reasoning(
+                        ApiStreamReasoningChunk {
+                            reasoning: "first thought\n".to_string(),
+                            details: None,
+                            signature: None,
+                            redacted_data: None,
+                            id: None,
+                        },
+                    )),
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Reasoning(
+                        ApiStreamReasoningChunk {
+                            reasoning: "second thought\n".to_string(),
+                            details: None,
+                            signature: None,
+                            redacted_data: None,
+                            id: None,
+                        },
+                    )),
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                        "OpenAI SSE stream error: error decoding response body (retryable)"
+                            .to_string(),
+                    )),
+                ]),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+            ],
+        )));
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-stream-retry-after-reasoning");
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+
+        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("recovered output"))
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("Provider stream error")),
+            "a retried attempt must not leave a stale error notice"
+        );
+        assert!(
+            agent
+                .state
+                .lock()
+                .await
+                .did_automatically_retry_failed_api_request
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retryable_stream_error_after_reasoning_does_not_retry_in_json_mode() {
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![
+                crate::providers::mock::MockResponse::Stream(vec![
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Reasoning(
+                        ApiStreamReasoningChunk {
+                            reasoning: "first thought\n".to_string(),
+                            details: None,
+                            signature: None,
+                            redacted_data: None,
+                            id: None,
+                        },
+                    )),
+                    crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Error(
+                        "OpenAI SSE stream error: error decoding response body (retryable)"
+                            .to_string(),
+                    )),
+                ]),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+            ],
+        )));
+        let (tx, _rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, "test-json-stream-retry-after-reasoning");
+        config.json_output = true;
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let mut agent = AgentLoop::new(config);
+
+        assert!(matches!(
+            agent.execute_turn().await,
+            TurnResult::Error(_)
+        ));
+        assert!(
+            !agent
+                .state
+                .lock()
+                .await
+                .did_automatically_retry_failed_api_request
+        );
+    }
+
+    #[tokio::test]
     async fn test_retryable_stream_error_after_signature_only_text_retries_once() {
         let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
             vec![
@@ -10278,6 +10588,238 @@ Irrespective of whether additional information or instructions are given, you ar
                 .await
                 .did_automatically_retry_failed_api_request
         );
+    }
+
+    #[test]
+    fn test_is_inspection_command_accepts_read_only_shapes() {
+        for command in [
+            "ls -la",
+            "cat file.rs",
+            "grep -rn foo src",
+            "grep -E 'a|b' file.rs",
+            "rg --files",
+            "find . -name '*.rs'",
+            "file /bin/ls",
+            "git status",
+            "git log --oneline",
+            "grep pattern file 2>/dev/null",
+            "grep pattern file | head -1",
+            "grep pattern file | sort | uniq -c | sort -rn",
+            "git branch",
+            "git remote -v",
+            "find . -name '*.rs' -print",
+        ] {
+            assert!(
+                AgentLoop::is_inspection_command(command),
+                "{command} must count as inspection"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_inspection_command_rejects_mutation_and_unknown_shapes() {
+        for command in [
+            "cargo test",
+            "python script.py",
+            "echo hi",
+            "nm /bin/ls | grep foo",
+            "grep pattern file > out.txt",
+            "find . -delete",
+            "find . -EXEC rm {} \\;",
+            "find . -fprint0 out.txt",
+            "find . -fprintf0 out.txt '%p\n'",
+            "git checkout main",
+            "git branch -D old-feature",
+            "git remote add origin git@example.com:repo.git",
+            "git log --output=file",
+            "sort -o sorted.txt unsorted.txt",
+            "ls && cat file",
+            "grep $(which ls) file",
+            "cat file; echo done",
+        ] {
+            assert!(
+                !AgentLoop::is_inspection_command(command),
+                "{command} must reset the inspection streak"
+            );
+        }
+    }
+
+    #[test]
+    fn test_user_text_requests_change_matches_change_verbs() {
+        for text in [
+            "please fix the crash on startup",
+            "implement the retry logic",
+            "refactor this module",
+            "can you increase performance here?",
+            "add a test for the parser",
+            "fixing the deadlock",
+            "the build is broken, got a fix?",
+            "added a test, now removing the debug print",
+            "who wrote this and can it be rewritten?",
+            "recently patched and migrated",
+        ] {
+            assert!(
+                AgentLoop::user_text_requests_change(text),
+                "{text} must read as a change request"
+            );
+        }
+        for text in [
+            "explain this module",
+            "what does this function do?",
+            "summarize the recent changes",
+        ] {
+            assert!(
+                !AgentLoop::user_text_requests_change(text),
+                "{text} must not read as a change request"
+            );
+        }
+        for word in AgentLoop::CHANGE_REQUEST_WORDS {
+            assert!(
+                AgentLoop::user_text_requests_change(&format!("please {word} the build")),
+                "listed word {word} must match"
+            );
+        }
+    }
+
+    fn inspection_call(tool_name: &str, args: serde_json::Value) -> PreparedToolCall {
+        PreparedToolCall {
+            tool_call: ApiStreamToolCall {
+                call_id: Some("call-1".to_string()),
+                function: ApiStreamToolCallFunction {
+                    id: None,
+                    name: Some(tool_name.to_string()),
+                    arguments: Some(args.to_string()),
+                },
+                signature: None,
+            },
+            tool_id: "call-1".to_string(),
+            tool_name: tool_name.to_string(),
+            parsed_args: Ok(args),
+        }
+    }
+
+    fn inspection_test_agent(
+        task_prompt: &str,
+    ) -> (
+        AgentLoop,
+        mpsc::Receiver<crate::cli::output::SequencedOutputEvent>,
+    ) {
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![],
+        )));
+        let (tx, rx) = mpsc::channel(32);
+        let mut config = test_agent_config(provider, task_prompt);
+        config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let agent = AgentLoop::new(config);
+        (agent, rx)
+    }
+
+    async fn seed_user_prompt(agent: &AgentLoop, prompt: &str) {
+        let mut history = agent.conversation_history.lock().await;
+        history.push(StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(prompt.to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        });
+    }
+
+    fn read_call() -> PreparedToolCall {
+        inspection_call("read_file", serde_json::json!({"paths": ["src/main.rs"]}))
+    }
+
+    #[tokio::test]
+    async fn test_inspection_streak_reminds_once_after_five_read_only_rounds() {
+        let (mut agent, mut rx) = inspection_test_agent("fix the crash");
+        seed_user_prompt(&agent, "please fix the crash on startup").await;
+        for _ in 0..4 {
+            agent.update_inspection_streak(&[read_call()]).await;
+            assert!(!agent.inspection_reminder_sent);
+        }
+        agent.update_inspection_streak(&[read_call()]).await;
+        assert!(agent.inspection_reminder_sent);
+        let rendered = drain_rendered_output(&mut rx);
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("read-only inspection"))
+                .count(),
+            1
+        );
+        agent.update_inspection_streak(&[read_call()]).await;
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("read-only inspection")),
+            "the reminder must fire only once per streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inspection_streak_resets_and_rearms_after_mutation() {
+        let (mut agent, mut rx) = inspection_test_agent("fix the crash");
+        seed_user_prompt(&agent, "please fix the crash on startup").await;
+        for _ in 0..5 {
+            agent.update_inspection_streak(&[read_call()]).await;
+        }
+        assert!(agent.inspection_reminder_sent);
+        let _ = drain_rendered_output(&mut rx);
+        agent
+            .update_inspection_streak(&[inspection_call(
+                "edit_file",
+                serde_json::json!({"path": "src/main.rs"}),
+            )])
+            .await;
+        assert_eq!(agent.inspection_streak, 0);
+        assert!(!agent.inspection_reminder_sent);
+        for _ in 0..5 {
+            agent.update_inspection_streak(&[read_call()]).await;
+        }
+        assert!(agent.inspection_reminder_sent);
+        let rendered = drain_rendered_output(&mut rx);
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|line| line.contains("read-only inspection"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inspection_streak_stays_silent_without_change_request() {
+        let (mut agent, mut rx) = inspection_test_agent("explain this module");
+        seed_user_prompt(&agent, "explain this module").await;
+        for _ in 0..6 {
+            agent.update_inspection_streak(&[read_call()]).await;
+        }
+        assert!(!agent.inspection_reminder_sent);
+        let rendered = drain_rendered_output(&mut rx);
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("read-only inspection"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inspection_streak_ignores_non_inspection_commands() {
+        let (mut agent, _rx) = inspection_test_agent("fix it");
+        seed_user_prompt(&agent, "fix it").await;
+        for _ in 0..4 {
+            agent.update_inspection_streak(&[read_call()]).await;
+        }
+        agent
+            .update_inspection_streak(&[inspection_call(
+                "execute_command",
+                serde_json::json!({"commands": ["cargo test"]}),
+            )])
+            .await;
+        assert_eq!(agent.inspection_streak, 0);
+        assert!(!agent.inspection_reminder_sent);
     }
 
     #[tokio::test]

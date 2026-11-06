@@ -41,6 +41,7 @@ pub enum StreamEvent {
         error: String,
         retryable: bool,
         substantive_output: bool,
+        visible_output: bool,
     },
 }
 
@@ -76,6 +77,7 @@ pub struct StreamOutcome {
     pub substantive_output: bool,
     pub errored: bool,
     pub retryable_error_before_output: Option<String>,
+    pub retryable_error_before_visible_output: Option<String>,
     pub non_retryable_error: Option<String>,
 }
 
@@ -96,8 +98,10 @@ pub struct StreamAccumulator {
     tool_call_order: Vec<String>,
     announced_tool_call_ids: HashSet<String>,
     substantive_output: bool,
+    visible_output: bool,
     stream_errored: bool,
     retryable_error_before_output: Option<String>,
+    retryable_error_before_visible_output: Option<String>,
     non_retryable_error: Option<String>,
     stream_usage: Option<ApiReqInfo>,
     json_output: bool,
@@ -120,8 +124,10 @@ impl StreamAccumulator {
             tool_call_order: Vec::new(),
             announced_tool_call_ids: HashSet::new(),
             substantive_output: false,
+            visible_output: false,
             stream_errored: false,
             retryable_error_before_output: None,
+            retryable_error_before_visible_output: None,
             non_retryable_error: None,
             stream_usage: None,
             json_output,
@@ -133,7 +139,8 @@ impl StreamAccumulator {
     /// Pre-output failure is decided by loop orchestration; recorded here
     /// so the retry decision sees it alongside chunk errors.
     pub fn note_preoutput_failure(&mut self, message: String) {
-        self.retryable_error_before_output = Some(message);
+        self.retryable_error_before_output = Some(message.clone());
+        self.retryable_error_before_visible_output = Some(message);
     }
 
     pub fn push(&mut self, chunk: &ApiStreamChunk) -> Vec<StreamEvent> {
@@ -170,6 +177,7 @@ impl StreamAccumulator {
             substantive_output: self.substantive_output,
             errored: self.stream_errored,
             retryable_error_before_output: self.retryable_error_before_output,
+            retryable_error_before_visible_output: self.retryable_error_before_visible_output,
             non_retryable_error: self.non_retryable_error,
         }
     }
@@ -180,6 +188,7 @@ impl StreamAccumulator {
         self.filtered_text.push_str(&processed);
         if self.json_output {
             self.substantive_output |= !text_chunk.text.is_empty();
+            self.visible_output |= !text_chunk.text.is_empty();
             tracing::info!(
                 target: "json_output",
                 "{}",
@@ -191,6 +200,7 @@ impl StreamAccumulator {
             );
         } else if !processed.is_empty() {
             self.substantive_output = true;
+            self.visible_output = true;
         }
         if text_chunk.signature.is_some() {
             self.accumulated_text_signature
@@ -247,6 +257,7 @@ impl StreamAccumulator {
         tool_chunk: &crate::providers::ApiStreamToolCallsChunk,
     ) -> Vec<StreamEvent> {
         self.substantive_output = true;
+        self.visible_output = true;
         let tc = tool_chunk.tool_call.clone();
         let key = tc
             .call_id
@@ -481,6 +492,7 @@ impl StreamAccumulator {
                 error: err.to_string(),
                 retryable: false,
                 substantive_output: self.substantive_output,
+                visible_output: self.visible_output,
             }];
         }
         if self.non_retryable_error.is_some() {
@@ -488,11 +500,15 @@ impl StreamAccumulator {
         }
         if !self.substantive_output {
             self.retryable_error_before_output = Some(err.to_string());
+            self.retryable_error_before_visible_output = Some(err.to_string());
             // OpenAI-compatible providers emit the transport
             // timing marker after the error. Keep draining so
             // the failed attempt remains observable and the
             // retry decision happens only at stream end.
             return Vec::new();
+        }
+        if !self.visible_output {
+            self.retryable_error_before_visible_output = Some(err.to_string());
         }
         self.stream_errored = true;
         if self.json_output {
@@ -510,6 +526,7 @@ impl StreamAccumulator {
             error: err.to_string(),
             retryable: true,
             substantive_output: self.substantive_output,
+            visible_output: self.visible_output,
         }]
     }
 }
@@ -625,6 +642,7 @@ mod tests {
                 error: "boom (retryable)".to_string(),
                 retryable: true,
                 substantive_output: true,
+                visible_output: true,
             }]
         );
 
@@ -643,6 +661,40 @@ mod tests {
         assert!(outcome.errored);
         assert_eq!(outcome.retryable_error_before_output, None);
         assert_eq!(outcome.non_retryable_error, None);
+    }
+
+    #[test]
+    fn accumulator_marks_reasoning_only_error_before_visible_output() {
+        let mut acc = StreamAccumulator::new(false, test_info());
+        acc.push(&ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
+            reasoning: "thinking".to_string(),
+            details: None,
+            signature: None,
+            redacted_data: None,
+            id: None,
+        }));
+        let events = acc.push(&ApiStreamChunk::Error("stall (retryable)".to_string()));
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::StreamError {
+                retryable,
+                visible_output,
+                substantive_output,
+                ..
+            } => {
+                assert!(retryable);
+                assert!(!visible_output);
+                assert!(substantive_output);
+            }
+            other => panic!("expected StreamError, got {other:?}"),
+        }
+
+        let outcome = acc.finish();
+        assert_eq!(outcome.retryable_error_before_output, None);
+        assert_eq!(
+            outcome.retryable_error_before_visible_output.as_deref(),
+            Some("stall (retryable)")
+        );
     }
 
     #[test]

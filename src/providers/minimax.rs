@@ -72,7 +72,7 @@ pub struct MinimaxProvider {
 impl MinimaxProvider {
     pub fn new(config: MinimaxConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(MINIMAX_CLIENT_TOTAL_TIMEOUT)
             .connect_timeout(std::time::Duration::from_secs(10))
             .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
             .tcp_nodelay(true)
@@ -803,6 +803,7 @@ async fn send_chunk(
     crate::providers::send_chunk(tx, chunk, "MiniMax", chunk_type).await
 }
 
+const MINIMAX_CLIENT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const MAX_XML_TOOL_CALL_BUFFER: usize = 64 * 1024;
 const XML_TOOL_CALL_CLOSING_TAG: &str = "</minimax:tool_call>";
 const MINIMAX_TEXT_FLUSH_THRESHOLD: usize = 64;
@@ -1599,6 +1600,14 @@ mod tests {
     use super::*;
     use crate::providers::{MessageRole, SharedContentFields, StorageMessage, ToolDefinition};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn test_minimax_client_total_timeout_matches_openai() {
+        assert_eq!(
+            MINIMAX_CLIENT_TOTAL_TIMEOUT,
+            std::time::Duration::from_secs(600)
+        );
+    }
 
     #[test]
     fn test_minimax_config() {

@@ -1180,6 +1180,8 @@ fn persist_transcript_line(
                 ts,
                 markdown,
                 spans,
+                attempt: (kind == crate::cli::tui::BlockKind::Reasoning)
+                    .then(|| app.reasoning_attempt()),
             }
         })
         .collect::<Vec<_>>();
@@ -1200,8 +1202,31 @@ fn persist_transcript_line(
 fn replay_transcript(app: &mut App, storage: &TaskStorage) {
     match storage.read_transcript(DEFAULT_TRANSCRIPT_CAP) {
         Ok(entries) => {
-            for entry in entries {
-                app.push_output_with_kind(restore_transcript_line(&entry), entry.kind);
+            let mut segment_start = 0;
+            let mut ranges = Vec::new();
+            for (index, entry) in entries.iter().enumerate() {
+                if entry.kind == crate::cli::tui::BlockKind::Separator {
+                    ranges.push((segment_start, index + 1));
+                    segment_start = index + 1;
+                }
+            }
+            ranges.push((segment_start, entries.len()));
+            for (start, end) in ranges {
+                let latest_attempt = entries[start..end]
+                    .iter()
+                    .filter(|entry| entry.kind == crate::cli::tui::BlockKind::Reasoning)
+                    .filter_map(|entry| entry.attempt)
+                    .max();
+                for entry in &entries[start..end] {
+                    if entry.kind == crate::cli::tui::BlockKind::Reasoning
+                        && entry
+                            .attempt
+                            .is_some_and(|attempt| Some(attempt) != latest_attempt)
+                    {
+                        continue;
+                    }
+                    app.push_output_with_kind(restore_transcript_line(entry), entry.kind);
+                }
             }
         }
         Err(error) => tracing::warn!(error = %error, "Failed to read task transcript"),
@@ -1391,7 +1416,10 @@ fn apply_output_event(
     storage: Option<&TaskStorage>,
     turn_render_worker: Option<&TurnRenderWorker>,
 ) {
-    if !matches!(&event, OutputEvent::ReasoningChunk(_)) {
+    if !matches!(
+        &event,
+        OutputEvent::ReasoningChunk(_) | OutputEvent::ReasoningAttemptReset
+    ) {
         if pending_reasoning_lines.is_some() || app.reasoning_stream_changed_since_persisted() {
             let reasoning_lines = app.reasoning_stream_lines();
             if !reasoning_lines.is_empty() {
@@ -1468,6 +1496,10 @@ fn apply_output_event(
             flush_pending_model_update(app, pending_model_update, storage);
             app.push_reasoning_chunk(&chunk);
             *pending_reasoning_lines = Some(app.reasoning_stream_lines());
+        }
+        OutputEvent::ReasoningAttemptReset => {
+            *pending_reasoning_lines = None;
+            app.reset_reasoning_attempt();
         }
         OutputEvent::UserPromptLine(line) => {
             flush_pending_model_update(app, pending_model_update, storage);
@@ -8350,7 +8382,7 @@ mod tests {
         let entries = storage.read_transcript(10_000).expect("transcript should read");
         let reasoning: Vec<_> = entries
             .iter()
-            .filter(|entry| entry.kind == BlockKind::Reasoning)
+            .filter(|entry| entry.kind == crate::cli::tui::BlockKind::Reasoning)
             .collect();
         assert_eq!(reasoning.len(), 5, "second flush must persist only its delta");
         for marker in ["alpha", "bravo", "charlie", "delta", "echo"] {
@@ -8359,6 +8391,133 @@ mod tests {
                 "missing persisted reasoning line {marker}"
             );
         }
+    }
+
+    #[test]
+    fn reasoning_attempt_reset_drops_failed_attempt_lines() {
+        let mut app = App::new();
+        app.set_content_height(24);
+        app.set_content_width(80);
+        let mut pending_model_update = None;
+        let mut pending_reasoning_lines = None;
+        for chunk in ["first\n", "second\n"] {
+            apply_output_event(
+                &mut app,
+                OutputEvent::ReasoningChunk(chunk.to_string()),
+                &mut pending_model_update,
+                &mut pending_reasoning_lines,
+                None,
+                None,
+            );
+        }
+        assert!(
+            app.output_line_kinds
+                .iter()
+                .any(|kind| *kind == crate::cli::tui::BlockKind::Reasoning)
+        );
+        apply_output_event(
+            &mut app,
+            OutputEvent::ReasoningAttemptReset,
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            None,
+            None,
+        );
+        assert!(
+            !app
+                .output_line_kinds
+                .iter()
+                .any(|kind| *kind == crate::cli::tui::BlockKind::Reasoning),
+            "reset must drop the failed attempt's live reasoning lines"
+        );
+        assert_eq!(app.reasoning_attempt(), 1);
+        apply_output_event(
+            &mut app,
+            OutputEvent::ReasoningChunk("recovered\n".to_string()),
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            None,
+            None,
+        );
+        let reasoning: Vec<_> = app
+            .output_line_kinds
+            .iter()
+            .filter(|kind| **kind == crate::cli::tui::BlockKind::Reasoning)
+            .collect();
+        assert_eq!(reasoning.len(), 1, "only the retry's lines must remain");
+    }
+
+    #[test]
+    fn reasoning_attempt_reset_hides_failed_attempt_on_resume() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir should create");
+        let storage =
+            crate::storage::task_storage::TaskStorage::new_with_dir("reasoning-reset", temp_dir.path())
+                .expect("task storage should open");
+        let mut app = App::new();
+        app.set_content_height(24);
+        app.set_content_width(80);
+        let mut pending_model_update = None;
+        let mut pending_reasoning_lines = None;
+        apply_output_event(
+            &mut app,
+            OutputEvent::ReasoningChunk("stale thought\n".to_string()),
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            Some(&storage),
+            None,
+        );
+        flush_pending_reasoning_lines(
+            &mut app,
+            &mut pending_reasoning_lines,
+            Some(&storage),
+        );
+        apply_output_event(
+            &mut app,
+            OutputEvent::ReasoningAttemptReset,
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            Some(&storage),
+            None,
+        );
+        apply_output_event(
+            &mut app,
+            OutputEvent::ReasoningChunk("fresh thought\n".to_string()),
+            &mut pending_model_update,
+            &mut pending_reasoning_lines,
+            Some(&storage),
+            None,
+        );
+        flush_pending_reasoning_lines(
+            &mut app,
+            &mut pending_reasoning_lines,
+            Some(&storage),
+        );
+
+        let entries = storage.read_transcript(10_000).expect("transcript should read");
+        let attempts: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.kind == crate::cli::tui::BlockKind::Reasoning)
+            .filter_map(|entry| entry.attempt)
+            .collect();
+        assert_eq!(attempts, vec![0, 1]);
+
+        let mut resumed = App::new();
+        replay_transcript(&mut resumed, &storage);
+        let markdown: Vec<_> = resumed
+            .output_lines
+            .iter()
+            .zip(resumed.output_line_kinds.iter())
+            .filter(|(_, kind)| **kind == crate::cli::tui::BlockKind::Reasoning)
+            .map(|(line, _)| line.to_string())
+            .collect();
+        assert!(
+            markdown.iter().any(|text| text.contains("fresh thought")),
+            "resumed transcript must keep the retry's reasoning"
+        );
+        assert!(
+            !markdown.iter().any(|text| text.contains("stale thought")),
+            "resumed transcript must hide the failed attempt's reasoning"
+        );
     }
 
     #[test]
@@ -9278,6 +9437,7 @@ mod tests {
                     ts: index as u64,
                     markdown: (*markdown).to_string(),
                     spans: Vec::new(),
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -9354,6 +9514,7 @@ mod tests {
                 ts: 0,
                 markdown: markdown.to_string(),
                 spans: Vec::new(),
+                attempt: None,
             })
         };
 

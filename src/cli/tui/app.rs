@@ -1177,6 +1177,7 @@ pub struct App {
     last_persisted_reasoning_line_id: Option<OutputLineId>,
     reasoning_stream_generation: u64,
     last_persisted_reasoning_generation: u64,
+    reasoning_attempt: u32,
     pub(crate) deferred_priority_events: VecDeque<crate::cli::output::SequencedOutputEvent>,
     /// Whether the model picker is active.
     pub model_picker_active: bool,
@@ -1604,6 +1605,7 @@ impl App {
             last_persisted_reasoning_line_id: None,
             reasoning_stream_generation: 0,
             last_persisted_reasoning_generation: 0,
+            reasoning_attempt: 0,
             deferred_priority_events: VecDeque::new(),
             model_picker_active: false,
             model_picker_results: Vec::new(),
@@ -2245,6 +2247,52 @@ impl App {
             })
             .collect();
         self.turn_stream_entries = remaining_entries;
+        self.cached_wrap_width = None;
+        self.cached_visible_window = None;
+        self.rebuild_visual_row_cache(self.last_wrap_width());
+        self.clear_text_selection();
+        self.clamp_to_content();
+    }
+
+    pub(crate) fn reasoning_attempt(&self) -> u32 {
+        self.reasoning_attempt
+    }
+
+    /// Drop the current turn's reasoning lines after a retried stream
+    /// attempt. The retry streams the thinking again from scratch, so
+    /// keeping the failed attempt would duplicate it in the transcript.
+    pub(crate) fn reset_reasoning_attempt(&mut self) {
+        self.finish_reasoning_stream();
+        self.pending_transcript_reasoning_lines = None;
+
+        let entries = std::mem::take(&mut self.turn_stream_entries);
+        let original_len = self.output_lines.len();
+        let reasoning_indices: Vec<usize> = entries
+            .iter()
+            .filter(|(_, kind)| *kind == StreamKind::Reasoning)
+            .map(|(index, _)| *index)
+            .filter(|index| *index < original_len)
+            .collect();
+
+        if !reasoning_indices.is_empty() {
+            let remove: HashSet<usize> = reasoning_indices.iter().copied().collect();
+            self.splice_output_triplet(&remove, 0, Vec::new(), BlockKind::Reasoning);
+        }
+
+        let mut removed_sorted = reasoning_indices;
+        removed_sorted.sort_unstable();
+        self.turn_stream_entries = entries
+            .into_iter()
+            .filter_map(|(index, kind)| {
+                if kind == StreamKind::Reasoning || index >= original_len {
+                    return None;
+                }
+                let removed_before =
+                    removed_sorted.partition_point(|removed_index| *removed_index < index);
+                Some((index - removed_before, kind))
+            })
+            .collect();
+        self.reasoning_attempt = self.reasoning_attempt.saturating_add(1);
         self.cached_wrap_width = None;
         self.cached_visible_window = None;
         self.rebuild_visual_row_cache(self.last_wrap_width());

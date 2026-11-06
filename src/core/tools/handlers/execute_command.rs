@@ -80,6 +80,227 @@ fn is_plain_search_command(command: &str) -> bool {
     matches!(executable, "grep" | "egrep" | "fgrep" | "rg")
 }
 
+const PIPESTATUS_MARKER: &str = "__SNED_PIPESTATUS__:";
+
+#[derive(Debug, PartialEq)]
+struct SearchPipelineStage {
+    name: String,
+    search: bool,
+}
+
+pub(crate) fn split_shell_command(command: &str, split_pipes: bool) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+    while let Some(character) = chars.next() {
+        if escaped {
+            escaped = false;
+            current.push(character);
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            current.push(character);
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            current.push(character);
+            continue;
+        }
+        match character {
+            '\'' | '"' => {
+                quote = Some(character);
+                current.push(character);
+            }
+            '#' | '`' | '$' | '(' | ')' | '{' | '}' | ';' | '\n' | '\r' | '!' => {
+                return None;
+            }
+            '&' => {
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    if split_pipes {
+                        return None;
+                    }
+                    parts.push(std::mem::take(&mut current));
+                } else {
+                    let next = chars.peek();
+                    let prev = current.chars().last();
+                    let redirection = prev == Some('>') || next == Some(&'>');
+                    if !redirection {
+                        return None;
+                    }
+                    current.push(character);
+                }
+            }
+            '|' => {
+                if chars.peek() == Some(&'|') {
+                    return None;
+                }
+                if split_pipes {
+                    parts.push(std::mem::take(&mut current));
+                } else {
+                    current.push(character);
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+    if quote.is_some() || escaped {
+        return None;
+    }
+    parts.push(current);
+    Some(parts)
+}
+
+fn shell_keywords() -> &'static [&'static str] {
+    &[
+        "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case",
+        "esac", "select", "function", "coproc",
+    ]
+}
+
+pub(crate) fn stage_executable(stage: &str) -> Option<String> {
+    let mut words = stage.split_whitespace();
+    let mut first = words.next()?;
+    if let Some(stripped) = first.strip_prefix('&') {
+        first = stripped;
+    }
+    let mut word = first;
+    while let Some((name, _)) = word.split_once('=') {
+        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            word = words.next()?;
+        } else {
+            break;
+        }
+    }
+    let unquoted = word.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')).or_else(|| {
+        word.strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+    });
+    let executable = unquoted.unwrap_or(word);
+    if executable.is_empty() {
+        return None;
+    }
+    Some(
+        executable
+            .rsplit('/')
+            .next()
+            .unwrap_or(executable)
+            .to_string(),
+    )
+}
+
+fn parse_search_pipeline(command: &str) -> Option<Vec<Vec<SearchPipelineStage>>> {
+    let segments = split_shell_command(command, false)?;
+    let mut parsed = Vec::with_capacity(segments.len());
+    for segment in &segments {
+        if segment.trim().is_empty() {
+            return None;
+        }
+        let first = segment.split_whitespace().next().unwrap_or("");
+        if shell_keywords().contains(&first) {
+            return None;
+        }
+        let stages = split_shell_command(segment, true)?;
+        let mut parsed_stages = Vec::with_capacity(stages.len());
+        for stage in &stages {
+            let name = stage_executable(stage)?;
+            let search = matches!(name.as_str(), "grep" | "egrep" | "fgrep" | "rg");
+            parsed_stages.push(SearchPipelineStage { name, search });
+        }
+        parsed.push(parsed_stages);
+    }
+    if parsed
+        .iter()
+        .any(|stages| !stages.iter().any(|stage| stage.search))
+    {
+        return None;
+    }
+    Some(parsed)
+}
+
+fn wrap_command_with_pipestatus_capture(segments: &[String]) -> String {
+    let mut wrapped = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            wrapped.push_str(" && ");
+        }
+        wrapped.push_str("{ ");
+        wrapped.push_str(segment);
+        wrapped.push_str(
+            "; __SNED_PS=(\"${PIPESTATUS[@]}\"); __SNED_RC=0; \
+             for __SNED_S in \"${__SNED_PS[@]}\"; do \
+             if [ \"$__SNED_S\" -ne 0 ]; then __SNED_RC=$__SNED_S; fi; done; \
+             __SNED_SEG=\"$__SNED_SEG${__SNED_SEG:+;}${__SNED_PS[*]}\"; \
+             (exit $__SNED_RC); }",
+        );
+    }
+    wrapped.push_str(
+        "; __SNED_EXIT=$?; printf '\\n__SNED_PIPESTATUS__:%s' \"$__SNED_SEG\"; exit $__SNED_EXIT",
+    );
+    wrapped
+}
+
+fn strip_pipestatus_trailer(stdout: &str) -> (String, Option<Vec<Vec<i32>>>) {
+    let Some(marker) = stdout.rsplit('\n').next() else {
+        return (stdout.to_string(), None);
+    };
+    let Some(payload) = marker.strip_prefix(PIPESTATUS_MARKER) else {
+        return (stdout.to_string(), None);
+    };
+    let mut statuses = Vec::new();
+    for segment in payload.split(';') {
+        let mut codes = Vec::new();
+        for code in segment.split_whitespace() {
+            let Ok(code) = code.parse::<i32>() else {
+                return (stdout.to_string(), None);
+            };
+            codes.push(code);
+        }
+        statuses.push(codes);
+    }
+    let stripped = stdout[..stdout.len() - marker.len()].to_string();
+    (stripped, Some(statuses))
+}
+
+fn pipeline_search_miss(
+    segments: &[Vec<SearchPipelineStage>],
+    statuses: &[Vec<i32>],
+) -> bool {
+    if segments.len() != statuses.len() {
+        return false;
+    }
+    let mut searcher_reported_miss = false;
+    for (stages, codes) in segments.iter().zip(statuses.iter()) {
+        if stages.len() != codes.len() {
+            return false;
+        }
+        for (stage, code) in stages.iter().zip(codes.iter()) {
+            if stage.search {
+                if *code != 0 && *code != 1 {
+                    return false;
+                }
+                if *code == 1 {
+                    searcher_reported_miss = true;
+                }
+            } else if *code != 0 {
+                return false;
+            }
+        }
+    }
+    searcher_reported_miss
+}
+
 enum StreamLine {
     Text(String),
     Overlong,
@@ -616,11 +837,23 @@ impl ExecuteCommandHandler {
                 return Err(anyhow::anyhow!("{}", err.display()));
             }
 
+            let use_bash = !cfg!(target_os = "windows");
+            let pipeline_stages = parse_search_pipeline(cmd_str);
+            let (effective_command, capture_pipeline_status) = match &pipeline_stages {
+                Some(_) if use_bash => (
+                    wrap_command_with_pipestatus_capture(
+                        &split_shell_command(cmd_str, false).unwrap_or_default(),
+                    ),
+                    true,
+                ),
+                _ => (cmd_str.clone(), false),
+            };
+
             let mut cmd = Self::configured_command_process(
-                cmd_str,
+                &effective_command,
                 cwd,
                 &sandboxed_env,
-                !cfg!(target_os = "windows"),
+                use_bash,
             );
 
             let timeout_duration =
@@ -663,6 +896,7 @@ impl ExecuteCommandHandler {
 
             let mut stdout_collected = String::new();
             let mut stderr_collected = String::new();
+            let mut pipestatus_trailer_line: Option<String> = None;
             let collect_limit = command_collect_limit();
             let mut stdout_collect_truncated = false;
             let mut stderr_collect_truncated = false;
@@ -745,6 +979,12 @@ impl ExecuteCommandHandler {
                                 let drain_stdout = async {
                                 while let Ok(Ok(Some(line))) = tokio::time::timeout_at(drain_deadline, stdout_reader.next_line()).await {
                                     let line = line.into_text("stdout");
+                                    if capture_pipeline_status
+                                        && line.starts_with(PIPESTATUS_MARKER)
+                                    {
+                                        pipestatus_trailer_line = Some(line);
+                                        continue;
+                                    }
                                     stdout_displayed += 1;
                                     if !json_output {
                                         if stream_limit.is_none() {
@@ -878,13 +1118,22 @@ impl ExecuteCommandHandler {
                                         tokio::select! {
                                             result = stdout_reader.next_line(), if !stdout_done => {
                                                 match result {
-                                                    Ok(Some(line)) => append_limited_output(
-                                                        &mut stdout_collected,
-                                                        &line.into_text("stdout"),
-                                                        collect_limit,
-                                                        &mut stdout_collect_truncated,
-                                                        &mut stdout_total_bytes,
-                                                    ),
+                                                    Ok(Some(line)) => {
+                                                        let line = line.into_text("stdout");
+                                                        if capture_pipeline_status
+                                                            && line.starts_with(PIPESTATUS_MARKER)
+                                                        {
+                                                            pipestatus_trailer_line = Some(line);
+                                                            continue;
+                                                        }
+                                                        append_limited_output(
+                                                            &mut stdout_collected,
+                                                            &line,
+                                                            collect_limit,
+                                                            &mut stdout_collect_truncated,
+                                                            &mut stdout_total_bytes,
+                                                        )
+                                                    }
                                                     Ok(None) | Err(_) => stdout_done = true,
                                                 }
                                             }
@@ -952,6 +1201,12 @@ impl ExecuteCommandHandler {
                         match result {
                             Ok(Some(line)) => {
                                 let line = line.into_text("stdout");
+                                if capture_pipeline_status
+                                    && line.starts_with(PIPESTATUS_MARKER)
+                                {
+                                    pipestatus_trailer_line = Some(line);
+                                    continue;
+                                }
                                 stdout_displayed += 1;
                                 if !json_output {
                                     if stream_limit.is_none() {
@@ -1124,6 +1379,11 @@ impl ExecuteCommandHandler {
 
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = stdout.into_owned();
+            let pipeline_statuses = pipestatus_trailer_line
+                .as_deref()
+                .map(|line| strip_pipestatus_trailer(line).1)
+                .flatten();
 
             tracing::debug!(
                 command = %cmd_str,
@@ -1179,10 +1439,13 @@ impl ExecuteCommandHandler {
             }
 
             if !output.status.success() {
-                if output.status.code() == Some(1)
+                let clean_search_miss = output.status.code() == Some(1)
                     && stderr.is_empty()
-                    && is_plain_search_command(cmd_str)
-                {
+                    && (is_plain_search_command(cmd_str)
+                        || pipeline_stages.as_ref().zip(pipeline_statuses.as_ref()).is_some_and(
+                            |(stages, statuses)| pipeline_search_miss(stages, statuses),
+                        ));
+                if clean_search_miss {
                     append_limited_text(
                         &mut combined_output,
                         "No matches found (exit code 1). Use search_files or broaden the search pattern.",
@@ -1824,7 +2087,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_commands_success() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new();
         let result = handler
             .execute_commands(vec!["echo hello".to_string()], None)
@@ -2163,7 +2430,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_scoped_approval_rechecks_structural_safety() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new();
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
@@ -2208,7 +2479,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_commands_failure() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new();
         let result = handler
             .execute_commands(vec!["false".to_string()], None)
@@ -2235,7 +2510,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_grep_no_match_is_not_a_tool_failure() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("file.swift"), "func other() {}\n").unwrap();
         let output = ExecuteCommandHandler::new()
@@ -2249,8 +2528,159 @@ mod tests {
         assert!(!output.contains("Command failed with exit code"));
     }
 
+    #[test]
+    fn test_parse_search_pipeline_accepts_supported_shapes() {
+        let parsed = parse_search_pipeline("nm /bin/ls | grep foo").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0],
+            vec![
+                SearchPipelineStage {
+                    name: "nm".to_string(),
+                    search: false,
+                },
+                SearchPipelineStage {
+                    name: "grep".to_string(),
+                    search: true,
+                },
+            ]
+        );
+        let parsed = parse_search_pipeline("grep a f | head -1 && grep b g | head -1").unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|stages| stages.len() == 2));
+        let parsed = parse_search_pipeline("FOO=1 /usr/bin/rg foo .").unwrap();
+        assert!(parsed[0][0].search);
+        assert_eq!(parsed[0][0].name, "rg");
+    }
+
+    #[test]
+    fn test_parse_search_pipeline_rejects_unsupported_shapes() {
+        assert!(parse_search_pipeline("grep pattern file; false").is_none());
+        assert!(parse_search_pipeline("grep pattern file || echo fallback").is_none());
+        assert!(parse_search_pipeline("grep $(which ls) file").is_none());
+        assert!(parse_search_pipeline("cat file | sort").is_none());
+        assert!(parse_search_pipeline("grep pattern file && echo done").is_none());
+        assert!(parse_search_pipeline("for f in *; do grep x $f; done").is_none());
+        assert!(parse_search_pipeline("grep pattern file |").is_none());
+    }
+
+    #[test]
+    fn test_pipeline_search_miss_requires_clean_stages() {
+        let segments = parse_search_pipeline("nm /bin/ls | grep foo").unwrap();
+        assert!(pipeline_search_miss(&segments, &[vec![0, 1]]));
+        let segments = parse_search_pipeline("grep a f | head -1").unwrap();
+        assert!(pipeline_search_miss(&segments, &[vec![1, 0]]));
+        assert!(!pipeline_search_miss(&segments, &[vec![0, 0]]));
+        let segments = parse_search_pipeline("nm /bin/ls | grep foo").unwrap();
+        assert!(!pipeline_search_miss(&segments, &[vec![1, 1]]));
+        assert!(!pipeline_search_miss(&segments, &[vec![2, 0]]));
+        assert!(!pipeline_search_miss(&segments, &[vec![0]]));
+    }
+
+    #[test]
+    fn test_strip_pipestatus_trailer() {
+        let (stripped, statuses) =
+            strip_pipestatus_trailer("match\n__SNED_PIPESTATUS__:0 1;1 0");
+        assert_eq!(stripped, "match\n");
+        assert_eq!(statuses, Some(vec![vec![0, 1], vec![1, 0]]));
+        let (stripped, statuses) = strip_pipestatus_trailer("plain output\n");
+        assert_eq!(stripped, "plain output\n");
+        assert_eq!(statuses, None);
+    }
+
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_pipeline_search_miss_is_not_a_tool_failure() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        for command in [
+            "printf 'alpha\\n' | grep beta",
+            "printf 'alpha\\n' | grep beta | head -1",
+        ] {
+            let output = handler
+                .execute_commands(vec![command.to_string()], None)
+                .await
+                .unwrap();
+            assert!(
+                output.contains("No matches found (exit code 1)"),
+                "command {command} must report a clean miss"
+            );
+            assert!(!output.contains("Command failed with exit code"));
+            assert!(!output.contains("__SNED_PIPESTATUS__"));
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_chained_pipeline_search_miss_is_not_a_tool_failure() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let output = ExecuteCommandHandler::new()
+            .with_yolo(true)
+            .execute_commands(
+                vec!["printf 'a\\n' | grep a | head -1 && printf 'b\\n' | grep zzz | head -1"
+                    .to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(output.contains("No matches found (exit code 1)"));
+        assert!(!output.contains("Command failed with exit code"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_nm_pipeline_search_miss_is_not_a_tool_failure() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let exe = std::env::current_exe().unwrap();
+        let output = ExecuteCommandHandler::new()
+            .with_yolo(true)
+            .execute_commands(
+                vec![format!(
+                    "nm {} | grep __sned_no_such_symbol__",
+                    exe.display()
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(output.contains("No matches found (exit code 1)"));
+        assert!(!output.contains("Command failed with exit code"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_pipeline_upstream_failure_stays_an_error() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let result = handler
+            .execute_commands(vec!["false | grep x".to_string()], None)
+            .await
+            .expect_err("upstream stage failure must stay a tool failure");
+        assert!(result.to_string().contains("Command failed with exit code"));
+        let result = handler
+            .execute_commands(
+                vec!["grep x /nonexistent-sned-dir-12345 | head -1".to_string()],
+                None,
+            )
+            .await
+            .expect_err("grep errors must stay tool failures");
+        assert!(result.to_string().contains("Command failed with exit code"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_script_failure() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let result = handler
             .execute_script("exit 7", "bash", None)
@@ -2260,7 +2690,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_script_python() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let result = handler
             .execute_script("print('hello from python')", "python3", None)
@@ -2270,7 +2704,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_script_raw_output_controls_carriage_returns() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
@@ -2446,7 +2884,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_bash_script_uses_bash_syntax() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let result = handler
             .execute_script("cat < <(printf 'bash works\\n')", "bash", None)
@@ -2457,7 +2899,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_commands_preserves_pipeline_failure_status() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let result = handler
             .execute_commands(vec!["false | tail -1".to_string()], None)
@@ -2470,7 +2916,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_commands_allows_successful_pipeline() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let result = handler
             .execute_commands(vec!["printf 'ok\\n' | tail -1".to_string()], None)
@@ -2480,7 +2930,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_commands_timeout_kills_child() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let temp_dir = tempfile::tempdir().unwrap();
         let pid_file = temp_dir.path().join("pid.txt");
@@ -2614,7 +3068,46 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_execute_commands_timeout_omits_pipestatus_trailer() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let handler = ExecuteCommandHandler::new().with_yolo(true);
+        let output_writer: crate::cli::output::OutputWriterArc =
+            Arc::new(crate::cli::output::StderrOutputWriter);
+        let result = handler
+            .execute_commands_with_timeout(
+                vec!["yes __SNED_PIPESTATUS__:0 1 | grep SNED".to_string()],
+                None,
+                Some(Duration::from_millis(100)),
+                false,
+                None,
+                None,
+                false,
+                false,
+                &output_writer,
+            )
+            .await;
+
+        let err = result.expect_err("command should time out");
+        let err_text = err.to_string();
+        let stdout_section = err_text
+            .split_once("Stdout: ")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default();
+        assert!(
+            !stdout_section.contains("__SNED_PIPESTATUS__"),
+            "timeout error must not leak the wrapped pipeline's status trailer"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_commands_timeout_retains_buffered_output() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let output_writer: crate::cli::output::OutputWriterArc =
             Arc::new(crate::cli::output::StderrOutputWriter);
@@ -2639,7 +3132,11 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_script_registers_process_group_for_cancellation() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let output_writer: crate::cli::output::OutputWriterArc =
@@ -2683,7 +3180,11 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_script_cancellation_kills_child_while_state_lock_is_held() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let state = Arc::new(tokio::sync::Mutex::new(TaskState::default()));
         let cancellation_flag = state.lock().await.is_cancelled_atomic.clone();
@@ -2732,7 +3233,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_script_timeout_kills_child() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let temp_dir = tempfile::tempdir().unwrap();
         let pid_file = temp_dir.path().join("pid.txt");
@@ -2863,7 +3368,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_command_timeout_no_task_leak() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let temp_dir = tempfile::tempdir().unwrap();
         let pid_file = temp_dir.path().join("pid.txt");
@@ -2917,7 +3426,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_command_timeout_kills_grandchildren() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         // Test that timeout kills not just the shell process but also any
         // grandchild processes spawned by the command (e.g., background jobs).
         #[cfg(unix)]
@@ -2976,7 +3489,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_script_timeout_kills_grandchildren() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         // Test that script timeout kills not just the interpreter process but also
         // any grandchild processes spawned by the script (e.g., background jobs).
         #[cfg(unix)]
@@ -3035,7 +3552,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_execute_command_missing_directory_error() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         let non_existent = std::path::Path::new("/tmp/sned_test_nonexistent_dir_xyz");
 
@@ -3058,7 +3579,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_yolo_mode_allows_unsafe_commands() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(true);
         // gcc is not in the safe list, but should be allowed in yolo mode
         let result = handler
@@ -3078,7 +3603,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_non_yolo_mode_rejects_unsafe_commands() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let handler = ExecuteCommandHandler::new().with_yolo(false);
         // gcc is not in the safe list
         let result = handler
@@ -3350,7 +3879,11 @@ mod tests {
     /// Default behaviour: stream every line. The 10k transcript eviction
     /// and scrollback handle unbounded bursts on their own.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_stream_default_streams_every_line() {
+        let _guard = crate::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         let script = "\
             for i in $(seq 1 30); do echo \"line-$i\"; done";
         let handler = ExecuteCommandHandler::new().with_yolo(true);
