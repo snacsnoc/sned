@@ -422,6 +422,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         }
     }
 

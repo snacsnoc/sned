@@ -1800,9 +1800,13 @@ impl Provider for OpenAiProvider {
         let url = format!("{}/chat/completions", self.base_url());
         let body = self.build_request_body(&request)?;
         let headers = self.build_headers()?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|error| {
+            ProviderError::UnexpectedError(format!("failed to serialize request body: {error}"))
+        })?;
+        crate::providers::report_request_body_bytes(&request, body_bytes.len() as u64);
 
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let request_bytes = serde_json::to_vec(&body).map_or(0, |body| body.len());
+            let request_bytes = body_bytes.len();
             tracing::debug!(
                 method = "POST",
                 provider = "openai",
@@ -1827,7 +1831,7 @@ impl Provider for OpenAiProvider {
         let headers_timeout = response_headers_timeout_for_request(self.config.stream);
         let response = match tokio::time::timeout(
             headers_timeout,
-            self.client.post(&url).headers(headers).json(&body).send(),
+            self.client.post(&url).headers(headers).body(body_bytes).send(),
         )
         .await
         {
@@ -2613,6 +2617,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -2660,6 +2665,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -2789,6 +2795,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -2846,6 +2853,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         }
     }
 
@@ -3067,6 +3075,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3108,6 +3117,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3394,6 +3404,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3430,6 +3441,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3487,6 +3499,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3523,6 +3536,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3582,6 +3596,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3645,6 +3660,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3683,6 +3699,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3717,6 +3734,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3776,6 +3794,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -3835,6 +3854,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -5170,6 +5190,7 @@ data: [DONE]
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let mut stream = provider.create_message(request).await.unwrap();
@@ -5232,6 +5253,7 @@ data: [DONE]
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let mut stream = provider.create_message(request).await.unwrap();

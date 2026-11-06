@@ -229,6 +229,36 @@ pub(crate) struct TuiTimingRecord {
     pub(crate) dropped_events: u64,
 }
 
+/// Per-provider-request payload and cache view. Sizes and token counts only;
+/// never model content, prompts, or credentials.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct ProviderRequestTimingRecord {
+    #[serde(rename = "type")]
+    pub(crate) record_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) turn: u32,
+    pub(crate) attempt: usize,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    /// Exact serialized HTTP request body size the provider sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) request_body_bytes: Option<u64>,
+    /// Local chars-per-4 estimate over the same request, for trend comparison
+    /// against provider-reported tokens.
+    pub(crate) estimated_input_tokens: u64,
+    pub(crate) request_to_stream_ready_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tokens_in: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tokens_out: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_reads: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_writes: Option<u32>,
+}
+
 /// A bounded progress sample distinguishes a large fixed backlog from drain
 /// throughput that degrades as the visible transcript grows.
 #[derive(Debug, serde::Serialize)]
@@ -1490,8 +1520,8 @@ fn format_timing_phases_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderTimingRecord, TimingHistogram, TuiTimingRecord, format_timing_phases,
-        format_timing_phases_with_retries, non_interactive_approval_message,
+        ProviderRequestTimingRecord, ProviderTimingRecord, TimingHistogram, TuiTimingRecord,
+        format_timing_phases, format_timing_phases_with_retries, non_interactive_approval_message,
         render_line_with_real_newlines,
     };
     use ratatui::text::{Line, Span};
@@ -1638,6 +1668,66 @@ mod tests {
         assert!(!serialized.contains("Authorization"));
         assert!(!serialized.contains("prompt"));
         assert!(!serialized.contains("response"));
+    }
+
+    #[test]
+    fn test_provider_request_timing_record_shape_excludes_model_content() {
+        let record = ProviderRequestTimingRecord {
+            record_type: "sned_timing_provider_request",
+            run_id: Some("run-fixture".to_string()),
+            session_id: "task-123".to_string(),
+            turn: 2,
+            attempt: 1,
+            provider: "openai".to_string(),
+            model: "fixture-model".to_string(),
+            request_body_bytes: Some(4096),
+            estimated_input_tokens: 1000,
+            request_to_stream_ready_us: 250,
+            tokens_in: Some(900),
+            tokens_out: Some(50),
+            cache_reads: Some(10),
+            cache_writes: Some(20),
+        };
+        let value = serde_json::to_value(&record).expect("request timing serializes");
+        assert_eq!(value["type"], "sned_timing_provider_request");
+        assert_eq!(value["run_id"], "run-fixture");
+        assert_eq!(value["turn"], 2);
+        assert_eq!(value["attempt"], 1);
+        assert_eq!(value["request_body_bytes"], 4096);
+        assert_eq!(value["estimated_input_tokens"], 1000);
+        assert_eq!(value["tokens_in"], 900);
+        let serialized = value.to_string();
+        assert!(!serialized.contains("Authorization"));
+        assert!(!serialized.contains("prompt"));
+        assert!(!serialized.contains("response"));
+
+        let without_usage = ProviderRequestTimingRecord {
+            record_type: "sned_timing_provider_request",
+            run_id: None,
+            session_id: "task-123".to_string(),
+            turn: 2,
+            attempt: 2,
+            provider: "openai".to_string(),
+            model: "fixture-model".to_string(),
+            request_body_bytes: None,
+            estimated_input_tokens: 1000,
+            request_to_stream_ready_us: 250,
+            tokens_in: None,
+            tokens_out: None,
+            cache_reads: None,
+            cache_writes: None,
+        };
+        let bare = serde_json::to_value(&without_usage).expect("bare record serializes");
+        for key in [
+            "run_id",
+            "request_body_bytes",
+            "tokens_in",
+            "tokens_out",
+            "cache_reads",
+            "cache_writes",
+        ] {
+            assert!(bare.get(key).is_none(), "expected {key} to be omitted");
+        }
     }
 
     #[test]

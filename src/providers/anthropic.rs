@@ -599,6 +599,10 @@ impl Provider for AnthropicProvider {
         let url = format!("{}/messages", self.base_url());
         let body = self.build_request_body(&request)?;
         let headers = self.build_headers()?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|error| {
+            ProviderError::UnexpectedError(format!("failed to serialize request body: {error}"))
+        })?;
+        crate::providers::report_request_body_bytes(&request, body_bytes.len() as u64);
 
         tracing::debug!(
             method = "POST",
@@ -613,7 +617,7 @@ impl Provider for AnthropicProvider {
             .client
             .post(&url)
             .headers(headers)
-            .json(&body)
+            .body(body_bytes)
             .send()
             .await?;
 
@@ -1304,6 +1308,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
         let body = provider.build_request_body(&request).unwrap();
         assert_eq!(
@@ -1341,6 +1346,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
         let body = provider.build_request_body(&request).unwrap();
         assert_eq!(
@@ -1378,6 +1384,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1466,6 +1473,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1504,6 +1512,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let body = provider.build_request_body(&request).unwrap();
@@ -1536,6 +1545,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         // Should not panic even with native_tools_on and tools: None

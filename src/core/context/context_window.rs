@@ -258,6 +258,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let error = validate_context_window(&request, &provider).unwrap_err();
@@ -315,6 +316,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         assert_eq!(estimate_request_tokens(&request), 16_384);

@@ -666,6 +666,22 @@ pub enum ToolChoice {
     Named(String),
 }
 
+/// Shared per-request slot for the exact serialized HTTP body size in bytes.
+/// The agent loop attaches a fresh slot per turn; providers fill it when
+/// finalizing the body; the loop reads it after `create_message` returns.
+/// Measurement only: lock failures are silently ignored.
+pub type RequestBodyBytes = std::sync::Arc<std::sync::Mutex<Option<u64>>>;
+
+/// Record the exact serialized body size for per-request measurement.
+/// No-op when the request carries no reporting slot (tests, mock providers).
+pub fn report_request_body_bytes(request: &ProviderRequest, body_len: u64) {
+    if let Some(slot) = request.body_bytes_report.as_ref() {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(body_len);
+        }
+    }
+}
+
 /// Configuration for a provider request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderRequest {
@@ -675,6 +691,10 @@ pub struct ProviderRequest {
     pub tool_choice: Option<ToolChoice>,
     pub use_response_api: Option<bool>,
     pub max_tokens: Option<u32>,
+    /// Slot for the provider to report the exact serialized body size.
+    /// Skipped by serde: measurement channel only, never persisted.
+    #[serde(skip)]
+    pub body_bytes_report: Option<RequestBodyBytes>,
 }
 
 /// HTTP error returned by a provider after the remote API responded with a non-success status.
@@ -1463,6 +1483,33 @@ mod tests {
             panic!("expected thinking block");
         };
         assert_eq!(thinking.signature, None);
+    }
+
+    #[test]
+    fn test_report_request_body_bytes_fills_slot_and_ignores_missing_slot() {
+        let slot: RequestBodyBytes = Default::default();
+        let request = ProviderRequest {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+            body_bytes_report: Some(slot.clone()),
+        };
+        report_request_body_bytes(&request, 1234);
+        assert_eq!(*slot.lock().expect("slot lockable"), Some(1234));
+
+        let slotless = ProviderRequest {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+            body_bytes_report: None,
+        };
+        report_request_body_bytes(&slotless, 5678);
     }
 
     #[test]

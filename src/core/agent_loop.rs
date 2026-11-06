@@ -2296,6 +2296,100 @@ impl AgentLoop {
         });
     }
 
+    /// Best-effort read of the shared body-size slot; `None` when the provider
+    /// never serialized (validation failure, lock failure) or carries no slot.
+    fn read_body_bytes_slot(request: &crate::providers::ProviderRequest) -> Option<u64> {
+        request
+            .body_bytes_report
+            .as_ref()
+            .and_then(|slot| slot.lock().ok())
+            .and_then(|guard| *guard)
+    }
+
+    /// Emit one per-request timing record for an outer stream attempt that
+    /// reached an outcome — including terminal provider failures, so slow
+    /// failures stay visible in the measurement instead of vanishing.
+    /// `usage_updated` gates provider-reported usage to this attempt.
+    async fn emit_provider_request_record(
+        &self,
+        provider_name: &str,
+        attempt: usize,
+        request_body_bytes: Option<u64>,
+        estimated_input_tokens: u64,
+        request_to_stream_ready_us: u64,
+        usage_updated: bool,
+    ) {
+        let (turn, attempt_usage) = {
+            let state = self.state.lock().await;
+            let turn = state.turns_completed.saturating_add(1);
+            let attempt_usage = if usage_updated {
+                state.last_api_req_info.clone()
+            } else {
+                None
+            };
+            (turn, attempt_usage)
+        };
+        crate::cli::output::emit_timing_record(&Self::build_provider_request_record(
+            crate::cli::output::timing_run_id(),
+            self.config.task_id.clone(),
+            turn,
+            attempt,
+            provider_name.to_string(),
+            self.resolve_active_model_id().unwrap_or_default(),
+            request_body_bytes,
+            estimated_input_tokens,
+            request_to_stream_ready_us,
+            attempt_usage,
+        ));
+    }
+
+    /// Assembles the per-request timing record without I/O so the join between
+    /// request size, token estimate, and provider-reported usage stays testable.
+    /// `usage` must already be gated to this attempt; `None` means the provider
+    /// reported no usage before the outcome was decided.
+    /// `attempt` counts outer stream attempts only: transport retries inside
+    /// `create_message_with_retry` share one slot and coalesce into one record,
+    /// so a retried attempt reports the last serialized size and the full
+    /// latency including retry delays.
+    fn build_provider_request_record(
+        run_id: Option<String>,
+        session_id: String,
+        turn: u32,
+        attempt: usize,
+        provider: String,
+        model: String,
+        request_body_bytes: Option<u64>,
+        estimated_input_tokens: u64,
+        request_to_stream_ready_us: u64,
+        usage: Option<crate::core::context::context_manager::ApiReqInfo>,
+    ) -> crate::cli::output::ProviderRequestTimingRecord {
+        let (tokens_in, tokens_out, cache_reads, cache_writes) = match usage {
+            Some(usage) => (
+                usage.tokens_in,
+                usage.tokens_out,
+                usage.cache_reads,
+                usage.cache_writes,
+            ),
+            None => (None, None, None, None),
+        };
+        crate::cli::output::ProviderRequestTimingRecord {
+            record_type: "sned_timing_provider_request",
+            run_id,
+            session_id,
+            turn,
+            attempt,
+            provider,
+            model,
+            request_body_bytes,
+            estimated_input_tokens,
+            request_to_stream_ready_us,
+            tokens_in,
+            tokens_out,
+            cache_reads,
+            cache_writes,
+        }
+    }
+
     /// Executes a single turn of the agent loop.
     async fn execute_turn(&mut self) -> TurnResult {
         // Reset per-turn counters so cumulative token totals stay correct but
@@ -2515,6 +2609,7 @@ impl AgentLoop {
             tool_choice: Some(crate::providers::ToolChoice::Auto),
             use_response_api: None,
             max_tokens: self.config.max_tokens,
+            body_bytes_report: Some(Default::default()),
         };
 
         let context_info = {
@@ -2622,6 +2717,11 @@ impl AgentLoop {
         };
 
         let mut stream_retry_attempt = 0usize;
+        let estimated_input_tokens = context_window::estimate_request_tokens(&request);
+        let mut request_body_bytes: Option<u64> = None;
+        let mut request_to_stream_ready_us: u64;
+        let mut request_sent_at: std::time::Instant;
+        let mut usage_updated_this_attempt: bool;
         let preoutput_retry_started_at = std::time::Instant::now();
         let preoutput_policy = provider.preoutput_policy();
         let preoutput_budget = preoutput_policy.budget;
@@ -2642,6 +2742,7 @@ impl AgentLoop {
             tool_call_order,
         ) = 'provider_stream_attempt: loop {
             self.reset_stream_attempt_timing().await;
+            usage_updated_this_attempt = false;
             tracing::debug!(
                 stream_attempt = stream_retry_attempt + 1,
                 message_count = request.messages.len(),
@@ -2669,6 +2770,7 @@ impl AgentLoop {
                 ));
             };
 
+            request_sent_at = std::time::Instant::now();
             let provider_request = create_message_with_retry(
                 provider.clone(),
                 request.clone(),
@@ -2702,6 +2804,10 @@ impl AgentLoop {
                         }
                         return TurnResult::Cancelled;
                     }
+                    request_to_stream_ready_us = request_sent_at.elapsed().as_micros() as u64;
+                    if let Some(bytes) = Self::read_body_bytes_slot(&request) {
+                        request_body_bytes = Some(bytes);
+                    }
                     stream
                 }
                 Ok(Err(e)) => {
@@ -2717,6 +2823,18 @@ impl AgentLoop {
                         let mut state = self.state.lock().await;
                         state.retryable_failed_request = Some(retry_message.clone());
                     }
+                    if let Some(bytes) = Self::read_body_bytes_slot(&request) {
+                        request_body_bytes = Some(bytes);
+                    }
+                    self.emit_provider_request_record(
+                        &provider.name().to_string(),
+                        stream_retry_attempt + 1,
+                        request_body_bytes,
+                        estimated_input_tokens,
+                        request_sent_at.elapsed().as_micros() as u64,
+                        false,
+                    )
+                    .await;
                     let actionable = crate::cli::actionable_errors::provider_error(&e);
                     let consecutive_failures = {
                         let state = self.state.lock().await;
@@ -2747,6 +2865,18 @@ impl AgentLoop {
                         "provider request did not produce a {output_kind} within {}s",
                         preoutput_budget.as_secs()
                     ));
+                    if let Some(bytes) = Self::read_body_bytes_slot(&request) {
+                        request_body_bytes = Some(bytes);
+                    }
+                    self.emit_provider_request_record(
+                        &provider.name().to_string(),
+                        stream_retry_attempt + 1,
+                        request_body_bytes,
+                        estimated_input_tokens,
+                        request_sent_at.elapsed().as_micros() as u64,
+                        false,
+                    )
+                    .await;
                     let actionable = crate::cli::actionable_errors::provider_error(&error);
                     return TurnResult::Error(format!(
                         "Provider request did not produce a {output_kind} within {}s: {}",
@@ -3060,6 +3190,7 @@ impl AgentLoop {
                             }
                         }
                         StreamEvent::UsageUpdated { usage, deltas } => {
+                            usage_updated_this_attempt = true;
                             let mut state = self.state.lock().await;
                             state.last_api_req_info = Some(usage);
                             state.cumulative_tokens_in =
@@ -3125,6 +3256,16 @@ impl AgentLoop {
                 retryable_error_before_visible_output,
                 non_retryable_error: non_retryable_stream_error,
             } = outcome;
+
+            self.emit_provider_request_record(
+                &provider.name().to_string(),
+                stream_retry_attempt + 1,
+                request_body_bytes,
+                estimated_input_tokens,
+                request_to_stream_ready_us,
+                usage_updated_this_attempt,
+            )
+            .await;
 
             // Final flush: print any remaining buffered content and ensure newline
             if in_code_block && !self.config.json_output {
@@ -10273,6 +10414,139 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(agent.state.lock().await.retryable_failed_request.is_none());
     }
 
+    #[test]
+    fn test_read_body_bytes_slot_returns_last_reported_size() {
+        let with_slot = crate::providers::ProviderRequest {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: None,
+            use_response_api: None,
+            max_tokens: None,
+            body_bytes_report: Some(Default::default()),
+        };
+        assert_eq!(AgentLoop::read_body_bytes_slot(&with_slot), None);
+        crate::providers::report_request_body_bytes(&with_slot, 2048);
+        assert_eq!(
+            AgentLoop::read_body_bytes_slot(&with_slot),
+            Some(2048)
+        );
+
+        let without_slot = crate::providers::ProviderRequest {
+            body_bytes_report: None,
+            ..with_slot
+        };
+        assert_eq!(AgentLoop::read_body_bytes_slot(&without_slot), None);
+    }
+
+    #[test]
+    fn test_build_provider_request_record_gates_usage_to_attempt() {
+        let usage = crate::core::context::context_manager::ApiReqInfo {
+            tokens_in: Some(120),
+            tokens_out: Some(34),
+            cache_reads: Some(7),
+            cache_writes: Some(8),
+            ..Default::default()
+        };
+        let record = AgentLoop::build_provider_request_record(
+            Some("run-1".to_string()),
+            "task-1".to_string(),
+            3,
+            1,
+            "mock".to_string(),
+            "model-1".to_string(),
+            Some(2048),
+            500,
+            250,
+            Some(usage),
+        );
+        assert_eq!(record.record_type, "sned_timing_provider_request");
+        assert_eq!(record.turn, 3);
+        assert_eq!(record.attempt, 1);
+        assert_eq!(record.request_body_bytes, Some(2048));
+        assert_eq!(record.estimated_input_tokens, 500);
+        assert_eq!(record.tokens_in, Some(120));
+        assert_eq!(record.tokens_out, Some(34));
+        assert_eq!(record.cache_reads, Some(7));
+        assert_eq!(record.cache_writes, Some(8));
+
+        let gated = AgentLoop::build_provider_request_record(
+            None,
+            "task-1".to_string(),
+            3,
+            2,
+            "mock".to_string(),
+            "model-1".to_string(),
+            None,
+            500,
+            250,
+            None,
+        );
+        assert_eq!(gated.attempt, 2);
+        assert_eq!(gated.request_body_bytes, None);
+        assert_eq!(gated.tokens_in, None);
+        assert_eq!(gated.tokens_out, None);
+        assert_eq!(gated.cache_reads, None);
+        assert_eq!(gated.cache_writes, None);
+    }
+
+    #[tokio::test]
+    async fn test_provider_request_timing_join_runs_without_panic() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("done"),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "timing-join-turn"));
+        agent
+            .conversation_history
+            .lock()
+            .await
+            .push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("hello".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+
+        let result = agent.execute_turn().await;
+        assert!(matches!(
+            result,
+            TurnResult::Continue | TurnResult::Complete
+        ));
+
+        let provider_name = agent
+            .config
+            .provider
+            .lock()
+            .expect("provider lockable")
+            .name()
+            .to_string();
+        let (turn, usage) = {
+            let state = agent.state.lock().await;
+            (
+                state.turns_completed.saturating_add(1),
+                state.last_api_req_info.clone(),
+            )
+        };
+        let record = AgentLoop::build_provider_request_record(
+            crate::cli::output::timing_run_id(),
+            "timing-join-turn".to_string(),
+            turn,
+            1,
+            provider_name,
+            agent.resolve_active_model_id().unwrap_or_default(),
+            None,
+            0,
+            0,
+            usage,
+        );
+        assert_eq!(record.record_type, "sned_timing_provider_request");
+        assert_eq!(record.session_id, "timing-join-turn");
+        assert_eq!(record.attempt, 1);
+        assert!(serde_json::to_value(&record).is_ok());
+    }
+
     #[tokio::test]
     async fn test_tool_call_turn_does_not_replace_full_response() {
         let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
@@ -12138,6 +12412,7 @@ Irrespective of whether additional information or instructions are given, you ar
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         assert!(context_window::validate_context_window(&request, provider.as_ref()).is_err());
@@ -15096,6 +15371,7 @@ Irrespective of whether additional information or instructions are given, you ar
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
         assert!(request.messages.iter().any(
             |m| matches!(&m.content, MessageContent::Text(text) if text == "retained summary")
@@ -15221,6 +15497,7 @@ Irrespective of whether additional information or instructions are given, you ar
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
         let max_allowed = 26_214;
         assert!(context_window::estimate_request_tokens(&request) > max_allowed);

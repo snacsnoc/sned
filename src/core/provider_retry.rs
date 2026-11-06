@@ -463,6 +463,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         let stream = create_message_with_retry(
@@ -501,6 +502,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
 
         // First call succeeds, should set consecutive failures to 0
@@ -548,6 +550,7 @@ mod tests {
             tool_choice: None,
             use_response_api: None,
             max_tokens: None,
+            body_bytes_report: None,
         };
         let retry_config = RetryConfig {
             max_retries: 0,
