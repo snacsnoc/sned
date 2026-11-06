@@ -2315,8 +2315,8 @@ impl AgentLoop {
         provider_name: &str,
         attempt: usize,
         request_body_bytes: Option<u64>,
-        estimated_input_tokens: u64,
         request_to_stream_ready_us: u64,
+        request_to_first_reasoning_us: Option<u64>,
         usage_updated: bool,
     ) {
         let (turn, attempt_usage) = {
@@ -2337,8 +2337,8 @@ impl AgentLoop {
             provider_name.to_string(),
             self.resolve_active_model_id().unwrap_or_default(),
             request_body_bytes,
-            estimated_input_tokens,
             request_to_stream_ready_us,
+            request_to_first_reasoning_us,
             attempt_usage,
         ));
     }
@@ -2359,8 +2359,8 @@ impl AgentLoop {
         provider: String,
         model: String,
         request_body_bytes: Option<u64>,
-        estimated_input_tokens: u64,
         request_to_stream_ready_us: u64,
+        request_to_first_reasoning_us: Option<u64>,
         usage: Option<crate::core::context::context_manager::ApiReqInfo>,
     ) -> crate::cli::output::ProviderRequestTimingRecord {
         let (tokens_in, tokens_out, cache_reads, cache_writes) = match usage {
@@ -2381,8 +2381,8 @@ impl AgentLoop {
             provider,
             model,
             request_body_bytes,
-            estimated_input_tokens,
             request_to_stream_ready_us,
+            request_to_first_reasoning_us,
             tokens_in,
             tokens_out,
             cache_reads,
@@ -2717,9 +2717,9 @@ impl AgentLoop {
         };
 
         let mut stream_retry_attempt = 0usize;
-        let estimated_input_tokens = context_window::estimate_request_tokens(&request);
         let mut request_body_bytes: Option<u64> = None;
         let mut request_to_stream_ready_us: u64;
+        let mut request_to_first_reasoning_us: Option<u64>;
         let mut request_sent_at: std::time::Instant;
         let mut usage_updated_this_attempt: bool;
         let preoutput_retry_started_at = std::time::Instant::now();
@@ -2743,6 +2743,7 @@ impl AgentLoop {
         ) = 'provider_stream_attempt: loop {
             self.reset_stream_attempt_timing().await;
             usage_updated_this_attempt = false;
+            request_to_first_reasoning_us = None;
             tracing::debug!(
                 stream_attempt = stream_retry_attempt + 1,
                 message_count = request.messages.len(),
@@ -2793,6 +2794,18 @@ impl AgentLoop {
                     let mut state = self.state.lock().await;
                     state.retryable_failed_request = Some(retry_message.clone());
                 }
+                if let Some(bytes) = Self::read_body_bytes_slot(&request) {
+                    request_body_bytes = Some(bytes);
+                }
+                self.emit_provider_request_record(
+                    &provider.name().to_string(),
+                    stream_retry_attempt + 1,
+                    request_body_bytes,
+                    request_sent_at.elapsed().as_micros() as u64,
+                    request_to_first_reasoning_us,
+                    false,
+                )
+                .await;
                 return TurnResult::Cancelled;
             };
             let stream = match request_result {
@@ -2802,6 +2815,18 @@ impl AgentLoop {
                             let mut state = self.state.lock().await;
                             state.retryable_failed_request = Some(retry_message.clone());
                         }
+                        if let Some(bytes) = Self::read_body_bytes_slot(&request) {
+                            request_body_bytes = Some(bytes);
+                        }
+                        self.emit_provider_request_record(
+                            &provider.name().to_string(),
+                            stream_retry_attempt + 1,
+                            request_body_bytes,
+                            request_sent_at.elapsed().as_micros() as u64,
+                            request_to_first_reasoning_us,
+                            false,
+                        )
+                        .await;
                         return TurnResult::Cancelled;
                     }
                     request_to_stream_ready_us = request_sent_at.elapsed().as_micros() as u64;
@@ -2816,6 +2841,18 @@ impl AgentLoop {
                             let mut state = self.state.lock().await;
                             state.retryable_failed_request = Some(retry_message.clone());
                         }
+                        if let Some(bytes) = Self::read_body_bytes_slot(&request) {
+                            request_body_bytes = Some(bytes);
+                        }
+                        self.emit_provider_request_record(
+                            &provider.name().to_string(),
+                            stream_retry_attempt + 1,
+                            request_body_bytes,
+                            request_sent_at.elapsed().as_micros() as u64,
+                            request_to_first_reasoning_us,
+                            false,
+                        )
+                        .await;
                         return TurnResult::Cancelled;
                     }
                     error!(error = %e, "provider request failed");
@@ -2830,8 +2867,8 @@ impl AgentLoop {
                         &provider.name().to_string(),
                         stream_retry_attempt + 1,
                         request_body_bytes,
-                        estimated_input_tokens,
                         request_sent_at.elapsed().as_micros() as u64,
+                        request_to_first_reasoning_us,
                         false,
                     )
                     .await;
@@ -2859,6 +2896,18 @@ impl AgentLoop {
                             let mut state = self.state.lock().await;
                             state.retryable_failed_request = Some(retry_message.clone());
                         }
+                        if let Some(bytes) = Self::read_body_bytes_slot(&request) {
+                            request_body_bytes = Some(bytes);
+                        }
+                        self.emit_provider_request_record(
+                            &provider.name().to_string(),
+                            stream_retry_attempt + 1,
+                            request_body_bytes,
+                            request_sent_at.elapsed().as_micros() as u64,
+                            request_to_first_reasoning_us,
+                            false,
+                        )
+                        .await;
                         return TurnResult::Cancelled;
                     }
                     let error = ProviderError::NetworkError(format!(
@@ -2872,8 +2921,8 @@ impl AgentLoop {
                         &provider.name().to_string(),
                         stream_retry_attempt + 1,
                         request_body_bytes,
-                        estimated_input_tokens,
                         request_sent_at.elapsed().as_micros() as u64,
+                        request_to_first_reasoning_us,
                         false,
                     )
                     .await;
@@ -3002,6 +3051,18 @@ impl AgentLoop {
                 // Uses lock-free AtomicBool to avoid mutex contention on every chunk.
                 if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
                     tracing::info!("cancellation detected during stream processing, aborting turn");
+                    if let Some(bytes) = Self::read_body_bytes_slot(&request) {
+                        request_body_bytes = Some(bytes);
+                    }
+                    self.emit_provider_request_record(
+                        &provider.name().to_string(),
+                        stream_retry_attempt + 1,
+                        request_body_bytes,
+                        request_sent_at.elapsed().as_micros() as u64,
+                        request_to_first_reasoning_us,
+                        usage_updated_this_attempt,
+                    )
+                    .await;
                     return TurnResult::Cancelled;
                 }
 
@@ -3157,6 +3218,9 @@ impl AgentLoop {
                         StreamEvent::ReasoningText(reasoning) => {
                             reasoning_chunks = reasoning_chunks.saturating_add(1);
                             self.record_first_reasoning_chunk_time().await;
+                            request_to_first_reasoning_us.get_or_insert_with(|| {
+                                request_sent_at.elapsed().as_micros() as u64
+                            });
                             if !self.config.json_output && !reasoning.is_empty() {
                                 reasoning_buffer.push_str(&reasoning);
                                 let complete = take_complete_lines(&mut reasoning_buffer).concat();
@@ -3261,8 +3325,8 @@ impl AgentLoop {
                 &provider.name().to_string(),
                 stream_retry_attempt + 1,
                 request_body_bytes,
-                estimated_input_tokens,
                 request_to_stream_ready_us,
+                request_to_first_reasoning_us,
                 usage_updated_this_attempt,
             )
             .await;
@@ -10456,15 +10520,15 @@ Irrespective of whether additional information or instructions are given, you ar
             "mock".to_string(),
             "model-1".to_string(),
             Some(2048),
-            500,
             250,
+            Some(1200),
             Some(usage),
         );
         assert_eq!(record.record_type, "sned_timing_provider_request");
+        assert_eq!(record.request_to_first_reasoning_us, Some(1200));
         assert_eq!(record.turn, 3);
         assert_eq!(record.attempt, 1);
         assert_eq!(record.request_body_bytes, Some(2048));
-        assert_eq!(record.estimated_input_tokens, 500);
         assert_eq!(record.tokens_in, Some(120));
         assert_eq!(record.tokens_out, Some(34));
         assert_eq!(record.cache_reads, Some(7));
@@ -10478,11 +10542,12 @@ Irrespective of whether additional information or instructions are given, you ar
             "mock".to_string(),
             "model-1".to_string(),
             None,
-            500,
             250,
+            None,
             None,
         );
         assert_eq!(gated.attempt, 2);
+        assert_eq!(gated.request_to_first_reasoning_us, None);
         assert_eq!(gated.request_body_bytes, None);
         assert_eq!(gated.tokens_in, None);
         assert_eq!(gated.tokens_out, None);
@@ -10538,13 +10603,105 @@ Irrespective of whether additional information or instructions are given, you ar
             agent.resolve_active_model_id().unwrap_or_default(),
             None,
             0,
-            0,
+            None,
             usage,
         );
         assert_eq!(record.record_type, "sned_timing_provider_request");
         assert_eq!(record.session_id, "timing-join-turn");
         assert_eq!(record.attempt, 1);
         assert!(serde_json::to_value(&record).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_provider_request_record_captures_first_reasoning_time() {
+        use crate::test_support::env_lock;
+        // SAFETY: env mutation is serialized by env_lock; restored below.
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "sned-timing-first-reasoning-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let prior = (
+            std::env::var("SNED_TIMING").ok(),
+            std::env::var("SNED_TIMING_FILE").ok(),
+            std::env::var("SNED_TIMING_RUN_ID").ok(),
+        );
+        unsafe {
+            std::env::set_var("SNED_TIMING", "1");
+            std::env::set_var("SNED_TIMING_FILE", &path);
+            std::env::set_var("SNED_TIMING_RUN_ID", "first-reasoning-probe");
+        }
+
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![crate::providers::mock::MockResponse::Stream(vec![
+                crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Reasoning(
+                    crate::providers::ApiStreamReasoningChunk {
+                        reasoning: "thinking it through".to_string(),
+                        details: None,
+                        signature: None,
+                        redacted_data: None,
+                        id: None,
+                    },
+                )),
+                crate::providers::mock::MockStreamEvent::Chunk(ApiStreamChunk::Text(
+                    ApiStreamTextChunk {
+                        text: "done".to_string(),
+                        id: None,
+                        signature: None,
+                    },
+                )),
+            ])],
+        )));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "timing-first-reasoning"));
+        agent
+            .conversation_history
+            .lock()
+            .await
+            .push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("hello".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+        let result = agent.execute_turn().await;
+        assert!(matches!(
+            result,
+            TurnResult::Continue | TurnResult::Complete
+        ));
+
+        let body = std::fs::read_to_string(&path).expect("timing record written");
+        let (timing, file, run) = prior;
+        restore_env("SNED_TIMING", timing);
+        restore_env("SNED_TIMING_FILE", file);
+        restore_env("SNED_TIMING_RUN_ID", run);
+
+        let value: serde_json::Value = body
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .find(|value: &serde_json::Value| {
+                value.get("type").and_then(|kind| kind.as_str())
+                    == Some("sned_timing_provider_request")
+                    && value.get("session_id").and_then(|id| id.as_str())
+                        == Some("timing-first-reasoning")
+            })
+            .expect("provider request record present");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            value.get("request_to_first_reasoning_us").is_some(),
+            "reasoning turn must report first-reasoning latency, got {value}"
+        );
+
+        fn restore_env(name: &str, prior: Option<String>) {
+            unsafe {
+                match prior {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -18933,6 +19090,14 @@ Irrespective of whether additional information or instructions are given, you ar
     #[tokio::test]
     async fn test_reset_stream_attempt_timing_clears_phase_state_and_flags() {
         use crate::providers::mock::{MockProvider, MockResponse};
+        use crate::test_support::env_lock;
+        // reset() only clears request_sent_time when timing is off, so force
+        // it off here: without this, any concurrent timing-enabled test (or a
+        // CI-exported SNED_TIMING=1) makes the is_none assertion below fail.
+        // SAFETY: env mutation is serialized by env_lock; restored below.
+        let _env_lock = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let prior_timing = std::env::var("SNED_TIMING").ok();
+        unsafe { std::env::remove_var("SNED_TIMING") };
         let provider: Arc<Providers> = Arc::new(Providers::Mock(MockProvider::new(vec![
             MockResponse::Stream(vec![]),
         ])));
@@ -18980,6 +19145,13 @@ Irrespective of whether additional information or instructions are given, you ar
         assert!(state.first_reasoning_chunk_time.is_none());
         assert!(state.first_displayable_text_time.is_none());
         assert!(state.first_output_emit_time.is_none());
+        drop(state);
+        unsafe {
+            match prior_timing {
+                Some(value) => std::env::set_var("SNED_TIMING", value),
+                None => std::env::remove_var("SNED_TIMING"),
+            }
+        }
     }
 
     #[test]

@@ -123,7 +123,10 @@ fn append_timing_line(path: &str, line: &str) -> std::io::Result<()> {
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(file, "{line}")
+    // One write call so concurrent appends cannot interleave mid-line:
+    // O_APPEND is atomic per syscall, but write_fmt may split payload and newline.
+    file.write_all(format!("{line}\n").as_bytes())?;
+    Ok(())
 }
 
 pub(crate) fn emit_timing_text(line: &str) {
@@ -245,10 +248,11 @@ pub(crate) struct ProviderRequestTimingRecord {
     /// Exact serialized HTTP request body size the provider sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) request_body_bytes: Option<u64>,
-    /// Local chars-per-4 estimate over the same request, for trend comparison
-    /// against provider-reported tokens.
-    pub(crate) estimated_input_tokens: u64,
     pub(crate) request_to_stream_ready_us: u64,
+    /// Time from send to the first reasoning chunk; absent when the attempt
+    /// produced no reasoning before its outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) request_to_first_reasoning_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tokens_in: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1681,8 +1685,8 @@ mod tests {
             provider: "openai".to_string(),
             model: "fixture-model".to_string(),
             request_body_bytes: Some(4096),
-            estimated_input_tokens: 1000,
             request_to_stream_ready_us: 250,
+            request_to_first_reasoning_us: Some(120),
             tokens_in: Some(900),
             tokens_out: Some(50),
             cache_reads: Some(10),
@@ -1694,7 +1698,7 @@ mod tests {
         assert_eq!(value["turn"], 2);
         assert_eq!(value["attempt"], 1);
         assert_eq!(value["request_body_bytes"], 4096);
-        assert_eq!(value["estimated_input_tokens"], 1000);
+        assert_eq!(value["request_to_first_reasoning_us"], 120);
         assert_eq!(value["tokens_in"], 900);
         let serialized = value.to_string();
         assert!(!serialized.contains("Authorization"));
@@ -1710,8 +1714,8 @@ mod tests {
             provider: "openai".to_string(),
             model: "fixture-model".to_string(),
             request_body_bytes: None,
-            estimated_input_tokens: 1000,
             request_to_stream_ready_us: 250,
+            request_to_first_reasoning_us: None,
             tokens_in: None,
             tokens_out: None,
             cache_reads: None,
@@ -1721,6 +1725,7 @@ mod tests {
         for key in [
             "run_id",
             "request_body_bytes",
+            "request_to_first_reasoning_us",
             "tokens_in",
             "tokens_out",
             "cache_reads",
