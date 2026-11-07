@@ -121,13 +121,22 @@ impl Drop for TuiTraceSessionGuard {
     }
 }
 
+/// Debug log path. The env override keeps parallel sessions (and the
+/// shared default) from interleaving in one file.
+fn debug_log_path() -> std::path::PathBuf {
+    std::env::var("SNED_DEBUG_FILE")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/sned-debug.log"))
+}
+
 fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
     match mode {
         TracingMode::JsonOnly => {
             let registry = tracing_subscriber::registry().with(JsonOutputLayer);
 
             if debug {
-                let log_file = std::fs::File::create("/tmp/sned-debug.log")
+                let log_file = std::fs::File::create(debug_log_path())
                     .expect("Failed to create debug log file");
                 let log_file = std::sync::Arc::new(log_file);
                 let file_layer = tracing_subscriber::fmt::layer()
@@ -183,7 +192,7 @@ fn init_tracing(mode: TracingMode, debug: bool, tui_mode: bool) {
                 .with(JsonOutputLayer);
 
             if debug {
-                let log_file = std::fs::File::create("/tmp/sned-debug.log")
+                let log_file = std::fs::File::create(debug_log_path())
                     .expect("Failed to create debug log file");
                 let log_file = std::sync::Arc::new(log_file);
                 let file_layer = tracing_subscriber::fmt::layer()
@@ -390,6 +399,10 @@ pub struct TaskOptions {
     #[arg(long, value_name = "turns", hide_short_help = true)]
     pub max_context_turns: Option<String>,
 
+    /// Maximum agent turns before the run ends (default: 100)
+    #[arg(long, value_name = "turns", hide_short_help = true)]
+    pub max_turns: Option<u32>,
+
     /// Maximum provider output tokens for this session
     #[arg(long, value_name = "tokens", hide_short_help = true)]
     pub max_tokens: Option<u32>,
@@ -402,7 +415,7 @@ pub struct TaskOptions {
     #[arg(long)]
     pub high_contrast: bool,
 
-    /// Enable debug logging to /tmp/sned-debug.log. Default disabled
+    /// Enable debug logging to /tmp/sned-debug.log (SNED_DEBUG_FILE overrides). Default disabled
     #[arg(long, hide_short_help = true)]
     pub debug: bool,
 
@@ -1881,11 +1894,14 @@ async fn build_task_components(
         show_thinking: !task_opts.hide_thinking,
         verbose: task_opts.verbose,
         json_output: task_opts.json,
-        // Test affordance: bound a live session's length without a CLI flag.
-        // Unset keeps the production default.
-        max_turns: std::env::var("SNED_MAX_TURNS")
-            .ok()
-            .and_then(|value| value.parse().ok())
+        // Explicit flag wins; the env override rides into child sessions.
+        max_turns: task_opts
+            .max_turns
+            .or_else(|| {
+                std::env::var("SNED_MAX_TURNS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            })
             .unwrap_or(100),
         max_consecutive_mistakes,
         double_check_completion: task_opts.double_check_completion,
@@ -3153,6 +3169,7 @@ mod tests {
                 track_changes: false,
                 no_checkpoints: false,
                 max_context_turns: None,
+                max_turns: None,
                 max_tokens: None,
                 context_window: None,
                 high_contrast: false,
@@ -3233,6 +3250,7 @@ mod tests {
                 track_changes: false,
                 no_checkpoints: false,
                 max_context_turns: None,
+                max_turns: None,
                 max_tokens: None,
                 context_window: None,
                 high_contrast: false,
@@ -3367,6 +3385,7 @@ mod tests {
                 track_changes: false,
                 no_checkpoints: false,
                 max_context_turns: None,
+                max_turns: None,
                 max_tokens: None,
                 context_window: None,
                 high_contrast: false,
