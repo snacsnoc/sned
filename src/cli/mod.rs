@@ -1881,7 +1881,12 @@ async fn build_task_components(
         show_thinking: !task_opts.hide_thinking,
         verbose: task_opts.verbose,
         json_output: task_opts.json,
-        max_turns: 100,
+        // Test affordance: bound a live session's length without a CLI flag.
+        // Unset keeps the production default.
+        max_turns: std::env::var("SNED_MAX_TURNS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(100),
         max_consecutive_mistakes,
         double_check_completion: task_opts.double_check_completion,
         timeout_secs: task_opts

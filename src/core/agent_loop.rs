@@ -93,6 +93,10 @@ fn truncated_debug_text(text: &str) -> String {
 /// behavior matches the request-level cap.
 const MAX_STREAM_RETRY_ATTEMPTS: usize = DEFAULT_MAX_CONSECUTIVE_PROVIDER_FAILURES as usize;
 const PARTIAL_MODEL_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// Turns remaining at which the model is told to wrap up instead of starting
+/// new work. Without this nudge, a drifting model never triggers the
+/// tool-silence stop condition and runs until the hard turn cap.
+const WRAP_UP_LEAD_TURNS: u32 = 3;
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
 use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
 
@@ -1853,6 +1857,7 @@ impl AgentLoop {
                 return Err(AgentError::MaxTurnsExceeded);
             }
             turn_count += 1;
+            self.maybe_inject_wrap_up_reminder(turn_count).await;
 
             // Check if cancelled
             {
@@ -4658,6 +4663,29 @@ impl AgentLoop {
             })
             .to_string()
         );
+    }
+
+    /// Pushes a one-shot wrap-up reminder once the session nears its turn cap.
+    /// Fires exactly once per task: `turn_count` increases monotonically, so
+    /// the equality holds for a single turn. Skipped for short caps where the
+    /// lead-in would fire immediately or underflow.
+    async fn maybe_inject_wrap_up_reminder(&self, turn_count: u32) {
+        if self.config.max_turns <= WRAP_UP_LEAD_TURNS
+            || turn_count != self.config.max_turns - WRAP_UP_LEAD_TURNS
+        {
+            return;
+        }
+        self.conversation_history.lock().await.push(StorageMessage {
+            id: Some(Self::next_message_id(&self.message_counter)),
+            role: MessageRole::User,
+            content: MessageContent::Text(format!(
+                "[Approaching turn limit]: this is turn {turn_count} of {}. Finish any in-progress tool use, start no new tool calls, and summarize results to close out the task.",
+                self.config.max_turns
+            )),
+            model_info: None,
+            metrics: None,
+            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+        });
     }
 
     async fn inject_plan_state_into_history(&self) {
@@ -17412,6 +17440,164 @@ Irrespective of whether additional information or instructions are given, you ar
                     )
                 })),
             "Plan state should be injected into at least one provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wrap_up_reminder_fires_once_at_lead_in() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let agent = AgentLoop::new(test_agent_config(provider, "test-wrap-up-once"));
+        assert_eq!(agent.config.max_turns, 10);
+
+        for turn in 1..=10 {
+            agent.maybe_inject_wrap_up_reminder(turn).await;
+        }
+
+        let history = agent.conversation_history.lock().await;
+        let reminders: Vec<_> = history
+            .iter()
+            .filter_map(|message| match &message.content {
+                crate::providers::MessageContent::Text(text)
+                    if text.contains("[Approaching turn limit]") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reminders.len(), 1);
+        assert!(reminders[0].contains("turn 7 of 10"));
+    }
+
+    #[tokio::test]
+    async fn test_wrap_up_reminder_skipped_for_short_caps() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let mut config = test_agent_config(provider, "test-wrap-up-short-cap");
+        config.max_turns = 3;
+        let agent = AgentLoop::new(config);
+
+        for turn in 1..=3 {
+            agent.maybe_inject_wrap_up_reminder(turn).await;
+        }
+
+        let history = agent.conversation_history.lock().await;
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_wrap_up_reminder_reaches_requests_exactly_once() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fixture-a.txt"), "alpha\n").unwrap();
+        std::fs::write(dir.path().join("fixture-b.txt"), "beta\n").unwrap();
+        let tool_chunk = |index: usize| {
+            let path = if index % 2 == 0 {
+                "fixture-a.txt"
+            } else {
+                "fixture-b.txt"
+            };
+            vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some(format!("call_ramble_{index}")),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("read_file".to_string()),
+                        arguments: Some(serde_json::json!({"paths": [path]}).to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            })]
+        };
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                vec![
+                    tool_chunk(0),
+                    tool_chunk(1),
+                    tool_chunk(2),
+                    tool_chunk(3),
+                    tool_chunk(4),
+                    tool_chunk(5),
+                ],
+                requests.clone(),
+            ),
+        ));
+        let mut config = test_agent_config(provider, "test-wrap-up-ramble");
+        config.max_turns = 6;
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        agent.state.lock().await.double_check_completion_enabled = false;
+
+        let state_manager = Arc::new(StateManager::new().unwrap());
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.run(vec![], state_manager),
+        )
+        .await
+        .expect("rambling run must terminate at the turn cap");
+        assert!(matches!(outcome, Err(AgentError::MaxTurnsExceeded)));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        for (index, request) in requests.iter().enumerate() {
+            let hits = request
+                .messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        &message.content,
+                        crate::providers::MessageContent::Text(text)
+                            if text.contains("[Approaching turn limit]")
+                    )
+                })
+                .count();
+            let expected = usize::from(index >= 2);
+            assert_eq!(hits, expected, "turn {} reminder count", index + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wrap_up_reminder_absent_when_task_completes_early() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                    text: "done".to_string(),
+                    id: None,
+                    signature: None,
+                })]],
+                requests.clone(),
+            ),
+        ));
+        let mut agent = AgentLoop::new(test_agent_config(provider, "test-wrap-up-early-done"));
+
+        let outcome = agent.execute_turn().await;
+        assert!(matches!(outcome, TurnResult::Complete));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].messages.iter().any(|message| {
+                matches!(
+                    &message.content,
+                    crate::providers::MessageContent::Text(text)
+                        if text.contains("[Approaching turn limit]")
+                )
+            }),
+            "a task finishing before the lead-in must never see the reminder"
         );
     }
 
