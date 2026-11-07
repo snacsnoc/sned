@@ -278,7 +278,24 @@ fn format_agent_rule_files(cwd: &Path, files: &[AgentRuleFile]) -> Option<String
         .collect::<Vec<_>>();
     let combined = parts.join("\n\n");
     check_injection_patterns(&combined, "AGENTS.md");
-    Some(format!("# AGENTS.md Rules\n\n{combined}"))
+    // One giant rules file would otherwise ride the system prompt whole on
+    // every turn; cap the combined text and say what was cut.
+    const MAX_RULE_BYTES: usize = 32 * 1024;
+    if combined.len() <= MAX_RULE_BYTES {
+        return Some(format!("# AGENTS.md Rules\n\n{combined}"));
+    }
+    let mut shown = MAX_RULE_BYTES;
+    while !combined.is_char_boundary(shown) {
+        shown -= 1;
+    }
+    let marker = format!(
+        "[AGENTS.md rules truncated: {shown} of {} bytes shown]",
+        combined.len()
+    );
+    Some(format!(
+        "# AGENTS.md Rules\n\n{}{marker}",
+        &combined[..shown]
+    ))
 }
 
 /// Read and combine only the workspace-root AGENTS.md file.
@@ -855,6 +872,48 @@ mod tests {
         assert!(
             files.is_empty(),
             "Nested rules are path-scoped, not startup rules"
+        );
+    }
+
+    #[test]
+    fn test_format_agent_rule_files_truncates_oversized_rules() {
+        let temp = TempDir::new().unwrap();
+        let cwd = temp.path();
+
+        // Body sized so the 32KiB cut lands inside a multi-byte char.
+        let mut body = "x".repeat(32753);
+        body.push('é');
+        body.push_str(&"y".repeat(100));
+        let files = vec![AgentRuleFile {
+            path: cwd.join("AGENTS.md"),
+            content: body,
+        }];
+
+        let out = format_agent_rule_files(cwd, &files).expect("rules present");
+        // Header (14) + x-run, then the split é backs the cut off to 32767.
+        assert!(
+            out.ends_with("[AGENTS.md rules truncated: 32767 of 32869 bytes shown]"),
+            "tail: {:?}",
+            &out[out.len().saturating_sub(120)..]
+        );
+        assert!(!out.contains('é'), "cut must not split the multi-byte char");
+        assert!(!out.contains("yyyy"), "tail past the cut stays out");
+    }
+
+    #[test]
+    fn test_format_agent_rule_files_leaves_small_rules_untouched() {
+        let temp = TempDir::new().unwrap();
+        let cwd = temp.path();
+        let files = vec![AgentRuleFile {
+            path: cwd.join("AGENTS.md"),
+            content: "small rules".to_string(),
+        }];
+
+        let out = format_agent_rule_files(cwd, &files).expect("rules present");
+        assert!(out.contains("small rules"));
+        assert!(
+            !out.contains("truncated:"),
+            "small rules pass through unmarked"
         );
     }
 
