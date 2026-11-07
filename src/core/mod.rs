@@ -32,4 +32,3 @@ pub mod shadow_git;
 pub mod stream_parsing;
 pub mod tool_output;
 pub mod tools;
-pub mod workspace;

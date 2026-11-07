@@ -298,148 +298,6 @@ fn commit_turn_internal(workspace_root: &Path, message: &str, force: bool) -> Re
 
     Ok(())
 }
-
-/// Undo the last turn by reverting to the previous shadow commit.
-/// Returns a list of files that were reverted.
-pub fn undo_last_turn(workspace_root: &Path) -> Result<(Vec<String>, Vec<String>)> {
-    with_shadow_lock(workspace_root, || undo_last_turn_locked(workspace_root))
-}
-
-fn undo_last_turn_locked(workspace_root: &Path) -> Result<(Vec<String>, Vec<String>)> {
-    let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
-
-    if !shadow_git_path.join("HEAD").exists() {
-        anyhow::bail!("Shadow git repo not initialized");
-    }
-
-    // Check we have at least 2 commits (can't undo the initial commit)
-    let rev_list_output = Command::new("git")
-        .arg("rev-list")
-        .arg("--count")
-        .arg("HEAD")
-        .current_dir(workspace_root)
-        .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root)
-        .output()
-        .context("Failed to count shadow commits")?;
-
-    let commit_count: usize = String::from_utf8_lossy(&rev_list_output.stdout)
-        .trim()
-        .parse()
-        .unwrap_or(0);
-
-    if commit_count < 2 {
-        anyhow::bail!("No turns to undo");
-    }
-
-    // Get files added in the last turn (these need to be deleted)
-    let added_files_output = Command::new("git")
-        .arg("diff")
-        .arg("--name-only")
-        .arg("--diff-filter=A")
-        .arg("HEAD~1")
-        .arg("HEAD")
-        .current_dir(workspace_root)
-        .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root)
-        .output()
-        .context("Failed to get added files")?;
-
-    let added_files: Vec<String> = String::from_utf8_lossy(&added_files_output.stdout)
-        .lines()
-        .filter(|s| !s.is_empty())
-        .map(std::string::ToString::to_string)
-        .collect();
-
-    // Get files modified in the last turn
-    let modified_files_output = Command::new("git")
-        .arg("diff")
-        .arg("--name-only")
-        .arg("HEAD~1")
-        .arg("HEAD")
-        .current_dir(workspace_root)
-        .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root)
-        .output()
-        .context("Failed to get modified files")?;
-
-    let modified_files: Vec<String> = String::from_utf8_lossy(&modified_files_output.stdout)
-        .lines()
-        .filter(|s| !s.is_empty())
-        .map(std::string::ToString::to_string)
-        .collect();
-
-    // Check for uncommitted changes outside the last turn's modified files
-    // to prevent destructive reset from destroying unrelated user edits
-    let status_output = Command::new("git")
-        .arg("status")
-        .arg("--porcelain")
-        .arg("-z")
-        .current_dir(workspace_root)
-        .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root)
-        .output()
-        .context("Failed to check working tree status")?;
-
-    if status_output.status.success() {
-        let uncommitted_files = porcelain_paths(&status_output.stdout);
-
-        // Check if any uncommitted file is outside the last turn's modified files
-        let unexpected_changes: Vec<&String> = uncommitted_files
-            .iter()
-            .filter(|f| !modified_files.contains(f) && !added_files.contains(f))
-            .collect();
-
-        if !unexpected_changes.is_empty() {
-            anyhow::bail!(
-                "Cannot undo: uncommitted changes detected in files not modified in the last turn: {}. \
-                 Commit or stash these changes before undoing, or use /diff to review pending changes.",
-                unexpected_changes
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-    }
-
-    // Reset shadow repo HEAD to previous commit (restores working tree)
-    let output = Command::new("git")
-        .arg("reset")
-        .arg("--hard")
-        .arg("HEAD~1")
-        .current_dir(workspace_root)
-        .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root)
-        .output()
-        .context("Failed to reset shadow repo")?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "git reset failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // Delete files that were added in the last turn (now untracked after reset)
-    for file in &added_files {
-        let file_path = workspace_root.join(file);
-        if file_path.exists() {
-            std::fs::remove_file(&file_path)
-                .with_context(|| format!("Failed to remove added file: {file}"))?;
-        }
-        // Remove empty parent directories to avoid accumulating orphan dirs
-        if let Some(parent) = file_path.parent()
-            && parent != workspace_root
-        {
-            // Remove empty parent dirs (fails gracefully if non-empty)
-            let _ = std::fs::remove_dir(parent);
-        }
-    }
-
-    Ok((added_files, modified_files))
-}
-
 /// Show diff between two turns.
 pub fn diff_turns(workspace_root: &Path, from: usize, to: usize) -> Result<String> {
     with_shadow_lock(workspace_root, || {
@@ -601,105 +459,6 @@ pub fn is_initialized(workspace_root: &Path) -> bool {
     workspace_root.join(SHADOW_GIT_DIR).join("HEAD").exists()
 }
 
-/// Get files that were modified by the user since the last shadow commit.
-/// Excludes files that were already modified by the agent in the last turn.
-pub fn get_user_edits_since_last_turn(workspace_root: &Path) -> Result<Vec<String>> {
-    with_shadow_lock(workspace_root, || {
-        get_user_edits_since_last_turn_locked(workspace_root)
-    })
-}
-
-fn get_user_edits_since_last_turn_locked(workspace_root: &Path) -> Result<Vec<String>> {
-    let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
-
-    if !shadow_git_path.join("HEAD").exists() {
-        anyhow::bail!("Shadow git repo not initialized");
-    }
-
-    // Get files modified in the last turn
-    let modified_files_output = Command::new("git")
-        .arg("diff")
-        .arg("--name-only")
-        .arg("HEAD~1")
-        .arg("HEAD")
-        .current_dir(workspace_root)
-        .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root)
-        .output()
-        .context("Failed to get modified files")?;
-
-    let modified_files: Vec<String> = String::from_utf8_lossy(&modified_files_output.stdout)
-        .lines()
-        .filter(|s| !s.is_empty())
-        .map(std::string::ToString::to_string)
-        .collect();
-
-    // Get files added in the last turn
-    let added_files_output = Command::new("git")
-        .arg("diff")
-        .arg("--name-only")
-        .arg("--diff-filter=A")
-        .arg("HEAD~1")
-        .arg("HEAD")
-        .current_dir(workspace_root)
-        .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root)
-        .output()
-        .context("Failed to get added files")?;
-
-    let added_files: Vec<String> = String::from_utf8_lossy(&added_files_output.stdout)
-        .lines()
-        .filter(|s| !s.is_empty())
-        .map(std::string::ToString::to_string)
-        .collect();
-
-    // Check for user edits (files modified in working tree but not in last turn)
-    // Use git status --porcelain to catch both tracked changes and untracked files
-    let status_output = Command::new("git")
-        .arg("status")
-        .arg("--porcelain")
-        .arg("-z")
-        .current_dir(workspace_root)
-        .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root)
-        .output()
-        .context("Failed to check working tree status")?;
-
-    let user_edited: Vec<String> = porcelain_paths(&status_output.stdout)
-        .into_iter()
-        .filter(|s| !modified_files.contains(s) && !added_files.contains(s))
-        .collect();
-
-    Ok(user_edited)
-}
-
-/// Get the number of turns (commits) in the shadow repo.
-#[must_use]
-pub fn turn_count(workspace_root: &Path) -> usize {
-    let shadow_git_path = workspace_root.join(SHADOW_GIT_DIR);
-
-    if !shadow_git_path.join("HEAD").exists() {
-        return 0;
-    }
-
-    let output = Command::new("git")
-        .arg("rev-list")
-        .arg("--count")
-        .arg("HEAD")
-        .current_dir(workspace_root)
-        .env("GIT_DIR", &shadow_git_path)
-        .env("GIT_WORK_TREE", workspace_root)
-        .output();
-
-    match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0),
-        Err(_) => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,7 +491,7 @@ mod tests {
         git_config_for_tests(temp.path());
         init_shadow_repo(temp.path()).unwrap();
         init_shadow_repo(temp.path()).unwrap();
-        assert_eq!(turn_count(temp.path()), 1);
+        assert_eq!(log(temp.path(), None).unwrap().lines().count(), 1);
     }
 
     #[test]
@@ -743,7 +502,7 @@ mod tests {
 
         fs::write(temp.path().join("test.txt"), "hello").unwrap();
         commit_turn(temp.path(), "test commit").unwrap();
-        assert_eq!(turn_count(temp.path()), 2);
+        assert_eq!(log(temp.path(), None).unwrap().lines().count(), 2);
     }
 
     #[test]
@@ -773,33 +532,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         git_config_for_tests(temp.path());
         init_shadow_repo(temp.path()).unwrap();
-        let count_before = turn_count(temp.path());
+        let count_before = log(temp.path(), None).unwrap().lines().count();
         commit_turn(temp.path(), "no-op commit").unwrap();
-        assert_eq!(turn_count(temp.path()), count_before);
-    }
-
-    #[test]
-    fn test_undo_last_turn_reverts_changes() {
-        let temp = TempDir::new().unwrap();
-        git_config_for_tests(temp.path());
-        init_shadow_repo(temp.path()).unwrap();
-
-        fs::write(temp.path().join("test.txt"), "hello").unwrap();
-        commit_turn(temp.path(), "add test file").unwrap();
-
-        let (added, _modified) = undo_last_turn(temp.path()).unwrap();
-        assert!(added.contains(&"test.txt".to_string()));
-        assert!(!temp.path().join("test.txt").exists());
-        assert_eq!(turn_count(temp.path()), 1);
-    }
-
-    #[test]
-    fn test_undo_last_turn_requires_two_commits() {
-        let temp = TempDir::new().unwrap();
-        git_config_for_tests(temp.path());
-        init_shadow_repo(temp.path()).unwrap();
-        let err = undo_last_turn(temp.path()).unwrap_err();
-        assert!(err.to_string().contains("No turns to undo"));
+        assert_eq!(
+            log(temp.path(), None).unwrap().lines().count(),
+            count_before
+        );
     }
 
     #[test]
@@ -834,41 +572,6 @@ mod tests {
     fn test_is_initialized_false_before_init() {
         let temp = TempDir::new().unwrap();
         assert!(!is_initialized(temp.path()));
-    }
-
-    #[test]
-    fn test_turn_count_zero_before_init() {
-        let temp = TempDir::new().unwrap();
-        assert_eq!(turn_count(temp.path()), 0);
-    }
-
-    #[test]
-    fn test_get_user_edits_detects_user_changes() {
-        let temp = TempDir::new().unwrap();
-        git_config_for_tests(temp.path());
-        init_shadow_repo(temp.path()).unwrap();
-
-        fs::write(temp.path().join("agent_file.txt"), "agent").unwrap();
-        commit_turn(temp.path(), "agent change").unwrap();
-
-        fs::write(temp.path().join("user_file.txt"), "user").unwrap();
-        let edits = get_user_edits_since_last_turn(temp.path()).unwrap();
-        assert!(edits.contains(&"user_file.txt".to_string()));
-        assert!(!edits.contains(&"agent_file.txt".to_string()));
-    }
-
-    #[test]
-    fn test_get_user_edits_preserves_paths_with_spaces() {
-        let temp = TempDir::new().unwrap();
-        git_config_for_tests(temp.path());
-        init_shadow_repo(temp.path()).unwrap();
-
-        fs::write(temp.path().join("agent file.txt"), "agent").unwrap();
-        commit_turn(temp.path(), "agent change").unwrap();
-
-        fs::write(temp.path().join("user file.txt"), "user").unwrap();
-        let edits = get_user_edits_since_last_turn(temp.path()).unwrap();
-        assert_eq!(edits, vec!["user file.txt"]);
     }
 
     #[test]

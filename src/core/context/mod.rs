@@ -33,5 +33,4 @@ pub use instructions::{
 };
 pub use model_detect::is_qwen_model;
 pub use system_prompt::{PromptBuilder, SystemPromptContext};
-pub use tool_examples::tool_examples_for_model;
 pub use trackers::FileContextTracker;
