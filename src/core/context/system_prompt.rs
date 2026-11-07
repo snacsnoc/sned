@@ -189,7 +189,7 @@ impl PromptBuilder {
 
         if is_act && self.has_tool(SnedTool::AttemptCompletion) {
             prompt.push_str(
-                "- In ACT mode, complete the task using tools as needed, then provide a final text response or call `attempt_completion`.\n",
+                "- In ACT mode, complete the task using tools as needed, then call `attempt_completion` with the result (a bare text reply bypasses this tool's checks).\n",
             );
         }
         if is_plan && self.has_tool(SnedTool::PlanModeRespond) {
@@ -348,7 +348,7 @@ mod tests {
         assert!(prompt.contains("Untouched tracked anchors remain valid"));
         assert!(!prompt.lines().any(|line| line.starts_with('\\')));
         assert!(prompt.contains("In ACT mode"));
-        assert!(prompt.contains("provide a final text response or call `attempt_completion`"));
+        assert!(prompt.contains("then call `attempt_completion` with the result"));
         assert!(!prompt.contains("finish with `attempt_completion`"));
         assert!(!prompt.contains("PLAN mode"));
         // Environment info is now provided by context_loader, not in system prompt

@@ -398,7 +398,7 @@ pub fn ask_followup_question_schema() -> ToolSchema {
 pub fn attempt_completion_schema() -> ToolSchema {
     ToolSchema {
         name: "attempt_completion",
-        description: "Present the final result when the task is complete.",
+        description: "Call this exactly once when the task is fully done. Prefer this over replying in text.",
         parameters: vec![
             ToolParameter {
                 name: "result",
@@ -1600,6 +1600,15 @@ mod tests {
         assert_eq!(
             select_tool_profile("Create a file", "plan"),
             ToolProfile::Plan
+        );
+    }
+
+    #[test]
+    fn test_attempt_completion_description_directs_call_over_text() {
+        let description = attempt_completion_schema().description;
+        assert!(
+            description.contains("Call this") && description.contains("text"),
+            "description must direct calling over bare text replies, got: {description}"
         );
     }
 
