@@ -1474,6 +1474,32 @@ impl AgentLoop {
         }
     }
 
+    /// Whether the trailing batches repeat a short mutation-free signature
+    /// cycle. Catches alternation (A,B,A,B) the identical-batch tripwire
+    /// misses; a batch that could change the workspace breaks the pattern
+    /// because later reads may observe new bytes.
+    fn pure_read_cycle_detected(history: &VecDeque<(String, bool)>) -> bool {
+        let len = history.len();
+        for width in 1..=3usize {
+            let span = 2 * width;
+            if len < span {
+                continue;
+            }
+            if history.iter().skip(len - span).any(|(_, mutated)| *mutated) {
+                continue;
+            }
+            let signatures: Vec<&str> = history
+                .iter()
+                .skip(len - span)
+                .map(|(signature, _)| signature.as_str())
+                .collect();
+            if signatures[..width] == signatures[width..] {
+                return true;
+            }
+        }
+        false
+    }
+
     async fn update_inspection_streak(
         &mut self,
         tool_calls: &[crate::core::tools::execution::PreparedToolCall],
@@ -1619,6 +1645,16 @@ impl AgentLoop {
             state.double_check_completion_enabled = self.config.double_check_completion;
             state.strict_plan_mode_enabled = self.config.strict_plan_mode_enabled;
             state.first_tool_result_printed = false;
+            // Cycle state belongs to one task: a reused loop must not warn
+            // on the first turns of the next task.
+            if !self.retry_mode {
+                state.recent_batch_signatures.clear();
+                state.tool_cycle_streak = 0;
+                state.at_cap_turn = false;
+                state.session_edited_paths.clear();
+                state.last_edit_turn = 0;
+                state.stability_nudge_fired = false;
+            }
             // Initialize session start time for session summary
             state.session_start_time = Some(std::time::Instant::now());
             if state.file_context_tracker.task_id().is_none() {
@@ -1857,7 +1893,15 @@ impl AgentLoop {
                 return Err(AgentError::MaxTurnsExceeded);
             }
             turn_count += 1;
+            self.maybe_inject_aging_nudge(turn_count).await;
+            self.maybe_inject_stability_nudge(turn_count).await;
             self.maybe_inject_wrap_up_reminder(turn_count).await;
+            // Reassigned every turn so a resumed loop never acts on a stale cap flag.
+            {
+                let mut state = self.state.lock().await;
+                state.at_cap_turn = turn_count == self.config.max_turns;
+                state.current_turn = turn_count;
+            }
 
             // Check if cancelled
             {
@@ -2702,6 +2746,27 @@ impl AgentLoop {
                 );
                 return TurnResult::Error(format!("Context window overflow: {msg}"));
             }
+        }
+
+        // The run loop flags the final turn via shared state because this
+        // function has no turn counter. Forbidding tools on the last turn
+        // forces a text answer so the run ends Complete, not MaxTurnsExceeded.
+        // Choice must be Some(None): a bare None falls back to Auto in
+        // every provider. Tools are stripped too so no schema is offered.
+        if self.state.lock().await.at_cap_turn {
+            request.tool_choice = Some(crate::providers::ToolChoice::None);
+            request.tools = None;
+            request.messages.push(StorageMessage {
+                id: Some(Self::next_message_id(&self.message_counter)),
+                role: MessageRole::User,
+                content: MessageContent::Text(format!(
+                    "[Final turn]: this is turn {} of {}. No further turns remain. Do not call any tools; provide your final summary of results as text now.",
+                    self.config.max_turns, self.config.max_turns
+                )),
+                model_info: None,
+                metrics: None,
+                ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+            });
         }
 
         let state_clone = self.state.clone();
@@ -3770,6 +3835,7 @@ impl AgentLoop {
         let mut tool_failure_count = 0usize;
         let mut completion_result: Option<String> = None;
         let mut identical_batch_streak: u32 = 0;
+        let mut cycle_streak: u32 = 0;
         if !prepared_tool_calls.is_empty() {
             let mut edit_files: Vec<(String, i32, i32)> = Vec::new();
             // Mutation bookkeeping derives from executed outcomes below,
@@ -3866,6 +3932,43 @@ impl AgentLoop {
                 let mut state = self.state.lock().await;
                 state.last_tool_batch_signature = None;
                 state.identical_tool_batch_streak = 0;
+                0
+            };
+
+            // Parallel cycle window: alternation the tripwire above cannot
+            // see. A batch that could mutate the workspace breaks the
+            // pattern, so only mutation-free repeats advance the streak.
+            cycle_streak = if all_executed {
+                let signature =
+                    crate::core::tools::execution::tool_batch_signature(&prepared_tool_calls);
+                let had_mutating_call = prepared_tool_calls.iter().any(|prepared| {
+                    matches!(
+                        prepared.tool_name.as_str(),
+                        "edit_file"
+                            | "write_to_file"
+                            | "execute_command"
+                            | "replace_symbol"
+                            | "rename_symbol"
+                            | "use_subagents"
+                    )
+                });
+                let mut state = self.state.lock().await;
+                state
+                    .recent_batch_signatures
+                    .push_back((signature, had_mutating_call));
+                while state.recent_batch_signatures.len() > 10 {
+                    state.recent_batch_signatures.pop_front();
+                }
+                if Self::pure_read_cycle_detected(&state.recent_batch_signatures) {
+                    state.tool_cycle_streak = state.tool_cycle_streak.saturating_add(1);
+                } else {
+                    state.tool_cycle_streak = 0;
+                }
+                state.tool_cycle_streak
+            } else {
+                let mut state = self.state.lock().await;
+                state.recent_batch_signatures.clear();
+                state.tool_cycle_streak = 0;
                 0
             };
 
@@ -4155,6 +4258,18 @@ impl AgentLoop {
                         ts: Some(chrono::Utc::now().timestamp_millis() as u64),
                     });
                 }
+                if cycle_streak == 2 {
+                    history.push(StorageMessage {
+                        id: Some(Self::next_message_id(&self.message_counter)),
+                        role: MessageRole::User,
+                        content: MessageContent::Text(String::from(
+                            "You are repeating a cycle of read-only tool calls. If you repeat the cycle again the session will stop. Change approach, or finish with a summary of what is done and what is blocked.",
+                        )),
+                        model_info: None,
+                        metrics: None,
+                        ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+                    });
+                }
             }
 
             // Read coverage is committed only after the result batch is in
@@ -4310,6 +4425,22 @@ impl AgentLoop {
                     edit_files.iter().map(|(p, _, _)| p.clone()).collect();
                 edited_paths.extend(files_created.iter().cloned());
                 edited_paths.extend(symbol_edited_paths.iter().cloned());
+                // Only re-edits restart the quiet clock; new scaffolding
+                // merely joins the set.
+                {
+                    let mut state = self.state.lock().await;
+                    let now = state.current_turn;
+                    let mut relapsed = false;
+                    for path in &edited_paths {
+                        if !state.session_edited_paths.insert(path.clone()) {
+                            state.last_edit_turn = now;
+                            relapsed = true;
+                        }
+                    }
+                    if relapsed {
+                        state.stability_nudge_fired = false;
+                    }
+                }
                 let mut history = self.conversation_history.lock().await;
                 let mut known_read_paths = Vec::new();
                 for msg in history.iter() {
@@ -4587,6 +4718,12 @@ impl AgentLoop {
                 "Stopped: the model repeated the identical tool call after being warned."
                     .to_string(),
             )
+        } else if cycle_streak >= 3 {
+            self.emit_turn_end("").await;
+            TurnResult::Error(
+                "Stopped: the model repeated a cycle of read-only tool calls after being warned."
+                    .to_string(),
+            )
         } else {
             // Same turn-end signal for the "more turns coming" branch.
             let markdown_text = response_text.as_deref().unwrap_or("");
@@ -4683,6 +4820,73 @@ impl AgentLoop {
             content: MessageContent::Text(format!(
                 "[Approaching turn limit]: this is turn {turn_count} of {}. Finish any in-progress tool use, start no new tool calls, and summarize results to close out the task.",
                 self.config.max_turns
+            )),
+            model_info: None,
+            metrics: None,
+            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+        });
+    }
+
+    /// Mid-run progress pressure: a blind turn-count nudge, escalating.
+    /// A false nudge costs one message; the wrap-up and the cap force
+    /// stand behind it. Fractions that would collide with the wrap-up
+    /// or each other stay silent so small caps keep their order.
+    async fn maybe_inject_aging_nudge(&self, turn_count: u32) {
+        let cap = self.config.max_turns;
+        let wrap_up_at = cap.saturating_sub(WRAP_UP_LEAD_TURNS);
+        let first = cap * 4 / 10;
+        let second = cap * 7 / 10;
+        let text = if turn_count == first && first >= 1 && first < wrap_up_at {
+            format!(
+                "[Progress check]: this is turn {turn_count} of {cap}. If the deliverable works, finish now with a summary; state what remains otherwise."
+            )
+        } else if turn_count == second && second > first && second < wrap_up_at {
+            format!(
+                "[Progress check]: this is turn {turn_count} of {cap}. Wrap up now: finish with a summary of results and what remains undone."
+            )
+        } else {
+            return;
+        };
+        self.conversation_history.lock().await.push(StorageMessage {
+            id: Some(Self::next_message_id(&self.message_counter)),
+            role: MessageRole::User,
+            content: MessageContent::Text(text),
+            model_info: None,
+            metrics: None,
+            ts: Some(chrono::Utc::now().timestamp_millis() as u64),
+        });
+    }
+
+    /// Stop-when-done pressure: names the observed stall instead of the
+    /// turn count, so it confronts rather than nags. Nudge-only; a halt
+    /// needs battery proof. Pure-create builds nudge early; tolerated.
+    async fn maybe_inject_stability_nudge(&self, turn_count: u32) {
+        const QUIET_TURNS: u32 = 8;
+        let fire = {
+            let state = self.state.lock().await;
+            !state.stability_nudge_fired
+                && !state.session_edited_paths.is_empty()
+                && turn_count >= state.last_edit_turn + QUIET_TURNS
+                && state.last_edit_turn + QUIET_TURNS
+                    < self.config.max_turns.saturating_sub(WRAP_UP_LEAD_TURNS)
+        };
+        if !fire {
+            return;
+        }
+        let (quiet_for, edited_count, last_edit) = {
+            let mut state = self.state.lock().await;
+            state.stability_nudge_fired = true;
+            (
+                turn_count - state.last_edit_turn,
+                state.session_edited_paths.len(),
+                state.last_edit_turn,
+            )
+        };
+        self.conversation_history.lock().await.push(StorageMessage {
+            id: Some(Self::next_message_id(&self.message_counter)),
+            role: MessageRole::User,
+            content: MessageContent::Text(format!(
+                "[Stability check]: you haven't reworked any file you wrote for {quiet_for} turns while you keep working ({edited_count} session files, last rework turn {last_edit}). If the deliverable is done, finish now with a summary; state what remains otherwise."
             )),
             model_info: None,
             metrics: None,
@@ -8604,6 +8808,160 @@ mod tests {
         assert!(
             matches!(&stopped, TurnResult::Error(message) if message.contains("identical tool call")),
             "fourth identical call must stop the session, got {stopped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_only_cycle_warns_then_stops() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cycle_a.txt"), "alpha\n").unwrap();
+        std::fs::write(dir.path().join("cycle_b.txt"), "beta\n").unwrap();
+        let read_a = tool_call_chunks(&[("c1", "read_file", json!({"paths": ["cycle_a.txt"]}))]);
+        let read_b = tool_call_chunks(&[("c1", "read_file", json!({"paths": ["cycle_b.txt"]}))]);
+        let responses = vec![
+            read_a.clone(),
+            read_b.clone(),
+            read_a.clone(),
+            read_b.clone(),
+            read_a.clone(),
+            read_b.clone(),
+        ];
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured)),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        let config = test_agent_config(provider, "read-cycle-loop");
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        for _ in 0..5 {
+            assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        }
+        {
+            let history = agent.conversation_history.lock().await;
+            let warned = history.iter().any(|message| match &message.content {
+                MessageContent::Text(text) => text.contains("repeating a cycle"),
+                _ => false,
+            });
+            assert!(warned, "fifth alternating read must warn the model");
+        }
+        let stopped = agent.execute_turn().await;
+        assert!(
+            matches!(&stopped, TurnResult::Error(message) if message.contains("cycle")),
+            "sixth alternating read must stop the session, got {stopped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_only_cycle_ignores_mutating_interleave() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cycle_a.txt"), "alpha\n").unwrap();
+        std::fs::write(dir.path().join("cycle_b.txt"), "beta\n").unwrap();
+        let read_a = tool_call_chunks(&[("c1", "read_file", json!({"paths": ["cycle_a.txt"]}))]);
+        let read_b = tool_call_chunks(&[("c1", "read_file", json!({"paths": ["cycle_b.txt"]}))]);
+        let edit = tool_call_chunks(&[(
+            "c1",
+            "edit_file",
+            json!({"path": "cycle_a.txt", "content": "changed"}),
+        )]);
+        let responses = vec![
+            read_a.clone(),
+            read_b.clone(),
+            edit.clone(),
+            read_a.clone(),
+            read_b.clone(),
+            edit.clone(),
+            read_a.clone(),
+            read_b.clone(),
+            edit.clone(),
+            read_a.clone(),
+        ];
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured)),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        registry.register(SnedTool::EditFile, Arc::new(StaticResultHandler("edited")));
+        let config = test_agent_config(provider, "read-cycle-with-edit");
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        for turn in 0..10 {
+            let outcome = agent.execute_turn().await;
+            assert!(
+                matches!(outcome, TurnResult::Continue),
+                "turn {turn} must continue, got {outcome:?}"
+            );
+        }
+        let history = agent.conversation_history.lock().await;
+        assert!(
+            !history.iter().any(|message| match &message.content {
+                MessageContent::Text(text) => {
+                    text.contains("repeating a cycle") || text.contains("identical tool call")
+                }
+                _ => false,
+            }),
+            "interleaved edit must suppress every loop warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_only_cycle_ignores_distinct_reads() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let mut responses = Vec::new();
+        for index in 0..90 {
+            let name = format!("distinct_{index}.txt");
+            std::fs::write(dir.path().join(&name), "filler\n").unwrap();
+            responses.push(tool_call_chunks(&[(
+                "c1",
+                "read_file",
+                json!({"paths": [name]}),
+            )]));
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured)),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        let config = test_agent_config(provider, "read-cycle-distinct");
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        for turn in 0..90 {
+            let outcome = agent.execute_turn().await;
+            assert!(
+                matches!(outcome, TurnResult::Continue),
+                "turn {turn} must continue, got {outcome:?}"
+            );
+        }
+        let history = agent.conversation_history.lock().await;
+        assert!(
+            !history.iter().any(|message| match &message.content {
+                MessageContent::Text(text) => {
+                    text.contains("repeating a cycle") || text.contains("identical tool call")
+                }
+                _ => false,
+            }),
+            "distinct reads must never warn"
         );
     }
 
@@ -17594,18 +17952,132 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    async fn test_aging_nudge_fires_at_fractions() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let mut config = test_agent_config(provider, "test-aging-nudge");
+        config.max_turns = 20;
+        let agent = AgentLoop::new(config);
+
+        for turn in 1..=20 {
+            agent.maybe_inject_aging_nudge(turn).await;
+        }
+
+        let history = agent.conversation_history.lock().await;
+        let nudges: Vec<_> = history
+            .iter()
+            .filter_map(|message| match &message.content {
+                crate::providers::MessageContent::Text(text)
+                    if text.contains("[Progress check]") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nudges.len(), 2);
+        assert!(nudges[0].contains("turn 8 of 20"));
+        assert!(nudges[0].contains("finish now with a summary"));
+        assert!(nudges[1].contains("turn 14 of 20"));
+        assert!(nudges[1].contains("Wrap up now"));
+    }
+
+    #[tokio::test]
+    async fn test_aging_nudge_skipped_on_colliding_fractions() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let mut config = test_agent_config(provider, "test-aging-nudge-collide");
+        config.max_turns = 6;
+        let agent = AgentLoop::new(config);
+
+        for turn in 1..=6 {
+            agent.maybe_inject_aging_nudge(turn).await;
+        }
+
+        let history = agent.conversation_history.lock().await;
+        let nudges: Vec<_> = history
+            .iter()
+            .filter_map(|message| match &message.content {
+                crate::providers::MessageContent::Text(text)
+                    if text.contains("[Progress check]") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nudges.len(), 1);
+        assert!(nudges[0].contains("turn 2 of 6"));
+    }
+
+    #[tokio::test]
+    async fn test_stability_nudge_fires_after_quiet_span() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let mut config = test_agent_config(provider, "test-stability-nudge");
+        config.max_turns = 30;
+        let agent = AgentLoop::new(config);
+        {
+            let mut state = agent.state.lock().await;
+            state.session_edited_paths.insert("game.js".to_string());
+            state.last_edit_turn = 2;
+        }
+
+        for turn in 1..=20 {
+            agent.maybe_inject_stability_nudge(turn).await;
+        }
+
+        let history = agent.conversation_history.lock().await;
+        let nudges: Vec<_> = history
+            .iter()
+            .filter_map(|message| match &message.content {
+                crate::providers::MessageContent::Text(text)
+                    if text.contains("[Stability check]") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nudges.len(), 1);
+        assert!(nudges[0].contains("8 turns"));
+        assert!(nudges[0].contains("last rework turn 2"));
+    }
+
+    #[tokio::test]
+    async fn test_stability_nudge_silent_without_edits() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let agent = AgentLoop::new(test_agent_config(provider, "test-stability-quiet"));
+
+        for turn in 1..=20 {
+            agent.maybe_inject_stability_nudge(turn).await;
+        }
+
+        let history = agent.conversation_history.lock().await;
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_wrap_up_reminder_reaches_requests_exactly_once() {
         use crate::core::tools::handlers::read_file::ReadFileHandler;
 
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("fixture-a.txt"), "alpha\n").unwrap();
-        std::fs::write(dir.path().join("fixture-b.txt"), "beta\n").unwrap();
+        for index in 0..6 {
+            std::fs::write(
+                dir.path().join(format!("fixture-{index}.txt")),
+                format!("content {index}\n"),
+            )
+            .unwrap();
+        }
+        // Distinct reads every turn: this pins wrap-up delivery without
+        // entering the read-cycle path (an A,B ramble would rightly halt).
         let tool_chunk = |index: usize| {
-            let path = if index % 2 == 0 {
-                "fixture-a.txt"
-            } else {
-                "fixture-b.txt"
-            };
+            let path = format!("fixture-{index}.txt");
             vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                 tool_call: ApiStreamToolCall {
                     call_id: Some(format!("call_ramble_{index}")),
@@ -17675,6 +18147,98 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    async fn test_at_cap_forces_text_answer_and_completes() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fixture-a.txt"), "alpha\n").unwrap();
+        std::fs::write(dir.path().join("fixture-b.txt"), "beta\n").unwrap();
+        let tool_chunk = |index: usize| {
+            let path = if index % 2 == 0 {
+                "fixture-a.txt"
+            } else {
+                "fixture-b.txt"
+            };
+            vec![ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
+                tool_call: ApiStreamToolCall {
+                    call_id: Some(format!("call_cap_{index}")),
+                    function: ApiStreamToolCallFunction {
+                        id: None,
+                        name: Some("read_file".to_string()),
+                        arguments: Some(serde_json::json!({"paths": [path]}).to_string()),
+                    },
+                    signature: None,
+                },
+                id: None,
+                signature: None,
+            })]
+        };
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut scripted = vec![
+            tool_chunk(0),
+            tool_chunk(1),
+            tool_chunk(2),
+            tool_chunk(3),
+            tool_chunk(4),
+        ];
+        scripted.push(vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+            text: "All fixtures read. Final summary of contents.".to_string(),
+            id: None,
+            signature: None,
+        })]);
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(scripted, requests.clone()),
+        ));
+        let mut config = test_agent_config(provider, "test-at-cap-ramble");
+        config.max_turns = 6;
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        let mut agent = AgentLoop::new(config)
+            .with_tools(Arc::new(registry))
+            .with_system_prompt_context(SystemPromptContext {
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        agent.state.lock().await.double_check_completion_enabled = false;
+
+        let state_manager = Arc::new(StateManager::new().unwrap());
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.run(vec![], state_manager),
+        )
+        .await
+        .expect("capped run must terminate");
+        assert!(
+            outcome.is_ok(),
+            "at-cap text answer must complete, got {outcome:?}"
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        for request in requests.iter().take(5) {
+            assert_eq!(
+                request.tool_choice,
+                Some(crate::providers::ToolChoice::Auto)
+            );
+        }
+        let final_request = &requests[5];
+        assert_eq!(
+            final_request.tool_choice,
+            Some(crate::providers::ToolChoice::None)
+        );
+        assert!(
+            final_request.messages.iter().any(|message| {
+                matches!(
+                    &message.content,
+                    crate::providers::MessageContent::Text(text)
+                        if text.contains("[Final turn]")
+                )
+            }),
+            "final request must carry the cap instruction"
+        );
+    }
+
+    #[tokio::test]
     async fn test_wrap_up_reminder_absent_when_task_completes_early() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = Arc::new(Providers::RecordingChunk(
@@ -17703,6 +18267,20 @@ Irrespective of whether additional information or instructions are given, you ar
                 )
             }),
             "a task finishing before the lead-in must never see the reminder"
+        );
+        assert_eq!(
+            requests[0].tool_choice,
+            Some(crate::providers::ToolChoice::Auto)
+        );
+        assert!(
+            !requests[0].messages.iter().any(|message| {
+                matches!(
+                    &message.content,
+                    crate::providers::MessageContent::Text(text)
+                        if text.contains("[Final turn]")
+                )
+            }),
+            "a non-cap request must not carry the cap instruction"
         );
     }
 
