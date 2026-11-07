@@ -23,27 +23,6 @@ const SHADOW_GIT_AUTHOR_EMAIL: &str = "sned@localhost";
 const SHADOW_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const STALE_INDEX_LOCK_AGE: Duration = Duration::from_secs(90);
 
-fn porcelain_paths(status: &[u8]) -> Vec<String> {
-    let mut records = status
-        .split(|byte| *byte == b'\0')
-        .filter(|record| !record.is_empty());
-    let mut paths = Vec::new();
-
-    while let Some(record) = records.next() {
-        if record.len() < 4 {
-            continue;
-        }
-
-        let kind = &record[..2];
-        paths.push(String::from_utf8_lossy(&record[3..]).into_owned());
-        if kind.contains(&b'R') || kind.contains(&b'C') {
-            let _ = records.next();
-        }
-    }
-
-    paths
-}
-
 pub(crate) struct ShadowGitLock {
     _file: File,
 }
@@ -572,18 +551,6 @@ mod tests {
     fn test_is_initialized_false_before_init() {
         let temp = TempDir::new().unwrap();
         assert!(!is_initialized(temp.path()));
-    }
-
-    #[test]
-    fn test_porcelain_paths_preserve_spaces_and_renames() {
-        assert_eq!(
-            porcelain_paths(b"?? a directory/user file.txt\0"),
-            vec!["a directory/user file.txt"]
-        );
-        assert_eq!(
-            porcelain_paths(b"R  new file.txt\0old file.txt\0"),
-            vec!["new file.txt"]
-        );
     }
 
     #[test]
