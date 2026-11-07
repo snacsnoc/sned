@@ -4818,7 +4818,7 @@ impl AgentLoop {
             id: Some(Self::next_message_id(&self.message_counter)),
             role: MessageRole::User,
             content: MessageContent::Text(format!(
-                "[Approaching turn limit]: this is turn {turn_count} of {}. Finish any in-progress tool use, start no new tool calls, and summarize results to close out the task.",
+                "[Approaching turn limit]: this is turn {turn_count} of {}. Finish any in-progress tool use, start no new tool calls, and call attempt_completion with a summary of results to close out the task.",
                 self.config.max_turns
             )),
             model_info: None,
@@ -17932,6 +17932,33 @@ Irrespective of whether additional information or instructions are given, you ar
             .collect();
         assert_eq!(reminders.len(), 1);
         assert!(reminders[0].contains("turn 7 of 10"));
+    }
+
+    #[tokio::test]
+    async fn test_wrap_up_reminder_directs_completion_call() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let agent = AgentLoop::new(test_agent_config(provider, "test-wrap-up-call"));
+        agent.maybe_inject_wrap_up_reminder(7).await;
+
+        let history = agent.conversation_history.lock().await;
+        let reminder = history
+            .iter()
+            .filter_map(|message| match &message.content {
+                crate::providers::MessageContent::Text(text)
+                    if text.contains("[Approaching turn limit]") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .next()
+            .expect("wrap-up reminder fires at the lead-in");
+        assert!(
+            reminder.contains("attempt_completion"),
+            "the reminder the model obeys must name the completion call, not just ask for a summary: {reminder}"
+        );
     }
 
     #[tokio::test]
