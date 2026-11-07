@@ -1001,14 +1001,6 @@ fn decode_openai_completion(
     chunks
 }
 
-async fn send_chunk(
-    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
-    chunk: ApiStreamChunk,
-    chunk_type: &str,
-) -> bool {
-    crate::providers::send_chunk(tx, chunk, "OpenAI", chunk_type).await
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 enum OpenAiTextStreamMode {
     #[default]
@@ -1276,15 +1268,16 @@ async fn process_openai_sse_line(
             Err(error) => {
                 delta_state.parse_failed = true;
                 if let Some(chunk) = openai_error_chunk(data) {
-                    send_chunk(tx, chunk, "error").await;
+                    crate::providers::send_chunk(tx, chunk, "OpenAI", "error").await;
                     return;
                 }
                 tracing::warn!(error = %error, "OpenAI SSE: failed to parse chunk");
-                let _ = send_chunk(
+                let _ = crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::Error(
                         "OpenAI SSE parse error: invalid JSON (retryable)".to_string(),
                     ),
+                    "OpenAI",
                     "error",
                 )
                 .await;
@@ -1301,13 +1294,14 @@ async fn process_openai_sse_line(
                     content,
                 )
             {
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::Text(ApiStreamTextChunk {
                         text: content,
                         id: Some(chunk.id.clone()),
                         signature: None,
                     }),
+                    "OpenAI",
                     "text",
                 )
                 .await;
@@ -1320,7 +1314,7 @@ async fn process_openai_sse_line(
                 && let Some(reasoning) =
                     normalize_reasoning_delta(&mut delta_state.emitted_reasoning, reasoning)
             {
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                         reasoning,
@@ -1329,6 +1323,7 @@ async fn process_openai_sse_line(
                         redacted_data: None,
                         id: Some(chunk.id.clone()),
                     }),
+                    "OpenAI",
                     "reasoning",
                 )
                 .await;
@@ -1341,9 +1336,10 @@ async fn process_openai_sse_line(
             if let Some(refusal) = delta.refusal
                 && !refusal.is_empty()
             {
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::Error(format!("OpenAI model refused: {refusal}")),
+                    "OpenAI",
                     "refusal",
                 )
                 .await;
@@ -1422,12 +1418,13 @@ async fn process_openai_sse_line(
                         && is_safe_tool_name(&completed_streamed_tool_name(name))
                         && {
                             let name = completed_streamed_tool_name(name);
-                            if !send_chunk(
+                            if !crate::providers::send_chunk(
                                 tx,
                                 ApiStreamChunk::ToolCallStarted {
                                     call_id: id.clone(),
                                     name,
                                 },
+                                "OpenAI",
                                 "tool_call_started",
                             )
                             .await
@@ -1461,12 +1458,13 @@ async fn process_openai_sse_line(
                             && !id.is_empty()
                             && is_safe_tool_name(&name)
                         {
-                            if !send_chunk(
+                            if !crate::providers::send_chunk(
                                 tx,
                                 ApiStreamChunk::ToolCallStarted {
                                     call_id: id.clone(),
                                     name,
                                 },
+                                "OpenAI",
                                 "tool_call_started",
                             )
                             .await
@@ -1495,7 +1493,7 @@ async fn process_openai_sse_line(
                                 Some("tool_calls"),
                             );
                             completed_tool_call_indices.insert(idx);
-                            send_chunk(
+                            crate::providers::send_chunk(
                                 tx,
                                 ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                                     tool_call: ApiStreamToolCall {
@@ -1510,6 +1508,7 @@ async fn process_openai_sse_line(
                                     id: Some(chunk.id.clone()),
                                     signature: None,
                                 }),
+                                "OpenAI",
                                 "tool_calls",
                             )
                             .await;
@@ -1524,7 +1523,7 @@ async fn process_openai_sse_line(
 
         if let Some(usage) = chunk.usage {
             *usage_sent = true;
-            send_chunk(
+            crate::providers::send_chunk(
                 tx,
                 ApiStreamChunk::Usage(openai_usage_chunk(
                     &usage,
@@ -1532,6 +1531,7 @@ async fn process_openai_sse_line(
                     last_stop_reason.clone(),
                     model_info,
                 )),
+                "OpenAI",
                 "usage",
             )
             .await;
@@ -1653,9 +1653,10 @@ pub async fn parse_openai_sse_to_chunks(
         && !delta_state.parse_failed
     {
         delta_state.parse_failed = true;
-        let _ = send_chunk(
+        let _ = crate::providers::send_chunk(
             tx,
             ApiStreamChunk::Error(format!("{err} (retryable)")),
+            "OpenAI",
             "error",
         )
         .await;
@@ -1715,12 +1716,13 @@ pub async fn finish_openai_sse_to_chunks(
                 && !id.is_empty()
                 && is_safe_tool_name(&name)
             {
-                if !send_chunk(
+                if !crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::ToolCallStarted {
                         call_id: id.clone(),
                         name,
                     },
+                    "OpenAI",
                     "tool_call_started",
                 )
                 .await
@@ -1746,7 +1748,7 @@ pub async fn finish_openai_sse_to_chunks(
                     last_stop_reason.as_deref(),
                 );
                 completed_tool_call_indices.insert(idx);
-                if !send_chunk(
+                if !crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -1761,6 +1763,7 @@ pub async fn finish_openai_sse_to_chunks(
                         id: None,
                         signature: None,
                     }),
+                    "OpenAI",
                     "tool_calls",
                 )
                 .await
@@ -1773,7 +1776,7 @@ pub async fn finish_openai_sse_to_chunks(
 
     // Emit synthetic Usage chunk if no usage chunk was sent
     if !*usage_sent
-        && !send_chunk(
+        && !crate::providers::send_chunk(
             tx,
             ApiStreamChunk::Usage(ApiStreamUsageChunk {
                 input_tokens: 0,
@@ -1786,6 +1789,7 @@ pub async fn finish_openai_sse_to_chunks(
                 stop_reason: last_stop_reason.clone(),
                 id: None,
             }),
+            "OpenAI",
             "usage",
         )
         .await
@@ -2027,15 +2031,11 @@ impl Provider for OpenAiProvider {
                             diagnostics = %diagnostics,
                             "OpenAI SSE stream timeout"
                         );
-                        if !send_chunk(
-                            &tx,
-                            ApiStreamChunk::Error(format!(
+                        if !crate::providers::send_chunk(&tx, ApiStreamChunk::Error(format!(
                                 "OpenAI SSE {phase} timeout after {}ms; diagnostics: {} (retryable). Increase or unset the corresponding SNED_SSE_*_TIMEOUT_SECS setting for long reasoning gaps.",
                                 timeout.as_millis(),
                                 diagnostics,
-                            )),
-                            "timeout",
-                        ).await {
+                            )), "OpenAI", "timeout").await {
                             stream_errored = true;
                             break;
                         }
@@ -2096,7 +2096,7 @@ impl Provider for OpenAiProvider {
                             diagnostics = %diagnostics,
                             "OpenAI SSE bytes_stream error"
                         );
-                        if !send_chunk(
+                        if !crate::providers::send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "OpenAI SSE stream error: {}; diagnostics: {}{}",
@@ -2104,6 +2104,7 @@ impl Provider for OpenAiProvider {
                                 diagnostics,
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
+                            "OpenAI",
                             "error",
                         )
                         .await
@@ -2132,7 +2133,7 @@ impl Provider for OpenAiProvider {
                 empty_sse_frames += empty_frames;
             }
             if !tx.is_closed() {
-                let _ = send_chunk(
+                let _ = crate::providers::send_chunk(
                     &tx,
                     ApiStreamChunk::Timing(ApiStreamTiming {
                         request_to_headers_us: request_to_headers.as_micros() as u64,
@@ -2144,6 +2145,7 @@ impl Provider for OpenAiProvider {
                         max_inter_raw_byte_gap_us: max_inter_raw_byte_gap.as_micros() as u64,
                         completed_at: Some(std::time::Instant::now()),
                     }),
+                    "OpenAI",
                     "timing",
                 )
                 .await;

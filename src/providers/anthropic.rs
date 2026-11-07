@@ -664,13 +664,14 @@ impl Provider for AnthropicProvider {
                         let error_msg = format!("Anthropic SSE stream error: {e}");
                         let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "Anthropic SSE bytes_stream error");
-                        if !send_chunk(
+                        if !crate::providers::send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "{}{}",
                                 error_msg,
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
+                            "Anthropic",
                             "error",
                         )
                         .await
@@ -864,14 +865,6 @@ pub(crate) fn get_anthropic_model_info(model_id: &str) -> ModelInfo {
     }
 }
 
-async fn send_chunk(
-    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
-    chunk: ApiStreamChunk,
-    chunk_type: &str,
-) -> bool {
-    crate::providers::send_chunk(tx, chunk, "Anthropic", chunk_type).await
-}
-
 async fn process_anthropic_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
@@ -896,11 +889,12 @@ async fn process_anthropic_sse_line(
         } else {
             last_tool_call.parse_failed = true;
             tracing::warn!("Anthropic SSE: failed to parse event");
-            let _ = send_chunk(
+            let _ = crate::providers::send_chunk(
                 tx,
                 ApiStreamChunk::Error(
                     "Anthropic SSE parse error: invalid JSON (retryable)".to_string(),
                 ),
+                "Anthropic",
                 "error",
             )
             .await;
@@ -925,9 +919,10 @@ pub async fn parse_anthropic_sse_to_chunks(
         && !last_tool_call.parse_failed
     {
         last_tool_call.parse_failed = true;
-        let _ = send_chunk(
+        let _ = crate::providers::send_chunk(
             tx,
             ApiStreamChunk::Error(format!("{err} (retryable)")),
+            "Anthropic",
             "error",
         )
         .await;
@@ -955,7 +950,7 @@ async fn process_anthropic_event(
 ) {
     match event {
         AnthropicStreamEvent::MessageStart { message } => {
-            send_chunk(
+            crate::providers::send_chunk(
                 tx,
                 ApiStreamChunk::Usage(ApiStreamUsageChunk {
                     input_tokens: message.usage.input_tokens,
@@ -968,6 +963,7 @@ async fn process_anthropic_event(
                     stop_reason: None,
                     id: None,
                 }),
+                "Anthropic",
                 "usage",
             )
             .await;
@@ -976,7 +972,7 @@ async fn process_anthropic_event(
             // Emit final output_tokens from MessageDelta — MessageStart only
             // provides initial counts (often output_tokens=0). Without this,
             // Anthropic token accounting and cost tracking are wrong.
-            send_chunk(
+            crate::providers::send_chunk(
                 tx,
                 ApiStreamChunk::Usage(ApiStreamUsageChunk {
                     input_tokens: 0,
@@ -989,6 +985,7 @@ async fn process_anthropic_event(
                     stop_reason: delta.stop_reason,
                     id: None,
                 }),
+                "Anthropic",
                 "usage_delta",
             )
             .await;
@@ -998,12 +995,13 @@ async fn process_anthropic_event(
         }
         AnthropicStreamEvent::Unknown => tracing::debug!("Ignoring unknown Anthropic stream event"),
         AnthropicStreamEvent::Error { error } => {
-            send_chunk(
+            crate::providers::send_chunk(
                 tx,
                 ApiStreamChunk::Error(format!(
                     "Anthropic API error ({}): {}",
                     error.error_type, error.message
                 )),
+                "Anthropic",
                 "error",
             )
             .await;
@@ -1017,7 +1015,7 @@ async fn process_anthropic_event(
                 signature,
             } => {
                 last_tool_call.last_was_text = false;
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                         reasoning: thinking,
@@ -1026,13 +1024,14 @@ async fn process_anthropic_event(
                         redacted_data: None,
                         id: None,
                     }),
+                    "Anthropic",
                     "reasoning",
                 )
                 .await;
             }
             AnthropicContentBlock::RedactedThinking { data } => {
                 last_tool_call.last_was_text = false;
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                         reasoning: "[Redacted thinking block]".to_string(),
@@ -1041,6 +1040,7 @@ async fn process_anthropic_event(
                         redacted_data: Some(data),
                         id: None,
                     }),
+                    "Anthropic",
                     "reasoning",
                 )
                 .await;
@@ -1051,7 +1051,7 @@ async fn process_anthropic_event(
                 last_tool_call.arguments.clear();
                 last_tool_call.last_was_text = false;
 
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -1066,6 +1066,7 @@ async fn process_anthropic_event(
                         id: None,
                         signature: None,
                     }),
+                    "Anthropic",
                     "tool_calls",
                 )
                 .await;
@@ -1073,25 +1074,27 @@ async fn process_anthropic_event(
             AnthropicContentBlock::Text { text } => {
                 // Emit newline between consecutive text blocks
                 if last_tool_call.last_was_text {
-                    send_chunk(
+                    crate::providers::send_chunk(
                         tx,
                         ApiStreamChunk::Text(ApiStreamTextChunk {
                             text: "\n".to_string(),
                             id: None,
                             signature: None,
                         }),
+                        "Anthropic",
                         "text_newline",
                     )
                     .await;
                 }
                 last_tool_call.last_was_text = true;
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::Text(ApiStreamTextChunk {
                         text,
                         id: None,
                         signature: None,
                     }),
+                    "Anthropic",
                     "text",
                 )
                 .await;
@@ -1102,7 +1105,7 @@ async fn process_anthropic_event(
                 tracing::debug!("Ignoring unknown Anthropic content delta")
             }
             AnthropicContentDelta::ThinkingDelta { thinking } => {
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                         reasoning: thinking,
@@ -1111,12 +1114,13 @@ async fn process_anthropic_event(
                         redacted_data: None,
                         id: None,
                     }),
+                    "Anthropic",
                     "reasoning",
                 )
                 .await;
             }
             AnthropicContentDelta::SignatureDelta { signature } => {
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                         reasoning: String::new(),
@@ -1125,18 +1129,20 @@ async fn process_anthropic_event(
                         redacted_data: None,
                         id: None,
                     }),
+                    "Anthropic",
                     "reasoning",
                 )
                 .await;
             }
             AnthropicContentDelta::TextDelta { text } => {
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::Text(ApiStreamTextChunk {
                         text,
                         id: None,
                         signature: None,
                     }),
+                    "Anthropic",
                     "text",
                 )
                 .await;
@@ -1179,7 +1185,7 @@ async fn process_anthropic_event(
                     "Anthropic",
                     "at content_block_stop",
                 );
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -1194,6 +1200,7 @@ async fn process_anthropic_event(
                         id: None,
                         signature: None,
                     }),
+                    "Anthropic",
                     "tool_calls",
                 )
                 .await;
@@ -1590,13 +1597,14 @@ mod tests {
         }
 
         let send_task = tokio::spawn(async move {
-            send_chunk(
+            crate::providers::send_chunk(
                 &tx,
                 ApiStreamChunk::Text(ApiStreamTextChunk {
                     text: "delivered".to_string(),
                     id: None,
                     signature: None,
                 }),
+                "Anthropic",
                 "text",
             )
             .await

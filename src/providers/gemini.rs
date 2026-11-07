@@ -460,14 +460,6 @@ fn gemini_candidate_block_error(finish_reason: &str) -> Option<String> {
 
 const GEMINI_SSE_PARSE_FAILURE: &str = "__sned_sse_parse_failure__";
 
-async fn send_chunk(
-    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
-    chunk: ApiStreamChunk,
-    chunk_type: &str,
-) -> bool {
-    crate::providers::send_chunk(tx, chunk, "Gemini", chunk_type).await
-}
-
 async fn process_gemini_sse_line(
     line: &str,
     tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
@@ -502,11 +494,12 @@ async fn process_gemini_sse_line(
         Err(e) => {
             *last_stop_reason = Some(GEMINI_SSE_PARSE_FAILURE.to_string());
             tracing::warn!(error = %e, "Gemini SSE: failed to parse chunk");
-            let _ = send_chunk(
+            let _ = crate::providers::send_chunk(
                 tx,
                 ApiStreamChunk::Error(
                     "Gemini SSE parse error: invalid JSON (retryable)".to_string(),
                 ),
+                "Gemini",
                 "error",
             )
             .await;
@@ -525,13 +518,9 @@ async fn process_gemini_sse_line(
     {
         *last_stop_reason = Some(block_reason.clone());
         if !*response_blocked {
-            send_chunk(
-                tx,
-                ApiStreamChunk::Error(format!(
+            crate::providers::send_chunk(tx, ApiStreamChunk::Error(format!(
                     "Gemini blocked the prompt (reason: {block_reason}). Rephrase the prompt and try again."
-                )),
-                "blocked_prompt",
-            )
+                )), "Gemini", "blocked_prompt")
             .await;
             if tx.is_closed() {
                 return;
@@ -564,7 +553,7 @@ async fn process_gemini_sse_line(
                 // Handle thinking content
                 if part.thought == Some(true) {
                     if let Some(text) = &part.text {
-                        send_chunk(
+                        crate::providers::send_chunk(
                             tx,
                             ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                                 reasoning: text.clone(),
@@ -573,6 +562,7 @@ async fn process_gemini_sse_line(
                                 redacted_data: None,
                                 id: Some(response_id.clone()),
                             }),
+                            "Gemini",
                             "reasoning",
                         )
                         .await;
@@ -584,13 +574,14 @@ async fn process_gemini_sse_line(
                 }
                 // Handle text content
                 else if let Some(text) = &part.text {
-                    send_chunk(
+                    crate::providers::send_chunk(
                         tx,
                         ApiStreamChunk::Text(ApiStreamTextChunk {
                             text: text.clone(),
                             id: Some(response_id.clone()),
                             signature: signature.clone(),
                         }),
+                        "Gemini",
                         "text",
                     )
                     .await;
@@ -612,12 +603,13 @@ async fn process_gemini_sse_line(
                             && !candidate_blocked
                             && !*response_blocked
                         {
-                            send_chunk(
+                            crate::providers::send_chunk(
                                 tx,
                                 ApiStreamChunk::ToolCallStarted {
                                     call_id: call_id.clone(),
                                     name: fc.name.clone(),
                                 },
+                                "Gemini",
                                 "tool_call_started",
                             )
                             .await;
@@ -670,13 +662,14 @@ async fn process_gemini_sse_line(
 
                 // Emit signature-only chunk if we have a signature but no text/function_call
                 if part_signature.is_some() && !emitted_chunk && part.text.is_none() {
-                    send_chunk(
+                    crate::providers::send_chunk(
                         tx,
                         ApiStreamChunk::Text(ApiStreamTextChunk {
                             text: String::new(),
                             id: Some(response_id.clone()),
                             signature: part_signature.clone(),
                         }),
+                        "Gemini",
                         "signature_only",
                     )
                     .await;
@@ -698,7 +691,13 @@ async fn process_gemini_sse_line(
         {
             *last_stop_reason = Some(finish.clone());
             if let Some(error) = gemini_candidate_block_error(&finish) {
-                send_chunk(tx, ApiStreamChunk::Error(error), "blocked_response").await;
+                crate::providers::send_chunk(
+                    tx,
+                    ApiStreamChunk::Error(error),
+                    "Gemini",
+                    "blocked_response",
+                )
+                .await;
                 if tx.is_closed() {
                     return;
                 }
@@ -719,7 +718,7 @@ async fn process_gemini_sse_line(
                 let validated_args =
                     crate::providers::validate_tool_call_args(args, "Gemini", "on finish");
                 completed_tool_call_ids.insert(call_id.clone());
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -734,6 +733,7 @@ async fn process_gemini_sse_line(
                         id: Some(response_id.clone()),
                         signature: signature.clone(),
                     }),
+                    "Gemini",
                     "tool_calls",
                 )
                 .await;
@@ -783,7 +783,7 @@ async fn process_gemini_sse_line(
             Some(input_cost + output_cost + cache_cost)
         });
 
-        send_chunk(
+        crate::providers::send_chunk(
             tx,
             ApiStreamChunk::Usage(ApiStreamUsageChunk {
                 input_tokens: input_tokens.saturating_sub(cache_read_tokens.unwrap_or(0)),
@@ -796,6 +796,7 @@ async fn process_gemini_sse_line(
                 stop_reason: last_stop_reason.clone(),
                 id: Some(response_id),
             }),
+            "Gemini",
             "usage",
         )
         .await;
@@ -816,7 +817,7 @@ async fn finish_gemini_sse_to_chunks(
                 let validated_args =
                     crate::providers::validate_tool_call_args(args, "Gemini", "at stream end");
                 completed_tool_call_ids.insert(call_id.clone());
-                send_chunk(
+                crate::providers::send_chunk(
                     tx,
                     ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                         tool_call: ApiStreamToolCall {
@@ -831,6 +832,7 @@ async fn finish_gemini_sse_to_chunks(
                         id: None,
                         signature: signature.clone(),
                     }),
+                    "Gemini",
                     "tool_calls",
                 )
                 .await;
@@ -857,13 +859,14 @@ async fn finish_gemini_sse_to_chunks(
             }
         }
         if sources.len() > 17 {
-            send_chunk(
+            crate::providers::send_chunk(
                 tx,
                 ApiStreamChunk::Text(ApiStreamTextChunk {
                     text: sources,
                     id: None,
                     signature: None,
                 }),
+                "Gemini",
                 "grounding_sources",
             )
             .await;
@@ -954,9 +957,10 @@ impl Provider for GeminiProvider {
                         if let Some(err) = sse_buffer.take_error() {
                             last_stop_reason = Some(GEMINI_SSE_PARSE_FAILURE.to_string());
                             stream_errored = true;
-                            let _ = send_chunk(
+                            let _ = crate::providers::send_chunk(
                                 &tx,
                                 ApiStreamChunk::Error(format!("{err} (retryable)")),
+                                "Gemini",
                                 "error",
                             )
                             .await;
@@ -966,13 +970,14 @@ impl Provider for GeminiProvider {
                         let error_msg = format!("Gemini SSE stream error: {e}");
                         let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "Gemini SSE bytes_stream error");
-                        if !send_chunk(
+                        if !crate::providers::send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "{}{}",
                                 error_msg,
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
+                            "Gemini",
                             "error",
                         )
                         .await

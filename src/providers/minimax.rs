@@ -795,14 +795,6 @@ struct OpenAIStreamFunction {
     arguments: Option<String>,
 }
 
-async fn send_chunk(
-    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
-    chunk: ApiStreamChunk,
-    chunk_type: &str,
-) -> bool {
-    crate::providers::send_chunk(tx, chunk, "MiniMax", chunk_type).await
-}
-
 const MINIMAX_CLIENT_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const MAX_XML_TOOL_CALL_BUFFER: usize = 64 * 1024;
 const XML_TOOL_CALL_CLOSING_TAG: &str = "</minimax:tool_call>";
@@ -838,13 +830,14 @@ async fn flush_minimax_text_buffer(
     }
 
     let text = std::mem::take(pending_text);
-    send_chunk(
+    crate::providers::send_chunk(
         tx,
         ApiStreamChunk::Text(ApiStreamTextChunk {
             text,
             id: Some(event_id.to_string()),
             signature: pending_text_signature.take(),
         }),
+        "MiniMax",
         "text",
     )
     .await;
@@ -872,7 +865,7 @@ async fn extract_and_emit_xml_tool_calls(
                 serde_json::to_value(&block).unwrap_or_default(),
             )
         });
-        send_chunk(
+        crate::providers::send_chunk(
             tx,
             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                 tool_call: ApiStreamToolCall {
@@ -889,6 +882,7 @@ async fn extract_and_emit_xml_tool_calls(
                 id: Some(event_id.to_string()),
                 signature: None,
             }),
+            "MiniMax",
             "tool_calls",
         )
         .await;
@@ -969,7 +963,7 @@ async fn emit_minimax_reasoning(
     if let Some(reasoning) =
         normalize_reasoning_delta(&mut reasoning_state.emitted_reasoning, reasoning)
     {
-        send_chunk(
+        crate::providers::send_chunk(
             tx,
             ApiStreamChunk::Reasoning(ApiStreamReasoningChunk {
                 reasoning,
@@ -978,6 +972,7 @@ async fn emit_minimax_reasoning(
                 redacted_data: None,
                 id: Some(event_id.to_string()),
             }),
+            "MiniMax",
             chunk_type,
         )
         .await;
@@ -1314,7 +1309,7 @@ async fn process_minimax_sse_line(
                             "on finish_reason:tool_calls",
                         );
                         completed_tool_call_indices.insert(*idx);
-                        send_chunk(
+                        crate::providers::send_chunk(
                             tx,
                             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                                 tool_call: ApiStreamToolCall {
@@ -1329,6 +1324,7 @@ async fn process_minimax_sse_line(
                                 id: Some(event.id.clone()),
                                 signature: None,
                             }),
+                            "MiniMax",
                             "tool_calls",
                         )
                         .await;
@@ -1351,7 +1347,7 @@ async fn process_minimax_sse_line(
                 .as_ref()
                 .map_or(0, |d| d.cached_tokens);
             let input_tokens = usage.prompt_tokens.saturating_sub(cached_tokens);
-            send_chunk(
+            crate::providers::send_chunk(
                 tx,
                 ApiStreamChunk::Usage(ApiStreamUsageChunk {
                     input_tokens,
@@ -1364,6 +1360,7 @@ async fn process_minimax_sse_line(
                     stop_reason,
                     id: Some(event.id.clone()),
                 }),
+                "MiniMax",
                 "usage",
             )
             .await;
@@ -1371,9 +1368,10 @@ async fn process_minimax_sse_line(
     } else {
         *last_stop_reason = Some(MINIMAX_SSE_PARSE_FAILURE.to_string());
         tracing::warn!("MiniMax SSE parse failure");
-        let _ = send_chunk(
+        let _ = crate::providers::send_chunk(
             tx,
             ApiStreamChunk::Error("MiniMax SSE parse error: invalid JSON (retryable)".to_string()),
+            "MiniMax",
             "error",
         )
         .await;
@@ -1470,9 +1468,10 @@ impl Provider for MinimaxProvider {
                         if let Some(err) = sse_buffer.take_error() {
                             last_stop_reason = Some(MINIMAX_SSE_PARSE_FAILURE.to_string());
                             stream_errored = true;
-                            let _ = send_chunk(
+                            let _ = crate::providers::send_chunk(
                                 &tx,
                                 ApiStreamChunk::Error(format!("{err} (retryable)")),
+                                "MiniMax",
                                 "error",
                             )
                             .await;
@@ -1482,13 +1481,14 @@ impl Provider for MinimaxProvider {
                         let error_msg = format!("MiniMax SSE stream error: {e}");
                         let is_retryable = is_retryable_stream_transport_error(&e.to_string());
                         tracing::debug!(error = %e, retryable = is_retryable, "MiniMax SSE bytes_stream error");
-                        if !send_chunk(
+                        if !crate::providers::send_chunk(
                             &tx,
                             ApiStreamChunk::Error(format!(
                                 "{}{}",
                                 error_msg,
                                 if is_retryable { " (retryable)" } else { "" }
                             )),
+                            "MiniMax",
                             "error",
                         )
                         .await
@@ -1556,7 +1556,7 @@ impl Provider for MinimaxProvider {
                             "MiniMax",
                             "at stream end",
                         );
-                        send_chunk(
+                        crate::providers::send_chunk(
                             &tx,
                             ApiStreamChunk::ToolCalls(ApiStreamToolCallsChunk {
                                 tool_call: ApiStreamToolCall {
@@ -1571,6 +1571,7 @@ impl Provider for MinimaxProvider {
                                 id: None,
                                 signature: None,
                             }),
+                            "MiniMax",
                             "tool_calls",
                         )
                         .await;
