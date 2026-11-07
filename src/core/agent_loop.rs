@@ -4993,7 +4993,8 @@ impl AgentLoop {
     }
 
     /// Prune oldest conversation history when it exceeds max_context_turns.
-    /// Keeps system prompt (first message if present) + most recent N turns.
+    /// Keeps the root message (first message if present) + the most recent half
+    /// of the turn budget, so the retained prefix stays stable across many turns.
     /// A "turn" is counted as a user-assistant pair (2 messages).
     /// CRITICAL: Preserves tool_use/tool_result pairs — never splits a tool result
     /// from its corresponding tool use. If a tool_result would be kept but its
@@ -5010,8 +5011,12 @@ impl AgentLoop {
             return history;
         }
 
-        // Start with the most recent N messages
-        let keep_from_base = history.len().saturating_sub(max_messages);
+        // Batch trim to half capacity instead of shaving a few messages per turn.
+        // Prefix caches key on exact leading bytes, so per-turn micro-trims churn
+        // the cache key every turn and keep it permanently cold; one deep cut buys
+        // many warm append-only turns before the threshold is reached again.
+        let keep_target = max_messages / 2;
+        let keep_from_base = history.len().saturating_sub(keep_target);
         let keep_from = Self::keep_from_preserving_tool_pairs(&history, keep_from_base);
 
         // Provider system prompts are sent separately. Preserve the original
@@ -15188,6 +15193,109 @@ Irrespective of whether additional information or instructions are given, you ar
             result.first().map(|message| message.role),
             Some(MessageRole::User)
         );
+    }
+
+    #[tokio::test]
+    async fn test_prune_conversation_history_trims_in_batches() {
+        use crate::providers::{
+            AssistantContentBlock, SharedContentFields, ToolResultBlock, ToolResultContent,
+            ToolUseBlock, UserContentBlock,
+        };
+        let agent = AgentLoop::new(AgentConfig {
+            max_context_turns: 10,
+            ..Default::default()
+        });
+        // 32 messages against a 30-message threshold: a batch trim drops to ~10
+        // kept messages, not to 30. Index 21 holds a tool_use whose result lands
+        // at index 25, straddling the naive cut, so pair preservation must pull
+        // the keep region back to 21.
+        let mut history = vec![StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("original task".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }];
+        for i in 1..32 {
+            let content = if i == 21 {
+                MessageContent::AssistantBlocks(vec![AssistantContentBlock::ToolUse(
+                    ToolUseBlock {
+                        id: "batch-tool-1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "a.rs"}),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                        reasoning_details: None,
+                    },
+                )])
+            } else if i == 25 {
+                MessageContent::UserBlocks(vec![UserContentBlock::ToolResult(
+                    ToolResultBlock {
+                        tool_use_id: "batch-tool-1".to_string(),
+                        content: ToolResultContent::Text("ok".to_string()),
+                        shared: SharedContentFields {
+                            call_id: None,
+                            signature: None,
+                        },
+                    },
+                )])
+            } else {
+                MessageContent::Text(format!("Message {i}"))
+            };
+            history.push(StorageMessage {
+                id: None,
+                role: if i % 2 == 1 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content,
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+        }
+
+        let result = agent.prune_conversation_history(history);
+        // Batch trim drops 32 messages to root + 21..=31 (pair preservation pulls
+        // the naive cut at 22 back to the tool_use at 21), not to 30.
+        assert_eq!(
+            result.len(),
+            12,
+            "batch trim keeps root plus a contiguous tail, got {}",
+            result.len()
+        );
+        assert!(matches!(
+            result.first().map(|message| &message.content),
+            Some(MessageContent::Text(text)) if text == "original task"
+        ));
+        for (offset, message) in result.iter().skip(1).enumerate() {
+            let index = 21 + offset;
+            match &message.content {
+                MessageContent::Text(text) => assert_eq!(
+                    text,
+                    &format!("Message {index}"),
+                    "retained tail stays contiguous"
+                ),
+                MessageContent::AssistantBlocks(blocks) => {
+                    assert_eq!(index, 21, "only the tool_use breaks the numbering");
+                    assert!(
+                        blocks.iter().any(|block| matches!(block, AssistantContentBlock::ToolUse(use_block) if use_block.id == "batch-tool-1")),
+                        "tool_use survives the cut"
+                    );
+                }
+                MessageContent::UserBlocks(blocks) => {
+                    assert_eq!(index, 25, "only the tool_result breaks the numbering");
+                    assert!(
+                        blocks.iter().any(|block| matches!(block, UserContentBlock::ToolResult(result_block) if result_block.tool_use_id == "batch-tool-1")),
+                        "tool_result survives the cut"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
