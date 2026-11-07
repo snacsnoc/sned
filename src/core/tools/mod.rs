@@ -413,7 +413,25 @@ pub fn resolve_sanitized_path(
             )));
         }
     } else {
-        workspace_root.join(path)
+        let direct = workspace_root.join(path);
+        if direct.exists() {
+            direct
+        } else {
+            // The model sometimes repeats the workspace directory itself
+            // (e.g. `SDRSkeleton/X.swift` from inside `.../SDRSkeleton`).
+            // Fall back to the stripped join only on a miss, so paths that
+            // resolve today keep resolving identically.
+            match workspace_root
+                .file_name()
+                .and_then(|root_name| path.strip_prefix(root_name).ok())
+            {
+                Some(rest) if !rest.as_os_str().is_empty() => {
+                    let stripped = workspace_root.join(rest);
+                    if stripped.exists() { stripped } else { direct }
+                }
+                _ => direct,
+            }
+        }
     };
 
     // Normalize by stripping `..` and `.` components manually so we can
@@ -970,6 +988,43 @@ mod tests {
         let workspace = std::path::Path::new("/tmp/workspace");
         let result = resolve_sanitized_path(workspace, "foo/bar/../../../etc/passwd");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_sanitized_path_strips_duplicated_root_dir_name() {
+        let base = tempfile::tempdir().unwrap();
+        let root_name = base
+            .path()
+            .file_name()
+            .expect("tempdir has a name")
+            .to_string_lossy()
+            .into_owned();
+        let file = base.path().join("target.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        // Direct hit keeps resolving exactly as before.
+        let direct = resolve_sanitized_path(base.path(), "target.rs").unwrap();
+        assert_eq!(direct, canonical);
+        // Doubled root name falls back to the stripped join.
+        let doubled = format!("{root_name}/target.rs");
+        let resolved = resolve_sanitized_path(base.path(), &doubled).unwrap();
+        assert_eq!(resolved, canonical);
+    }
+
+    #[test]
+    fn test_resolve_sanitized_path_duplicated_name_without_match_keeps_direct() {
+        let base = tempfile::tempdir().unwrap();
+        let root_name = base
+            .path()
+            .file_name()
+            .expect("tempdir has a name")
+            .to_string_lossy()
+            .into_owned();
+        // No stripped hit: behaves exactly as before (direct join, which may
+        // legitimately not exist yet for write targets).
+        let doubled = format!("{root_name}/missing.rs");
+        let resolved = resolve_sanitized_path(base.path(), &doubled).unwrap();
+        assert_eq!(resolved, base.path().join(&doubled));
     }
 
     #[test]
