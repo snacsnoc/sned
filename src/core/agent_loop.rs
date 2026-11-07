@@ -2487,7 +2487,9 @@ impl AgentLoop {
         // 2. Apply context pruning if enabled
         let (truncated_history, context_reduced) = truncated_history;
         let truncated_len = truncated_history.len();
-        let pruned_history = self.prune_conversation_history(truncated_history);
+        let pruned_history = self
+            .prune_and_store_conversation_history(truncated_history)
+            .await;
         if self.current_turn_retry_candidate.is_none() {
             self.current_turn_retry_candidate = Self::current_turn_retry_candidate(&pruned_history);
         }
@@ -5069,6 +5071,38 @@ impl AgentLoop {
         } else {
             history[keep_from..].to_vec()
         }
+    }
+
+    /// Prune for this request and, when a trim fired, write it back to stored
+    /// history. Without the write-back the stored history grows unbounded
+    /// while every request re-prunes the same sliding window, and the
+    /// shifting front keeps the provider prefix cache permanently cold.
+    async fn prune_and_store_conversation_history(
+        &self,
+        history: Vec<StorageMessage>,
+    ) -> Vec<StorageMessage> {
+        let before = history.len();
+        let pruned = self.prune_conversation_history(history);
+        if pruned.len() >= before {
+            return pruned;
+        }
+        let mut stored = self.conversation_history.lock().await;
+        *stored = pruned;
+        let request = stored.clone();
+        drop(stored);
+        {
+            let mut state = self.state.lock().await;
+            Self::clear_history_dependent_read_state(&mut state);
+            // Stored indices shifted: a stale deleted range would misalign
+            // the context manager, so reset it as emergency truncation does.
+            state.conversation_history_deleted_range = None;
+        }
+        tracing::debug!(
+            before,
+            after = request.len(),
+            "history batch trim written back to stored history"
+        );
+        request
     }
 
     /// Apply emergency truncation repeatedly until the current request fits the provider
@@ -15324,6 +15358,77 @@ Irrespective of whether additional information or instructions are given, you ar
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_prune_writes_trim_back_to_stored_history() {
+        let agent = AgentLoop::new(AgentConfig {
+            max_context_turns: 10,
+            ..Default::default()
+        });
+        let push_text = |history: &mut Vec<StorageMessage>, i: usize| {
+            history.push(StorageMessage {
+                id: None,
+                role: if i % 2 == 1 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content: MessageContent::Text(format!("Message {i}")),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+        };
+        // Below the 30-message threshold the stored history passes through
+        // untouched.
+        {
+            let mut stored = agent.conversation_history.lock().await;
+            stored.push(StorageMessage {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("original task".to_string()),
+                model_info: None,
+                metrics: None,
+                ts: None,
+            });
+            for i in 1..10 {
+                push_text(&mut stored, i);
+            }
+        }
+        let snapshot: Vec<StorageMessage> = agent.conversation_history.lock().await.clone();
+        let request = agent.prune_and_store_conversation_history(snapshot).await;
+        assert_eq!(request.len(), 10);
+        assert_eq!(agent.conversation_history.lock().await.len(), 10);
+
+        // Past the threshold the stored history is replaced by the trimmed
+        // base, so later requests grow append-only and re-cache instead of
+        // sliding a fresh window every turn.
+        {
+            let mut stored = agent.conversation_history.lock().await;
+            for i in 10..32 {
+                push_text(&mut stored, i);
+            }
+            agent.state.lock().await.conversation_history_deleted_range = Some((0, 5));
+        }
+        let snapshot: Vec<StorageMessage> = agent.conversation_history.lock().await.clone();
+        let request = agent.prune_and_store_conversation_history(snapshot).await;
+        // 32 messages keep root plus the last 10.
+        assert_eq!(request.len(), 11);
+        let stored = agent.conversation_history.lock().await;
+        assert_eq!(stored.len(), 11);
+        assert!(matches!(
+            stored.first().map(|message| &message.content),
+            Some(MessageContent::Text(text)) if text == "original task"
+        ));
+        assert!(
+            agent
+                .state
+                .lock()
+                .await
+                .conversation_history_deleted_range
+                .is_none()
+        );
     }
 
     #[tokio::test]
