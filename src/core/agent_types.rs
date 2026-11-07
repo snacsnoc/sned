@@ -6,7 +6,7 @@ use crate::core::context::context_manager::ApiReqInfo;
 use crate::providers::Providers;
 use crate::providers::StorageMessage;
 use lru::LruCache;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -116,6 +116,25 @@ pub struct TaskState {
     pub text_only_turns: u32,
     pub last_tool_batch_signature: Option<String>,
     pub identical_tool_batch_streak: u32,
+    /// Recent batch signatures plus whether the batch could change the
+    /// workspace. Backs the cycle detector the identical-batch tripwire
+    /// cannot see (alternating A,B,A,B reads look fresh every turn).
+    pub recent_batch_signatures: VecDeque<(String, bool)>,
+    /// Consecutive batches ending a mutation-free signature cycle.
+    pub tool_cycle_streak: u32,
+    /// Set by the run loop on the final turn of a capped run so
+    /// execute_turn (which has no turn counter) can forbid tools and
+    /// demand a text answer instead of hitting MaxTurnsExceeded.
+    pub at_cap_turn: bool,
+    /// Current loop turn, mirrored for sites that lack the counter.
+    pub current_turn: u32,
+    /// Every workspace path this task really wrote. Scaffolding joins
+    /// without restarting the clock; only re-edits do.
+    pub session_edited_paths: HashSet<String>,
+    /// Turn of the last re-edit to a session-written file.
+    pub last_edit_turn: u32,
+    /// The stability nudge fires once per quiet span; a re-edit re-arms it.
+    pub stability_nudge_fired: bool,
     /// Whether strict plan mode is enabled (default: true).
     pub strict_plan_mode_enabled: bool,
     /// File context tracker for stale context warnings.
@@ -250,6 +269,13 @@ impl Default for TaskState {
             text_only_turns: 0,
             last_tool_batch_signature: None,
             identical_tool_batch_streak: 0,
+            recent_batch_signatures: VecDeque::new(),
+            tool_cycle_streak: 0,
+            at_cap_turn: false,
+            current_turn: 0,
+            session_edited_paths: HashSet::new(),
+            last_edit_turn: 0,
+            stability_nudge_fired: false,
             strict_plan_mode_enabled: true,
             file_context_tracker: crate::core::context::trackers::FileContextTracker::new(),
             last_api_req_info: None,
