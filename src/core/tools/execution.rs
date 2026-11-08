@@ -259,10 +259,11 @@ pub(crate) fn prepare_tool_calls(
         }
 
         let mut tool_call_clone = tool_call.clone();
-        let tool_id = tool_call_clone.function.id.take().unwrap_or_else(|| {
-            error!("Tool call ID is None after initialization, generating fallback");
-            ulid::Ulid::new().to_string()
-        });
+        let tool_id = tool_call_clone
+            .function
+            .id
+            .take()
+            .expect("tool call id initialized above");
         let tool_name = tool_call_clone.function.name.take().unwrap_or_else(|| {
             warn!("Tool call missing name, using 'unknown_tool'");
             "unknown_tool".to_string()
