@@ -2762,9 +2762,10 @@ mod tests {
         let captured = capture_async(reader, 1024).await.unwrap();
         writer_task.await.unwrap();
 
-        assert_eq!(captured.retained_len(), 1024);
-        assert_eq!(captured.total_bytes(), 16 * 1024);
         assert!(captured.is_truncated(1024));
+        assert!(captured
+            .display(1024, "stdout")
+            .contains("retaining 1024 of 16384 bytes"));
     }
 
     #[tokio::test]

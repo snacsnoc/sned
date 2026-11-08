@@ -384,19 +384,6 @@ impl From<OutputEvent> for SequencedOutputEvent {
     }
 }
 
-impl std::ops::Deref for SequencedOutputEvent {
-    type Target = OutputEvent;
-    fn deref(&self) -> &Self::Target {
-        &self.event
-    }
-}
-
-impl std::ops::DerefMut for SequencedOutputEvent {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.event
-    }
-}
-
 /// An output event that can be rendered by the TUI or forwarded to stderr.
 #[derive(Clone, Debug)]
 pub enum OutputEvent {

@@ -40,16 +40,6 @@ impl CapturedOutput {
     }
 
     #[must_use]
-    pub fn retained_len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    #[must_use]
-    pub fn total_bytes(&self) -> u64 {
-        self.total_bytes
-    }
-
-    #[must_use]
     pub fn display(&self, limit: usize, stream: &str) -> String {
         let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
         if let Some(marker) = self.truncation_marker(limit, stream) {
