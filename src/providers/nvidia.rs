@@ -29,7 +29,7 @@ impl std::fmt::Debug for NvidiaConfig {
         f.debug_struct("NvidiaConfig")
             .field(
                 "api_key",
-                &format!("***REDACTED ({} chars)***", self.api_key.len()),
+                &crate::providers::redacted_key(&self.api_key),
             )
             .field("model_id", &self.model_id)
             .field("model_info", &self.model_info)

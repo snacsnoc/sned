@@ -51,7 +51,7 @@ impl std::fmt::Debug for MinimaxConfig {
         f.debug_struct("MinimaxConfig")
             .field(
                 "api_key",
-                &format!("***REDACTED ({} chars)***", self.api_key.len()),
+                &crate::providers::redacted_key(&self.api_key),
             )
             .field("api_line", &self.api_line)
             .field("model_id", &self.model_id)

@@ -368,6 +368,10 @@ pub(crate) fn is_retryable_stream_transport_error(error: &str) -> bool {
         || error == "eof"
 }
 
+pub(crate) fn redacted_key(key: &str) -> String {
+    format!("***REDACTED ({} chars)***", key.len())
+}
+
 pub(crate) fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
     let max_overlap = left.len().min(right.len());
     for overlap in (1..=max_overlap).rev() {

@@ -39,7 +39,7 @@ impl std::fmt::Debug for GeminiConfig {
         f.debug_struct("GeminiConfig")
             .field(
                 "api_key",
-                &format!("***REDACTED ({} chars)***", self.api_key.len()),
+                &crate::providers::redacted_key(&self.api_key),
             )
             .field("base_url", &self.base_url)
             .field("model_id", &self.model_id)
