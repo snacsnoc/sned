@@ -14,6 +14,11 @@ pub fn configured_output_limit(env_var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+#[must_use]
+pub fn truncation_message(stream: &str, retained: usize, total: u64) -> String {
+    format!("({stream} output truncated after retaining {retained} of {total} bytes.)")
+}
+
 #[derive(Debug, Default)]
 pub struct CapturedOutput {
     bytes: Vec<u8>,
@@ -56,13 +61,8 @@ impl CapturedOutput {
 
     #[must_use]
     pub fn truncation_marker(&self, limit: usize, stream: &str) -> Option<String> {
-        self.is_truncated(limit).then(|| {
-            format!(
-                "({stream} output truncated after retaining {} of {} bytes.)",
-                self.bytes.len(),
-                self.total_bytes
-            )
-        })
+        self.is_truncated(limit)
+            .then(|| truncation_message(stream, self.bytes.len(), self.total_bytes))
     }
 
     #[must_use]

@@ -4,7 +4,9 @@
 use crate::cli::output::OutputEvent;
 use crate::core::agent_loop::TaskState;
 use crate::core::approval::CommandSafetyChecker;
-use crate::core::process_output::{capture_async_with_raw_output, configured_output_limit};
+use crate::core::process_output::{
+    capture_async_with_raw_output, configured_output_limit, truncation_message,
+};
 use crate::core::tools::{
     ToolContext, ToolError, ToolHandler, coerce_command_array,
     parse_relaxed_stringified_string_array,
@@ -457,8 +459,8 @@ fn finalize_collected_output(
 ) -> String {
     if truncated {
         output.push_str(&format!(
-            "\n({stream} output truncated after retaining {} of {total_bytes} bytes.)\n",
-            output.len()
+            "\n{}\n",
+            truncation_message(stream, output.len(), total_bytes)
         ));
     }
     output
