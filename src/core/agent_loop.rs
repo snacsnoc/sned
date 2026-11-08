@@ -4901,7 +4901,7 @@ impl AgentLoop {
             id: Some(Self::next_message_id(&self.message_counter)),
             role: MessageRole::User,
             content: MessageContent::Text(format!(
-                "[Stability check]: you haven't reworked any file you wrote for {quiet_for} turns while you keep working ({edited_count} session files, last rework turn {last_edit}). If the deliverable is done, finish now with a summary; state what remains otherwise."
+                "[Stability check]: no rework or shell activity for {quiet_for} turns while you keep working ({edited_count} session files, last activity turn {last_edit}). If the deliverable is done, finish now with a summary; state what remains otherwise."
             )),
             model_info: None,
             metrics: None,
@@ -18236,7 +18236,50 @@ Irrespective of whether additional information or instructions are given, you ar
             .collect();
         assert_eq!(nudges.len(), 1);
         assert!(nudges[0].contains("8 turns"));
-        assert!(nudges[0].contains("last rework turn 2"));
+        assert!(nudges[0].contains("last activity turn 2"));
+    }
+
+    #[tokio::test]
+    async fn test_stability_nudge_reports_shell_activity_honestly() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let mut config = test_agent_config(provider, "test-stability-shell-wording");
+        config.max_turns = 30;
+        let agent = AgentLoop::new(config);
+        {
+            let mut state = agent.state.lock().await;
+            state.session_edited_paths.insert("game.js".to_string());
+            state.note_shell_action(5);
+        }
+
+        for turn in 1..=20 {
+            agent.maybe_inject_stability_nudge(turn).await;
+        }
+
+        let history = agent.conversation_history.lock().await;
+        let nudges: Vec<_> = history
+            .iter()
+            .filter_map(|message| match &message.content {
+                crate::providers::MessageContent::Text(text)
+                    if text.contains("[Stability check]") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nudges.len(), 1);
+        assert!(
+            nudges[0].contains("last activity turn 5"),
+            "a shell-bumped clock must not claim a rework happened, got: {}",
+            nudges[0]
+        );
+        assert!(
+            !nudges[0].contains("rework turn"),
+            "rework framing is false after shell-only activity, got: {}",
+            nudges[0]
+        );
     }
 
     #[tokio::test]
