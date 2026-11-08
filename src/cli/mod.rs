@@ -403,6 +403,11 @@ pub struct TaskOptions {
     #[arg(long, value_name = "turns", hide_short_help = true)]
     pub max_turns: Option<u32>,
 
+    /// Disable mid-run pressure nudges (aging, stability, wrap-up reminders).
+    /// Control arm for measuring nudge effects; SNED_NO_PRESSURE_NUDGES also disables.
+    #[arg(long, hide_short_help = true)]
+    pub no_pressure_nudges: bool,
+
     /// Maximum provider output tokens for this session
     #[arg(long, value_name = "tokens", hide_short_help = true)]
     pub max_tokens: Option<u32>,
@@ -1926,6 +1931,8 @@ async fn build_task_components(
                 crate::storage::state_manager::GlobalStateKey::StrictPlanModeEnabled,
             )
             .unwrap_or(true),
+        pressure_nudges: !task_opts.no_pressure_nudges
+            && std::env::var_os("SNED_NO_PRESSURE_NUDGES").is_none(),
     };
 
     let shell_path = std::env::var("SHELL").ok();
@@ -3170,6 +3177,7 @@ mod tests {
                 no_checkpoints: false,
                 max_context_turns: None,
                 max_turns: None,
+                no_pressure_nudges: false,
                 max_tokens: None,
                 context_window: None,
                 high_contrast: false,
@@ -3251,6 +3259,7 @@ mod tests {
                 no_checkpoints: false,
                 max_context_turns: None,
                 max_turns: None,
+                no_pressure_nudges: false,
                 max_tokens: None,
                 context_window: None,
                 high_contrast: false,
@@ -3386,6 +3395,7 @@ mod tests {
                 no_checkpoints: false,
                 max_context_turns: None,
                 max_turns: None,
+                no_pressure_nudges: false,
                 max_tokens: None,
                 context_window: None,
                 high_contrast: false,

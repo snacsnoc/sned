@@ -18,6 +18,7 @@ use crate::core::agent_stream::{
 };
 use crate::core::agent_types::code_block_display_limit;
 pub use crate::core::agent_types::{AgentConfig, AgentError, AgentMode, TaskState, TurnResult};
+use crate::core::agent_types::NudgeKind;
 use crate::core::context::{PromptBuilder, SystemPromptContext, context_manager, context_window};
 use crate::core::file_editor::AnchorStateManager;
 use crate::core::provider_retry::{
@@ -1661,6 +1662,12 @@ impl AgentLoop {
                 // Narration patience belongs to one task: a new task starts
                 // unconvinced, or its first narration would complete it.
                 state.text_only_turns = 0;
+                // Quit spans belong to one task too: a new task starts
+                // with no nudge behind it.
+                state.last_nudge_turn = None;
+                state.last_nudge_kind = None;
+                state.tool_calls_since_nudge = 0;
+                state.edits_since_nudge = 0;
             }
             // Initialize session start time for session summary
             state.session_start_time = Some(std::time::Instant::now());
@@ -1903,6 +1910,7 @@ impl AgentLoop {
             self.maybe_inject_aging_nudge(turn_count).await;
             self.maybe_inject_stability_nudge(turn_count).await;
             self.emit_override_telemetry(turn_count).await;
+            self.emit_quit_telemetry(turn_count).await;
             self.maybe_inject_wrap_up_reminder(turn_count).await;
             // Reassigned every turn so a resumed loop never acts on a stale cap flag.
             {
@@ -3974,6 +3982,12 @@ impl AgentLoop {
             // Phase 3: Collect results in order, then push as ONE StorageMessage
             let mut tool_result_blocks: Vec<UserContentBlock> = Vec::new();
             for outcome in batch_output.outcomes {
+                // Every executed tool result counts as post-nudge activity
+                // for quit telemetry, denied and malformed calls excepted.
+                if outcome.executed {
+                    let mut state = self.state.lock().await;
+                    state.tool_calls_since_nudge = state.tool_calls_since_nudge.saturating_add(1);
+                }
                 let tool_id = outcome.tool_id;
                 let tool_name = outcome.tool_name;
                 let tool_params = outcome.tool_params;
@@ -4720,6 +4734,23 @@ impl AgentLoop {
             if self.config.json_output {
                 self.emit_turn_result_event(true).await;
             }
+            // One line per terminal completion while a nudge span is open,
+            // so the scorer can tell nag-quits from worked finishes.
+            {
+                let state = self.state.lock().await;
+                if let Some(proximity) =
+                    state.completion_proximity(state.current_turn, forced_at_cap)
+                {
+                    tracing::debug!(
+                        kind = proximity.kind.as_str(),
+                        completed_within_n_turns_of_nudge = proximity.within_n_turns,
+                        tool_calls = proximity.tool_calls,
+                        edits = proximity.edits,
+                        forced = proximity.forced,
+                        "completion proximity"
+                    );
+                }
+            }
             // attempt_completion or plan_mode_respond on the final turn
             // still counts as genuine; only a bare summary is forced.
             if forced_at_cap {
@@ -4830,6 +4861,13 @@ impl AgentLoop {
         {
             return;
         }
+        if !self.config.pressure_nudges {
+            return;
+        }
+        self.state
+            .lock()
+            .await
+            .record_nudge_fire(NudgeKind::WrapUp, turn_count);
         self.conversation_history.lock().await.push(StorageMessage {
             id: Some(Self::next_message_id(&self.message_counter)),
             role: MessageRole::User,
@@ -4863,7 +4901,14 @@ impl AgentLoop {
         } else {
             return;
         };
-        self.state.lock().await.snapshot_override_watch();
+        if !self.config.pressure_nudges {
+            return;
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.snapshot_override_watch();
+            state.record_nudge_fire(NudgeKind::Aging, turn_count);
+        }
         self.conversation_history.lock().await.push(StorageMessage {
             id: Some(Self::next_message_id(&self.message_counter)),
             role: MessageRole::User,
@@ -4879,6 +4924,9 @@ impl AgentLoop {
     /// needs battery proof. Pure-create builds nudge early; tolerated.
     async fn maybe_inject_stability_nudge(&self, turn_count: u32) {
         const QUIET_TURNS: u32 = 8;
+        if !self.config.pressure_nudges {
+            return;
+        }
         let fire = {
             let state = self.state.lock().await;
             !state.stability_nudge_fired
@@ -4894,6 +4942,7 @@ impl AgentLoop {
             let mut state = self.state.lock().await;
             state.stability_nudge_fired = true;
             state.snapshot_override_watch();
+            state.record_nudge_fire(NudgeKind::Stability, turn_count);
             (
                 turn_count - state.last_edit_turn,
                 state.session_edited_paths.len(),
@@ -4910,6 +4959,23 @@ impl AgentLoop {
             metrics: None,
             ts: Some(chrono::Utc::now().timestamp_millis() as u64),
         });
+    }
+
+    /// Log-only quit telemetry. While a nudge span is open, each turn
+    /// reports how much work happened since the fire. Nothing reads this
+    /// but the battery scorer; it never halts.
+    async fn emit_quit_telemetry(&self, turn_count: u32) {
+        let state = self.state.lock().await;
+        let Some(status) = state.quit_span_status(turn_count) else {
+            return;
+        };
+        tracing::debug!(
+            kind = status.kind.as_str(),
+            turns_since_nudge = status.turns_since,
+            tool_calls = status.tool_calls,
+            edits = status.edits,
+            "early quit watch"
+        );
     }
 
     /// Log-only override telemetry. While a nudge-override span is open,
@@ -7065,6 +7131,7 @@ mod tests {
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         }
     }
 
@@ -8324,6 +8391,34 @@ mod tests {
             41,
             "a read-only shell probe must not touch the quiet clock"
         );
+    }
+
+    #[tokio::test]
+    async fn test_executed_tool_result_bumps_quit_calls_not_edits() {
+        use crate::core::tools::handlers::read_file::ReadFileHandler;
+        use serde_json::json;
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = dir.path().join("probe.txt");
+        std::fs::write(&path, "alpha\n").unwrap();
+        let responses = vec![tool_call_chunks(&[(
+            "c1",
+            "read_file",
+            json!({"paths": [path.to_string_lossy()]}),
+        )])];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(SnedTool::ReadFile, Arc::new(ReadFileHandler::new()));
+        let config = test_agent_config(provider, "quit-calls-bump");
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        let state = agent.state.lock().await;
+        assert_eq!(state.tool_calls_since_nudge, 1);
+        assert_eq!(state.edits_since_nudge, 0);
     }
 
     #[tokio::test]
@@ -12353,6 +12448,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::ChannelOutputWriter::new(tx)),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let mut agent = AgentLoop::new(config);
@@ -12409,6 +12505,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::ChannelOutputWriter::new(tx)),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let mut agent = AgentLoop::new(config);
@@ -12477,6 +12574,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let mut agent = AgentLoop::new(config);
@@ -12646,6 +12744,54 @@ Irrespective of whether additional information or instructions are given, you ar
             matches!(agent.execute_turn().await, TurnResult::Complete),
             "two consecutive narrations end the task under the uniform rule"
         );
+    }
+
+    #[tokio::test]
+    async fn test_nudges_off_yields_zero_injections() {
+        async fn quiet_agent(task_id: &str) -> AgentLoop {
+            let provider = Arc::new(Providers::Mock(
+                crate::providers::mock::MockProvider::single_text_response("unused"),
+            ));
+            let mut config = test_agent_config(provider, task_id);
+            config.max_turns = 30;
+            config.pressure_nudges = false;
+            AgentLoop::new(config)
+        }
+
+        async fn history_has(agent: &AgentLoop, marker: &str) -> bool {
+            agent
+                .conversation_history
+                .lock()
+                .await
+                .iter()
+                .any(|message| {
+                    matches!(
+                        &message.content,
+                        crate::providers::MessageContent::Text(text)
+                            if text.contains(marker)
+                    )
+                })
+        }
+
+        let agent = quiet_agent("nudges-off-aging").await;
+        agent.maybe_inject_aging_nudge(12).await;
+        assert_eq!(agent.state.lock().await.last_nudge_turn, None);
+        assert!(!history_has(&agent, "[Progress check]").await);
+
+        let agent = quiet_agent("nudges-off-stability").await;
+        {
+            let mut state = agent.state.lock().await;
+            state.session_edited_paths.insert("game.js".to_string());
+            state.last_edit_turn = 2;
+        }
+        agent.maybe_inject_stability_nudge(10).await;
+        assert_eq!(agent.state.lock().await.last_nudge_turn, None);
+        assert!(!history_has(&agent, "[Stability check]").await);
+
+        let agent = quiet_agent("nudges-off-wrap-up").await;
+        agent.maybe_inject_wrap_up_reminder(27).await;
+        assert_eq!(agent.state.lock().await.last_nudge_turn, None);
+        assert!(!history_has(&agent, "[Approaching]").await);
     }
 
     #[tokio::test]
@@ -13339,6 +13485,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let agent = AgentLoop::new(config).with_task_storage(task_storage);
@@ -13517,6 +13664,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let agent = AgentLoop::new(config).with_task_storage(task_storage);
@@ -13569,6 +13717,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         })
         .with_task_storage(task_storage_empty);
 
@@ -13710,6 +13859,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
         let mut agent = AgentLoop::new(config).with_task_storage(task_storage);
         agent.state_manager = Some(state_manager);
@@ -13759,6 +13909,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let hook_manager = Arc::new(HookManager::new("test-user"));
@@ -13801,6 +13952,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let hook_manager = Arc::new(HookManager::new("test-user"));
@@ -13950,6 +14102,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -13992,6 +14145,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -14035,6 +14189,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -14084,6 +14239,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -14164,6 +14320,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -14256,6 +14413,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -14346,6 +14504,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -14406,6 +14565,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -14464,6 +14624,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -14504,6 +14665,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -15219,6 +15381,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let checkpoint_mgr = crate::core::checkpoints::TaskCheckpointManager::new(
@@ -15268,6 +15431,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let agent = AgentLoop::new(config).with_system_prompt_context(
@@ -15339,6 +15503,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let agent = AgentLoop::new(config);
@@ -17746,6 +17911,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -17821,6 +17987,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -17913,6 +18080,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -17985,6 +18153,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 interactive_mode: true,
                 output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
                 strict_plan_mode_enabled: true,
+                pressure_nudges: true,
             };
 
             let mut agent = AgentLoop::new(config);
@@ -18053,6 +18222,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         };
 
         let registry = ToolRegistry::new();
@@ -18663,6 +18833,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: false,
+            pressure_nudges: true,
         };
 
         let registry = ToolRegistry::new();
@@ -18755,6 +18926,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: false,
+            pressure_nudges: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -18868,6 +19040,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: false,
+            pressure_nudges: true,
         };
 
         let mut registry = ToolRegistry::new();
@@ -19064,6 +19237,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: false,
+            pressure_nudges: true,
         };
 
         let registry = ToolRegistry::new();
@@ -19145,6 +19319,7 @@ Irrespective of whether additional information or instructions are given, you ar
             interactive_mode: true,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: false,
+            pressure_nudges: true,
         };
 
         let mut registry = ToolRegistry::new();

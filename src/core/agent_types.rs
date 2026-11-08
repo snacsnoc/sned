@@ -141,6 +141,17 @@ pub struct TaskState {
     /// Whether a watched path has been re-edited since the snapshot.
     /// Flips once per span; the next nudge fire opens a new span.
     pub override_reedited: bool,
+    /// Turn that opened the current early-quit span, if any nudge fired.
+    /// Empty-edit fires record here too: an aging fire followed by instant
+    /// completion is the quit phenomenon itself, unlike the halt scorer
+    /// which needs watched paths.
+    pub last_nudge_turn: Option<u32>,
+    /// Which nudge opened the current early-quit span.
+    pub last_nudge_kind: Option<NudgeKind>,
+    /// Executed tool results since the last nudge fire.
+    pub tool_calls_since_nudge: u32,
+    /// Edits recorded since the last nudge fire.
+    pub edits_since_nudge: u32,
     /// Whether strict plan mode is enabled (default: true).
     pub strict_plan_mode_enabled: bool,
     /// File context tracker for stale context warnings.
@@ -284,6 +295,10 @@ impl Default for TaskState {
             stability_nudge_fired: false,
             override_watch: None,
             override_reedited: false,
+            last_nudge_turn: None,
+            last_nudge_kind: None,
+            tool_calls_since_nudge: 0,
+            edits_since_nudge: 0,
             strict_plan_mode_enabled: true,
             file_context_tracker: crate::core::context::trackers::FileContextTracker::new(),
             last_api_req_info: None,
@@ -374,6 +389,7 @@ impl Default for AgentConfig {
             interactive_mode: false,
             output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
             strict_plan_mode_enabled: true,
+            pressure_nudges: true,
         }
     }
 }
@@ -424,6 +440,46 @@ pub struct AgentConfig {
     pub output_writer: crate::cli::output::OutputWriterArc,
     /// Whether strict plan mode is enabled (blocks write tools in Plan mode).
     pub strict_plan_mode_enabled: bool,
+    /// Whether mid-run pressure nudges (aging, stability, wrap-up) fire.
+    /// Off for the A/B control arm; default true.
+    pub pressure_nudges: bool,
+}
+
+/// Which pressure nudge opened an early-quit span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NudgeKind {
+    Aging,
+    Stability,
+    WrapUp,
+}
+
+impl NudgeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aging => "aging",
+            Self::Stability => "stability",
+            Self::WrapUp => "wrap_up",
+        }
+    }
+}
+
+/// Snapshot of the open early-quit span for the per-turn telemetry line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QuitSpanStatus {
+    pub kind: NudgeKind,
+    pub turns_since: u32,
+    pub tool_calls: u32,
+    pub edits: u32,
+}
+
+/// Snapshot for the terminal completion line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompletionProximity {
+    pub within_n_turns: u32,
+    pub kind: NudgeKind,
+    pub tool_calls: u32,
+    pub edits: u32,
+    pub forced: bool,
 }
 
 /// Result of a single turn in the agent loop.
@@ -456,7 +512,42 @@ impl TaskState {
     /// stays observable as flipped until the next fire snapshots anew.
     /// Clearing the baseline here would erase the flip in the same turn,
     /// leaving the per-turn emit permanently true.
+    /// Record a nudge fire for early-quit telemetry. Every fire opens a
+    /// new span and zeroes both activity counters.
+    pub fn record_nudge_fire(&mut self, kind: NudgeKind, now: u32) {
+        self.last_nudge_turn = Some(now);
+        self.last_nudge_kind = Some(kind);
+        self.tool_calls_since_nudge = 0;
+        self.edits_since_nudge = 0;
+    }
+
+    /// Snapshot of the open early-quit span for the per-turn telemetry
+    /// line. None when no nudge has fired yet.
+    pub fn quit_span_status(&self, now: u32) -> Option<QuitSpanStatus> {
+        let fire_turn = self.last_nudge_turn?;
+        Some(QuitSpanStatus {
+            kind: self.last_nudge_kind?,
+            turns_since: now.saturating_sub(fire_turn),
+            tool_calls: self.tool_calls_since_nudge,
+            edits: self.edits_since_nudge,
+        })
+    }
+
+    /// Snapshot for the terminal completion line. None when no nudge fired,
+    /// so nudge-free completions stay out of the quit sample.
+    pub fn completion_proximity(&self, now: u32, forced: bool) -> Option<CompletionProximity> {
+        let status = self.quit_span_status(now)?;
+        Some(CompletionProximity {
+            within_n_turns: status.turns_since,
+            kind: status.kind,
+            tool_calls: status.tool_calls,
+            edits: status.edits,
+            forced,
+        })
+    }
+
     pub fn note_session_edit(&mut self, path: &str, now: u32) {
+        self.edits_since_nudge = self.edits_since_nudge.saturating_add(1);
         if !self.session_edited_paths.insert(path.to_string()) {
             self.note_override_reedit(path);
             self.last_edit_turn = now;
@@ -604,6 +695,65 @@ mod tests {
         let watched = state.override_watch.as_ref().expect("span 2 snapshots");
         assert_eq!(watched.len(), 2);
         assert!(!state.override_reedited);
+    }
+
+    #[test]
+    fn test_nudge_fire_records_kind_turn_and_zeroes_counters() {
+        for kind in [NudgeKind::Aging, NudgeKind::Stability, NudgeKind::WrapUp] {
+            let mut state = TaskState::default();
+            state.tool_calls_since_nudge = 7;
+            state.edits_since_nudge = 3;
+            state.record_nudge_fire(kind, 40);
+            assert_eq!(state.last_nudge_turn, Some(40));
+            assert_eq!(state.last_nudge_kind, Some(kind));
+            assert_eq!(state.tool_calls_since_nudge, 0);
+            assert_eq!(state.edits_since_nudge, 0);
+        }
+    }
+
+    #[test]
+    fn test_session_edit_bumps_quit_edits_not_calls() {
+        let mut state = TaskState::default();
+        state.record_nudge_fire(NudgeKind::Stability, 10);
+        state.note_session_edit("game.js", 12);
+        assert_eq!(state.edits_since_nudge, 1);
+        assert_eq!(state.tool_calls_since_nudge, 0);
+    }
+
+    #[test]
+    fn test_completion_proximity_reports_exact_counts() {
+        let mut state = TaskState::default();
+        assert_eq!(state.quit_span_status(50), None);
+        assert_eq!(state.completion_proximity(50, false), None);
+        state.record_nudge_fire(NudgeKind::Aging, 40);
+        state.tool_calls_since_nudge = 5;
+        state.edits_since_nudge = 2;
+        assert_eq!(
+            state.completion_proximity(42, false),
+            Some(CompletionProximity {
+                within_n_turns: 2,
+                kind: NudgeKind::Aging,
+                tool_calls: 5,
+                edits: 2,
+                forced: false,
+            })
+        );
+        assert_eq!(
+            state
+                .completion_proximity(42, true)
+                .expect("span open")
+                .forced,
+            true
+        );
+    }
+
+    #[test]
+    fn test_empty_watch_fire_still_records_quit_span() {
+        let mut state = TaskState::default();
+        state.record_nudge_fire(NudgeKind::Aging, 40);
+        let status = state.quit_span_status(41).expect("quit span records");
+        assert_eq!(status.kind, NudgeKind::Aging);
+        assert_eq!(status.turns_since, 1);
     }
 
     #[test]
