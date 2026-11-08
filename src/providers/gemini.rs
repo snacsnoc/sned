@@ -13,7 +13,7 @@ use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, ModelInfo, Provider,
     ProviderError, ProviderHttpError, ProviderModel, ProviderRequest, SseLineBuffer,
-    ThinkingConfig, gemini_format, is_retryable_stream_transport_error,
+    ThinkingConfig, gemini_format,
 };
 use futures::StreamExt;
 use indexmap::IndexMap;
@@ -967,24 +967,7 @@ impl Provider for GeminiProvider {
                         }
                     }
                     Err(e) => {
-                        let error_msg = format!("Gemini SSE stream error: {e}");
-                        let is_retryable = is_retryable_stream_transport_error(&e.to_string());
-                        tracing::debug!(error = %e, retryable = is_retryable, "Gemini SSE bytes_stream error");
-                        if !crate::providers::send_chunk(
-                            &tx,
-                            ApiStreamChunk::Error(format!(
-                                "{}{}",
-                                error_msg,
-                                if is_retryable { " (retryable)" } else { "" }
-                            )),
-                            "Gemini",
-                            "error",
-                        )
-                        .await
-                        {
-                            stream_errored = true;
-                            break;
-                        }
+                        crate::providers::report_sse_transport_error(&tx, "Gemini", e).await;
                         stream_errored = true;
                         break;
                     }

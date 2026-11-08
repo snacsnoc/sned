@@ -333,6 +333,25 @@ pub(crate) async fn send_chunk(
     }
 }
 
+pub(crate) async fn report_sse_transport_error(
+    tx: &tokio::sync::mpsc::Sender<ApiStreamChunk>,
+    provider: &str,
+    e: reqwest::Error,
+) {
+    let is_retryable = is_retryable_stream_transport_error(&e.to_string());
+    tracing::debug!(error = %e, retryable = is_retryable, "{provider} SSE bytes_stream error");
+    send_chunk(
+        tx,
+        ApiStreamChunk::Error(format!(
+            "{provider} SSE stream error: {e}{}",
+            if is_retryable { " (retryable)" } else { "" }
+        )),
+        provider,
+        "error",
+    )
+    .await;
+}
+
 pub(crate) fn is_retryable_stream_transport_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("timeout")

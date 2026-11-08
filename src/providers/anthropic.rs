@@ -6,7 +6,6 @@ use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, MessageRole,
     ModelInfo, Provider, ProviderError, ProviderHttpError, ProviderModel, ProviderRequest,
-    is_retryable_stream_transport_error,
 };
 use futures::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -661,24 +660,7 @@ impl Provider for AnthropicProvider {
                         }
                     }
                     Err(e) => {
-                        let error_msg = format!("Anthropic SSE stream error: {e}");
-                        let is_retryable = is_retryable_stream_transport_error(&e.to_string());
-                        tracing::debug!(error = %e, retryable = is_retryable, "Anthropic SSE bytes_stream error");
-                        if !crate::providers::send_chunk(
-                            &tx,
-                            ApiStreamChunk::Error(format!(
-                                "{}{}",
-                                error_msg,
-                                if is_retryable { " (retryable)" } else { "" }
-                            )),
-                            "Anthropic",
-                            "error",
-                        )
-                        .await
-                        {
-                            stream_errored = true;
-                            break;
-                        }
+                        crate::providers::report_sse_transport_error(&tx, "Anthropic", e).await;
                         stream_errored = true;
                         break;
                     }

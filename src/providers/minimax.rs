@@ -27,8 +27,7 @@ use crate::providers::{
     ApiStream, ApiStreamChunk, ApiStreamReasoningChunk, ApiStreamTextChunk, ApiStreamToolCall,
     ApiStreamToolCallFunction, ApiStreamToolCallsChunk, ApiStreamUsageChunk, AssistantContentBlock,
     MessageContent, MessageRole, ModelInfo, Provider, ProviderError, ProviderHttpError,
-    ProviderModel, ProviderRequest, StorageMessage, UserContentBlock,
-    is_retryable_stream_transport_error, normalize_reasoning_delta,
+    ProviderModel, ProviderRequest, StorageMessage, UserContentBlock, normalize_reasoning_delta,
 };
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -1478,24 +1477,7 @@ impl Provider for MinimaxProvider {
                         }
                     }
                     Err(e) => {
-                        let error_msg = format!("MiniMax SSE stream error: {e}");
-                        let is_retryable = is_retryable_stream_transport_error(&e.to_string());
-                        tracing::debug!(error = %e, retryable = is_retryable, "MiniMax SSE bytes_stream error");
-                        if !crate::providers::send_chunk(
-                            &tx,
-                            ApiStreamChunk::Error(format!(
-                                "{}{}",
-                                error_msg,
-                                if is_retryable { " (retryable)" } else { "" }
-                            )),
-                            "MiniMax",
-                            "error",
-                        )
-                        .await
-                        {
-                            stream_errored = true;
-                            break;
-                        }
+                        crate::providers::report_sse_transport_error(&tx, "MiniMax", e).await;
                         stream_errored = true;
                         break;
                     }
