@@ -1654,6 +1654,8 @@ impl AgentLoop {
                 state.session_edited_paths.clear();
                 state.last_edit_turn = 0;
                 state.stability_nudge_fired = false;
+                state.override_watch = None;
+                state.override_reedited = false;
             }
             // Initialize session start time for session summary
             state.session_start_time = Some(std::time::Instant::now());
@@ -1895,6 +1897,7 @@ impl AgentLoop {
             turn_count += 1;
             self.maybe_inject_aging_nudge(turn_count).await;
             self.maybe_inject_stability_nudge(turn_count).await;
+            self.emit_override_telemetry(turn_count).await;
             self.maybe_inject_wrap_up_reminder(turn_count).await;
             // Reassigned every turn so a resumed loop never acts on a stale cap flag.
             {
@@ -4430,15 +4433,8 @@ impl AgentLoop {
                 {
                     let mut state = self.state.lock().await;
                     let now = state.current_turn;
-                    let mut relapsed = false;
                     for path in &edited_paths {
-                        if !state.session_edited_paths.insert(path.clone()) {
-                            state.last_edit_turn = now;
-                            relapsed = true;
-                        }
-                    }
-                    if relapsed {
-                        state.stability_nudge_fired = false;
+                        state.note_session_edit(path, now);
                     }
                 }
                 let mut history = self.conversation_history.lock().await;
@@ -4847,6 +4843,7 @@ impl AgentLoop {
         } else {
             return;
         };
+        self.state.lock().await.snapshot_override_watch();
         self.conversation_history.lock().await.push(StorageMessage {
             id: Some(Self::next_message_id(&self.message_counter)),
             role: MessageRole::User,
@@ -4876,6 +4873,7 @@ impl AgentLoop {
         let (quiet_for, edited_count, last_edit) = {
             let mut state = self.state.lock().await;
             state.stability_nudge_fired = true;
+            state.snapshot_override_watch();
             (
                 turn_count - state.last_edit_turn,
                 state.session_edited_paths.len(),
@@ -4892,6 +4890,21 @@ impl AgentLoop {
             metrics: None,
             ts: Some(chrono::Utc::now().timestamp_millis() as u64),
         });
+    }
+
+    /// Log-only override telemetry. While a nudge-override span is open,
+    /// each turn reports whether any pre-nudge file has been re-edited.
+    /// Nothing reads this but the battery scorer; it never halts.
+    async fn emit_override_telemetry(&self, turn_count: u32) {
+        let state = self.state.lock().await;
+        if state.override_watch.is_none() {
+            return;
+        }
+        tracing::debug!(
+            overridden = !state.override_reedited,
+            quiet_turns = turn_count.saturating_sub(state.last_edit_turn),
+            "nudge override telemetry"
+        );
     }
 
     async fn inject_plan_state_into_history(&self) {
@@ -18072,6 +18085,88 @@ Irrespective of whether additional information or instructions are given, you ar
         assert_eq!(nudges.len(), 1);
         assert!(nudges[0].contains("8 turns"));
         assert!(nudges[0].contains("last rework turn 2"));
+    }
+
+    #[tokio::test]
+    async fn test_override_telemetry_tracks_pre_nudge_reedits() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let mut config = test_agent_config(provider, "test-override-telemetry");
+        config.max_turns = 60;
+        let agent = AgentLoop::new(config);
+        {
+            let mut state = agent.state.lock().await;
+            state.session_edited_paths.insert("game.js".to_string());
+            state.last_edit_turn = 2;
+        }
+
+        for turn in 1..=20 {
+            agent.maybe_inject_stability_nudge(turn).await;
+        }
+
+        // Nudge fired at turn 10: baseline snapshots the pre-nudge set.
+        {
+            let state = agent.state.lock().await;
+            assert_eq!(
+                state.override_watch.as_ref().map(|w| w.len()),
+                Some(1),
+                "one pre-nudge file watched"
+            );
+            assert!(!state.override_reedited);
+        }
+        // New scaffolding joins without flipping the span.
+        {
+            let mut state = agent.state.lock().await;
+            assert!(state.session_edited_paths.insert("harness.js".to_string()));
+            assert!(!state.override_reedited);
+        }
+        // Re-editing a watched path ends the span; the flip sticks
+        // until the next fire.
+        {
+            let mut state = agent.state.lock().await;
+            assert!(!state.session_edited_paths.insert("game.js".to_string()));
+            state.note_override_reedit("game.js");
+            assert!(state.override_reedited);
+            state.note_override_reedit("game.js");
+            assert!(state.override_reedited);
+        }
+        // Without a re-arm nothing re-fires: the ended span stays put.
+        for turn in 21..=30 {
+            agent.maybe_inject_stability_nudge(turn).await;
+        }
+        {
+            let history = agent.conversation_history.lock().await;
+            let fires = history
+                .iter()
+                .filter(|message| {
+                    matches!(&message.content, crate::providers::MessageContent::Text(text) if text.contains("[Stability check]"))
+                })
+                .count();
+            assert_eq!(fires, 1, "no re-arm, no second fire");
+            let state = agent.state.lock().await;
+            assert!(state.override_reedited, "ended span stays flipped");
+        }
+        // Re-arm re-opens the nudge; the next fire snapshots span 2
+        // fresh. The ended span stays flipped until that fire.
+        {
+            let mut state = agent.state.lock().await;
+            state.stability_nudge_fired = false;
+            state.session_edited_paths.insert("level.js".to_string());
+            state.last_edit_turn = 30;
+            assert!(state.override_reedited);
+        }
+        for turn in 31..=50 {
+            agent.maybe_inject_stability_nudge(turn).await;
+        }
+        {
+            let state = agent.state.lock().await;
+            let watched = state.override_watch.as_ref().expect("span 2 snapshots");
+            assert!(watched.contains("game.js"));
+            assert!(watched.contains("harness.js"));
+            assert!(watched.contains("level.js"));
+            assert!(!state.override_reedited);
+        }
     }
 
     #[tokio::test]

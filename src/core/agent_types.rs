@@ -135,6 +135,12 @@ pub struct TaskState {
     pub last_edit_turn: u32,
     /// The stability nudge fires once per quiet span; a re-edit re-arms it.
     pub stability_nudge_fired: bool,
+    /// Pre-nudge file set backing override telemetry. A re-edit of a
+    /// watched path ends the override span. Log-only; no halt reads it.
+    pub override_watch: Option<HashSet<String>>,
+    /// Whether a watched path has been re-edited since the snapshot.
+    /// Flips once per span; the next nudge fire opens a new span.
+    pub override_reedited: bool,
     /// Whether strict plan mode is enabled (default: true).
     pub strict_plan_mode_enabled: bool,
     /// File context tracker for stale context warnings.
@@ -276,6 +282,8 @@ impl Default for TaskState {
             session_edited_paths: HashSet::new(),
             last_edit_turn: 0,
             stability_nudge_fired: false,
+            override_watch: None,
+            override_reedited: false,
             strict_plan_mode_enabled: true,
             file_context_tracker: crate::core::context::trackers::FileContextTracker::new(),
             last_api_req_info: None,
@@ -432,6 +440,40 @@ pub enum TurnResult {
 }
 
 impl TaskState {
+    /// Snapshot the pre-nudge file set for override telemetry. Every fire
+    /// opens a new span: the ended span stays observable as flipped until
+    /// this overwrites it, so the scorer sees each span's outcome.
+    pub fn snapshot_override_watch(&mut self) {
+        self.override_watch = Some(self.session_edited_paths.clone());
+        self.override_reedited = false;
+    }
+
+    /// Record one edited path for the stability clock. A re-edit restarts
+    /// the quiet clock and re-arms the nudge; the override span it ends
+    /// stays observable as flipped until the next fire snapshots anew.
+    /// Clearing the baseline here would erase the flip in the same turn,
+    /// leaving the per-turn emit permanently true.
+    pub fn note_session_edit(&mut self, path: &str, now: u32) {
+        if !self.session_edited_paths.insert(path.to_string()) {
+            self.note_override_reedit(path);
+            self.last_edit_turn = now;
+            self.stability_nudge_fired = false;
+        }
+    }
+
+    /// Record a re-edit against the override snapshot. Only a path watched
+    /// before the nudge ends the span; new scaffolding never flips it.
+    pub fn note_override_reedit(&mut self, path: &str) {
+        if !self.override_reedited
+            && self
+                .override_watch
+                .as_ref()
+                .is_some_and(|watched| watched.contains(path))
+        {
+            self.override_reedited = true;
+        }
+    }
+
     /// Retain a completed response for `/full` without letting a tiny follow-up
     /// response evict a large response that the user may still need to recover.
     pub fn retain_full_response(&mut self, response: Option<String>, code_line_limit: usize) {
@@ -524,6 +566,33 @@ mod tests {
     fn test_double_check_completion_is_opt_in() {
         assert!(!TaskState::default().double_check_completion_enabled);
         assert!(!AgentConfig::default().double_check_completion);
+    }
+
+    #[test]
+    fn test_note_session_edit_reopens_span_on_reedit() {
+        let mut state = TaskState::default();
+        state.session_edited_paths.insert("game.js".to_string());
+        state.last_edit_turn = 2;
+        state.snapshot_override_watch();
+
+        // New scaffolding joins the set without touching the clock.
+        state.note_session_edit("harness.js", 12);
+        assert_eq!(state.last_edit_turn, 2);
+        assert!(state.override_watch.is_some());
+
+        // A re-edit restarts the clock and re-arms the nudge, but the
+        // ended span stays observable as flipped until the next fire.
+        state.note_session_edit("game.js", 15);
+        assert_eq!(state.last_edit_turn, 15);
+        assert!(!state.stability_nudge_fired);
+        assert!(state.override_watch.is_some());
+        assert!(state.override_reedited);
+
+        // The next snapshot opens span 2 fresh over the grown set.
+        state.snapshot_override_watch();
+        let watched = state.override_watch.as_ref().expect("span 2 snapshots");
+        assert_eq!(watched.len(), 2);
+        assert!(!state.override_reedited);
     }
 
     #[test]
