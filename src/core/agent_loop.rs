@@ -98,6 +98,10 @@ const PARTIAL_MODEL_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::f
 /// new work. Without this nudge, a drifting model never triggers the
 /// tool-silence stop condition and runs until the hard turn cap.
 const WRAP_UP_LEAD_TURNS: u32 = 3;
+// A pressure nudge must land strictly more than this many turns before the
+// wind-down starts; firing inside it crowds the close-out instead of
+// applying pressure. Strict: a nudge exactly on the boundary still collides.
+const NUDGE_CLEARANCE_TURNS: u32 = 3;
 // MAX_TOOL_ARGUMENT_SIZE moved to providers/mod.rs for shared use
 use crate::providers::MAX_TOOL_ARGUMENT_SIZE;
 
@@ -4890,11 +4894,19 @@ impl AgentLoop {
         let wrap_up_at = cap.saturating_sub(WRAP_UP_LEAD_TURNS);
         let first = cap * 4 / 10;
         let second = cap * 7 / 10;
-        let text = if turn_count == first && first >= 1 && first < wrap_up_at {
+        let text = if turn_count == first
+            && first >= 1
+            && first < wrap_up_at
+            && wrap_up_at - first > NUDGE_CLEARANCE_TURNS
+        {
             format!(
                 "[Progress check]: this is turn {turn_count} of {cap}. If the deliverable works, finish now with a summary; state what remains otherwise."
             )
-        } else if turn_count == second && second > first && second < wrap_up_at {
+        } else if turn_count == second
+            && second > first
+            && second < wrap_up_at
+            && wrap_up_at - second > NUDGE_CLEARANCE_TURNS
+        {
             format!(
                 "[Progress check]: this is turn {turn_count} of {cap}. Wrap up now: finish with a summary of results and what remains undone."
             )
@@ -12795,6 +12807,68 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
+    async fn test_small_cap_skips_aging_nudge_but_keeps_wrap_up() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let mut config = test_agent_config(provider, "small-cap-aging-guard");
+        config.max_turns = 10;
+        config.pressure_nudges = true;
+        let agent = AgentLoop::new(config);
+        agent.maybe_inject_aging_nudge(4).await;
+        agent.maybe_inject_aging_nudge(7).await;
+        let history = agent.conversation_history.lock().await;
+        assert!(
+            !history.iter().any(|message| matches!(
+                &message.content,
+                crate::providers::MessageContent::Text(text)
+                    if text.contains("[Progress check]")
+            )),
+            "aging nudges stay silent on a 10-turn cap"
+        );
+        drop(history);
+        agent.maybe_inject_wrap_up_reminder(7).await;
+        let history = agent.conversation_history.lock().await;
+        assert!(
+            history.iter().any(|message| matches!(
+                &message.content,
+                crate::providers::MessageContent::Text(text)
+                    if text.contains("[Approaching turn limit]")
+            )),
+            "the wrap-up reminder still fires on a small cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aging_nudge_clearance_is_strict_at_the_boundary() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let mut config = test_agent_config(provider, "aging-clearance-boundary");
+        config.max_turns = 20;
+        config.pressure_nudges = true;
+        let agent = AgentLoop::new(config);
+        // First clears the wind-down by 9 turns and fires; second lands
+        // exactly on the boundary (17 - 14 = 3) and must stay silent.
+        agent.maybe_inject_aging_nudge(8).await;
+        agent.maybe_inject_aging_nudge(14).await;
+        let history = agent.conversation_history.lock().await;
+        let nudges: Vec<_> = history
+            .iter()
+            .filter_map(|message| match &message.content {
+                crate::providers::MessageContent::Text(text)
+                    if text.contains("[Progress check]") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nudges.len(), 1);
+        assert!(nudges[0].contains("turn 8 of 20"));
+    }
+
+    #[tokio::test]
     async fn test_forced_at_cap_text_marks_completion_distinctly() {
         let provider = Arc::new(Providers::Mock(
             crate::providers::mock::MockProvider::single_text_response("Final summary."),
@@ -18339,10 +18413,10 @@ Irrespective of whether additional information or instructions are given, you ar
             crate::providers::mock::MockProvider::single_text_response("unused"),
         ));
         let mut config = test_agent_config(provider, "test-aging-nudge");
-        config.max_turns = 20;
+        config.max_turns = 30;
         let agent = AgentLoop::new(config);
 
-        for turn in 1..=20 {
+        for turn in 1..=30 {
             agent.maybe_inject_aging_nudge(turn).await;
         }
 
@@ -18359,39 +18433,10 @@ Irrespective of whether additional information or instructions are given, you ar
             })
             .collect();
         assert_eq!(nudges.len(), 2);
-        assert!(nudges[0].contains("turn 8 of 20"));
+        assert!(nudges[0].contains("turn 12 of 30"));
         assert!(nudges[0].contains("finish now with a summary"));
-        assert!(nudges[1].contains("turn 14 of 20"));
+        assert!(nudges[1].contains("turn 21 of 30"));
         assert!(nudges[1].contains("Wrap up now"));
-    }
-
-    #[tokio::test]
-    async fn test_aging_nudge_skipped_on_colliding_fractions() {
-        let provider = Arc::new(Providers::Mock(
-            crate::providers::mock::MockProvider::single_text_response("unused"),
-        ));
-        let mut config = test_agent_config(provider, "test-aging-nudge-collide");
-        config.max_turns = 6;
-        let agent = AgentLoop::new(config);
-
-        for turn in 1..=6 {
-            agent.maybe_inject_aging_nudge(turn).await;
-        }
-
-        let history = agent.conversation_history.lock().await;
-        let nudges: Vec<_> = history
-            .iter()
-            .filter_map(|message| match &message.content {
-                crate::providers::MessageContent::Text(text)
-                    if text.contains("[Progress check]") =>
-                {
-                    Some(text.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(nudges.len(), 1);
-        assert!(nudges[0].contains("turn 2 of 6"));
     }
 
     #[tokio::test]
