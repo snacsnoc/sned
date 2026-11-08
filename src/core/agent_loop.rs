@@ -803,6 +803,7 @@ impl AgentLoop {
         text_only_completes_task: bool,
         completion_tool_emitted: bool,
         response_text: Option<&str>,
+        forced: bool,
     ) -> Option<serde_json::Value> {
         if !text_only_completes_task || completion_tool_emitted {
             return None;
@@ -816,6 +817,7 @@ impl AgentLoop {
         Some(serde_json::json!({
             "type": "completion",
             "result": result,
+            "forced": forced,
         }))
     }
 
@@ -4605,6 +4607,7 @@ impl AgentLoop {
                 text_only_completes_task,
                 completion_tool_emitted,
                 response_text.as_deref(),
+                forced_at_cap,
             )
         {
             tracing::info!(target: "json_output", "{}", event.to_string());
@@ -12491,22 +12494,39 @@ Irrespective of whether additional information or instructions are given, you ar
         let (_thinking, response_text) =
             split_model_output("<think>\nhidden work\n</think>\nVisible result");
 
-        let event =
-            AgentLoop::synthetic_json_completion_event(true, false, response_text.as_deref())
-                .unwrap();
+        let event = AgentLoop::synthetic_json_completion_event(
+            true,
+            false,
+            response_text.as_deref(),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(event["type"], "completion");
         assert_eq!(event["result"], "Visible result");
+        assert_eq!(event["forced"], false);
+    }
+
+    #[test]
+    fn test_synthetic_json_completion_marks_forced_summaries() {
+        let event =
+            AgentLoop::synthetic_json_completion_event(true, false, Some("Done"), true).unwrap();
+
+        assert_eq!(event["type"], "completion");
+        assert_eq!(
+            event["forced"], true,
+            "cap-forced summaries must be distinguishable in the JSON payload"
+        );
     }
 
     #[test]
     fn test_synthetic_json_completion_skips_attempt_completion_path() {
         assert!(
-            AgentLoop::synthetic_json_completion_event(true, true, Some("Done")).is_none(),
+            AgentLoop::synthetic_json_completion_event(true, true, Some("Done"), false).is_none(),
             "attempt_completion already emits a completion event"
         );
         assert!(
-            AgentLoop::synthetic_json_completion_event(false, false, Some("Done")).is_none(),
+            AgentLoop::synthetic_json_completion_event(false, false, Some("Done"), false).is_none(),
             "non-completing text turns should not emit completion"
         );
     }
