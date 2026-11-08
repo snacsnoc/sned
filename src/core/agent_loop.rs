@@ -1656,6 +1656,9 @@ impl AgentLoop {
                 state.stability_nudge_fired = false;
                 state.override_watch = None;
                 state.override_reedited = false;
+                // Narration patience belongs to one task: a new task starts
+                // unconvinced, or its first narration would complete it.
+                state.text_only_turns = 0;
             }
             // Initialize session start time for session summary
             state.session_start_time = Some(std::time::Instant::now());
@@ -2058,7 +2061,7 @@ impl AgentLoop {
                     dequeued_message_for_notification = false;
                     continue;
                 }
-                TurnResult::Complete => {
+                TurnResult::Complete | TurnResult::CompleteAtCap => {
                     self.current_turn_retry_candidate = None;
                     if dequeued_message_for_notification && !self.config.json_output {
                         info!("[sned] Queued message sent to provider");
@@ -3747,25 +3750,16 @@ impl AgentLoop {
                 let act_mode = self.config.mode == AgentMode::Act;
                 let plan_active = self.plan_execution_active().await;
 
-                let did_tool_work = history.iter().any(|message| {
-                    matches!(&message.content, MessageContent::UserBlocks(blocks)
-                        if blocks
-                            .iter()
-                            .any(|block| matches!(block, UserContentBlock::ToolResult(_))))
-                });
-
-                let can_escalate_profile = self
-                    .deps
-                    .tool_profile
-                    .is_some_and(|profile| profile.escalate().is_some());
                 let act_progress_response = act_mode
                     && response_text
                         .as_deref()
                         .is_some_and(is_progress_only_response);
-                if !plan_active
-                    && !act_progress_response
-                    && (text_only_turns > 1 || (act_mode && !can_escalate_profile) || did_tool_work)
-                {
+                let at_cap = self.state.lock().await.at_cap_turn;
+                // First-turn exits let a single read plus one narration pass
+                // as completion, which battery tm3 caught live. The cap turn
+                // is the exception: no further turn exists, so a bare summary
+                // ends the run as forced, never as genuine.
+                if !plan_active && !act_progress_response && (text_only_turns > 1 || at_cap) {
                     text_only_completes_task = true;
                 } else if !plan_active && (text_only_turns == 1 || act_progress_response) {
                     if let Some(profile) = self.deps.tool_profile
@@ -3794,7 +3788,7 @@ impl AgentLoop {
                             metrics: None,
                             ts: Some(chrono::Utc::now().timestamp_millis() as u64),
                         });
-                    } else if !act_mode || can_escalate_profile {
+                    } else {
                         let completion_instruction = match self.config.mode {
                             AgentMode::Plan => "call plan_mode_respond",
                             AgentMode::Act => "call attempt_completion",
@@ -3989,6 +3983,17 @@ impl AgentLoop {
                     Self::invalidate_changed_read_state(&self.state).await;
                     if executed {
                         commands_executed += 1;
+                        // Verify loops are activity even when they change no
+                        // tracked file: a `cargo test` cycle must not read as
+                        // eight quiet turns to the stability nudge.
+                        if !Self::tool_call_is_inspection(
+                            &tool_name,
+                            &Ok::<_, String>(tool_params.clone()),
+                        ) {
+                            let mut state = self.state.lock().await;
+                            let now = state.current_turn;
+                            state.note_shell_action(now);
+                        }
                     }
                 }
 
@@ -4589,6 +4594,11 @@ impl AgentLoop {
             && (completion_candidate || plan_mode_responded)
             && !plan_active
             && !plan_blocks_completion;
+        // A cap-forced summary is not an accepted result. Read before the
+        // block below moves `completion_result` into the output event.
+        let forced_at_cap = self.state.lock().await.at_cap_turn
+            && completion_result.is_none()
+            && !plan_mode_responded;
 
         if self.config.json_output
             && let Some(event) = Self::synthetic_json_completion_event(
@@ -4707,7 +4717,14 @@ impl AgentLoop {
             if self.config.json_output {
                 self.emit_turn_result_event(true).await;
             }
-            TurnResult::Complete
+            // attempt_completion or plan_mode_respond on the final turn
+            // still counts as genuine; only a bare summary is forced.
+            if forced_at_cap {
+                tracing::info!("task ended at the turn cap without an accepted completion call");
+                TurnResult::CompleteAtCap
+            } else {
+                TurnResult::Complete
+            }
         } else if identical_batch_streak >= 3 {
             self.emit_turn_end("").await;
             TurnResult::Error(
@@ -5683,12 +5700,19 @@ impl AgentLoop {
 
 // Brief future-tense announcements of tool work are progress, not final answers.
 fn is_progress_only_response(text: &str) -> bool {
-    let normalized = text.trim().to_lowercase().replace('’', "'");
-    if normalized.lines().count() != 1 {
-        return false;
-    }
+    // A promise buried after filler ("OK writing now, for real. I'll
+    // produce the file.") is still a promise: match the intention prefix
+    // at any clause start, not just the string start.
+    text.split(['.', '!', '?', ';'])
+        .map(|clause| clause.trim().to_lowercase().replace('’', "'"))
+        .filter(|clause| !clause.is_empty())
+        .any(|clause| {
+            clause_intention(&clause).is_some_and(|intention| intention_has_work_verb(intention))
+        })
+}
 
-    let Some(intention) = [
+fn clause_intention(clause: &str) -> Option<&str> {
+    [
         "i'll ",
         "i will ",
         "let me ",
@@ -5697,10 +5721,10 @@ fn is_progress_only_response(text: &str) -> bool {
         "i am going to ",
     ]
     .iter()
-    .find_map(|prefix| normalized.strip_prefix(prefix)) else {
-        return false;
-    };
+    .find_map(|prefix| clause.strip_prefix(prefix))
+}
 
+fn intention_has_work_verb(intention: &str) -> bool {
     intention.split_whitespace().take(8).any(|word| {
         let word = word.trim_matches(|character: char| !character.is_ascii_alphanumeric());
         [
@@ -5735,6 +5759,7 @@ fn is_progress_only_response(text: &str) -> bool {
             "analyz",
             "analys",
             "investigat",
+            "produc",
             "list",
             "find",
             "scan",
@@ -8092,6 +8117,7 @@ mod tests {
         match result {
             TurnResult::Continue => "continue",
             TurnResult::Complete => "complete",
+            TurnResult::CompleteAtCap => "complete_at_cap",
             TurnResult::Cancelled => "cancelled",
             TurnResult::Error(_) => "error",
         }
@@ -8261,6 +8287,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_non_inspection_shell_restarts_quiet_clock() {
+        use crate::core::tools::handlers::execute_command::ExecuteCommandHandler;
+        use serde_json::json;
+        let responses = vec![
+            tool_call_chunks(&[("c1", "execute_command", json!({"commands": ["true"]}))]),
+            tool_call_chunks(&[("c2", "execute_command", json!({"commands": ["ls"]}))]),
+        ];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            SnedTool::ExecuteCommand,
+            Arc::new(ExecuteCommandHandler::new()),
+        );
+        let config = test_agent_config(provider, "shell-quiet-clock");
+        let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
+        agent.state.lock().await.current_turn = 41;
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert_eq!(
+            agent.state.lock().await.last_edit_turn,
+            41,
+            "an executed non-inspection shell command proves the session is not quiet"
+        );
+        agent.state.lock().await.current_turn = 42;
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert_eq!(
+            agent.state.lock().await.last_edit_turn,
+            41,
+            "a read-only shell probe must not touch the quiet clock"
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_result_collapses_to_digest_line() {
         use crate::core::tools::handlers::read_file::ReadFileHandler;
         use serde_json::json;
@@ -8386,20 +8449,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_text_after_tool_work_completes_without_completion_tool() {
+    async fn test_summary_after_tool_work_completes_on_second_narration() {
         use crate::core::tools::handlers::read_file::ReadFileHandler;
         use serde_json::json;
         let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let path = dir.path().join("probe.txt");
         std::fs::write(&path, "alpha\nbeta\n").unwrap();
         let path_str = path.to_string_lossy().to_string();
-        let responses = vec![
-            tool_call_chunks(&[("c1", "read_file", json!({"paths": [path_str]}))]),
+        let summary = || {
             vec![ApiStreamChunk::Text(ApiStreamTextChunk {
                 text: "Done: the file contains alpha and beta.".to_string(),
                 id: None,
                 signature: None,
-            })],
+            })]
+        };
+        let responses = vec![
+            tool_call_chunks(&[("c1", "read_file", json!({"paths": [path_str]}))]),
+            summary(),
+            summary(),
         ];
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = Arc::new(Providers::RecordingChunk(
@@ -8411,13 +8478,17 @@ mod tests {
         let mut agent = AgentLoop::new(config).with_tools(Arc::new(registry));
         assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
         assert!(
+            matches!(agent.execute_turn().await, TurnResult::Continue),
+            "a lone summary after a read must not end the task: reads are not deliverables"
+        );
+        assert!(
             matches!(agent.execute_turn().await, TurnResult::Complete),
-            "a summary after real tool work must end the task, not cost another round trip"
+            "two consecutive narrations end the task under the uniform rule"
         );
         assert_eq!(
             captured.lock().unwrap().len(),
-            2,
-            "no third request may be spent re-asking for attempt_completion"
+            3,
+            "no fourth request may be spent re-asking for attempt_completion"
         );
     }
 
@@ -8481,6 +8552,13 @@ mod tests {
         )
         .await;
         let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let done_text = || {
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "Done".to_string(),
+                id: None,
+                signature: None,
+            })]
+        };
         let responses = vec![
             chunks,
             tool_call_chunks(&[(
@@ -8488,11 +8566,8 @@ mod tests {
                 "read_file",
                 serde_json::json!({"paths": ["Cargo.toml"]}),
             )]),
-            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
-                text: "Done".to_string(),
-                id: None,
-                signature: None,
-            })],
+            done_text(),
+            done_text(),
         ];
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = Arc::new(Providers::RecordingChunk(
@@ -8520,6 +8595,10 @@ mod tests {
         assert_eq!(
             *executions.lock().unwrap(),
             ["start Cargo.toml", "finish Cargo.toml"]
+        );
+        assert!(
+            matches!(agent.execute_turn().await, TurnResult::Continue),
+            "a lone summary after a retried read is a first narration, not a completion"
         );
         assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
 
@@ -8591,14 +8670,18 @@ mod tests {
         let next = shown_end + 1;
         let range =
             serde_json::json!({"paths": ["large.txt"], "start_line": next, "end_line": next + 2});
-        let responses = vec![
-            tool_call_chunks(&[("next_range", "read_file", range.clone())]),
-            tool_call_chunks(&[("same_range", "read_file", range)]),
+        let done_text = || {
             vec![ApiStreamChunk::Text(ApiStreamTextChunk {
                 text: "Done".to_string(),
                 id: None,
                 signature: None,
-            })],
+            })]
+        };
+        let responses = vec![
+            tool_call_chunks(&[("next_range", "read_file", range.clone())]),
+            tool_call_chunks(&[("same_range", "read_file", range)]),
+            done_text(),
+            done_text(),
         ];
         let mut recording =
             crate::providers::RecordingChunkProvider::new(responses, Arc::clone(&captured));
@@ -8608,6 +8691,10 @@ mod tests {
             .await;
         assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
         assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
+        assert!(
+            matches!(agent.execute_turn().await, TurnResult::Continue),
+            "a lone summary after reads is a first narration, not a completion"
+        );
         assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
 
         let captured = captured.lock().unwrap();
@@ -9927,18 +10014,21 @@ Irrespective of whether additional information or instructions are given, you ar
 
     #[tokio::test]
     async fn test_new_task_recomputes_profile_in_same_act_session() {
-        let responses = vec![
+        let answer = || {
             vec![ApiStreamChunk::Text(ApiStreamTextChunk {
                 text: "The answer is 4.".to_string(),
                 id: None,
                 signature: None,
-            })],
+            })]
+        };
+        let inspect = || {
             vec![ApiStreamChunk::Text(ApiStreamTextChunk {
                 text: "I need to inspect the file first.".to_string(),
                 id: None,
                 signature: None,
-            })],
-        ];
+            })]
+        };
+        let responses = vec![answer(), answer(), inspect(), inspect()];
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = Arc::new(Providers::RecordingChunk(
             crate::providers::RecordingChunkProvider::new(responses, requests.clone()),
@@ -9979,7 +10069,7 @@ Irrespective of whether additional information or instructions are given, you ar
                 .as_ref()
                 .is_some_and(|tools| tools.iter().any(|tool| tool.function.name == "read_file"))
         );
-        let tools = requests[1]
+        let tools = requests[2]
             .tools
             .as_ref()
             .expect("new ACT task should receive tools");
@@ -10180,6 +10270,7 @@ Irrespective of whether additional information or instructions are given, you ar
         let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
             vec![
                 crate::providers::mock::MockResponse::Text("The answer is 4.".to_string()),
+                crate::providers::mock::MockResponse::Text("The answer is 4.".to_string()),
                 crate::providers::mock::MockResponse::ToolCalls(vec![
                     crate::providers::mock::MockToolCall {
                         call_id: "fresh-act-write".to_string(),
@@ -10187,6 +10278,7 @@ Irrespective of whether additional information or instructions are given, you ar
                         arguments: serde_json::json!({"path": "fixture.txt", "content": "new content\n"}),
                     },
                 ]),
+                crate::providers::mock::MockResponse::Text("Wrote the file.".to_string()),
                 crate::providers::mock::MockResponse::Text("Wrote the file.".to_string()),
             ],
         )));
@@ -11198,6 +11290,7 @@ Irrespective of whether additional information or instructions are given, you ar
                     )),
                 ]),
                 crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
             ],
         )));
         let (tx, mut rx) = mpsc::channel(32);
@@ -11206,7 +11299,9 @@ Irrespective of whether additional information or instructions are given, you ar
         let mut agent = AgentLoop::new(config);
 
         let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
 
+        let result = agent.execute_turn().await;
         assert!(matches!(result, TurnResult::Complete));
         let rendered = drain_rendered_output(&mut rx);
         assert!(
@@ -11246,6 +11341,7 @@ Irrespective of whether additional information or instructions are given, you ar
                     )),
                 ]),
                 crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
             ],
         )));
         let (tx, mut rx) = mpsc::channel(32);
@@ -11253,6 +11349,7 @@ Irrespective of whether additional information or instructions are given, you ar
         config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
         let mut agent = AgentLoop::new(config);
 
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
         assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
 
         let rendered = drain_rendered_output(&mut rx);
@@ -11299,6 +11396,7 @@ Irrespective of whether additional information or instructions are given, you ar
                     )),
                 ]),
                 crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
             ],
         )));
         let (tx, mut rx) = mpsc::channel(32);
@@ -11306,6 +11404,7 @@ Irrespective of whether additional information or instructions are given, you ar
         config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
         let mut agent = AgentLoop::new(config);
 
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
         assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
         let rendered = drain_rendered_output(&mut rx);
         assert!(
@@ -11386,6 +11485,7 @@ Irrespective of whether additional information or instructions are given, you ar
                     )),
                 ]),
                 crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
             ],
         )));
         let (tx, mut rx) = mpsc::channel(32);
@@ -11393,6 +11493,7 @@ Irrespective of whether additional information or instructions are given, you ar
         config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
         let mut agent = AgentLoop::new(config);
 
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
         assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
 
         let rendered = drain_rendered_output(&mut rx);
@@ -11435,6 +11536,7 @@ Irrespective of whether additional information or instructions are given, you ar
                     )),
                 ]),
                 crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
             ],
         )));
         let (tx, mut rx) = mpsc::channel(32);
@@ -11442,6 +11544,7 @@ Irrespective of whether additional information or instructions are given, you ar
         config.output_writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
         let mut agent = AgentLoop::new(config);
 
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
         assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
 
         let rendered = drain_rendered_output(&mut rx);
@@ -11702,6 +11805,7 @@ Irrespective of whether additional information or instructions are given, you ar
                     )),
                 ]),
                 crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
+                crate::providers::mock::MockResponse::Text("recovered output\n".to_string()),
             ],
         )));
         let (tx, mut rx) = mpsc::channel(32);
@@ -11711,7 +11815,9 @@ Irrespective of whether additional information or instructions are given, you ar
         let mut agent = AgentLoop::new(config);
 
         let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
 
+        let result = agent.execute_turn().await;
         assert!(matches!(result, TurnResult::Complete));
         let rendered = drain_rendered_output(&mut rx);
         assert!(
@@ -12247,8 +12353,9 @@ Irrespective of whether additional information or instructions are given, you ar
         };
 
         let mut agent = AgentLoop::new(config);
+        agent.state.lock().await.at_cap_turn = true;
         let result = agent.execute_turn().await;
-        assert!(matches!(result, TurnResult::Complete));
+        assert!(matches!(result, TurnResult::CompleteAtCap));
 
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(events.iter().any(|event| {
@@ -12302,8 +12409,9 @@ Irrespective of whether additional information or instructions are given, you ar
         };
 
         let mut agent = AgentLoop::new(config);
+        agent.state.lock().await.at_cap_turn = true;
         let result = agent.execute_turn().await;
-        assert!(matches!(result, TurnResult::Complete));
+        assert!(matches!(result, TurnResult::CompleteAtCap));
 
         let rendered = drain_rendered_output(&mut rx).join("\n");
         let rendered = crate::cli::tui::ansi_converter::ansi_to_ratatui_lines(&rendered)
@@ -12320,7 +12428,7 @@ Irrespective of whether additional information or instructions are given, you ar
     async fn text_only_completion_emits_copyable_response() {
         let answer = "## Findings\n\nA final answer.";
         let provider = Arc::new(Providers::Mock(
-            crate::providers::mock::MockProvider::single_text_response(answer),
+            crate::providers::mock::MockProvider::single_text_response_repeat(answer),
         ));
         let (tx, mut rx) = mpsc::channel(32);
         let writer = Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
@@ -12328,6 +12436,7 @@ Irrespective of whether additional information or instructions are given, you ar
         let mut config = test_agent_config(provider, "test-text-only-copy");
         config.output_writer = writer;
         let mut agent = AgentLoop::new(config);
+        assert!(matches!(agent.execute_turn().await, TurnResult::Continue));
         assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
         let events = drain_output_events(&mut priority_rx, &mut rx);
         assert!(events.iter().any(
@@ -12341,7 +12450,7 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
-    async fn test_one_shot_text_only_response_completes_without_tool_nudge() {
+    async fn test_one_shot_text_only_response_marks_forced_completion() {
         let config = AgentConfig {
             provider: Arc::new(std::sync::Mutex::new(Arc::new(Providers::Mock(
                 crate::providers::mock::MockProvider::single_text_response("4"),
@@ -12368,8 +12477,9 @@ Irrespective of whether additional information or instructions are given, you ar
         };
 
         let mut agent = AgentLoop::new(config);
+        agent.state.lock().await.at_cap_turn = true;
         let result = agent.execute_turn().await;
-        assert!(matches!(result, TurnResult::Complete));
+        assert!(matches!(result, TurnResult::CompleteAtCap));
 
         let history = agent.conversation_history.lock().await;
         assert_eq!(history.len(), 1);
@@ -12474,46 +12584,63 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[tokio::test]
-    async fn test_act_text_only_response_completes_without_a_nudge() {
-        let config = AgentConfig {
-            provider: Arc::new(std::sync::Mutex::new(Arc::new(Providers::Mock(
-                crate::providers::mock::MockProvider::single_text_response("I checked it."),
-            )))),
-            mode: AgentMode::Act,
-            task_id: "test-text-only-nudge".to_string(),
-            enable_checkpoints: false,
-            use_auto_condense: false,
-            show_token_usage: false,
-            show_thinking: true,
-            verbose: false,
-            json_output: false,
-            max_turns: 2,
-            max_consecutive_mistakes: Some(3),
-            double_check_completion: false,
-            timeout_secs: 300,
-            track_changes: false,
-            is_subagent_execution: false,
-            max_context_turns: 50,
-            max_tokens: None,
-            interactive_mode: false,
-            output_writer: Arc::new(crate::cli::output::StderrOutputWriter),
-            strict_plan_mode_enabled: true,
-        };
+    async fn test_act_first_text_only_turn_continues_with_steering() {
+        let responses = vec![
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "I checked it.".to_string(),
+                id: None,
+                signature: None,
+            })],
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "I checked it, nothing to do.".to_string(),
+                id: None,
+                signature: None,
+            })],
+        ];
+        let provider = Arc::new(Providers::RecordingChunk(
+            crate::providers::RecordingChunkProvider::new(
+                responses,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ),
+        ));
+        let mut config = test_agent_config(provider, "test-text-only-nudge");
+        config.output_writer = Arc::new(crate::cli::output::StderrOutputWriter);
+        config.strict_plan_mode_enabled = true;
 
         let mut agent = AgentLoop::new(config);
         let result = agent.execute_turn().await;
-        assert!(matches!(result, TurnResult::Complete));
+        assert!(
+            matches!(result, TurnResult::Continue),
+            "a first narration with no tool work behind it must not end the run, got {result:?}"
+        );
         let history = agent.conversation_history.lock().await;
-        let nudge_count = history
-            .iter()
-            .filter(|message| {
-                matches!(
-                    &message.content,
-                    MessageContent::Text(text) if text.contains("use the required tool")
-                )
-            })
-            .count();
-        assert_eq!(nudge_count, 0);
+        assert!(
+            history.iter().any(|message| matches!(
+                &message.content,
+                MessageContent::Text(text) if text.contains("use the required tool")
+            )),
+            "first text-only turn must steer toward a tool or attempt_completion"
+        );
+        drop(history);
+        assert!(
+            matches!(agent.execute_turn().await, TurnResult::Complete),
+            "two consecutive narrations end the task under the uniform rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forced_at_cap_text_marks_completion_distinctly() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("Final summary."),
+        ));
+        let mut config = test_agent_config(provider, "test-forced-at-cap");
+        config.output_writer = Arc::new(crate::cli::output::StderrOutputWriter);
+        let mut agent = AgentLoop::new(config);
+        agent.state.lock().await.at_cap_turn = true;
+        assert!(
+            matches!(agent.execute_turn().await, TurnResult::CompleteAtCap),
+            "a cap-forced summary without attempt_completion must not masquerade as genuine completion"
+        );
     }
 
     #[tokio::test]
@@ -12567,6 +12694,17 @@ Irrespective of whether additional information or instructions are given, you ar
     }
 
     #[test]
+    fn test_buried_promise_counts_as_progress_only() {
+        assert!(is_progress_only_response("I'll inspect both files."));
+        assert!(is_progress_only_response(
+            "OK writing now, for real. I'll produce the complete file."
+        ));
+        assert!(!is_progress_only_response(
+            "The requested change is complete."
+        ));
+    }
+
+    #[test]
     fn test_agent_mode_equality() {
         assert_eq!(AgentMode::Plan, AgentMode::Plan);
         assert_ne!(AgentMode::Plan, AgentMode::Act);
@@ -12577,11 +12715,12 @@ Irrespective of whether additional information or instructions are given, you ar
         let results = [
             TurnResult::Continue,
             TurnResult::Complete,
+            TurnResult::CompleteAtCap,
             TurnResult::Cancelled,
             TurnResult::Error("test".to_string()),
         ];
 
-        assert_eq!(results.len(), 4);
+        assert_eq!(results.len(), 5);
     }
 
     #[test]
@@ -17281,8 +17420,12 @@ Irrespective of whether additional information or instructions are given, you ar
             crate::providers::RecordingChunkProvider::new(responses, requests),
         ));
         let mut agent = AgentLoop::new(test_agent_config(provider, "test-split-usage-context"));
+        agent.state.lock().await.at_cap_turn = true;
 
-        assert!(matches!(agent.execute_turn().await, TurnResult::Complete));
+        assert!(matches!(
+            agent.execute_turn().await,
+            TurnResult::CompleteAtCap
+        ));
 
         let state = agent.state.lock().await;
         let usage = state.last_api_req_info.as_ref().unwrap();
@@ -17829,8 +17972,11 @@ Irrespective of whether additional information or instructions are given, you ar
 
             let history = agent.conversation_history.lock().await;
             if mode == AgentMode::Act {
-                assert!(matches!(result, TurnResult::Complete));
-                assert!(!history.iter().any(|message| matches!(
+                assert!(
+                    matches!(result, TurnResult::Continue),
+                    "a first narration ends nothing under the uniform rule, got {result:?}"
+                );
+                assert!(history.iter().any(|message| matches!(
                     &message.content,
                     MessageContent::Text(text) if text.contains("You returned text without using a tool")
                 )));
@@ -17852,11 +17998,14 @@ Irrespective of whether additional information or instructions are given, you ar
     async fn test_plan_state_is_injected_into_provider_request() {
         use crate::core::plan_state::PlanStepStatus;
 
-        let responses = vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
-            text: "No-op response".to_string(),
-            id: None,
-            signature: None,
-        })]];
+        let no_op = || {
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "No-op response".to_string(),
+                id: None,
+                signature: None,
+            })]
+        };
+        let responses = vec![no_op(), no_op()];
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = Arc::new(Providers::RecordingChunk(
@@ -17900,6 +18049,9 @@ Irrespective of whether additional information or instructions are given, you ar
             state.plan_state = Some(plan);
             state.last_injected_plan_state_hash = None;
         }
+
+        let result = agent.execute_turn().await;
+        assert!(matches!(result, TurnResult::Continue));
 
         let result = agent.execute_turn().await;
         assert!(matches!(result, TurnResult::Complete));
@@ -18363,23 +18515,28 @@ Irrespective of whether additional information or instructions are given, you ar
     #[tokio::test]
     async fn test_wrap_up_reminder_absent_when_task_completes_early() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done_text = || {
+            vec![ApiStreamChunk::Text(ApiStreamTextChunk {
+                text: "done".to_string(),
+                id: None,
+                signature: None,
+            })]
+        };
         let provider = Arc::new(Providers::RecordingChunk(
             crate::providers::RecordingChunkProvider::new(
-                vec![vec![ApiStreamChunk::Text(ApiStreamTextChunk {
-                    text: "done".to_string(),
-                    id: None,
-                    signature: None,
-                })]],
+                vec![done_text(), done_text()],
                 requests.clone(),
             ),
         ));
         let mut agent = AgentLoop::new(test_agent_config(provider, "test-wrap-up-early-done"));
 
         let outcome = agent.execute_turn().await;
+        assert!(matches!(outcome, TurnResult::Continue));
+        let outcome = agent.execute_turn().await;
         assert!(matches!(outcome, TurnResult::Complete));
 
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.len(), 2);
         assert!(
             !requests[0].messages.iter().any(|message| {
                 matches!(

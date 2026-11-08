@@ -433,6 +433,9 @@ pub enum TurnResult {
     Continue,
     /// Task completed successfully.
     Complete,
+    /// Turn cap forced a text answer: the run ends, but no completion
+    /// tool accepted the result, so success metrics must not count it.
+    CompleteAtCap,
     /// Task cancelled.
     Cancelled,
     /// Error occurred.
@@ -459,6 +462,14 @@ impl TaskState {
             self.last_edit_turn = now;
             self.stability_nudge_fired = false;
         }
+    }
+
+    /// Record shell activity that proves the session is not quiet. Shell
+    /// edits carry no tracked path, so they restart the stability clock
+    /// without joining the path set or touching the override span, which
+    /// stays tool-tracked per the battery scorer restriction.
+    pub fn note_shell_action(&mut self, now: u32) {
+        self.last_edit_turn = now;
     }
 
     /// Record a re-edit against the override snapshot. Only a path watched
