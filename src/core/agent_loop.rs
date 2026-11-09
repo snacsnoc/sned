@@ -716,6 +716,10 @@ pub struct AgentLoop {
     retry_mode: bool,
     inspection_streak: u32,
     inspection_reminder_sent: bool,
+    /// Shadow switch for the re-pair battery: fires still snapshot and
+    /// record so telemetry matches the live arm, but nothing reaches
+    /// history. Env-gated with no CLI surface until it proves useful.
+    nudge_shadow: bool,
 }
 
 impl AgentLoop {
@@ -998,6 +1002,7 @@ impl AgentLoop {
             retry_mode: false,
             inspection_streak: 0,
             inspection_reminder_sent: false,
+            nudge_shadow: std::env::var_os("SNED_NUDGE_SHADOW").is_some(),
         }
     }
 
@@ -4872,6 +4877,9 @@ impl AgentLoop {
             .lock()
             .await
             .record_nudge_fire(NudgeKind::WrapUp, turn_count);
+        if self.nudge_shadow {
+            return;
+        }
         self.conversation_history.lock().await.push(StorageMessage {
             id: Some(Self::next_message_id(&self.message_counter)),
             role: MessageRole::User,
@@ -4921,6 +4929,9 @@ impl AgentLoop {
             state.snapshot_override_watch();
             state.record_nudge_fire(NudgeKind::Aging, turn_count);
         }
+        if self.nudge_shadow {
+            return;
+        }
         self.conversation_history.lock().await.push(StorageMessage {
             id: Some(Self::next_message_id(&self.message_counter)),
             role: MessageRole::User,
@@ -4961,6 +4972,9 @@ impl AgentLoop {
                 state.last_edit_turn,
             )
         };
+        if self.nudge_shadow {
+            return;
+        }
         self.conversation_history.lock().await.push(StorageMessage {
             id: Some(Self::next_message_id(&self.message_counter)),
             role: MessageRole::User,
@@ -12804,6 +12818,42 @@ Irrespective of whether additional information or instructions are given, you ar
         agent.maybe_inject_wrap_up_reminder(27).await;
         assert_eq!(agent.state.lock().await.last_nudge_turn, None);
         assert!(!history_has(&agent, "[Approaching]").await);
+    }
+
+    #[tokio::test]
+    async fn test_nudge_shadow_records_without_injecting() {
+        let provider = Arc::new(Providers::Mock(
+            crate::providers::mock::MockProvider::single_text_response("unused"),
+        ));
+        let mut config = test_agent_config(provider, "nudge-shadow");
+        config.max_turns = 30;
+        config.pressure_nudges = true;
+        let mut agent = AgentLoop::new(config);
+        agent.nudge_shadow = true;
+        {
+            let mut state = agent.state.lock().await;
+            state.session_edited_paths.insert("game.js".to_string());
+            state.last_edit_turn = 2;
+        }
+        agent.maybe_inject_aging_nudge(12).await;
+        agent.maybe_inject_stability_nudge(12).await;
+        agent.maybe_inject_wrap_up_reminder(27).await;
+        let state = agent.state.lock().await;
+        assert_eq!(state.last_nudge_turn, Some(27));
+        assert!(state.override_watch.is_some());
+        assert!(state.quit_span_status(28).is_some());
+        drop(state);
+        let history = agent.conversation_history.lock().await;
+        assert!(
+            !history.iter().any(|message| matches!(
+                &message.content,
+                crate::providers::MessageContent::Text(text)
+                    if text.contains("[Progress check]")
+                        || text.contains("[Stability check]")
+                        || text.contains("[Approaching turn limit]")
+            )),
+            "shadow fires telemetry without touching history"
+        );
     }
 
     #[tokio::test]
