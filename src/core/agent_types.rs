@@ -168,6 +168,9 @@ pub struct TaskState {
     pub is_subagent_execution: bool,
     /// Counter for debouncing conversation history saves (save every N turns).
     pub turns_since_save: u32,
+    /// Messages already covered by the on-disk snapshot+journal. A full
+    /// rewrite resets it; anything below it means history shrank in place.
+    pub history_saved_len: usize,
     /// File content cache for cross-call coordination within a single turn.
     /// Maps absolute file paths to their latest content after edits in this turn.
     pub file_content_cache: LruCache<String, String>,
@@ -307,6 +310,7 @@ impl Default for TaskState {
             subagents_enabled: false,
             is_subagent_execution: false,
             turns_since_save: 0,
+            history_saved_len: 0,
             file_content_cache: LruCache::new(
                 NonZeroUsize::new(MAX_FILE_CONTENT_CACHE_ENTRIES)
                     .expect("file content cache entry limit must be non-zero"),

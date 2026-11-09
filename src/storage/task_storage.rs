@@ -600,7 +600,15 @@ impl TaskStorage {
 
     /// Read API conversation history with the recovery lineage a caller
     /// needs to remap saved message ranges after mid-file record loss.
+    /// Journal lines appended since the last snapshot merge after the
+    /// snapshot records; a torn tail from a crash mid-append truncates.
     pub fn read_api_conversation_history_with_recovery(&self) -> RecoveredHistory {
+        let mut recovered = self.read_snapshot_with_recovery();
+        self.merge_history_journal(&mut recovered);
+        recovered
+    }
+
+    fn read_snapshot_with_recovery(&self) -> RecoveredHistory {
         let file_path = self
             .task_dir
             .join(GlobalFileNames::API_CONVERSATION_HISTORY);
@@ -731,6 +739,31 @@ impl TaskStorage {
         }
     }
 
+    fn merge_history_journal(&self, recovered: &mut RecoveredHistory) {
+        let path = self
+            .task_dir
+            .join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL);
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(_) => return,
+        };
+        for line in contents.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<StorageMessage>(line) {
+                Ok(message) => recovered.messages.push(message),
+                Err(error) => {
+                    recovered.used_fallback = true;
+                    if recovered.first_error.is_none() {
+                        recovered.first_error = Some(error.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     /// Encode history for storage with no duplicate `signature` keys.
     ///
     /// Thinking blocks carry the provider signature twice (direct field plus
@@ -742,20 +775,93 @@ impl TaskStorage {
     fn encode_history_for_storage(history: &[StorageMessage]) -> io::Result<String> {
         let mut normalized = history.to_vec();
         for message in &mut normalized {
-            if let MessageContent::AssistantBlocks(blocks) = &mut message.content {
-                for block in blocks {
-                    if let AssistantContentBlock::Thinking(thinking) = block {
-                        if thinking.signature.is_none() {
-                            thinking.signature = thinking.shared.signature.clone();
-                        }
-                        thinking.shared.signature.clone_from(&thinking.signature);
-                    }
-                }
-            }
+            Self::normalize_message_for_storage(message);
         }
         let value = serde_json::to_value(&normalized)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         serde_json::to_string(&value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    fn normalize_message_for_storage(message: &mut StorageMessage) {
+        if let MessageContent::AssistantBlocks(blocks) = &mut message.content {
+            for block in blocks {
+                if let AssistantContentBlock::Thinking(thinking) = block {
+                    if thinking.signature.is_none() {
+                        thinking.signature = thinking.shared.signature.clone();
+                    }
+                    thinking.shared.signature.clone_from(&thinking.signature);
+                }
+            }
+        }
+    }
+
+    fn encode_message_for_storage(message: &StorageMessage) -> io::Result<String> {
+        let mut normalized = message.clone();
+        Self::normalize_message_for_storage(&mut normalized);
+        let value = serde_json::to_value(&normalized)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        serde_json::to_string(&value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Append messages to the history journal as one JSON object per line.
+    /// A failed append rolls the file back to its prior length, so a retry
+    /// writes the same lines once — mirroring the atomic full rewrite this
+    /// replaces. Callers advance their saved offset only on success.
+    pub async fn append_history_journal_async(
+        &self,
+        messages: &[StorageMessage],
+    ) -> io::Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut data = String::new();
+        for message in messages {
+            data.push_str(&Self::encode_message_for_storage(message)?);
+            data.push('\n');
+        }
+        let path = self
+            .task_dir
+            .join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL);
+        let _guard = self
+            .acquire_lock_with_retry_for(API_CONVERSATION_HISTORY_LOCK_FILE)
+            .await?;
+        // Read inside the lock: a length taken before it could miss a
+        // concurrent append, and the rollback below would eat it.
+        let prior_len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let result = Self::append_bytes_async(&path, data.as_bytes()).await;
+        if result.is_err() {
+            if prior_len == 0 {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let _ = Self::truncate_path_async(&path, prior_len).await;
+            }
+        }
+        result
+    }
+
+    async fn append_bytes_async(path: &std::path::Path, data: &[u8]) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        file.write_all(data).await?;
+        Ok(())
+    }
+
+    async fn truncate_path_async(path: &std::path::Path, len: u64) -> io::Result<()> {
+        let file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+        file.set_len(len).await
+    }
+
+    fn clear_history_journal(&self) {
+        let path = self
+            .task_dir
+            .join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL);
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// Parse history message-by-message, collecting the indices that fail
@@ -971,7 +1077,9 @@ impl TaskStorage {
             let file_path = self
                 .task_dir
                 .join(GlobalFileNames::API_CONVERSATION_HISTORY);
-            crate::storage::disk::atomic_write_file(&file_path, &data)
+            crate::storage::disk::atomic_write_file(&file_path, &data)?;
+            self.clear_history_journal();
+            Ok(())
         })
     }
 
@@ -988,7 +1096,11 @@ impl TaskStorage {
         let _guard = self
             .acquire_lock_with_retry_for(API_CONVERSATION_HISTORY_LOCK_FILE)
             .await?;
-        crate::storage::disk::atomic_write_file_async(&file_path, &data).await
+        let result = crate::storage::disk::atomic_write_file_async(&file_path, &data).await;
+        if result.is_ok() {
+            self.clear_history_journal();
+        }
+        result
     }
 
     /// Read compacted summary
@@ -1679,6 +1791,95 @@ mod tests {
         let read = storage.read_api_conversation_history();
 
         assert_eq!(read, history);
+    }
+
+    fn journal_test_message(text: &str) -> StorageMessage {
+        use crate::providers::{MessageContent, MessageRole};
+        StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_journal_append_and_merge_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let snapshot = vec![journal_test_message("one"), journal_test_message("two")];
+        storage.write_api_conversation_history(&snapshot).unwrap();
+        let journal = vec![journal_test_message("three"), journal_test_message("four")];
+        storage
+            .append_history_journal_async(&journal)
+            .await
+            .unwrap();
+
+        let read = storage.read_api_conversation_history();
+        let expected: Vec<StorageMessage> =
+            snapshot.into_iter().chain(journal.into_iter()).collect();
+        assert_eq!(read, expected);
+    }
+
+    #[tokio::test]
+    async fn test_journal_torn_tail_truncates() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let snapshot = vec![journal_test_message("one")];
+        storage.write_api_conversation_history(&snapshot).unwrap();
+        storage
+            .append_history_journal_async(&[journal_test_message("two")])
+            .await
+            .unwrap();
+        let journal_path = task_dir.join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL);
+        fs::write(
+            &journal_path,
+            fs::read_to_string(&journal_path).unwrap() + "{\"torn\":",
+        )
+        .unwrap();
+
+        let recovered = storage.read_api_conversation_history_with_recovery();
+        assert!(recovered.used_fallback);
+        assert_eq!(recovered.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_clears_journal() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        let first = vec![journal_test_message("one")];
+        storage.write_api_conversation_history(&first).unwrap();
+        storage
+            .append_history_journal_async(&[journal_test_message("two")])
+            .await
+            .unwrap();
+        let journal_path = task_dir.join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL);
+        assert!(journal_path.exists());
+
+        let second = vec![journal_test_message("three")];
+        storage.write_api_conversation_history(&second).unwrap();
+        assert!(!journal_path.exists());
+        assert_eq!(storage.read_api_conversation_history(), second);
     }
 
     #[test]

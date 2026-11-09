@@ -399,6 +399,8 @@ pub struct GlobalFileNames;
 
 impl GlobalFileNames {
     pub const API_CONVERSATION_HISTORY: &'static str = "api_conversation_history.json";
+    pub const API_CONVERSATION_HISTORY_JOURNAL: &'static str =
+        "api_conversation_history.journal.jsonl";
     pub const CONTEXT_HISTORY: &'static str = "context_history.json";
     pub const UI_MESSAGES: &'static str = "ui_messages.json";
     pub const COMPACTED_SUMMARY: &'static str = "compacted_summary.json";

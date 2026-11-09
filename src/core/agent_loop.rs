@@ -1668,6 +1668,7 @@ impl AgentLoop {
                 state.stability_nudge_fired = false;
                 state.override_watch = None;
                 state.override_reedited = false;
+                state.history_saved_len = 0;
                 // Narration patience belongs to one task: a new task starts
                 // unconvinced, or its first narration would complete it.
                 state.text_only_turns = 0;
@@ -5287,13 +5288,32 @@ impl AgentLoop {
                 error!("Failed to save last API request info: {}", e);
             }
 
-            // Debounce: only save every 5 turns to reduce I/O overhead
+            // Debounce: only save every 5 turns to reduce I/O overhead.
+            // Steady state appends just the new tail to the journal; the
+            // full snapshot runs only after history was rewritten in place
+            // (compaction, truncation, task switch), when the saved offset
+            // no longer lines up with memory.
             if full_save {
                 let history = self.conversation_history.lock().await.clone();
-                if !history.is_empty()
-                    && let Err(e) = storage.write_api_conversation_history_async(&history).await
-                {
-                    error!("Failed to save API conversation history: {}", e);
+                if !history.is_empty() {
+                    let saved_len = self.state.lock().await.history_saved_len;
+                    let result = if saved_len == 0 || saved_len > history.len() {
+                        storage.write_api_conversation_history_async(&history).await
+                    } else if saved_len < history.len() {
+                        storage
+                            .append_history_journal_async(&history[saved_len..])
+                            .await
+                    } else {
+                        Ok(())
+                    };
+                    match result {
+                        Ok(()) => {
+                            self.state.lock().await.history_saved_len = history.len();
+                        }
+                        Err(e) => {
+                            error!("Failed to save API conversation history: {}", e);
+                        }
+                    }
                 }
 
                 // Save compacted summary if present
@@ -5501,6 +5521,7 @@ impl AgentLoop {
 
         if truncated_any {
             let mut state = self.state.lock().await;
+            state.history_saved_len = 0;
             Self::clear_history_dependent_read_state(&mut state);
             if state.conversation_history_deleted_range.is_some() {
                 tracing::debug!(
@@ -5563,8 +5584,11 @@ impl AgentLoop {
             };
 
             if !recovered.messages.is_empty() {
-                let mut current = self.conversation_history.lock().await;
-                std::mem::swap(&mut *current, &mut recovered.messages);
+                {
+                    let mut current = self.conversation_history.lock().await;
+                    std::mem::swap(&mut *current, &mut recovered.messages);
+                }
+                self.state.lock().await.history_saved_len = 0;
                 loaded = true;
             }
 
@@ -13662,11 +13686,11 @@ Irrespective of whether additional information or instructions are given, you ar
         }
 
         // Verify file was created
-        let expected_path = sned_dir
-            .join("data")
-            .join("tasks")
-            .join(task_id)
-            .join("api_conversation_history.json");
+        let task_files = sned_dir.join("data").join("tasks").join(task_id);
+        let expected_path = task_files.join("api_conversation_history.json");
+        let journal_path = task_files.join(
+            crate::storage::disk::GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL,
+        );
 
         assert!(
             expected_path.exists(),
@@ -13696,13 +13720,19 @@ Irrespective of whether additional information or instructions are given, you ar
             agent.save_conversation_history().await;
         }
 
+        // The second batch appends to the journal; the snapshot stays put.
         let content = std::fs::read_to_string(&expected_path).unwrap();
-        let messages: Vec<StorageMessage> = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            messages.len(),
-            2,
-            "Should have 2 messages after second save batch"
+        let snapshot: Vec<StorageMessage> = serde_json::from_str(&content).unwrap();
+        assert_eq!(snapshot.len(), 1, "Snapshot keeps the first batch");
+        assert!(
+            journal_path.exists(),
+            "Second batch lands in the journal, not a full rewrite"
         );
+
+        // The merged read is the supported view: snapshot plus journal tail.
+        let storage = agent.deps.task_storage.as_ref().unwrap();
+        let merged = storage.read_api_conversation_history();
+        assert_eq!(merged.len(), 2, "Should have 2 messages after second save batch");
 
         // Cleanup: temp_dir dropped automatically
     }
