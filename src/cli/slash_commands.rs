@@ -1507,6 +1507,7 @@ pub struct ModelPickerEntry {
     pub model_id: &'static str,
     pub label: &'static str,
     pub description: &'static str,
+    pub needs_key: bool,
 }
 
 /// Build the list of available model picker entries.
@@ -1518,116 +1519,150 @@ pub fn build_model_picker_entries() -> Vec<ModelPickerEntry> {
             model_id: "claude-fable-5",
             label: "claude-fable-5",
             description: "Claude Fable 5",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "anthropic",
             model_id: "claude-opus-5",
             label: "claude-opus-5",
             description: "Claude Opus 5",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "anthropic",
             model_id: "claude-sonnet-5",
             label: "claude-sonnet-5",
             description: "Claude Sonnet 5",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "anthropic",
             model_id: "claude-haiku-4-5-20251001",
             label: "claude-haiku-4-5-20251001",
             description: "Claude Haiku 4.5",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "openai",
             model_id: "gpt-5.6-sol",
             label: "gpt-5.6-sol",
             description: "GPT-5.6 Sol",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "openai",
             model_id: "gpt-5.6-terra",
             label: "gpt-5.6-terra",
             description: "GPT-5.6 Terra",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "openai",
             model_id: "gpt-5.6-luna",
             label: "gpt-5.6-luna",
             description: "GPT-5.6 Luna",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "minimax",
             model_id: "MiniMax-M3.1-Flash",
             label: "MiniMax-M3.1-Flash",
             description: "MiniMax M3.1 Flash",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "minimax",
             model_id: "minimax-m3",
             label: "minimax-m3",
             description: "MiniMax M3",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "minimax",
             model_id: "minimax-m2.7",
             label: "minimax-m2.7",
             description: "MiniMax M2.7",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "gemini",
             model_id: "gemini-3.6-flash",
             label: "gemini-3.6-flash",
             description: "Gemini 3.6 Flash",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "gemini",
             model_id: "gemini-3.5-flash",
             label: "gemini-3.5-flash",
             description: "Gemini 3.5 Flash",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "gemini",
             model_id: "gemini-3.5-flash-lite",
             label: "gemini-3.5-flash-lite",
             description: "Gemini 3.5 Flash-Lite",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "deepseek",
             model_id: "deepseek-chat",
             label: "deepseek-chat",
             description: "DeepSeek Chat",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "nvidia",
             model_id: "meta/llama-3.1-8b-instruct",
             label: "llama-3.1-8b-instruct",
             description: "NVIDIA NIM Llama 3.1 8B",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "openrouter",
             model_id: "anthropic/claude-sonnet-5",
             label: "anthropic/claude-sonnet-5",
             description: "OpenRouter - Claude Sonnet 5",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "openrouter",
             model_id: "openai/gpt-5.6-sol",
             label: "openai/gpt-5.6-sol",
             description: "OpenRouter - GPT-5.6 Sol",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "openrouter",
             model_id: "google/gemini-3.6-flash",
             label: "google/gemini-3.6-flash",
             description: "OpenRouter - Gemini 3.6 Flash",
+            needs_key: false,
         },
         ModelPickerEntry {
             provider: "openrouter",
             model_id: "minimax/minimax-m3",
             label: "minimax/minimax-m3",
             description: "OpenRouter - MiniMax M3",
+            needs_key: false,
         },
     ]
+}
+
+/// Order picker entries ready-first, flagging the rest.
+/// Stable: relative order within each group is preserved.
+pub fn partition_by_readiness(
+    mut entries: Vec<ModelPickerEntry>,
+    ready: &dyn Fn(&str) -> bool,
+) -> Vec<ModelPickerEntry> {
+    for entry in &mut entries {
+        entry.needs_key = !ready(entry.provider);
+    }
+    let (mut ready_first, mut rest): (Vec<ModelPickerEntry>, Vec<ModelPickerEntry>) =
+        entries.into_iter().partition(|entry| !entry.needs_key);
+    ready_first.append(&mut rest);
+    ready_first
 }
 
 #[must_use]
@@ -1786,6 +1821,36 @@ Below is the user's input when they indicated that they wanted to compact their 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_partition_by_readiness_orders_ready_first() {
+        let entries = build_model_picker_entries();
+        let total = entries.len();
+        let ready_count = entries
+            .iter()
+            .filter(|entry| entry.provider == "minimax")
+            .count();
+        assert!(ready_count > 0, "fixture needs a ready provider");
+        assert!(ready_count < total, "fixture needs an unready provider");
+
+        let ordered = partition_by_readiness(entries, &|provider| provider == "minimax");
+        assert_eq!(ordered.len(), total);
+        let first_unready = ordered
+            .iter()
+            .position(|entry| entry.needs_key)
+            .expect("unready entries sort last");
+        assert_eq!(first_unready, ready_count);
+        assert!(
+            ordered[..first_unready]
+                .iter()
+                .all(|entry| entry.provider == "minimax" && !entry.needs_key),
+            "ready entries keep their relative order first"
+        );
+        assert!(
+            ordered[first_unready..].iter().all(|entry| entry.needs_key),
+            "everything after the split needs a key"
+        );
+    }
 
     #[test]
     fn test_no_slash_command() {

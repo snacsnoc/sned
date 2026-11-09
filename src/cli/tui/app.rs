@@ -5938,12 +5938,17 @@ impl App {
                 .skip(first_visible)
                 .take(visible_rows)
                 .map(|(i, entry)| {
-                    let label = format!(
+                    let mut label = format!(
                         "[{}] {} - {}",
                         entry.provider, entry.label, entry.description
                     );
+                    if entry.needs_key {
+                        label.push_str(" · needs key");
+                    }
                     if i == selected {
                         Line::from(Span::styled(label, theme::picker_selected_style()))
+                    } else if entry.needs_key {
+                        Line::from(Span::styled(label, theme::dim_style()))
                     } else {
                         Line::from(label)
                     }

@@ -642,6 +642,7 @@ enum Action {
         cli_cmd: Option<crate::cli::slash_commands::CliOnlyCommand>,
     },
     ModelSwitch(PendingModelSwitch),
+    OpenModelPicker,
     ModelApiKeySubmitted(PendingModelSwitch, String),
     SetReasoningEffort(crate::cli::ReasoningEffort),
     PlanApprove,
@@ -704,6 +705,48 @@ async fn activate_model_switch(
             );
         }
     }
+}
+
+async fn open_model_picker(
+    app: &mut App,
+    session: &Arc<Mutex<InteractiveSession>>,
+    task_opts: &TaskOptions,
+) {
+    let mut entries = crate::cli::slash_commands::build_model_picker_entries();
+    {
+        let sess = session.lock().await;
+        let current = sess.task_opts.provider.clone();
+        let mut readiness = std::collections::HashMap::new();
+        for entry in &entries {
+            if readiness.contains_key(entry.provider) {
+                continue;
+            }
+            let remembered = sess.provider_api_key(entry.provider);
+            let explicit = remembered.or_else(|| {
+                if current.as_deref() == Some(entry.provider) {
+                    task_opts.api_key.clone()
+                } else {
+                    None
+                }
+            });
+            let ready = crate::cli::runtime_provider_api_key_available(
+                entry.provider,
+                explicit.as_deref(),
+                &sess.state_manager,
+            )
+            .unwrap_or(true);
+            readiness.insert(entry.provider, ready);
+        }
+        let ordered = crate::cli::slash_commands::partition_by_readiness(entries, &|provider| {
+            readiness.get(provider).copied().unwrap_or(true)
+        });
+        entries = ordered;
+    }
+    // Exactly one picker may hold the input.
+    clear_input_overlays(app);
+    app.model_picker_results = entries;
+    app.model_picker_selected = 0;
+    app.model_picker_active = true;
 }
 
 async fn request_model_switch(
@@ -3597,6 +3640,23 @@ async fn handle_key_event_inner(
         return Ok(None);
     }
 
+    // Ctrl+O - open the model picker (same as bare /model)
+    if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if !app.has_pending_approval()
+            && !app.picker_active
+            && !app.slash_command_active
+            && !app.slash_command_help_active
+            && !app.model_picker_active
+            && !app.reasoning_effort_picker_active
+            && app.pending_model_switch.is_none()
+            && app.pending_clear.is_none()
+            && !is_followup_question_active(task_id)
+        {
+            return Ok(Some(Action::OpenModelPicker));
+        }
+        return Ok(None);
+    }
+
     // All keys reach the textarea; history is browsed by scrolling.
     use tui_textarea::Input;
     app.input.input(Input::from(key));
@@ -4015,11 +4075,7 @@ async fn handle_cli_only_command_with_terminal(
         }
         CliOnlyCommand::ModelSwitch(model_spec) => {
             if model_spec.is_empty() {
-                // Exactly one picker may hold the input.
-                clear_input_overlays(app);
-                app.model_picker_results = crate::cli::slash_commands::build_model_picker_entries();
-                app.model_picker_selected = 0;
-                app.model_picker_active = true;
+                open_model_picker(app, session, task_opts).await;
                 return Ok(false);
             }
 
@@ -6347,6 +6403,10 @@ async fn run_main_loop(
                                 Action::ModelSwitch(request) => {
                                     request_model_switch(request, None, app, &session, &agent_busy)
                                         .await;
+                                    break;
+                                }
+                                Action::OpenModelPicker => {
+                                    open_model_picker(app, &session, &task_opts).await;
                                     break;
                                 }
                                 Action::SetReasoningEffort(effort) => {
@@ -10447,6 +10507,73 @@ mod tests {
         echo_agent_prompt(&mut app, "finished prompt", &output_writer);
         drain_output(&mut rx, &mut app);
         assert!(transcript_text(&app).contains("finished prompt"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_returns_open_model_picker_action() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(matches!(action, Some(Action::OpenModelPicker)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_stays_inert_while_modal_state_holds() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.model_picker_active = true;
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(
+            !matches!(action, Some(Action::OpenModelPicker)),
+            "Ctrl+O must not open a second picker"
+        );
+
+        let mut app = App::new();
+        app.pending_model_switch =
+            Some(crate::cli::tui::app::PendingModelSwitch {
+                provider: "minimax".to_string(),
+                model_id: "minimax-m3".to_string(),
+            });
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(
+            !matches!(action, Some(Action::OpenModelPicker)),
+            "Ctrl+O must not fire during secret entry"
+        );
         Ok(())
     }
 
