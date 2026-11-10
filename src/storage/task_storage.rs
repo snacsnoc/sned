@@ -739,7 +739,65 @@ impl TaskStorage {
         }
     }
 
+    /// A journal older than the snapshot was already absorbed by it: the
+    /// writer clears the journal right after the snapshot lands, so a
+    /// survivor means the process died in between. Merging would duplicate
+    /// the tail; quarantine the stale file instead. A journal newer than
+    /// the snapshot holds lines the snapshot never saw and must merge.
+    fn journal_superseded_by_snapshot(&self) -> bool {
+        let journal = self
+            .task_dir
+            .join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL);
+        let snapshot = self
+            .task_dir
+            .join(GlobalFileNames::API_CONVERSATION_HISTORY);
+        match (fs::metadata(&journal), fs::metadata(&snapshot)) {
+            (Ok(journal_meta), Ok(snapshot_meta)) => {
+                match (journal_meta.modified(), snapshot_meta.modified()) {
+                    (Ok(journal_mtime), Ok(snapshot_mtime)) => journal_mtime < snapshot_mtime,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn quarantine_superseded_journal(&self) {
+        let result = self.with_lock_file(API_CONVERSATION_HISTORY_LOCK_FILE, || {
+            // Re-check under the same lock the append path holds: a
+            // debounced save may have landed fresh lines after the first
+            // check, and removing those would lose real turns.
+            if !self.journal_superseded_by_snapshot() {
+                return Ok(());
+            }
+            let path = self
+                .task_dir
+                .join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL);
+            match crate::storage::disk::create_backup(&path) {
+                Ok(_) => fs::remove_file(&path),
+                Err(error) => {
+                    tracing::warn!(
+                        journal = %path.display(),
+                        error = %error,
+                        "Keeping superseded history journal after backup failed; it will be quarantined again on the next load"
+                    );
+                    Ok(())
+                }
+            }
+        });
+        if let Err(error) = result {
+            tracing::warn!(
+                error = %error,
+                "Failed to lock superseded history journal; it will be quarantined again on the next load"
+            );
+        }
+    }
+
     fn merge_history_journal(&self, recovered: &mut RecoveredHistory) {
+        if self.journal_superseded_by_snapshot() {
+            self.quarantine_superseded_journal();
+            return;
+        }
         let path = self
             .task_dir
             .join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL);
@@ -754,11 +812,15 @@ impl TaskStorage {
             match serde_json::from_str::<StorageMessage>(line) {
                 Ok(message) => recovered.messages.push(message),
                 Err(error) => {
+                    // A torn tail is one bad line, not the end of the
+                    // file: later lines may still be intact (an earlier
+                    // append's bytes survive a crash mid-write after
+                    // them). Keep them; the error is already recorded.
                     recovered.used_fallback = true;
                     if recovered.first_error.is_none() {
                         recovered.first_error = Some(error.to_string());
                     }
-                    break;
+                    continue;
                 }
             }
         }
@@ -847,6 +909,10 @@ impl TaskStorage {
             .open(path)
             .await?;
         file.write_all(data).await?;
+        // The saved offset advances only after this returns, so the bytes
+        // must be durable first; otherwise a crash leaves the offset past
+        // lines that never reached disk.
+        file.sync_all().await?;
         Ok(())
     }
 
@@ -1803,6 +1869,119 @@ mod tests {
             metrics: None,
             ts: None,
         }
+    }
+
+    fn journal_texts(messages: &[StorageMessage]) -> Vec<String> {
+        use crate::providers::MessageContent;
+        messages
+            .iter()
+            .map(|message| match &message.content {
+                MessageContent::Text(text) => text.clone(),
+                _ => String::from("<non-text>"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_merge_keeps_valid_lines_after_torn_tail() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        storage
+            .write_api_conversation_history(&[journal_test_message("one")])
+            .unwrap();
+        // Crash mid-append: valid line, torn bytes, then a valid line the
+        // crash orphaned after the tear. A reader that stops at the tear
+        // loses "three" even though its bytes are intact.
+        let journal_path = task_dir.join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL);
+        let two = TaskStorage::encode_message_for_storage(&journal_test_message("two")).unwrap();
+        let three =
+            TaskStorage::encode_message_for_storage(&journal_test_message("three")).unwrap();
+        fs::write(&journal_path, format!("{two}\n{{\"torn\":\n{three}\n")).unwrap();
+
+        let recovered = storage.read_api_conversation_history_with_recovery();
+        assert_eq!(
+            journal_texts(&recovered.messages),
+            vec!["one", "two", "three"]
+        );
+        assert!(recovered.used_fallback);
+    }
+
+    #[tokio::test]
+    async fn test_merge_quarantines_journal_older_than_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // Crash between snapshot write and journal clear: the journal still
+        // holds "three" but the snapshot already absorbed it. Merging would
+        // duplicate the tail.
+        let three =
+            TaskStorage::encode_message_for_storage(&journal_test_message("three")).unwrap();
+        fs::write(
+            &task_dir.join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL),
+            format!("{three}\n"),
+        )
+        .unwrap();
+        let snapshot_data = TaskStorage::encode_history_for_storage(&[
+            journal_test_message("one"),
+            journal_test_message("two"),
+            journal_test_message("three"),
+        ])
+        .unwrap();
+        crate::storage::disk::atomic_write_file(
+            &task_dir.join(GlobalFileNames::API_CONVERSATION_HISTORY),
+            &snapshot_data,
+        )
+        .unwrap();
+
+        let recovered = storage.read_api_conversation_history_with_recovery();
+        assert_eq!(
+            journal_texts(&recovered.messages),
+            vec!["one", "two", "three"]
+        );
+        assert!(
+            !task_dir
+                .join(GlobalFileNames::API_CONVERSATION_HISTORY_JOURNAL)
+                .exists(),
+            "superseded journal must be quarantined, not left to duplicate the tail on the next load"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_keeps_journal_newer_than_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let task_dir = temp_dir.path().join("test-task");
+        fs::create_dir_all(&task_dir).unwrap();
+        let storage = TaskStorage {
+            task_dir: task_dir.clone(),
+        };
+
+        // Ordinary steady state: snapshot first, journal appended after.
+        // The quarantine must not eat legitimate new lines.
+        storage
+            .write_api_conversation_history(&[
+                journal_test_message("one"),
+                journal_test_message("two"),
+            ])
+            .unwrap();
+        storage
+            .append_history_journal_async(&[journal_test_message("three")])
+            .await
+            .unwrap();
+
+        let recovered = storage.read_api_conversation_history_with_recovery();
+        assert_eq!(
+            journal_texts(&recovered.messages),
+            vec!["one", "two", "three"]
+        );
     }
 
     #[tokio::test]

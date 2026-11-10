@@ -723,6 +723,24 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
+    /// Shadow mode silences pressure-nudge output while still recording
+    /// telemetry. Presence alone does not enable it: an exported-but-empty
+    /// (or `=0`) variable must stay off, or ambient environments flip test
+    /// and production behavior without anyone opting in.
+    fn nudge_shadow_enabled() -> bool {
+        let Ok(raw) = std::env::var("SNED_NUDGE_SHADOW") else {
+            return false;
+        };
+        Self::nudge_shadow_opt_in(&raw)
+    }
+
+    fn nudge_shadow_opt_in(raw: &str) -> bool {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    }
+
     fn new_history_was_discarded(
         previous_deleted_range: Option<(usize, usize)>,
         current_deleted_range: Option<(usize, usize)>,
@@ -1002,7 +1020,7 @@ impl AgentLoop {
             retry_mode: false,
             inspection_streak: 0,
             inspection_reminder_sent: false,
-            nudge_shadow: std::env::var_os("SNED_NUDGE_SHADOW").is_some(),
+            nudge_shadow: Self::nudge_shadow_enabled(),
         }
     }
 
@@ -1905,15 +1923,7 @@ impl AgentLoop {
                 if let Err(e) = StateManager::persist_async(Arc::clone(&state_manager)).await {
                     error!("Failed to persist state manager on max turns: {}", e);
                 }
-                // Force-save conversation history to preserve final turns
-                if let Some(ref storage) = self.deps.task_storage {
-                    let history = self.conversation_history.lock().await.clone();
-                    if !history.is_empty()
-                        && let Err(e) = storage.write_api_conversation_history_async(&history).await
-                    {
-                        error!("Failed to save conversation history on max turns: {}", e);
-                    }
-                }
+                self.force_save_conversation_history("max turns").await;
                 return Err(AgentError::MaxTurnsExceeded);
             }
             turn_count += 1;
@@ -1955,18 +1965,7 @@ impl AgentLoop {
                         .await;
                     // Force-save conversation history to preserve turns that would
                     // otherwise be lost to the debounce window (W4)
-                    if let Some(ref storage) = self.deps.task_storage {
-                        let history = self.conversation_history.lock().await.clone();
-                        if !history.is_empty()
-                            && let Err(e) =
-                                storage.write_api_conversation_history_async(&history).await
-                        {
-                            tracing::error!(
-                                "Failed to save conversation history on cancellation: {}",
-                                e
-                            );
-                        }
-                    }
+                    self.force_save_conversation_history("cancellation").await;
                     self.record_task_history(&state_manager, task_text.as_deref().unwrap_or(""))
                         .await;
                     return Ok(());
@@ -2243,15 +2242,8 @@ impl AgentLoop {
                     }
                     // Force-save conversation history immediately on cancellation (W4 fix)
                     // Bypass the 5-turn debounce to prevent data loss
+                    self.force_save_conversation_history("cancel").await;
                     if let Some(ref storage) = self.deps.task_storage {
-                        let history = self.conversation_history.lock().await.clone();
-                        if !history.is_empty()
-                            && let Err(e) =
-                                storage.write_api_conversation_history_async(&history).await
-                        {
-                            error!("Failed to save conversation history on cancel: {}", e);
-                        }
-
                         let summary = self.state.lock().await.compacted_summary.clone();
                         if let Some(summary) = summary
                             && let Err(e) = storage.write_compacted_summary_async(&summary).await
@@ -2495,7 +2487,7 @@ impl AgentLoop {
             // Pass history by reference to context_manager — saves a full deep clone
             // of every message/tool-result per turn.
             let mut conversation_guard = self.conversation_history.lock().await;
-            close_dangling_tool_calls(&mut conversation_guard);
+            let dangling_inserted = close_dangling_tool_calls(&mut conversation_guard);
             let original_history_len = conversation_guard.len();
             let result = context_manager::get_new_context_messages_and_metadata(
                 &conversation_guard,
@@ -2511,6 +2503,9 @@ impl AgentLoop {
                     .name(),
             );
             drop(conversation_guard);
+            if dangling_inserted > 0 {
+                self.note_history_rewritten_below_offset().await;
+            }
 
             // Update state if deleted range changed, then persist the
             // range without holding the state guard across disk IO.
@@ -2701,8 +2696,14 @@ impl AgentLoop {
             let workspace_root = self.resolve_workspace_root();
             let compaction = compact_old_tool_results(&mut request.messages, &workspace_root);
             if compaction.collapsed > 0 {
-                let mut history = self.conversation_history.lock().await;
-                persist_compacted_tool_blocks(&original, &request.messages, &mut history);
+                {
+                    let mut history = self.conversation_history.lock().await;
+                    persist_compacted_tool_blocks(&original, &request.messages, &mut history);
+                }
+                // Rewritten block contents keep their indices, so the
+                // offset still lines up but points at stale bytes: force
+                // the next save to take a full snapshot.
+                self.note_history_rewritten_below_offset().await;
             }
             if compaction.read_results_collapsed > 0 {
                 let (paths, unknown_path) =
@@ -2730,6 +2731,9 @@ impl AgentLoop {
                     &mut history,
                 );
                 drop(history);
+                // Same staleness as above: rewritten contents need a
+                // full snapshot on the next save.
+                self.note_history_rewritten_below_offset().await;
                 if fresh_result_trim.read_results_collapsed > 0 {
                     let (paths, unknown_path) = canonical_read_state_paths(
                         &workspace_root,
@@ -4696,17 +4700,7 @@ impl AgentLoop {
                     .emit(OutputEvent::CompletionAvailable(result.clone()));
             }
             // Force save on completion (async, non-blocking)
-            if let Some(ref storage) = self.deps.task_storage {
-                let history = self.conversation_history.lock().await.clone();
-                if !history.is_empty()
-                    && let Err(e) = storage.write_api_conversation_history_async(&history).await
-                {
-                    error!(
-                        "Failed to save API conversation history on completion: {}",
-                        e
-                    );
-                }
-            }
+            self.force_save_conversation_history("completion").await;
             // Use the response-only text (thinking tags stripped) for
             // markdown re-rendering. accumulated_text contains raw
             // thinking tags which pulldown_cmark treats as raw HTML and
@@ -5256,6 +5250,36 @@ impl AgentLoop {
     }
 
     /// Format duration as human-readable string.
+
+    /// Mark in-memory history as rewritten below the saved offset
+    /// (insertions, in-place edits). The offset no longer lines up with
+    /// disk, so the next save must take a full snapshot instead of
+    /// appending from a stale position.
+    async fn note_history_rewritten_below_offset(&self) {
+        self.state.lock().await.history_saved_len = 0;
+    }
+
+    /// Full-snapshot save that bypasses the debounce, for paths that must
+    /// not lose the final turns (max turns, cancellation, completion). A
+    /// snapshot absorbs the journal, so the saved offset must advance to
+    /// the new end or the next debounced save re-appends absorbed lines.
+    async fn force_save_conversation_history(&self, context: &str) {
+        let Some(ref storage) = self.deps.task_storage else {
+            return;
+        };
+        let history = self.conversation_history.lock().await.clone();
+        if history.is_empty() {
+            return;
+        }
+        match storage.write_api_conversation_history_async(&history).await {
+            Ok(()) => {
+                self.state.lock().await.history_saved_len = history.len();
+            }
+            Err(e) => {
+                error!("Failed to save conversation history on {context}: {e}");
+            }
+        }
+    }
 
     /// Save conversation history to disk if task storage is configured.
     async fn save_conversation_history(&self) {
@@ -5968,7 +5992,12 @@ fn truncate_thinking_text(thinking: &mut String, token_limit: usize) {
 }
 
 /// Strict providers reject a tool call with no following result.
-fn close_dangling_tool_calls(history: &mut Vec<StorageMessage>) {
+/// Close tool calls left dangling by an interruption, synthesising the
+/// missing results in place. Returns the number of inserted messages:
+/// insertions shift every later index, so callers must reset the saved
+/// history offset afterwards or the next journal append slices from a
+/// stale position and duplicates the shifted tail.
+fn close_dangling_tool_calls(history: &mut Vec<StorageMessage>) -> usize {
     let mut insertions: Vec<(usize, StorageMessage)> = Vec::new();
     for (index, message) in history.iter().enumerate() {
         let MessageContent::AssistantBlocks(blocks) = &message.content else {
@@ -6024,9 +6053,11 @@ fn close_dangling_tool_calls(history: &mut Vec<StorageMessage>) {
             },
         ));
     }
+    let inserted = insertions.len();
     for (index, message) in insertions.into_iter().rev() {
         history.insert(index, message);
     }
+    inserted
 }
 
 /// What one compaction pass removed, so callers and tests can observe
@@ -13597,6 +13628,119 @@ Irrespective of whether additional information or instructions are given, you ar
             tool_result_present,
             "tool_result should still be present after pruning"
         );
+    }
+
+    fn convergence_text_msg(text: &str) -> StorageMessage {
+        StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }
+    }
+
+    async fn save_full_turn(agent: &AgentLoop) {
+        agent.state.lock().await.turns_since_save = 5;
+        agent.save_conversation_history().await;
+    }
+
+    /// A force full-snapshot save must advance the saved offset: otherwise
+    /// the next debounced save re-appends history the snapshot already
+    /// absorbed and the tail duplicates on disk.
+    #[tokio::test]
+    async fn test_force_save_advances_offset_no_duplicate_tail() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let sned_dir = temp_dir.path().join(".sned");
+        let task_id = "force-save-offset";
+        let task_storage = TaskStorage::new_with_dir(task_id, &sned_dir).unwrap();
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![],
+        )));
+        let agent =
+            AgentLoop::new(test_agent_config(provider, task_id)).with_task_storage(task_storage);
+
+        {
+            let mut history = agent.conversation_history.lock().await;
+            history.push(convergence_text_msg("m1"));
+            history.push(convergence_text_msg("m2"));
+        }
+        save_full_turn(&agent).await;
+        // m3 arrives after the last debounced save, so the offset is stale
+        // when the force-save absorbs it into a fresh snapshot.
+        {
+            let mut history = agent.conversation_history.lock().await;
+            history.push(convergence_text_msg("m3"));
+        }
+        agent.force_save_conversation_history("test").await;
+        {
+            let mut history = agent.conversation_history.lock().await;
+            history.push(convergence_text_msg("m4"));
+        }
+        save_full_turn(&agent).await;
+
+        let storage = agent.deps.task_storage.as_ref().unwrap();
+        let merged = storage.read_api_conversation_history();
+        let texts: Vec<String> = merged
+            .iter()
+            .map(|message| match &message.content {
+                MessageContent::Text(text) => text.clone(),
+                _ => String::from("<non-text>"),
+            })
+            .collect();
+        assert_eq!(texts, vec!["m1", "m2", "m3", "m4"]);
+    }
+
+    /// Insertions below the saved offset shift every later index: without
+    /// a reset the next append slices from the stale position, duplicating
+    /// the shifted tail and losing the inserted message.
+    #[tokio::test]
+    async fn test_dangling_insert_resets_offset_no_duplicate_tail() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let sned_dir = temp_dir.path().join(".sned");
+        let task_id = "dangling-insert-offset";
+        let task_storage = TaskStorage::new_with_dir(task_id, &sned_dir).unwrap();
+        let provider = Arc::new(Providers::Mock(crate::providers::mock::MockProvider::new(
+            vec![],
+        )));
+        let agent =
+            AgentLoop::new(test_agent_config(provider, task_id)).with_task_storage(task_storage);
+
+        {
+            let mut history = agent.conversation_history.lock().await;
+            history.push(assistant_call_msg(
+                "c1",
+                "write_to_file",
+                serde_json::json!({"path": "a.txt"}),
+            ));
+            history.push(convergence_text_msg("m2"));
+        }
+        save_full_turn(&agent).await;
+        let expected = {
+            let mut history = agent.conversation_history.lock().await;
+            assert_eq!(close_dangling_tool_calls(&mut history), 1);
+            history.clone()
+        };
+        agent.note_history_rewritten_below_offset().await;
+        save_full_turn(&agent).await;
+
+        let storage = agent.deps.task_storage.as_ref().unwrap();
+        assert_eq!(storage.read_api_conversation_history(), expected);
+    }
+
+    #[test]
+    fn test_nudge_shadow_opt_in_values() {
+        for raw in ["1", "true", "on", "yes", " TRUE ", "On"] {
+            assert!(AgentLoop::nudge_shadow_opt_in(raw), "{raw:?} must enable shadow");
+        }
+        for raw in ["", "0", "false", "off", "no", "2"] {
+            assert!(!AgentLoop::nudge_shadow_opt_in(raw), "{raw:?} must stay off");
+        }
     }
 
     #[tokio::test]
