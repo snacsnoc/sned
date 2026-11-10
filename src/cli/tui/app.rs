@@ -1185,6 +1185,12 @@ pub struct App {
     pub model_picker_results: Vec<crate::cli::slash_commands::ModelPickerEntry>,
     /// Currently selected index in model picker.
     pub model_picker_selected: usize,
+    /// Whether the session picker is active.
+    pub resume_picker_active: bool,
+    /// Session picker entries, newest first.
+    pub resume_picker_results: Vec<crate::storage::global_state::HistoryItem>,
+    /// Currently selected index in session picker.
+    pub resume_picker_selected: usize,
     /// Whether the reasoning effort picker is active.
     pub reasoning_effort_picker_active: bool,
     /// Currently selected index in reasoning effort picker.
@@ -1610,6 +1616,9 @@ impl App {
             model_picker_active: false,
             model_picker_results: Vec::new(),
             model_picker_selected: 0,
+            resume_picker_active: false,
+            resume_picker_results: Vec::new(),
+            resume_picker_selected: 0,
             reasoning_effort_picker_active: false,
             reasoning_effort_picker_selected: 0,
             reasoning_effort_picker_options: Vec::new(),
@@ -5087,6 +5096,9 @@ impl App {
         if self.model_picker_active {
             self.render_model_picker_overlay(frame, output_area);
         }
+        if self.resume_picker_active {
+            self.render_resume_picker_overlay(frame, output_area);
+        }
         if self.reasoning_effort_picker_active {
             self.render_reasoning_effort_picker_overlay(frame, output_area);
         }
@@ -5097,6 +5109,7 @@ impl App {
         let selection_blocked = self.picker_active
             || self.slash_command_active
             || self.model_picker_active
+            || self.resume_picker_active
             || self.reasoning_effort_picker_active
             || self.pending_model_switch.is_some();
         if selection_blocked {
@@ -5917,6 +5930,58 @@ impl App {
         );
     }
 
+    fn render_resume_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
+        let Some((overlay_area, visible_rows)) =
+            Self::picker_overlay_area(output_area, self.resume_picker_results.len())
+        else {
+            return;
+        };
+        let selected = self
+            .resume_picker_selected
+            .min(self.resume_picker_results.len().saturating_sub(1));
+        let first_visible =
+            Self::picker_viewport_start(selected, self.resume_picker_results.len(), visible_rows);
+
+        let rows: Vec<Line> = if self.resume_picker_results.is_empty() {
+            vec![Line::from(Span::styled(" No matches", theme::dim_style()))]
+        } else {
+            self.resume_picker_results
+                .iter()
+                .enumerate()
+                .skip(first_visible)
+                .take(visible_rows)
+                .map(|(i, entry)| {
+                    let label = resume_picker_row_label(&entry.task, entry.ts);
+                    if i == selected {
+                        Line::from(Span::styled(label, theme::picker_selected_style()))
+                    } else {
+                        Line::from(label)
+                    }
+                })
+                .collect()
+        };
+
+        frame.render_widget(Clear, overlay_area);
+        let block =
+            theme::overlay_block(format!(" Resume ({}) ", self.resume_picker_results.len()));
+        let inner = block.inner(overlay_area);
+        frame.render_widget(block, overlay_area);
+        let [list_area, footer_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+        frame.render_widget(Paragraph::new(rows), list_area);
+        frame.render_widget(
+            Paragraph::new("Tab/Enter resume · ↑/↓ select · Esc close").style(theme::dim_style()),
+            footer_area,
+        );
+        Self::render_picker_scrollbar(
+            frame,
+            list_area,
+            self.resume_picker_results.len(),
+            selected,
+            visible_rows,
+        );
+    }
+
     fn render_model_picker_overlay(&self, frame: &mut Frame, output_area: Rect) {
         let Some((overlay_area, visible_rows)) =
             Self::picker_overlay_area(output_area, self.model_picker_results.len())
@@ -6108,6 +6173,31 @@ impl App {
     }
 }
 
+fn resume_picker_row_label(task: &str, ts: i64) -> String {
+    let first_line = task.lines().next().unwrap_or(task);
+    let short: String = first_line.chars().take(72).collect();
+    let task = if short.len() < first_line.len() {
+        format!("{short}…")
+    } else {
+        short
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(ts);
+    let age = now.saturating_sub(ts).max(0);
+    let recency = if age < 60 {
+        "just now".to_string()
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else if age < 86400 {
+        format!("{}h ago", age / 3600)
+    } else {
+        format!("{}d ago", age / 86400)
+    };
+    format!("{task} · {recency}")
+}
+
 /// Compact token count for the status bar (e.g., "45k/200k" fits the old "73% ctx" slot).
 fn format_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
@@ -6160,6 +6250,30 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+
+    #[test]
+    fn resume_picker_row_label_shows_recency() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock readable")
+            .as_secs() as i64;
+        assert_eq!(
+            resume_picker_row_label("fix tetris", now - 30),
+            "fix tetris \u{b7} just now"
+        );
+        assert_eq!(
+            resume_picker_row_label("fix tetris", now - 7200),
+            "fix tetris \u{b7} 2h ago"
+        );
+        assert_eq!(
+            resume_picker_row_label("multiline\nsecond line", now - 90000),
+            "multiline \u{b7} 1d ago"
+        );
+        let long = "x".repeat(100);
+        let label = resume_picker_row_label(&long, now - 120);
+        assert!(label.ends_with("\u{b7} 2m ago"));
+        assert!(label.len() < 100);
+    }
 
     fn make_scrolling_app(total_lines: usize, content_height: usize) -> App {
         let mut app = App::new();

@@ -729,6 +729,30 @@ impl StateManager {
             .cloned()
     }
 
+    /// Recent tasks for a workspace, newest first, capped at `limit`.
+    pub fn get_recent_tasks_for_workspace(
+        &self,
+        workspace_path: &str,
+        limit: usize,
+    ) -> Vec<HistoryItem> {
+        let mut tasks: Vec<HistoryItem> = self
+            .global_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .task_history
+            .iter()
+            .filter(|h| {
+                h.workspace_root_path
+                    .as_ref()
+                    .is_some_and(|p| workspace_paths_match(p, workspace_path))
+            })
+            .cloned()
+            .collect();
+        sort_by_timestamp(&mut tasks);
+        tasks.truncate(limit);
+        tasks
+    }
+
     // ==================== Global State ====================
 
     /// Return a consistent snapshot for runtime consumers that need multiple settings.
@@ -1439,6 +1463,49 @@ mod tests {
             let history = manager.get_task_history();
             assert_eq!(history.len(), 1);
             assert_eq!(history[0].id, "task-2");
+        });
+    }
+
+    #[test]
+    fn test_get_recent_tasks_for_workspace_filters_and_orders() {
+        with_temp_data_dir(|| {
+            let manager = StateManager::new().unwrap();
+            manager.initialize().unwrap();
+            manager.set_task_history(Vec::new());
+
+            let workspace_root = TempDir::new().unwrap();
+            let workspace = workspace_root.path().join("workspace");
+            fs::create_dir_all(&workspace).unwrap();
+            let ws = workspace.to_string_lossy().into_owned();
+
+            for (id, ts, task) in [
+                ("old", 1000, "Old task"),
+                ("new", 3000, "New task"),
+                ("mid", 2000, "Mid task"),
+                ("elsewhere", 4000, "Other workspace"),
+            ] {
+                manager.add_task_to_history(HistoryItem {
+                    id: id.to_string(),
+                    ts,
+                    task: task.to_string(),
+                    workspace_root_path: Some(if id == "elsewhere" {
+                        "/other/ws".to_string()
+                    } else {
+                        ws.clone()
+                    }),
+                    ..Default::default()
+                });
+            }
+
+            let recent = manager.get_recent_tasks_for_workspace(&ws, 2);
+            assert_eq!(
+                recent
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["new", "mid"],
+                "newest first, capped, other workspaces excluded"
+            );
         });
     }
 

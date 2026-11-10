@@ -13,6 +13,7 @@ enum SlashCommandId {
     Exit,
     Clear,
     New,
+    Resume,
     Copy,
     Full,
     History,
@@ -151,6 +152,17 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         description: "Start a fresh conversation",
         usage: "/new",
         detail: "Starts a new conversation with empty context. The previous session is kept on disk and stays resumable via --session-id.",
+        category: SlashCommandCategory::Local,
+        requires_args: false,
+        requirement: CommandRequirement::Always,
+    },
+    SlashCommandSpec {
+        id: SlashCommandId::Resume,
+        name: "resume",
+        aliases: &[],
+        description: "Resume a previous conversation",
+        usage: "/resume",
+        detail: "Opens the session picker to resume a recent conversation in place. Refused while the agent is busy or approval is pending.",
         category: SlashCommandCategory::Local,
         requires_args: false,
         requirement: CommandRequirement::Always,
@@ -615,6 +627,7 @@ pub enum CliOnlyCommand {
     Quit,
     Clear,
     New,
+    Resume,
     Copy,
     Full,
     History,
@@ -775,6 +788,7 @@ impl CliOnlyCommand {
                 | Self::Quit
                 | Self::Clear
                 | Self::New
+                | Self::Resume
                 | Self::Copy
                 | Self::Full
                 | Self::History
@@ -881,6 +895,7 @@ fn cli_command_from_match(matched: &StaticCommandMatch<'_>) -> Option<CliOnlyCom
         }
         SlashCommandId::Clear => Some(CliOnlyCommand::Clear),
         SlashCommandId::New => Some(CliOnlyCommand::New),
+        SlashCommandId::Resume => Some(CliOnlyCommand::Resume),
         SlashCommandId::Copy => Some(CliOnlyCommand::Copy),
         SlashCommandId::Full => Some(CliOnlyCommand::Full),
         SlashCommandId::History => Some(CliOnlyCommand::History),
@@ -2229,6 +2244,10 @@ mod tests {
     #[test]
     fn test_parse_copy_command() {
         assert_eq!(CliOnlyCommand::parse("copy"), Some(CliOnlyCommand::Copy));
+        assert_eq!(
+            CliOnlyCommand::parse("resume"),
+            Some(CliOnlyCommand::Resume)
+        );
     }
 
     #[test]

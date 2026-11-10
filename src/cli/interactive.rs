@@ -338,6 +338,64 @@ impl InteractiveSession {
         })
     }
 
+    pub async fn start_resumed_task(
+        &self,
+        output_writer: crate::cli::output::OutputWriterArc,
+        resumed_id: &str,
+    ) -> anyhow::Result<Self> {
+        let workspace_root = self.system_prompt_context.cwd.clone().unwrap_or_default();
+        let task_storage = TaskStorage::new(resumed_id)?;
+        if !resumed_task_has_metadata(resumed_id) {
+            anyhow::bail!("session {resumed_id} has no saved data");
+        }
+        for handle in &self.ctrl_c_handles {
+            handle.abort();
+        }
+
+        let old_agent = self.agent_loop().await;
+        let enable_checkpoints = old_agent.checkpoint_manager().is_some();
+        let mut agent_config = old_agent.config_snapshot();
+        drop(old_agent);
+        agent_config.task_id = resumed_id.to_string();
+        agent_config.output_writer = output_writer;
+        agent_config.interactive_mode = true;
+
+        let checkpoint_mgr = crate::core::checkpoints::TaskCheckpointManager::new(
+            resumed_id.to_string(),
+            enable_checkpoints,
+            &workspace_root,
+        );
+
+        let agent_loop = crate::core::agent_loop::AgentLoop::new(agent_config)
+            .with_system_prompt_context(self.system_prompt_context.clone())
+            .with_tools(Arc::clone(&self.tool_registry))
+            .with_task_storage(task_storage.clone())
+            .with_context_loader(self.context_loader.clone())
+            .with_approval_manager(Arc::clone(&self.approval_manager))
+            .with_hooks(Arc::clone(&self.hook_manager))
+            .with_checkpoint_manager(checkpoint_mgr)
+            .with_yolo(self.task_opts.yolo);
+
+        let ctrl_c_handles =
+            crate::core::cancellation::setup_ctrl_c_handler(agent_loop.state_handle()).await;
+
+        Ok(Self {
+            agent_loop: Arc::new(tokio::sync::Mutex::new(agent_loop)),
+            approval_manager: Arc::clone(&self.approval_manager),
+            hook_manager: Arc::clone(&self.hook_manager),
+            state_manager: Arc::clone(&self.state_manager),
+            task_storage,
+            provider_api_keys: self.provider_api_keys.clone(),
+            task_opts: self.task_opts.clone(),
+            pending_reasoning_effort: None,
+            root_opts: self.root_opts.clone(),
+            tool_registry: Arc::clone(&self.tool_registry),
+            context_loader: self.context_loader.clone(),
+            system_prompt_context: self.system_prompt_context.clone(),
+            ctrl_c_handles,
+        })
+    }
+
     async fn queue_handle(&self) -> crate::core::agent_loop::MessageQueueHandle {
         self.agent_loop.lock().await.message_queue_handle()
     }
@@ -643,6 +701,7 @@ enum Action {
     },
     ModelSwitch(PendingModelSwitch),
     OpenModelPicker,
+    ResumeTask(String),
     ModelApiKeySubmitted(PendingModelSwitch, String),
     SetReasoningEffort(crate::cli::ReasoningEffort),
     PlanApprove,
@@ -1048,6 +1107,12 @@ fn clear_reasoning_effort_picker(app: &mut App) {
     app.reasoning_effort_picker_options.clear();
 }
 
+fn clear_resume_picker(app: &mut App) {
+    app.resume_picker_active = false;
+    app.resume_picker_results.clear();
+    app.resume_picker_selected = 0;
+}
+
 fn resolve_interactive_model_input(
     text: &str,
     skills: &[crate::core::context::instructions::SkillMetadata],
@@ -1087,6 +1152,7 @@ fn clear_input_overlays(app: &mut App) {
     close_slash_command_mode(app);
     clear_model_picker(app);
     clear_reasoning_effort_picker(app);
+    clear_resume_picker(app);
 }
 
 /// Drop a pending model switch and its input. Both Esc and Ctrl+C cancel
@@ -3164,6 +3230,7 @@ async fn handle_key_event_inner(
         && !app.slash_command_active
         && !app.slash_command_help_active
         && !app.model_picker_active
+        && !app.resume_picker_active
         && !app.reasoning_effort_picker_active
         && !is_followup_question_active(task_id)
         && app
@@ -3332,6 +3399,19 @@ async fn handle_key_event_inner(
         };
         clear_model_picker(app);
         return Ok(Some(Action::ModelSwitch(request)));
+    }
+
+    if app.resume_picker_active
+        && !app.resume_picker_results.is_empty()
+        && (key.code == KeyCode::Tab
+            || (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT)))
+    {
+        let entry = &app.resume_picker_results[app
+            .resume_picker_selected
+            .min(app.resume_picker_results.len() - 1)];
+        let task_id = entry.id.clone();
+        clear_resume_picker(app);
+        return Ok(Some(Action::ResumeTask(task_id)));
     }
 
     let efforts = app.reasoning_effort_picker_options.clone();
@@ -3509,6 +3589,7 @@ async fn handle_key_event_inner(
     let can_navigate_history = key.modifiers.is_empty()
         && !app.picker_active
         && !app.model_picker_active
+        && !app.resume_picker_active
         && !app.reasoning_effort_picker_active;
 
     if key.code == KeyCode::Up && can_navigate_history && on_first_input_line {
@@ -3563,6 +3644,19 @@ async fn handle_key_event_inner(
         }
     }
 
+    // Up/Down for session picker navigation (when session picker is active)
+    if app.resume_picker_active && !app.resume_picker_results.is_empty() {
+        if key.code == KeyCode::Up {
+            app.resume_picker_selected = app.resume_picker_selected.saturating_sub(1);
+            return Ok(None);
+        }
+        if key.code == KeyCode::Down {
+            app.resume_picker_selected =
+                (app.resume_picker_selected + 1).min(app.resume_picker_results.len() - 1);
+            return Ok(None);
+        }
+    }
+
     if app.reasoning_effort_picker_active && !efforts.is_empty() {
         if key.code == KeyCode::Up {
             app.reasoning_effort_picker_selected =
@@ -3579,6 +3673,12 @@ async fn handle_key_event_inner(
     // Escape key - dismiss model picker
     if key.code == KeyCode::Esc && app.model_picker_active {
         clear_model_picker(app);
+        return Ok(None);
+    }
+
+    // Escape key - dismiss session picker
+    if key.code == KeyCode::Esc && app.resume_picker_active {
+        clear_resume_picker(app);
         return Ok(None);
     }
 
@@ -3647,6 +3747,7 @@ async fn handle_key_event_inner(
             && !app.slash_command_active
             && !app.slash_command_help_active
             && !app.model_picker_active
+            && !app.resume_picker_active
             && !app.reasoning_effort_picker_active
             && app.pending_model_switch.is_none()
             && app.pending_clear.is_none()
@@ -3860,6 +3961,165 @@ async fn switch_to_fresh_task(
     Ok(())
 }
 
+fn resumed_task_has_metadata(resumed_id: &str) -> bool {
+    crate::storage::disk::get_tasks_dir()
+        .join(resumed_id)
+        .join(crate::storage::disk::GlobalFileNames::TASK_METADATA)
+        .exists()
+}
+
+async fn switch_to_resumed_task(
+    app: &mut App,
+    output_writer: &OutputWriterArc,
+    session: &Arc<Mutex<InteractiveSession>>,
+    task_id: &mut String,
+    task_storage: &mut TaskStorage,
+    agent_busy: &Arc<AtomicBool>,
+    state_handle: &Arc<Mutex<Option<Arc<Mutex<crate::core::agent_types::TaskState>>>>>,
+    queue_handle: &Arc<Mutex<Option<crate::core::agent_loop::MessageQueueHandle>>>,
+    approval_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    priority_rx: &mut mpsc::UnboundedReceiver<SequencedOutputEvent>,
+    output_rx: &mut mpsc::Receiver<SequencedOutputEvent>,
+    task_opts: &TaskOptions,
+    resumed_id: &str,
+) -> anyhow::Result<()> {
+    if app.cancellation_pending {
+        app.show_notification(
+            "Cancellation is still finishing; wait before resuming a conversation.",
+            NotificationKind::Info,
+        );
+        return Ok(());
+    }
+    if agent_busy.load(Ordering::Relaxed) {
+        app.push_styled(
+            "Agent is busy. Wait for it to finish before resuming a conversation.",
+            Style::default().fg(theme::warning_fg()),
+        );
+        return Ok(());
+    }
+    if session
+        .lock()
+        .await
+        .agent_loop()
+        .await
+        .has_queued_messages()
+        .await
+    {
+        app.push_styled(
+            "There are queued follow-ups for this conversation. Let them run before resuming another one.",
+            Style::default().fg(theme::warning_fg()),
+        );
+        return Ok(());
+    }
+    if resumed_id == task_id.as_str() {
+        app.push_styled(
+            "Already on that conversation.",
+            Style::default().fg(theme::warning_fg()),
+        );
+        return Ok(());
+    }
+    // Probe before discard/shutdown: bailing after the old writer is gone
+    // would drop transcript lines pushed between shutdown and restart.
+    if !resumed_task_has_metadata(resumed_id) {
+        app.push_styled(
+            format!("Could not resume conversation: session {resumed_id} has no saved data."),
+            Style::default().fg(theme::warning_fg()),
+        );
+        return Ok(());
+    }
+    if app.has_pending_approval() {
+        app.resolve_pending_approval(crate::core::approval::ApprovalResult::Denied);
+        app.push_styled(
+            "Pending approval denied for the resumed conversation.",
+            Style::default().fg(theme::warning_fg()),
+        );
+    }
+
+    let old_task_id = task_id.clone();
+    discard_pending_output(approval_rx, priority_rx, output_rx);
+    if let Err(error) = app.shutdown_task_transcript_writer() {
+        tracing::warn!(error = %error, "Failed to shut down task transcript writer");
+    }
+    let resumed = match session
+        .lock()
+        .await
+        .start_resumed_task(output_writer.clone(), resumed_id)
+        .await
+    {
+        Ok(resumed) => resumed,
+        Err(error) => {
+            app.push_styled(
+                format!("Could not resume conversation: {error}"),
+                Style::default().fg(theme::warning_fg()),
+            );
+            app.start_task_transcript_writer(task_storage)?;
+            return Ok(());
+        }
+    };
+    *session.lock().await = resumed;
+    *task_id = session
+        .lock()
+        .await
+        .agent_loop()
+        .await
+        .task_id()
+        .to_string();
+    *task_storage = session.lock().await.task_storage();
+    refresh_session_handles(app, session, queue_handle, state_handle, task_opts).await;
+    // Provider/model stay inherited: resume restores history, not provider
+    // setup, so the status bar needs no refresh. Revisit if resume ever
+    // restores the saved session's per-task model.
+    app.task_id.clone_from(task_id);
+    let loaded = {
+        let sess = session.lock().await;
+        let agent = sess.agent_loop().await;
+        let loaded = agent.load_conversation_history().await;
+        agent.load_file_context_tracker().await;
+        loaded
+    };
+    if loaded {
+        let sess = session.lock().await;
+        let hook_manager = Arc::clone(&sess.hook_manager);
+        let resumed_task_id = task_id.clone();
+        drop(sess);
+        let _ =
+            tokio::task::spawn_blocking(move || hook_manager.task_resume(&resumed_task_id)).await;
+    }
+    app.clear_output()?;
+    app.set_input_text("");
+    clear_input_overlays(app);
+    app.pending_clear = None;
+    // A requested-but-unapplied /model switch targets the old task's provider
+    // setup, so it can't carry over; say so instead of dropping it silently.
+    if let Some(pending) = app.pending_model_switch.take() {
+        app.push_styled(
+            format!(
+                "Dropped unapplied model switch to {} {}.",
+                pending.provider, pending.model_id
+            ),
+            Style::default().fg(theme::warning_fg()),
+        );
+    }
+    app.plan_state_cache = None;
+    app.plan_state_cache_ptr = None;
+    app.start_time = Some(Instant::now());
+    app.force_bottom();
+    replay_transcript(app, task_storage);
+    app.start_task_transcript_writer(task_storage)?;
+    let short_id = task_id.chars().take(8).collect::<String>();
+    let short_old = old_task_id.chars().take(8).collect::<String>();
+    if loaded {
+        app.push_plain(format!(
+            "Resumed conversation {short_id} (previous {short_old} resumable via /resume)."
+        ));
+    } else {
+        app.push_plain(format!(
+            "Resumed conversation {short_id} with no saved history (previous {short_old} resumable via /resume)."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 async fn handle_cli_only_command(
     cli_cmd: crate::cli::slash_commands::CliOnlyCommand,
@@ -3903,7 +4163,7 @@ async fn handle_cli_only_command_with_terminal(
     app: &mut App,
     output_writer: &OutputWriterArc,
     session: &Arc<Mutex<InteractiveSession>>,
-    _task_id: &str,
+    task_id: &str,
     agent_busy: &Arc<AtomicBool>,
     agent_done: &Arc<tokio::sync::Notify>,
     agent_start_time: &Arc<Mutex<Option<Instant>>>,
@@ -3977,6 +4237,30 @@ async fn handle_cli_only_command_with_terminal(
                 "Cannot start a new conversation from here.",
                 Style::default().fg(theme::warning_fg()),
             );
+        }
+        CliOnlyCommand::Resume => {
+            let (state_manager, workspace) = {
+                let sess = session.lock().await;
+                (
+                    Arc::clone(&sess.state_manager),
+                    sess.system_prompt_context.cwd.clone().unwrap_or_default(),
+                )
+            };
+            let mut tasks = state_manager.get_recent_tasks_for_workspace(&workspace, 10);
+            tasks.retain(|task| task.id != task_id);
+            if tasks.is_empty() {
+                app.push_styled(
+                    "No previous conversations for this workspace.",
+                    Style::default().fg(theme::warning_fg()),
+                );
+                return Ok(false);
+            }
+            // Exactly one picker may hold the input.
+            clear_input_overlays(app);
+            app.resume_picker_results = tasks;
+            app.resume_picker_selected = 0;
+            app.resume_picker_active = true;
+            return Ok(false);
         }
         CliOnlyCommand::Copy => {
             handle_copy_command(app, copy_to_clipboard);
@@ -6330,6 +6614,7 @@ async fn run_main_loop(
                             let overlays_open = app.picker_active
                                 || app.slash_command_active
                                 || app.model_picker_active
+                                || app.resume_picker_active
                                 || app.reasoning_effort_picker_active;
                             // Only cancelling the agent or idling arms the quit
                             // timer; dismissing overlays never does.
@@ -6407,6 +6692,25 @@ async fn run_main_loop(
                                 }
                                 Action::OpenModelPicker => {
                                     open_model_picker(app, &session, &task_opts).await;
+                                    break;
+                                }
+                                Action::ResumeTask(resumed_id) => {
+                                    switch_to_resumed_task(
+                                        app,
+                                        &output_writer,
+                                        &session,
+                                        &mut task_id,
+                                        &mut task_storage,
+                                        &agent_busy,
+                                        &state_handle,
+                                        &queue_handle,
+                                        approval_output_rx,
+                                        priority_output_rx,
+                                        output_rx,
+                                        task_opts,
+                                        &resumed_id,
+                                    )
+                                    .await?;
                                     break;
                                 }
                                 Action::SetReasoningEffort(effort) => {
@@ -14405,6 +14709,222 @@ mod tests {
         assert!(visible.contains(&task_id));
         assert!(visible.contains(&old_task_id));
         assert!(!visible.contains("old conversation line"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resume_command_switches_to_saved_task() -> anyhow::Result<()> {
+        use crate::providers::{MessageContent, MessageRole, StorageMessage};
+
+        let resumed_id = ulid::Ulid::new().to_string();
+        let resumed_storage = TaskStorage::new(&resumed_id)?;
+        resumed_storage.create_initial_metadata("/tmp", None)?;
+        resumed_storage.write_api_conversation_history(&[StorageMessage {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text("resumed hello".to_string()),
+            model_info: None,
+            metrics: None,
+            ts: None,
+        }])?;
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let old_task_id = session
+            .lock()
+            .await
+            .agent_loop()
+            .await
+            .task_id()
+            .to_string();
+
+        let (tx, mut output_rx) = mpsc::channel(8);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let state_handle = Arc::new(Mutex::new(None));
+        let queue_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.push_plain("old conversation line");
+        let mut task_id = old_task_id.clone();
+        let mut task_storage = session.lock().await.task_storage();
+
+        switch_to_resumed_task(
+            &mut app,
+            &output_writer,
+            &session,
+            &mut task_id,
+            &mut task_storage,
+            &agent_busy,
+            &state_handle,
+            &queue_handle,
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut output_rx,
+            &task_opts,
+            &resumed_id,
+        )
+        .await?;
+
+        assert_eq!(task_id, resumed_id);
+        assert_eq!(
+            session.lock().await.agent_loop().await.task_id(),
+            task_id.as_str()
+        );
+        assert_eq!(task_storage.task_dir(), resumed_storage.task_dir());
+        assert!(queue_handle.lock().await.is_some());
+        assert!(state_handle.lock().await.is_some());
+        assert_eq!(app.task_id, task_id);
+        let history = session
+            .lock()
+            .await
+            .agent_loop()
+            .await
+            .get_conversation_history()
+            .await;
+        assert!(history.iter().any(|message| matches!(
+            &message.content,
+            MessageContent::Text(text) if text.contains("resumed hello")
+        )));
+        let visible: String = app.output_lines.iter().map(App::line_to_string).collect();
+        assert!(visible.contains("Resumed conversation"));
+        assert!(!visible.contains("old conversation line"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resume_command_bails_on_missing_metadata() -> anyhow::Result<()> {
+        let missing_id = ulid::Ulid::new().to_string();
+        assert!(!resumed_task_has_metadata(&missing_id));
+
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let old_task_id = session
+            .lock()
+            .await
+            .agent_loop()
+            .await
+            .task_id()
+            .to_string();
+
+        let (tx, mut output_rx) = mpsc::channel(8);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        let agent_busy = Arc::new(AtomicBool::new(false));
+        let state_handle = Arc::new(Mutex::new(None));
+        let queue_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.push_plain("old conversation line");
+        let mut task_id = old_task_id.clone();
+        let mut task_storage = session.lock().await.task_storage();
+
+        switch_to_resumed_task(
+            &mut app,
+            &output_writer,
+            &session,
+            &mut task_id,
+            &mut task_storage,
+            &agent_busy,
+            &state_handle,
+            &queue_handle,
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut output_rx,
+            &task_opts,
+            &missing_id,
+        )
+        .await?;
+
+        assert_eq!(task_id, old_task_id);
+        let visible_before_replay: String =
+            app.output_lines.iter().map(App::line_to_string).collect();
+        assert!(visible_before_replay.contains("old conversation line"));
+        assert_eq!(
+            session.lock().await.agent_loop().await.task_id(),
+            old_task_id.as_str()
+        );
+        assert!(queue_handle.lock().await.is_none());
+        let visible: String = app.output_lines.iter().map(App::line_to_string).collect();
+        assert!(visible.contains("Could not resume conversation"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resume_command_refuses_while_busy() -> anyhow::Result<()> {
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts.clone(),
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let old_task_id = session
+            .lock()
+            .await
+            .agent_loop()
+            .await
+            .task_id()
+            .to_string();
+
+        let (tx, mut output_rx) = mpsc::channel(8);
+        let output_writer: OutputWriterArc = Arc::new(ChannelOutputWriter::new(tx));
+        let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        let (_priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+        let agent_busy = Arc::new(AtomicBool::new(true));
+        let state_handle = Arc::new(Mutex::new(None));
+        let queue_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        let mut task_id = old_task_id.clone();
+        let mut task_storage = session.lock().await.task_storage();
+
+        switch_to_resumed_task(
+            &mut app,
+            &output_writer,
+            &session,
+            &mut task_id,
+            &mut task_storage,
+            &agent_busy,
+            &state_handle,
+            &queue_handle,
+            &mut approval_rx,
+            &mut priority_rx,
+            &mut output_rx,
+            &task_opts,
+            "some-other-task",
+        )
+        .await?;
+
+        assert_eq!(task_id, old_task_id);
+        assert!(queue_handle.lock().await.is_none());
+        let visible: String = app.output_lines.iter().map(App::line_to_string).collect();
+        assert!(visible.contains("Agent is busy"));
         Ok(())
     }
 
