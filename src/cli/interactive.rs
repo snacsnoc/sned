@@ -769,38 +769,62 @@ async fn activate_model_switch(
 async fn open_model_picker(
     app: &mut App,
     session: &Arc<Mutex<InteractiveSession>>,
-    task_opts: &TaskOptions,
+    agent_busy: &Arc<AtomicBool>,
 ) {
-    let mut entries = crate::cli::slash_commands::build_model_picker_entries();
-    {
+    if agent_busy.load(Ordering::Relaxed) {
+        app.push_styled(
+            "Agent is busy. Wait for it to finish before switching models.",
+            Style::default().fg(theme::warning_fg()),
+        );
+        return;
+    }
+    let entries = crate::cli::slash_commands::build_model_picker_entries();
+    // Snapshot everything the readiness check needs, then drop the guard:
+    // the keychain and file IO below must not stall session-lock holders.
+    // Provider and key come from the live session, not the startup-frozen
+    // task options the loop was launched with.
+    let (state_manager, current_provider, live_api_key, remembered) = {
         let sess = session.lock().await;
-        let current = sess.task_opts.provider.clone();
-        let mut readiness = std::collections::HashMap::new();
+        let mut remembered = std::collections::HashMap::new();
         for entry in &entries {
-            if readiness.contains_key(entry.provider) {
-                continue;
-            }
-            let remembered = sess.provider_api_key(entry.provider);
-            let explicit = remembered.or_else(|| {
-                if current.as_deref() == Some(entry.provider) {
-                    task_opts.api_key.clone()
+            remembered
+                .entry(entry.provider)
+                .or_insert_with(|| sess.provider_api_key(entry.provider));
+        }
+        (
+            Arc::clone(&sess.state_manager),
+            sess.task_opts.provider.clone(),
+            sess.task_opts.api_key.clone(),
+            remembered,
+        )
+    };
+    let mut readiness = std::collections::HashMap::new();
+    for entry in &entries {
+        if readiness.contains_key(entry.provider) {
+            continue;
+        }
+        let explicit = remembered
+            .get(entry.provider)
+            .cloned()
+            .flatten()
+            .or_else(|| {
+                if current_provider.as_deref() == Some(entry.provider) {
+                    live_api_key.clone()
                 } else {
                     None
                 }
             });
-            let ready = crate::cli::runtime_provider_api_key_available(
-                entry.provider,
-                explicit.as_deref(),
-                &sess.state_manager,
-            )
-            .unwrap_or(true);
-            readiness.insert(entry.provider, ready);
-        }
-        let ordered = crate::cli::slash_commands::partition_by_readiness(entries, &|provider| {
-            readiness.get(provider).copied().unwrap_or(true)
-        });
-        entries = ordered;
+        let ready = crate::cli::runtime_provider_api_key_available(
+            entry.provider,
+            explicit.as_deref(),
+            &state_manager,
+        )
+        .unwrap_or(true);
+        readiness.insert(entry.provider, ready);
     }
+    let entries = crate::cli::slash_commands::partition_by_readiness(entries, &|provider| {
+        readiness.get(provider).copied().unwrap_or(true)
+    });
     // Exactly one picker may hold the input.
     clear_input_overlays(app);
     app.model_picker_results = entries;
@@ -2774,6 +2798,7 @@ async fn refresh_input_completions(
     // edits the prompt, it is no longer a valid overlay for that input.
     clear_model_picker(app);
     clear_reasoning_effort_picker(app);
+    clear_resume_picker(app);
     if app.slash_command_help_active {
         app.slash_command_results = crate::cli::slash_commands::filter_slash_commands(
             &app.slash_command_all_entries,
@@ -3682,6 +3707,13 @@ async fn handle_key_event_inner(
         return Ok(None);
     }
 
+    // An open session picker owns the keyboard, like the reasoning
+    // effort picker below: ordinary keys must not leak into the textarea
+    // and get wiped by the accept path.
+    if app.resume_picker_active {
+        return Ok(None);
+    }
+
     if key.code == KeyCode::Esc && app.reasoning_effort_picker_active {
         clear_reasoning_effort_picker(app);
         return Ok(None);
@@ -4085,7 +4117,11 @@ async fn switch_to_resumed_task(
         let _ =
             tokio::task::spawn_blocking(move || hook_manager.task_resume(&resumed_task_id)).await;
     }
-    app.clear_output()?;
+    // A failed clear must not skip the writer restart below: the session
+    // is already swapped, and returning early would leave it writer-down.
+    if let Err(error) = app.clear_output() {
+        tracing::warn!(error = %error, "Failed to clear output for resumed conversation");
+    }
     app.set_input_text("");
     clear_input_overlays(app);
     app.pending_clear = None;
@@ -4359,7 +4395,7 @@ async fn handle_cli_only_command_with_terminal(
         }
         CliOnlyCommand::ModelSwitch(model_spec) => {
             if model_spec.is_empty() {
-                open_model_picker(app, session, task_opts).await;
+                open_model_picker(app, session, agent_busy).await;
                 return Ok(false);
             }
 
@@ -6691,7 +6727,7 @@ async fn run_main_loop(
                                     break;
                                 }
                                 Action::OpenModelPicker => {
-                                    open_model_picker(app, &session, &task_opts).await;
+                                    open_model_picker(app, &session, &agent_busy).await;
                                     break;
                                 }
                                 Action::ResumeTask(resumed_id) => {
@@ -10878,6 +10914,61 @@ mod tests {
             !matches!(action, Some(Action::OpenModelPicker)),
             "Ctrl+O must not fire during secret entry"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_model_picker_refuses_while_busy() -> anyhow::Result<()> {
+        let task_opts = retry_test_task_opts();
+        let session = Arc::new(Mutex::new(
+            InteractiveSession::build_with_writer(
+                task_opts,
+                RootOnlyOptions {
+                    session_id: None,
+                    continue_session: false,
+                },
+                None,
+            )
+            .await?,
+        ));
+        let mut app = App::new();
+        let agent_busy = Arc::new(AtomicBool::new(true));
+
+        open_model_picker(&mut app, &session, &agent_busy).await;
+
+        assert!(!app.model_picker_active);
+        let visible: String = app.output_lines.iter().map(App::line_to_string).collect();
+        assert!(visible.contains("Agent is busy"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_picker_swallow_ordinary_keys() -> anyhow::Result<()> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, _rx) = mpsc::channel(4);
+        let output_writer: OutputWriterArc =
+            Arc::new(crate::cli::output::ChannelOutputWriter::new(tx));
+        let state_handle = Arc::new(Mutex::new(None));
+        let mut app = App::new();
+        app.resume_picker_active = true;
+        app.resume_picker_results = vec![crate::storage::global_state::HistoryItem {
+            id: "task-2".to_string(),
+            task: "old work".to_string(),
+            ..Default::default()
+        }];
+
+        let action = handle_key_event(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
+            &mut app,
+            &output_writer,
+            &state_handle,
+            "task-1",
+        )
+        .await?;
+        assert!(action.is_none());
+        assert!(app.input.lines().join("\n").is_empty());
+        assert!(app.resume_picker_active);
         Ok(())
     }
 
